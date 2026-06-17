@@ -21,6 +21,8 @@ import (
 	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
 	"piccolod/internal/services"
+
+	"gopkg.in/yaml.v3"
 )
 
 const (
@@ -29,6 +31,7 @@ const (
 	manifestUpdateBackupFilename = "app.manifest-update.prev.yaml"
 	installStateBackupFilename   = "install_state.manifest-update.prev.json"
 	exposureReviewConfirmation   = "exposure_review"
+	inputUsageScanSentinelPrefix = "__PICCOLO_INPUT_USAGE_SCAN_SENTINEL_"
 )
 
 var (
@@ -37,12 +40,16 @@ var (
 )
 
 type ManifestUpdateInputField struct {
-	Name       string `json:"name"`
-	Type       string `json:"type"`
-	Provenance string `json:"provenance"`
-	Required   bool   `json:"required"`
-	Generate   bool   `json:"generate"`
-	Locked     bool   `json:"locked"`
+	Name                  string `json:"name"`
+	Type                  string `json:"type"`
+	Provenance            string `json:"provenance"`
+	Required              bool   `json:"required"`
+	Generate              bool   `json:"generate"`
+	Locked                bool   `json:"locked"`
+	Sensitive             bool   `json:"sensitive,omitempty"`
+	HasCurrentValue       bool   `json:"has_current_value,omitempty"`
+	CurrentValueSensitive bool   `json:"current_value_sensitive,omitempty"`
+	CurrentValueDisplay   string `json:"current_value_display,omitempty"`
 }
 
 type ManifestUpdateConfigureResult struct {
@@ -58,6 +65,7 @@ type ManifestUpdateRequest struct {
 	RawTemplate        []byte
 	Inputs             map[string]interface{}
 	RegenerateInputs   []string
+	ClearInputs        []string
 	Confirmations      []string
 	CatalogPending     bool
 	SystemContext      InstallSystemContext
@@ -90,6 +98,18 @@ type ManifestUpdateReviewItem struct {
 	Confirmation string `json:"confirmation"`
 }
 
+type ManifestUpdateKeptValueReviewItem struct {
+	Field          string   `json:"field"`
+	RiskKind       string   `json:"risk_kind"`
+	OldSemantic    []string `json:"old_semantic,omitempty"`
+	NewSemantic    []string `json:"new_semantic,omitempty"`
+	SemanticDelta  []string `json:"semantic_delta,omitempty"`
+	OldUsage       []string `json:"old_usage,omitempty"`
+	NewUsage       []string `json:"new_usage,omitempty"`
+	Confirmation   string   `json:"confirmation"`
+	BlockingReason string   `json:"blocking_reason,omitempty"`
+}
+
 type ManifestUpdateImagePlanItem struct {
 	ServiceName    string `json:"service_name"`
 	ImageRef       string `json:"image_ref"`
@@ -105,28 +125,29 @@ type ManifestUpdateDataSafetySummary struct {
 }
 
 type ManifestUpdateResult struct {
-	InstanceID            string                           `json:"instance_id"`
-	BaseManifestHash      string                           `json:"base_manifest_hash"`
-	RuntimeFingerprint    string                           `json:"runtime_fingerprint"`
-	DryRunToken           string                           `json:"dry_run_token,omitempty"`
-	RenderedAppID         string                           `json:"rendered_app_id"`
-	DiffKind              string                           `json:"diff_kind"`
-	UpdateClass           string                           `json:"update_class,omitempty"`
-	Applicable            bool                             `json:"applicable"`
-	BlockingReason        string                           `json:"blocking_reason,omitempty"`
-	MetadataOnly          bool                             `json:"metadata_only"`
-	AccessRepairPending   bool                             `json:"access_repair_pending,omitempty"`
-	AccessRepairMessage   string                           `json:"access_repair_message,omitempty"`
-	Summary               ManifestUpdateSummary            `json:"summary"`
-	Decisions             []ManifestUpdateDecision         `json:"decisions,omitempty"`
-	ExposureReview        []ManifestUpdateReviewItem       `json:"exposure_review,omitempty"`
-	RequiredConfirmations []string                         `json:"required_confirmations,omitempty"`
-	OperationRiskFlags    []string                         `json:"operation_risk_flags,omitempty"`
-	RuntimeReadiness      []string                         `json:"runtime_readiness,omitempty"`
-	StagedImageRootfs     []string                         `json:"staged_image_rootfs,omitempty"`
-	ListenerRoutingAuth   []string                         `json:"listener_routing_auth,omitempty"`
-	StorageBoundary       []string                         `json:"storage_boundary,omitempty"`
-	DataSafety            *ManifestUpdateDataSafetySummary `json:"data_safety,omitempty"`
+	InstanceID            string                              `json:"instance_id"`
+	BaseManifestHash      string                              `json:"base_manifest_hash"`
+	RuntimeFingerprint    string                              `json:"runtime_fingerprint"`
+	DryRunToken           string                              `json:"dry_run_token,omitempty"`
+	RenderedAppID         string                              `json:"rendered_app_id"`
+	DiffKind              string                              `json:"diff_kind"`
+	UpdateClass           string                              `json:"update_class,omitempty"`
+	Applicable            bool                                `json:"applicable"`
+	BlockingReason        string                              `json:"blocking_reason,omitempty"`
+	MetadataOnly          bool                                `json:"metadata_only"`
+	AccessRepairPending   bool                                `json:"access_repair_pending,omitempty"`
+	AccessRepairMessage   string                              `json:"access_repair_message,omitempty"`
+	Summary               ManifestUpdateSummary               `json:"summary"`
+	Decisions             []ManifestUpdateDecision            `json:"decisions,omitempty"`
+	ExposureReview        []ManifestUpdateReviewItem          `json:"exposure_review,omitempty"`
+	KeptValueReview       []ManifestUpdateKeptValueReviewItem `json:"kept_value_review,omitempty"`
+	RequiredConfirmations []string                            `json:"required_confirmations,omitempty"`
+	OperationRiskFlags    []string                            `json:"operation_risk_flags,omitempty"`
+	RuntimeReadiness      []string                            `json:"runtime_readiness,omitempty"`
+	StagedImageRootfs     []string                            `json:"staged_image_rootfs,omitempty"`
+	ListenerRoutingAuth   []string                            `json:"listener_routing_auth,omitempty"`
+	StorageBoundary       []string                            `json:"storage_boundary,omitempty"`
+	DataSafety            *ManifestUpdateDataSafetySummary    `json:"data_safety,omitempty"`
 }
 
 type manifestUpdateCandidate struct {
@@ -134,6 +155,7 @@ type manifestUpdateCandidate struct {
 	InstanceID           string
 	RawTemplate          []byte
 	Inputs               map[string]interface{}
+	InputSensitive       map[string]bool
 	SystemContext        InstallSystemContext
 	BaseManifestHash     string
 	RuntimeFingerprint   string
@@ -217,13 +239,14 @@ func (m *AppManager) ConfigureCustomManifestUpdate(ctx context.Context, instance
 			return nil, err
 		}
 		raw = pendingRaw
-		def, err := m.schemaForInstallStateRawTemplate(ctx, instanceID, raw, pendingState)
+		currentDef, _ := state.GetAppDefinition(instanceID)
+		def, renderedSchema, err := m.schemaForInstallStateRawTemplateWithOrigin(ctx, instanceID, raw, pendingState, currentDef)
 		if err != nil {
 			return nil, fmt.Errorf("pending catalog manifest schema: %w", err)
 		}
 		fields, preflight := manifestUpdateInputFieldsForCatalogPending(def.Inputs, pendingState, instanceID)
 		return &ManifestUpdateConfigureResult{
-			Inputs:                   def.Inputs,
+			Inputs:                   manifestUpdateDisplayInputs(def.Inputs, instanceID, renderedSchema),
 			Fields:                   fields,
 			SecretGeneratedPreflight: preflight,
 			Eligible:                 true,
@@ -235,9 +258,13 @@ func (m *AppManager) ConfigureCustomManifestUpdate(ctx context.Context, instance
 		return nil, fmt.Errorf("parse manifest schema: %w", err)
 	}
 	PrepareSmartDefaultsForUpdate(def, instanceID)
-	fields, preflight := manifestUpdateInputFields(def.Inputs)
+	inputState, err := manifestUpdateInputState(state, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	displayInputs, fields, preflight := manifestUpdateInputFields(def.Inputs, inputState, instanceID)
 	result := &ManifestUpdateConfigureResult{
-		Inputs:                   def.Inputs,
+		Inputs:                   displayInputs,
 		Fields:                   fields,
 		SecretGeneratedPreflight: preflight,
 		Eligible:                 true,
@@ -284,37 +311,124 @@ func PrepareSmartDefaultsForUpdate(schema *api.AppDefinition, instanceID string)
 	}
 }
 
-func manifestUpdateInputFields(inputs map[string]api.AppInput) ([]ManifestUpdateInputField, []string) {
+func manifestUpdateDisplayInputs(inputs map[string]api.AppInput, instanceID string, redactMetadata bool) map[string]api.AppInput {
+	displayInputs := make(map[string]api.AppInput, len(inputs))
+	for name, spec := range inputs {
+		displayInputs[name] = clientDisplayInputSpec(name, spec, instanceID, redactMetadata)
+	}
+	return displayInputs
+}
+
+func manifestUpdateInputFields(inputs map[string]api.AppInput, st *InstallState, instanceID string) (map[string]api.AppInput, []ManifestUpdateInputField, []string) {
 	names := make([]string, 0, len(inputs))
 	for name := range inputs {
 		names = append(names, name)
 	}
 	slices.Sort(names)
+	displayInputs := make(map[string]api.AppInput, len(inputs))
 	fields := make([]ManifestUpdateInputField, 0, len(names))
 	preflight := []string{}
 	for _, name := range names {
 		spec := inputs[name]
 		provenance := "Entered now"
 		locked := false
+		currentUsable := false
+		if st != nil && st.InstallInputs != nil {
+			value, present := st.InstallInputs[name]
+			currentUsable = present && installInputValueUsableForSchema(value, spec)
+		}
+		currentSensitive := manifestUpdateStoredInputSensitive(name, spec, st)
+		sensitive := inputIsSensitive(name, spec) || currentSensitive
+		currentDisplay := ""
 		if name == "__app_address__" {
 			provenance = "Locked current value"
 			locked = true
-		} else if spec.Type == "password" || spec.Generate {
-			provenance = "Re-enter required"
-			preflight = append(preflight, name)
+		} else if currentUsable {
+			if sensitive {
+				provenance = "Current stored value will be kept"
+			} else {
+				provenance = "Current value will be kept"
+				currentDisplay = manifestUpdateCurrentValueDisplay(st.InstallInputs[name])
+			}
+		} else if sensitive {
+			if spec.Required || spec.Generate {
+				provenance = "Re-enter required"
+			} else {
+				provenance = "Optional secret; leave blank to keep unset"
+			}
+			if spec.Required || spec.Generate {
+				preflight = append(preflight, name)
+			}
 		} else if spec.Default != nil {
 			provenance = "New manifest default"
+		} else if spec.Required {
+			provenance = "Enter required"
 		}
 		fields = append(fields, ManifestUpdateInputField{
-			Name:       name,
-			Type:       spec.Type,
-			Provenance: provenance,
-			Required:   spec.Required,
-			Generate:   spec.Generate,
-			Locked:     locked,
+			Name:                  name,
+			Type:                  spec.Type,
+			Provenance:            provenance,
+			Required:              spec.Required,
+			Generate:              spec.Generate,
+			Locked:                locked,
+			Sensitive:             sensitive,
+			HasCurrentValue:       currentUsable && name != "__app_address__",
+			CurrentValueSensitive: currentSensitive,
+			CurrentValueDisplay:   currentDisplay,
 		})
 	}
-	return fields, preflight
+	displayInputs = manifestUpdateDisplayInputs(inputs, instanceID, false)
+	return displayInputs, fields, preflight
+}
+
+func manifestUpdateCurrentValueDisplay(value any) string {
+	if value == nil {
+		return ""
+	}
+	var text string
+	switch v := value.(type) {
+	case string:
+		text = v
+	default:
+		if encoded, err := json.Marshal(v); err == nil {
+			text = string(encoded)
+		} else {
+			text = fmt.Sprint(v)
+		}
+	}
+	text = strings.TrimSpace(text)
+	if len(text) > 160 {
+		text = text[:157] + "..."
+	}
+	return text
+}
+
+func manifestUpdateStoredInputSensitive(name string, newSpec api.AppInput, st *InstallState) bool {
+	if inputIsSensitive(name, newSpec) || newSpec.Generate {
+		return true
+	}
+	if st == nil || st.InstallInputs == nil {
+		return false
+	}
+	if _, ok := st.InstallInputs[name]; !ok {
+		return false
+	}
+	if st.InputSensitive != nil && st.InputSensitive[name] {
+		return true
+	}
+	oldRaw := st.RawTemplate
+	if len(bytes.TrimSpace(oldRaw)) == 0 {
+		return true
+	}
+	oldSchema, err := ParseAppSchema(oldRaw)
+	if err != nil {
+		return true
+	}
+	oldSpec, ok := oldSchema.Inputs[name]
+	if !ok {
+		return true
+	}
+	return inputIsSensitive(name, oldSpec) || oldSpec.Generate
 }
 
 func manifestUpdateInputFieldsForCatalogPending(inputs map[string]api.AppInput, st *InstallState, instanceID string) ([]ManifestUpdateInputField, []string) {
@@ -335,26 +449,69 @@ func manifestUpdateInputFieldsForCatalogPending(inputs map[string]api.AppInput, 
 			inputs[name] = spec
 			continue
 		}
-		if value, exists := st.InstallInputs[name]; exists && strings.TrimSpace(fmt.Sprint(value)) != "" {
+		value, oldPresent := any(nil), false
+		if st.InstallInputs != nil {
+			value, oldPresent = st.InstallInputs[name]
+		}
+		currentUsable := oldPresent && installInputValueUsableForSchema(value, spec)
+		currentSensitive := manifestUpdateStoredInputSensitive(name, spec, st)
+		if currentUsable && !currentSensitive && !spec.Generate {
 			continue
 		}
-		if !spec.Required && !spec.Generate {
+		if !spec.Required && !spec.Generate && !currentSensitive {
 			continue
 		}
-		provenance := "Required by catalog update"
-		if spec.Type == "password" || spec.Generate {
-			provenance = "Generate or enter required"
-			preflight = append(preflight, name)
+		provenance := "Required for this update"
+		if currentUsable {
+			if currentSensitive || spec.Generate {
+				provenance = "Current stored value will be kept"
+			} else {
+				provenance = "Current value will be kept"
+			}
+		} else if inputIsSensitive(name, spec) || spec.Generate {
+			if spec.Required || spec.Generate {
+				if spec.Generate {
+					provenance = "Generate or enter required"
+				} else {
+					provenance = "Re-enter required"
+				}
+				preflight = append(preflight, name)
+			} else {
+				provenance = "Optional secret; leave blank to keep unset"
+			}
 		}
 		fields = append(fields, ManifestUpdateInputField{
-			Name:       name,
-			Type:       spec.Type,
-			Provenance: provenance,
-			Required:   spec.Required,
-			Generate:   spec.Generate,
+			Name:                  name,
+			Type:                  spec.Type,
+			Provenance:            provenance,
+			Required:              spec.Required,
+			Generate:              spec.Generate,
+			Sensitive:             inputIsSensitive(name, spec) || currentSensitive,
+			HasCurrentValue:       currentUsable,
+			CurrentValueSensitive: currentSensitive,
+			CurrentValueDisplay: func() string {
+				if currentUsable && !currentSensitive {
+					return manifestUpdateCurrentValueDisplay(value)
+				}
+				return ""
+			}(),
 		})
 	}
 	return fields, preflight
+}
+
+func manifestUpdateInputState(state *FilesystemStateManager, instanceID string) (*InstallState, error) {
+	st, err := state.LoadInstallState(instanceID)
+	if errors.Is(err, ErrInstallStateNotFound) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("%w: load config ledger: %v", ErrInstalledConfigUnavailable, err)
+	}
+	if !st.isV2Complete() {
+		return nil, nil
+	}
+	return st, nil
 }
 
 func (m *AppManager) pendingCatalogManifestUpdateSource(state *FilesystemStateManager, instanceID string) ([]byte, *InstallState, error) {
@@ -367,7 +524,7 @@ func (m *AppManager) pendingCatalogManifestUpdateSource(state *FilesystemStateMa
 	}
 	pendingRaw, _, _, ok := st.pendingCatalogSourceForFlow(pendingCatalogReviewFlowManifest)
 	if !ok {
-		return nil, nil, fmt.Errorf("%w: no pending catalog update requires review", ErrManifestUpdateRejected)
+		return nil, nil, fmt.Errorf("%w: no pending update requires review", ErrManifestUpdateRejected)
 	}
 	return pendingRaw, st, nil
 }
@@ -478,7 +635,7 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 		}
 		_, pendingHash, _, ok := currentState.pendingCatalogSourceForFlow(pendingCatalogReviewFlowManifest)
 		if !ok {
-			return nil, fmt.Errorf("%w: pending catalog update changed after dry run", ErrManifestUpdateConflict)
+			return nil, fmt.Errorf("%w: pending update changed after dry run", ErrManifestUpdateConflict)
 		}
 		if pendingHash != cand.PendingSourceHash {
 			return nil, fmt.Errorf("%w: pending catalog source changed after dry run", ErrManifestUpdateConflict)
@@ -501,6 +658,7 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 			cand.OIDCCredentials,
 			false,
 		)
+		nextState.InputSensitive = persistedInstallInputSensitive(nextState.InstallInputs, cand.InputSensitive)
 	}
 	nextState.Revision = candidateLedgerRevision
 	applyTxn, err := m.beginInstalledAppApplyTransaction(ctx, state, installedAppApplyTransactionSpec{
@@ -574,6 +732,7 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 		Summary:               cand.Summary,
 		Decisions:             cand.Classification.Decisions,
 		ExposureReview:        cand.Classification.ExposureReview,
+		KeptValueReview:       cand.Classification.KeptValueReview,
 		RequiredConfirmations: cand.Classification.RequiredConfirmations,
 		OperationRiskFlags:    cand.Classification.OperationRiskFlags,
 		RuntimeReadiness:      cand.Classification.RuntimeReadiness,
@@ -1234,6 +1393,7 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 	pendingSourceHash := ""
 	var catalogState *InstallState
 	var candidateInstallState *InstallState
+	var inputState *InstallState
 	if req.CatalogPending {
 		pendingRaw, st, err := m.pendingCatalogManifestUpdateSource(state, req.InstanceID)
 		if err != nil {
@@ -1252,11 +1412,17 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		if existingOIDC == nil {
 			existingOIDC = st.OIDCCredentials
 		}
+	} else {
+		inputState, err = manifestUpdateInputState(state, req.InstanceID)
+		if err != nil {
+			return nil, nil, err
+		}
 	}
 
 	var preSchema *api.AppDefinition
+	preSchemaRendered := false
 	if req.CatalogPending {
-		preSchema, err = m.schemaForInstallStateRawTemplate(ctx, req.InstanceID, rawTemplate, catalogState)
+		preSchema, preSchemaRendered, err = m.schemaForInstallStateRawTemplateWithOrigin(ctx, req.InstanceID, rawTemplate, catalogState, curDef)
 		if err != nil {
 			return nil, nil, fmt.Errorf("pending catalog manifest schema: %w", err)
 		}
@@ -1271,22 +1437,30 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		return manifestUpdateRejectedResult(req.InstanceID, curDef, appInst, "candidate adds service-level oidc_client; first v2 implementation rejects OIDC credential lifecycle changes")
 	}
 	var inputs map[string]interface{}
+	var inputSensitive map[string]bool
 	if req.CatalogPending {
-		normalized, provenance, err := normalizePendingCatalogManifestReviewInputs(preSchema.Inputs, catalogState, req, req.InstanceID)
+		normalized, provenance, sensitive, err := normalizePendingCatalogManifestReviewInputs(preSchema.Inputs, catalogState, req, req.InstanceID)
 		if err != nil {
 			return nil, nil, err
 		}
 		inputs = normalized
+		inputSensitive = sensitive
 		nextState := *catalogState
 		nextState.markCatalogSourceCommitted(req.InstanceID, appInst.CatalogSource, rawTemplate)
 		nextState.InstallInputs, nextState.InputProvenance = persistedInstalledConfigLedger(inputs, provenance)
+		nextState.InputSensitive = persistedInstallInputSensitive(nextState.InstallInputs, inputSensitive)
 		candidateInstallState = &nextState
 	} else {
-		inputs, err = normalizeManifestUpdateInputs(preSchema.Inputs, req.Inputs, req.RegenerateInputs, req.InstanceID)
+		inputs, inputSensitive, err = normalizeManifestUpdateInputs(preSchema.Inputs, inputState, req.Inputs, req.RegenerateInputs, req.ClearInputs, req.InstanceID)
 		if err != nil {
 			return nil, nil, err
 		}
 	}
+	renderState := inputState
+	if req.CatalogPending {
+		renderState = catalogState
+	}
+	unsafeRender := manifestRenderHasUnsafeValues(renderState, curDef, preSchema, inputs, existingOIDC)
 	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
 		RawTemplate:   rawTemplate,
 		UserInputs:    inputs,
@@ -1295,6 +1469,9 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		ExistingOIDC:  existingOIDC,
 	}, nil, m.syncSelfSkippingLister(req.InstanceID))
 	if err != nil {
+		if unsafeRender {
+			return manifestUpdateRejectedResult(req.InstanceID, curDef, appInst, sensitiveStructuralRenderRejectedReason)
+		}
 		return nil, nil, err
 	}
 	if hasOIDCClient(res.Definition.Services) && existingOIDC == nil {
@@ -1313,9 +1490,60 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 	if err != nil {
 		return nil, nil, err
 	}
-	policy, summary := evaluateCustomManifestUpdatePolicy(curDef, res.Definition)
+	reuseState := renderState
+	displayOldDef := curDef
+	displayNewDef := res.Definition
+	displayNew, displayChanged, err := m.renderDisplayDefinitionWithSentinels(ctx, req.InstanceID, rawTemplate, inputs, systemContext, reuseState, curDef, res.Definition, existingOIDC)
+	if err != nil {
+		return nil, nil, fmt.Errorf("render safe manifest update display: %w", err)
+	}
+	if displayChanged {
+		displayNewDef = displayNew
+		if reuseState != nil && len(bytes.TrimSpace(reuseState.RawTemplate)) > 0 && reuseState.InstallSystemCtx != nil {
+			displayOld, _, err := m.renderDisplayDefinitionWithSentinels(ctx, req.InstanceID, reuseState.RawTemplate, reuseState.InstallInputs, *reuseState.InstallSystemCtx, reuseState, curDef, curDef, reuseState.OIDCCredentials)
+			if err == nil {
+				displayOldDef = displayOld
+			}
+		}
+	}
+	realPolicy, realSummary := evaluateCustomManifestUpdatePolicy(curDef, res.Definition)
+	policy, summary := evaluateCustomManifestUpdatePolicy(displayOldDef, displayNewDef)
+	if displayChanged {
+		policy = mergeCustomManifestDisplayPolicy(realPolicy, policy)
+		summary = mergeDisplaySummaryRuntimeSemantics(summary, realSummary, "rendered app structure changed through sensitive input")
+		if reason := manifestSensitiveStructuralDriftReason(manifestSensitiveStructuralDrift(res.Definition, displayNewDef)); reason != "" {
+			scrubSensitiveStructuralDriftClassification(&policy.Classification, reason)
+			scrubSensitiveStructuralDriftSummary(&summary, reason)
+		}
+	} else {
+		policy = realPolicy
+		summary = realSummary
+	}
+	keptValueReview := m.manifestUpdateKeptValueReviewItems(ctx, req.InstanceID, reuseState, rawTemplate, preSchema, preSchemaRendered, inputs, systemContext, existingOIDC, req)
+	if len(keptValueReview) > 0 {
+		policy.Classification.KeptValueReview = keptValueReview
+		for _, item := range keptValueReview {
+			if reason := manifestUpdateKeptValueFailClosedReason(item); reason != "" {
+				markManifestUpdateRejected(&policy.Classification, &summary, "kept_value_reuse_ambiguous", "inputs."+item.Field, reason)
+				continue
+			}
+			addManifestUpdateRequiredConfirmation(&policy.Classification, item.Confirmation)
+			addManifestUpdateRiskFlag(&policy.Classification, item.RiskKind)
+			summary.WillPreserve = append(summary.WillPreserve, fmt.Sprintf("current value for input %s after review", item.Field))
+		}
+	}
+	if policy.Classification.HasRejected {
+		policy.Stageable = false
+		if policy.Reason == "" {
+			policy.Reason = policy.Classification.FirstRejectedReason
+		}
+	}
 	diffKind := classifyDiff(cloneDefinitionForCompare(curDef), cloneDefinitionForCompare(res.Definition))
 	candidateDigest := Sha256Hex(res.CanonicalBytes)
+	unsafeDisplayFragments := manifestUpdateUnsafeDisplayFragments(reuseState, curDef, res.Definition, inputs, existingOIDC)
+	sanitizeManifestUpdateSummaryForDisplay(&summary, unsafeDisplayFragments)
+	sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
+	policy.Reason = redactUnsafeDisplayText(policy.Reason, unsafeDisplayFragments)
 	blockingReason := ""
 	if !policy.Stageable {
 		blockingReason = policy.Reason
@@ -1342,12 +1570,14 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 	}
 	if len(imagePlan) > 0 {
 		policy.Classification.StagedImageRootfs = manifestUpdateImagePlanSummary(imagePlan)
+		sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
 		result.StagedImageRootfs = append([]string(nil), policy.Classification.StagedImageRootfs...)
 	}
 	cand := &manifestUpdateCandidate{
 		InstanceID:           req.InstanceID,
 		RawTemplate:          append([]byte(nil), rawTemplate...),
 		Inputs:               inputs,
+		InputSensitive:       inputSensitive,
 		SystemContext:        systemContext,
 		BaseManifestHash:     baseHash,
 		RuntimeFingerprint:   runtimeFingerprint,
@@ -1390,6 +1620,7 @@ type manifestUpdateClassification struct {
 	ListenerRoutingAuth   []string
 	StorageBoundary       []string
 	DataSafety            *ManifestUpdateDataSafetySummary
+	KeptValueReview       []ManifestUpdateKeptValueReviewItem
 	HasOperatorReview     bool
 	HasRejected           bool
 	RequiresV2Apply       bool
@@ -1406,6 +1637,7 @@ func applyManifestUpdateClassification(result *ManifestUpdateResult, c manifestU
 	}
 	result.Decisions = append([]ManifestUpdateDecision(nil), c.Decisions...)
 	result.ExposureReview = append([]ManifestUpdateReviewItem(nil), c.ExposureReview...)
+	result.KeptValueReview = append([]ManifestUpdateKeptValueReviewItem(nil), c.KeptValueReview...)
 	result.RequiredConfirmations = append([]string(nil), c.RequiredConfirmations...)
 	result.OperationRiskFlags = append([]string(nil), c.OperationRiskFlags...)
 	result.RuntimeReadiness = append([]string(nil), c.RuntimeReadiness...)
@@ -1413,6 +1645,570 @@ func applyManifestUpdateClassification(result *ManifestUpdateResult, c manifestU
 	result.ListenerRoutingAuth = append([]string(nil), c.ListenerRoutingAuth...)
 	result.StorageBoundary = append([]string(nil), c.StorageBoundary...)
 	result.DataSafety = c.DataSafety
+}
+
+func addManifestUpdateRequiredConfirmation(classification *manifestUpdateClassification, value string) {
+	if classification == nil || strings.TrimSpace(value) == "" || slices.Contains(classification.RequiredConfirmations, value) {
+		return
+	}
+	classification.RequiredConfirmations = append(classification.RequiredConfirmations, value)
+}
+
+func addManifestUpdateRiskFlag(classification *manifestUpdateClassification, value string) {
+	if classification == nil || strings.TrimSpace(value) == "" || slices.Contains(classification.OperationRiskFlags, value) {
+		return
+	}
+	classification.OperationRiskFlags = append(classification.OperationRiskFlags, value)
+}
+
+func markManifestUpdateRejected(classification *manifestUpdateClassification, summary *ManifestUpdateSummary, flag, path, reason string) {
+	if classification == nil || strings.TrimSpace(reason) == "" {
+		return
+	}
+	classification.HasRejected = true
+	if classification.FirstRejectedReason == "" {
+		classification.FirstRejectedReason = reason
+	}
+	classification.Decisions = append(classification.Decisions, ManifestUpdateDecision{
+		Flag:    flag,
+		Path:    path,
+		Outcome: "rejected",
+		Summary: reason,
+		Reason:  reason,
+	})
+	if summary != nil && !slices.Contains(summary.Rejected, reason) {
+		summary.Rejected = append(summary.Rejected, reason)
+	}
+}
+
+func manifestSensitiveStructuralDriftReason(paths []string) string {
+	if len(paths) == 0 {
+		return ""
+	}
+	return sensitiveStructuralRenderRejectedReason
+}
+
+func scrubSensitiveStructuralDriftSummary(summary *ManifestUpdateSummary, reason string) {
+	if summary == nil {
+		return
+	}
+	summary.WillChange = []string{sensitiveStructuralRenderRejectedSummary}
+	summary.WillRestart = nil
+	summary.ExpectedInterruption = nil
+	if !slices.Contains(summary.Rejected, reason) {
+		summary.Rejected = append(summary.Rejected, reason)
+	}
+}
+
+func scrubSensitiveStructuralDriftClassification(classification *manifestUpdateClassification, reason string) {
+	if classification == nil || strings.TrimSpace(reason) == "" {
+		return
+	}
+	classification.HasRejected = true
+	classification.HasOperatorReview = false
+	classification.RequiresV2Apply = false
+	classification.V1StructuralRestart = false
+	classification.FirstRejectedReason = reason
+	classification.Decisions = []ManifestUpdateDecision{{
+		Flag:    "sensitive_value_in_manifest_structure",
+		Path:    "manifest",
+		Outcome: "rejected",
+		Summary: reason,
+		Reason:  reason,
+	}}
+	classification.ExposureReview = nil
+	classification.KeptValueReview = nil
+	classification.RequiredConfirmations = nil
+	classification.OperationRiskFlags = nil
+	classification.RuntimeReadiness = nil
+	classification.StagedImageRootfs = nil
+	classification.ListenerRoutingAuth = nil
+	classification.StorageBoundary = nil
+	classification.DataSafety = nil
+}
+
+func manifestSensitiveStructuralDrift(realDef, displayDef *api.AppDefinition) []string {
+	realSig := manifestPublicStructureSignature(realDef)
+	displaySig := manifestPublicStructureSignature(displayDef)
+	changed := make([]string, 0)
+	for path, realValue := range realSig {
+		displayValue, ok := displaySig[path]
+		if !ok || displayValue != realValue {
+			changed = append(changed, path)
+		}
+	}
+	for path := range displaySig {
+		if _, ok := realSig[path]; !ok {
+			changed = append(changed, path)
+		}
+	}
+	slices.Sort(changed)
+	return changed
+}
+
+func manifestPublicStructureSignature(def *api.AppDefinition) map[string]string {
+	out := map[string]string{}
+	if def == nil {
+		return out
+	}
+	data, err := SerializeAppDefinition(def)
+	if err != nil {
+		out["$"] = "unserializable"
+		return out
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(data, &root); err != nil {
+		out["$"] = "unparseable"
+		return out
+	}
+	manifestCollectPublicStructure(&root, nil, "$", true, out)
+	return out
+}
+
+func manifestCollectPublicStructure(node *yaml.Node, segments []string, path string, includeScalars bool, out map[string]string) {
+	if node == nil {
+		return
+	}
+	if node.Kind == yaml.DocumentNode && len(node.Content) > 0 {
+		manifestCollectPublicStructure(node.Content[0], segments, path, includeScalars, out)
+		return
+	}
+	switch node.Kind {
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			label := fmt.Sprintf("#%d", i/2)
+			if key != nil && key.Kind == yaml.ScalarNode && strings.TrimSpace(key.Value) != "" {
+				label = key.Value
+			}
+			childPath := path + "." + manifestPublicStructurePathLabel(label)
+			out[childPath+"#key"] = label
+			childSegments := append(append([]string(nil), segments...), label)
+			childScalars := includeScalars && !manifestPublicStructureDataValuePath(childSegments)
+			manifestCollectPublicStructure(value, childSegments, childPath, childScalars, out)
+		}
+	case yaml.SequenceNode:
+		for i, child := range node.Content {
+			manifestCollectPublicStructure(child, append(append([]string(nil), segments...), fmt.Sprintf("[%d]", i)), fmt.Sprintf("%s[%d]", path, i), includeScalars, out)
+		}
+	case yaml.ScalarNode:
+		if includeScalars {
+			out[path] = node.Value
+		}
+	}
+}
+
+func manifestPublicStructureDataValuePath(segments []string) bool {
+	if len(segments) == 0 {
+		return false
+	}
+	for _, segment := range segments {
+		if segment == "app_config" {
+			return true
+		}
+	}
+	last := segments[len(segments)-1]
+	return last == "environment" || last == "env"
+}
+
+func manifestPublicStructurePathLabel(label string) string {
+	if strings.TrimSpace(label) == "" {
+		return "<empty>"
+	}
+	replacer := strings.NewReplacer("\\", "\\\\", ".", "\\.", "[", "\\[", "]", "\\]", "#", "\\#")
+	return replacer.Replace(label)
+}
+
+func manifestUpdateKeptValueFailClosedReason(item ManifestUpdateKeptValueReviewItem) string {
+	if item.RiskKind != "kept_secret_semantic_changed" {
+		return ""
+	}
+	if slices.Contains(item.SemanticDelta, "previous source schema unavailable") ||
+		slices.Contains(item.SemanticDelta, "previous source usage unavailable") ||
+		slices.Contains(item.SemanticDelta, "candidate source usage unavailable") {
+		if strings.TrimSpace(item.BlockingReason) != "" {
+			return item.BlockingReason
+		}
+		return fmt.Sprintf("current stored value for input %s cannot be safely reused because previous meaning or usage could not be verified", item.Field)
+	}
+	return ""
+}
+
+func (m *AppManager) manifestUpdateKeptValueReviewItems(ctx context.Context, instanceID string, st *InstallState, newRaw []byte, newSchema *api.AppDefinition, newSchemaRendered bool, normalizedInputs map[string]interface{}, systemContext InstallSystemContext, existingOIDC *OIDCCredentials, req ManifestUpdateRequest) []ManifestUpdateKeptValueReviewItem {
+	if st == nil || st.InstallInputs == nil || newSchema == nil {
+		return nil
+	}
+	oldRaw := st.RawTemplate
+	var oldSchema *api.AppDefinition
+	oldSchemaRendered := false
+	oldSchemaUnavailable := false
+	if len(bytes.TrimSpace(oldRaw)) > 0 {
+		var err error
+		oldSchema, oldSchemaRendered, err = m.schemaForInstallStateRawTemplateWithOrigin(ctx, instanceID, oldRaw, st, nil)
+		if err != nil {
+			oldSchemaUnavailable = true
+		}
+	} else {
+		oldSchemaUnavailable = true
+	}
+	regen := map[string]bool{}
+	for _, name := range req.RegenerateInputs {
+		regen[name] = true
+	}
+	clearInputs := map[string]bool{}
+	for _, name := range req.ClearInputs {
+		clearInputs[name] = true
+	}
+	names := make([]string, 0, len(newSchema.Inputs))
+	for name := range newSchema.Inputs {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	items := []ManifestUpdateKeptValueReviewItem{}
+	for _, name := range names {
+		if name == "__app_address__" {
+			continue
+		}
+		if _, ok := st.InstallInputs[name]; !ok {
+			continue
+		}
+		if _, provided := req.Inputs[name]; provided || regen[name] || clearInputs[name] {
+			continue
+		}
+		newSpec := newSchema.Inputs[name]
+		oldSpec, oldSpecPresent := api.AppInput{}, false
+		if oldSchema != nil {
+			oldSpec, oldSpecPresent = oldSchema.Inputs[name]
+		}
+		oldUnsafeInputs := displayUnsafeStoredInputNames(st, oldSchema, oldSchema)
+		newUnsafeInputs := displayUnsafeStoredInputNames(st, oldSchema, newSchema)
+		var oldUsage []string
+		oldUsageOK := false
+		if !oldSchemaUnavailable {
+			oldUsage, oldUsageOK = manifestRenderedInputUsageRefs(oldRaw, st.InstallInputs, st.InstallSystemCtx, st.OIDCCredentials, name, oldUnsafeInputs)
+		}
+		newUsage, newUsageOK := manifestRenderedInputUsageRefs(newRaw, normalizedInputs, &systemContext, existingOIDC, name, newUnsafeInputs)
+		oldUsageRaw := manifestInputUsageRefs(oldRaw, name)
+		newUsageRaw := manifestInputUsageRefs(newRaw, name)
+		delta := manifestInputSemanticDelta(name, oldSpec, oldSpecPresent, newSpec)
+		if oldSchemaUnavailable {
+			delta = append(delta, "previous source schema unavailable")
+		}
+		if !oldUsageOK {
+			delta = append(delta, "previous source usage unavailable")
+			oldUsage = manifestInputUsageRefs(oldRaw, name)
+		}
+		if !newUsageOK {
+			delta = append(delta, "candidate source usage unavailable")
+			newUsage = manifestInputUsageRefs(newRaw, name)
+		}
+		if !slices.Equal(oldUsage, newUsage) || !slices.Equal(oldUsageRaw, newUsageRaw) {
+			delta = append(delta, "template usage changed")
+		}
+		if len(delta) == 0 {
+			continue
+		}
+		riskKind := "kept_value_semantic_changed"
+		storedSensitive := manifestUpdateStoredInputSensitive(name, newSpec, st)
+		if inputIsSensitive(name, newSpec) || newSpec.Generate || storedSensitive || (oldSpecPresent && (inputIsSensitive(name, oldSpec) || oldSpec.Generate)) {
+			riskKind = "kept_secret_semantic_changed"
+		} else if slices.Contains(delta, "template usage changed") {
+			riskKind = "kept_value_usage_changed"
+		}
+		blockingReason := ""
+		if oldSchemaUnavailable {
+			blockingReason = "previous source schema unavailable; replace or regenerate the current stored value"
+		} else if !oldUsageOK || !newUsageOK {
+			blockingReason = "template usage unavailable; replace or regenerate the current stored value"
+		}
+		items = append(items, ManifestUpdateKeptValueReviewItem{
+			Field:          name,
+			RiskKind:       riskKind,
+			OldSemantic:    manifestInputSemanticSummary(name, oldSpec, oldSpecPresent, oldSchemaRendered),
+			NewSemantic:    manifestInputSemanticSummary(name, newSpec, true, newSchemaRendered),
+			SemanticDelta:  delta,
+			OldUsage:       oldUsage,
+			NewUsage:       newUsage,
+			Confirmation:   keptValueReviewConfirmationID(name),
+			BlockingReason: blockingReason,
+		})
+	}
+	return items
+}
+
+func manifestInputSemanticSummary(name string, spec api.AppInput, present bool, redactDefault bool) []string {
+	if !present {
+		return []string{"not declared"}
+	}
+	defaultSummary := manifestInputDefaultSummary(spec)
+	if spec.Default != nil && (redactDefault || inputIsSensitive(name, spec) || spec.Generate) {
+		defaultSummary = "<redacted>"
+	}
+	out := []string{
+		"type=" + strings.TrimSpace(spec.Type),
+		fmt.Sprintf("required=%t", spec.Required),
+		fmt.Sprintf("generate=%t", spec.Generate),
+		fmt.Sprintf("sensitive=%t", inputIsSensitive(name, spec)),
+		"default=" + defaultSummary,
+	}
+	if strings.TrimSpace(spec.Label) != "" {
+		out = append(out, "label=<present>")
+	}
+	if strings.TrimSpace(spec.Description) != "" {
+		out = append(out, "description=<present>")
+	}
+	if spec.Validation != nil {
+		if strings.TrimSpace(spec.Validation.Regex) != "" {
+			out = append(out, "validation_regex=<present>")
+		}
+		if strings.TrimSpace(spec.Validation.Message) != "" {
+			out = append(out, "validation_message=<present>")
+		}
+	}
+	return out
+}
+
+func manifestInputSemanticDelta(name string, oldSpec api.AppInput, oldPresent bool, newSpec api.AppInput) []string {
+	if !oldPresent {
+		return []string{"input was not declared in previous source"}
+	}
+	delta := []string{}
+	if strings.TrimSpace(oldSpec.Type) != strings.TrimSpace(newSpec.Type) {
+		delta = append(delta, fmt.Sprintf("type changed from %q to %q", oldSpec.Type, newSpec.Type))
+	}
+	if oldSpec.Required != newSpec.Required {
+		delta = append(delta, fmt.Sprintf("required changed from %t to %t", oldSpec.Required, newSpec.Required))
+	}
+	if oldSpec.Generate != newSpec.Generate {
+		delta = append(delta, fmt.Sprintf("generate changed from %t to %t", oldSpec.Generate, newSpec.Generate))
+	}
+	if inputIsSensitive(name, oldSpec) != inputIsSensitive(name, newSpec) {
+		delta = append(delta, fmt.Sprintf("sensitive changed from %t to %t", inputIsSensitive(name, oldSpec), inputIsSensitive(name, newSpec)))
+	}
+	if !manifestInputDefaultsEqual(oldSpec, newSpec) {
+		delta = append(delta, "default changed")
+	}
+	if strings.TrimSpace(oldSpec.Label) != strings.TrimSpace(newSpec.Label) {
+		delta = append(delta, "label changed")
+	}
+	if strings.TrimSpace(oldSpec.Description) != strings.TrimSpace(newSpec.Description) {
+		delta = append(delta, "description changed")
+	}
+	if !reflect.DeepEqual(oldSpec.Validation, newSpec.Validation) {
+		delta = append(delta, "validation changed")
+	}
+	return delta
+}
+
+func manifestInputDefaultSummary(spec api.AppInput) string {
+	if spec.Default == nil {
+		return "<none>"
+	}
+	value := normalizeInputValueForValidation(spec.Type, spec.Default)
+	if encoded, err := json.Marshal(value); err == nil {
+		return string(encoded)
+	}
+	return fmt.Sprint(value)
+}
+
+func manifestInputDefaultsEqual(oldSpec, newSpec api.AppInput) bool {
+	oldValue := normalizeInputValueForValidation(oldSpec.Type, oldSpec.Default)
+	newValue := normalizeInputValueForValidation(newSpec.Type, newSpec.Default)
+	if reflect.DeepEqual(oldValue, newValue) {
+		return true
+	}
+	oldStrings, oldOK := inputArrayStrings(oldValue)
+	newStrings, newOK := inputArrayStrings(newValue)
+	return oldOK && newOK && slices.Equal(oldStrings, newStrings)
+}
+
+func manifestInputUsageRefs(raw []byte, name string) []string {
+	if len(bytes.TrimSpace(raw)) == 0 || strings.TrimSpace(name) == "" {
+		return nil
+	}
+	lines := strings.Split(string(raw), "\n")
+	out := []string{}
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || !strings.Contains(trimmed, "Inputs") || !strings.Contains(trimmed, name) {
+			continue
+		}
+		if len(trimmed) > 140 {
+			trimmed = trimmed[:137] + "..."
+		}
+		out = append(out, fmt.Sprintf("line %d: %s", i+1, trimmed))
+	}
+	return out
+}
+
+func manifestRenderedInputUsageRefs(raw []byte, inputs map[string]interface{}, systemCtx *InstallSystemContext, creds *OIDCCredentials, name string, unsafeInputs map[string]struct{}) ([]string, bool) {
+	if len(bytes.TrimSpace(raw)) == 0 || strings.TrimSpace(name) == "" || systemCtx == nil {
+		return nil, false
+	}
+	sentinel := inputUsageScanSentinelPrefix + Sha256Hex([]byte(name))[:16] + "__"
+	scanInputs := make(map[string]interface{}, len(inputs)+1)
+	unsafeKeyFragments := []string{"<redacted>"}
+	for key, value := range inputs {
+		if key == name {
+			continue
+		}
+		if _, unsafe := unsafeInputs[key]; unsafe || inputNameLooksSensitive(key) {
+			value := inputUsageScanSentinelPrefix + Sha256Hex([]byte(key))[:16] + "__"
+			scanInputs[key] = value
+			unsafeKeyFragments = append(unsafeKeyFragments, inputUsageSentinelKeyFragments(value)...)
+			continue
+		}
+		if fragment := strings.TrimSpace(fmt.Sprint(value)); fragment != "" {
+			unsafeKeyFragments = append(unsafeKeyFragments, fragment)
+		}
+		scanInputs[key] = value
+	}
+	scanInputs[name] = sentinel
+	if creds != nil {
+		clientID, clientSecret := inputUsageOIDCSentinels()
+		unsafeKeyFragments = append(unsafeKeyFragments, inputUsageSentinelKeyFragments(clientID)...)
+		unsafeKeyFragments = append(unsafeKeyFragments, inputUsageSentinelKeyFragments(clientSecret)...)
+	}
+	rendered, err := RenderManifest(raw, scanInputs, manifestInputUsageSystemContext(*systemCtx, creds))
+	if err != nil {
+		return nil, false
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(rendered, &root); err != nil {
+		return nil, false
+	}
+	refs := []string{}
+	collectManifestInputUsageRefs(&root, "$", sentinel, unsafeKeyFragments, &refs)
+	slices.Sort(refs)
+	return slices.Compact(refs), true
+}
+
+func manifestInputUsageSystemContext(ctx InstallSystemContext, creds *OIDCCredentials) map[string]interface{} {
+	out := map[string]interface{}{
+		"Domain":       ctx.Domain,
+		"Architecture": ctx.Architecture,
+		"Timezone":     ctx.Timezone,
+	}
+	if creds != nil {
+		clientID, clientSecret := inputUsageOIDCSentinels()
+		out["Auth"] = map[string]string{
+			"Issuer":       ctx.IssuerHint,
+			"ClientID":     clientID,
+			"ClientSecret": clientSecret,
+		}
+	}
+	return out
+}
+
+func inputUsageOIDCSentinels() (string, string) {
+	return inputUsageScanSentinelPrefix + "oidc_client_id__", inputUsageScanSentinelPrefix + "oidc_client_secret__"
+}
+
+func collectManifestInputUsageRefs(node *yaml.Node, path, sentinel string, unsafeKeyFragments []string, refs *[]string) {
+	if node == nil {
+		return
+	}
+	switch node.Kind {
+	case yaml.DocumentNode:
+		for _, child := range node.Content {
+			collectManifestInputUsageRefs(child, path, sentinel, unsafeKeyFragments, refs)
+		}
+	case yaml.MappingNode:
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			key := node.Content[i]
+			value := node.Content[i+1]
+			keyPath := manifestInputUsageKeyPath(path, key, sentinel, unsafeKeyFragments, i/2)
+			childPath := keyPath + ".value"
+			if key != nil && key.Kind == yaml.ScalarNode && strings.Contains(key.Value, sentinel) {
+				*refs = append(*refs, keyPath+" (key)")
+			}
+			collectManifestInputUsageRefs(value, childPath, sentinel, unsafeKeyFragments, refs)
+		}
+	case yaml.SequenceNode:
+		for i, child := range node.Content {
+			collectManifestInputUsageRefs(child, fmt.Sprintf("%s[%d]", path, i), sentinel, unsafeKeyFragments, refs)
+		}
+	case yaml.ScalarNode:
+		if strings.Contains(node.Value, sentinel) {
+			*refs = append(*refs, path)
+		}
+	}
+}
+
+func manifestInputUsageKeyPath(path string, key *yaml.Node, sentinel string, unsafeKeyFragments []string, index int) string {
+	fallback := fmt.Sprintf("%s.<key%d>", path, index)
+	if key == nil || key.Kind != yaml.ScalarNode {
+		return fallback
+	}
+	label := strings.TrimSpace(key.Value)
+	if label == "" {
+		return fallback
+	}
+	if manifestInputUsageKeyLabelUnsafe(label, sentinel, unsafeKeyFragments) {
+		return fallback + "#" + Sha256Hex([]byte(label))[:8]
+	}
+	label = manifestInputUsagePathLabel(label)
+	if label == "" {
+		return fallback
+	}
+	return path + "." + label
+}
+
+func manifestInputUsageKeyLabelUnsafe(label, sentinel string, unsafeFragments []string) bool {
+	if label == "" || strings.Contains(label, sentinel) || strings.Contains(label, inputUsageScanSentinelPrefix) {
+		return true
+	}
+	for _, fragment := range unsafeFragments {
+		fragment = strings.TrimSpace(fragment)
+		if fragment != "" && strings.Contains(label, fragment) {
+			return true
+		}
+	}
+	return false
+}
+
+func inputUsageSentinelKeyFragments(value string) []string {
+	value = strings.TrimSpace(value)
+	if len(value) < 4 {
+		return nil
+	}
+	fragments := []string{}
+	for i := 4; i <= len(value); i++ {
+		fragments = append(fragments, value[:i])
+	}
+	return fragments
+}
+
+func manifestInputUsagePathLabel(label string) string {
+	const maxUsagePathLabel = 64
+	var b strings.Builder
+	for _, r := range label {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '_' || r == '-':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+		if b.Len() >= maxUsagePathLabel {
+			break
+		}
+	}
+	return strings.Trim(b.String(), "_")
+}
+
+func keptValueReviewConfirmationID(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "kept_value_review"
+	}
+	return "kept_value_review:" + name
 }
 
 func evaluateCustomManifestUpdatePolicy(oldDef, newDef *api.AppDefinition) (customManifestPolicyResult, ManifestUpdateSummary) {
@@ -2412,14 +3208,16 @@ func allowMissingListenerEndpointsForTest() bool {
 	return os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1"
 }
 
-func normalizeManifestUpdateInputs(declared map[string]api.AppInput, provided map[string]interface{}, regenerate []string, instanceID string) (map[string]interface{}, error) {
+func normalizeManifestUpdateInputs(declared map[string]api.AppInput, st *InstallState, provided map[string]interface{}, regenerate []string, clear []string, instanceID string) (map[string]interface{}, map[string]bool, error) {
 	out := make(map[string]interface{}, len(provided)+len(declared)+1)
-	for k, v := range provided {
-		out[k] = v
-	}
+	inputSensitive := map[string]bool{}
 	regen := map[string]bool{}
 	for _, name := range regenerate {
 		regen[name] = true
+	}
+	clearInputs := map[string]bool{}
+	for _, name := range clear {
+		clearInputs[name] = true
 	}
 	out["__app_address__"] = instanceID
 	names := make([]string, 0, len(declared))
@@ -2433,47 +3231,131 @@ func normalizeManifestUpdateInputs(declared map[string]api.AppInput, provided ma
 			out[name] = instanceID
 			continue
 		}
-		if spec.Generate {
-			if regen[name] {
+		oldValue, oldPresent := any(nil), false
+		if st != nil && st.InstallInputs != nil {
+			oldValue, oldPresent = st.InstallInputs[name]
+		}
+		oldUsable := oldPresent && installInputValueUsableForSchema(oldValue, spec)
+		currentSensitive := oldPresent && manifestUpdateStoredInputSensitive(name, spec, st)
+		value, providedValue := provided[name]
+		providedNonEmpty := providedValue && strings.TrimSpace(fmt.Sprint(value)) != ""
+		if providedValue && !providedNonEmpty && currentSensitive && !inputIsSensitive(name, spec) && !spec.Generate {
+			return nil, nil, fmt.Errorf("input %q replacement value cannot be empty; clear it explicitly", name)
+		}
+		if clearInputs[name] {
+			if spec.Required {
+				return nil, nil, fmt.Errorf("input %q is required and cannot be cleared", name)
+			}
+			out[name] = manifestUpdateClearedInputValue(spec)
+			continue
+		}
+		switch {
+		case spec.Generate:
+			switch {
+			case regen[name]:
 				value, err := GenerateSecurePassword()
 				if err != nil {
-					return nil, fmt.Errorf("generate input %q: %w", name, err)
+					return nil, nil, fmt.Errorf("generate input %q: %w", name, err)
 				}
 				out[name] = value
-				continue
+				inputSensitive[name] = true
+			case providedNonEmpty:
+				out[name] = value
+				inputSensitive[name] = true
+			case providedValue:
+				return nil, nil, fmt.Errorf("input %q must be provided or explicitly regenerated", name)
+			case oldUsable:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, err
+				}
+				out[name] = oldValue
+				inputSensitive[name] = true
+			case oldPresent:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, err
+				}
+				return nil, nil, fmt.Errorf("input %q must be provided or explicitly regenerated", name)
+			default:
+				return nil, nil, fmt.Errorf("input %q must be provided or explicitly regenerated", name)
 			}
-			if value, exists := out[name]; exists && value != nil && strings.TrimSpace(fmt.Sprint(value)) != "" {
-				continue
+		case inputIsSensitive(name, spec):
+			switch {
+			case providedNonEmpty:
+				out[name] = value
+				inputSensitive[name] = true
+			case providedValue && spec.Required:
+				return nil, nil, fmt.Errorf("input %q replacement value cannot be empty", name)
+			case providedValue:
+				return nil, nil, fmt.Errorf("input %q replacement value cannot be empty; clear it explicitly", name)
+			case oldUsable:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, err
+				}
+				out[name] = oldValue
+				inputSensitive[name] = true
+			case oldPresent:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, err
+				}
+				if spec.Required {
+					return nil, nil, fmt.Errorf("input %q is required", name)
+				}
+			case spec.Required:
+				return nil, nil, fmt.Errorf("input %q is required", name)
+			case spec.Default != nil:
+				out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
+			default:
+				out[name] = zeroInputValue(spec.Type)
 			}
-			return nil, fmt.Errorf("input %q must be provided or explicitly regenerated", name)
+		default:
+			switch {
+			case providedValue:
+				out[name] = value
+			case oldUsable:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, currentSensitive); err != nil {
+					return nil, nil, err
+				}
+				out[name] = oldValue
+				if currentSensitive {
+					inputSensitive[name] = true
+				}
+			case oldPresent && currentSensitive:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, currentSensitive); err != nil {
+					return nil, nil, err
+				}
+			case spec.Default != nil:
+				out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
+			case spec.Required:
+				return nil, nil, fmt.Errorf("input %q is required", name)
+			default:
+				out[name] = zeroInputValue(spec.Type)
+			}
 		}
-		if _, exists := out[name]; exists {
-			continue
-		}
-		if spec.Required {
-			return nil, fmt.Errorf("input %q is required", name)
-		}
-		if spec.Default != nil {
-			out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
-			continue
-		}
-		out[name] = zeroInputValue(spec.Type)
 	}
 	if err := ValidateInputs(declared, out); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return out, nil
+	return out, persistedInstallInputSensitive(out, inputSensitive), nil
 }
 
-func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInput, st *InstallState, req ManifestUpdateRequest, instanceID string) (map[string]interface{}, map[string]string, error) {
+func manifestUpdateClearedInputValue(spec api.AppInput) interface{} {
+	return zeroInputValue(spec.Type)
+}
+
+func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInput, st *InstallState, req ManifestUpdateRequest, instanceID string) (map[string]interface{}, map[string]string, map[string]bool, error) {
 	if st == nil {
-		return nil, nil, fmt.Errorf("%w: catalog install state is missing", ErrInstalledConfigUnavailable)
+		return nil, nil, nil, fmt.Errorf("%w: catalog install state is missing", ErrInstalledConfigUnavailable)
 	}
 	out := make(map[string]interface{}, len(declared)+1)
 	provenance := make(map[string]string, len(declared)+1)
+	inputSensitive := map[string]bool{}
 	regen := map[string]bool{}
 	for _, name := range req.RegenerateInputs {
 		regen[name] = true
+	}
+	clearInputs := map[string]bool{}
+	for _, name := range req.ClearInputs {
+		clearInputs[name] = true
 	}
 	names := make([]string, 0, len(declared))
 	for name := range declared {
@@ -2488,7 +3370,8 @@ func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInpu
 		if value := st.InputProvenance[name]; value != "" {
 			provenance[name] = value
 		}
-		_, oldPresent := out[name]
+		oldValue, oldPresent := out[name]
+		oldUsable := oldPresent && installInputValueUsableForSchema(oldValue, spec)
 		if name == "__app_address__" {
 			out[name] = instanceID
 			provenance[name] = InputProvenanceSystem
@@ -2496,37 +3379,72 @@ func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInpu
 		}
 		value, provided := req.Inputs[name]
 		providedNonEmpty := provided && strings.TrimSpace(fmt.Sprint(value)) != ""
+		currentSensitive := oldPresent && manifestUpdateStoredInputSensitive(name, spec, st)
+		if provided && !providedNonEmpty && currentSensitive && !inputIsSensitive(name, spec) && !spec.Generate {
+			return nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty; clear it explicitly", name)
+		}
+		if clearInputs[name] {
+			if spec.Required {
+				return nil, nil, nil, fmt.Errorf("input %q is required and cannot be cleared", name)
+			}
+			out[name] = manifestUpdateClearedInputValue(spec)
+			provenance[name] = InputProvenanceOperator
+			continue
+		}
 		switch {
 		case spec.Generate:
 			switch {
 			case regen[name]:
 				generated, err := GenerateSecurePassword()
 				if err != nil {
-					return nil, nil, fmt.Errorf("generate input %q: %w", name, err)
+					return nil, nil, nil, fmt.Errorf("generate input %q: %w", name, err)
 				}
 				out[name] = generated
 				provenance[name] = InputProvenanceGenerated
+				inputSensitive[name] = true
 			case providedNonEmpty:
 				out[name] = value
 				provenance[name] = InputProvenanceOperator
+				inputSensitive[name] = true
 			case provided:
-				return nil, nil, fmt.Errorf("input %q must be provided or explicitly regenerated", name)
-			case !oldPresent:
-				return nil, nil, fmt.Errorf("input %q is missing and must be provided or regenerated", name)
+				return nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty; clear or regenerate it explicitly", name)
+			case !oldUsable:
+				if oldPresent {
+					if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+						return nil, nil, nil, err
+					}
+				}
+				return nil, nil, nil, fmt.Errorf("input %q is missing and must be provided or regenerated", name)
+			default:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, nil, err
+				}
+				inputSensitive[name] = true
 			}
 		case inputIsSensitive(name, spec):
 			switch {
 			case providedNonEmpty:
 				out[name] = value
 				provenance[name] = InputProvenanceOperator
+				inputSensitive[name] = true
 			case provided && spec.Required:
-				return nil, nil, fmt.Errorf("input %q replacement value cannot be empty", name)
+				return nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty", name)
 			case provided:
-				out[name] = ""
-				provenance[name] = InputProvenanceOperator
+				return nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty; clear it explicitly", name)
+			case oldUsable:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, nil, err
+				}
+				inputSensitive[name] = true
 			case oldPresent:
+				if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+					return nil, nil, nil, err
+				}
+				if spec.Required {
+					return nil, nil, nil, fmt.Errorf("input %q is missing and must be provided", name)
+				}
 			case spec.Required:
-				return nil, nil, fmt.Errorf("input %q is missing and must be provided", name)
+				return nil, nil, nil, fmt.Errorf("input %q is missing and must be provided", name)
 			case spec.Default != nil:
 				out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
 				provenance[name] = InputProvenanceCatalogDefault
@@ -2540,15 +3458,25 @@ func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInpu
 				provenance[name] = InputProvenanceOperator
 				continue
 			}
-			if oldPresent {
+			if oldUsable {
+				if err := validateKeptInstallInputValue(name, spec, oldValue, currentSensitive); err != nil {
+					return nil, nil, nil, err
+				}
+				if currentSensitive {
+					inputSensitive[name] = true
+				}
 				continue
 			}
-			if spec.Required {
-				return nil, nil, fmt.Errorf("input %q is required", name)
+			if oldPresent && currentSensitive {
+				if err := validateKeptInstallInputValue(name, spec, oldValue, currentSensitive); err != nil {
+					return nil, nil, nil, err
+				}
 			}
 			if spec.Default != nil {
 				out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
 				provenance[name] = InputProvenanceCatalogDefault
+			} else if spec.Required {
+				return nil, nil, nil, fmt.Errorf("input %q is required", name)
 			} else {
 				out[name] = zeroInputValue(spec.Type)
 				provenance[name] = InputProvenanceCatalogDefault
@@ -2556,9 +3484,9 @@ func normalizePendingCatalogManifestReviewInputs(declared map[string]api.AppInpu
 		}
 	}
 	if err := ValidateInputs(declared, out); err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
-	return out, provenance, nil
+	return out, provenance, persistedInstallInputSensitive(out, inputSensitive), nil
 }
 
 func zeroInputValue(inputType string) interface{} {
@@ -2620,6 +3548,9 @@ func manifestUpdateRejectedResult(instanceID string, curDef *api.AppDefinition, 
 	baseHash, _ := canonicalManifestHash(curDef)
 	fp, _ := manifestRuntimeFingerprint(appInst)
 	summary := ManifestUpdateSummary{Rejected: []string{reason}}
+	if reason == sensitiveStructuralRenderRejectedReason {
+		summary.WillChange = []string{sensitiveStructuralRenderRejectedSummary}
+	}
 	decision := ManifestUpdateDecision{
 		Flag:    "manifest_update_rejected",
 		Outcome: "rejected",

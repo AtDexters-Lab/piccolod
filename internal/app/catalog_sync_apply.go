@@ -519,18 +519,18 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		if !updatePolicy.Stageable {
 			reason := strings.TrimSpace(updatePolicy.Reason)
 			if reason == "" {
-				reason = "catalog update rejected by service app update policy"
+				reason = "update rejected by service app update policy"
 			} else {
-				reason = "catalog update rejected by service app update policy: " + reason
+				reason = "update rejected by service app update policy: " + reason
 			}
 			return m.recordSyncFailure(state, appInst, newHash, errors.New(reason))
 		}
 		if !updatePolicy.Allowed {
 			reason := strings.TrimSpace(updatePolicy.Reason)
 			if reason == "" {
-				reason = "catalog update requires operator review"
+				reason = "update requires operator review"
 			} else {
-				reason = "catalog update requires operator review: " + reason
+				reason = "update requires operator review: " + reason
 			}
 			if err := m.storePendingRenderedCatalogManifestReviewSource(state, instanceID, installSt, rawBytes, errors.New(reason)); err != nil {
 				log.Printf("WARN: catalog sync %s: store pending service-app update source: %v", instanceID, err)

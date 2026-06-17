@@ -1068,9 +1068,23 @@ stage_auto_unlock() {
   check "11a.5" "Authed /security/auto-unlock has auto_reboot block" "$au" '"auto_reboot"'
   check "11a.6" "Authed /security/auto-unlock has has_outstanding_blob" "$au" '"has_outstanding_blob"'
 
-  # 11a.7 — Test action exercises a full deposit/pickup round-trip.
+  # 11a.7 — Test action exercises a full deposit/pickup round-trip. Fresh
+  # alpha VMs can briefly flap through namek TPM re-enrollment; retry only the
+  # external-auth failure tokens and still require an eventual success body.
   local test_resp
-  test_resp=$(post_csrf "/api/v1/security/auto-unlock/test")
+  for i in $(seq 1 12); do
+    test_resp=$(post_csrf "/api/v1/security/auto-unlock/test" || true)
+    if echo "$test_resp" | grep -q '"success":true'; then
+      break
+    fi
+    if ! echo "$test_resp" | grep -qE '"error_kind":"(auth_failed|service_unreachable)"'; then
+      break
+    fi
+    if [[ "$i" -lt 12 ]]; then
+      echo -e "  ${YELLOW}WAIT${NC} [11a.7] auto-unlock test hit transient namek auth window; retrying"
+      sleep 6
+    fi
+  done
   check "11a.7" "/security/auto-unlock/test returns success=true" "$test_resp" '"success":true'
 
   # 11a.8 — Scheduler startup log (proves goroutine spawned).
@@ -1189,7 +1203,7 @@ stage_auto_unlock() {
 # Stage 11: Resource Stewardship (HTTP + SSH)
 #
 # Exercises the post-RFC resource-stewardship plumbing end-to-end:
-#   - New-shape manifest (convertx: priority normal, bounded 512MB) installs cleanly.
+#   - New-shape manifest (small HTTP fixture: priority normal, bounded 512MB) installs cleanly.
 #   - Per-app-user slice gets a piccolo-resources.conf drop-in with the
 #     expected MemoryHigh/MemoryMax/CPUWeight values.
 #   - systemctl show reports matching live properties.
@@ -1202,48 +1216,20 @@ stage_stewardship() {
   echo -e "\n${CYAN}═══ Stage 11: Resource Stewardship ═══${NC}"
   ensure_session
 
-  # Inline new-shape convertx manifest (mirrors piccolo-store/apps/convertx/app.yaml
-  # post-Phase-2.4). Inlined because the remote catalog on
-  # github.com/AtDexters-Lab/piccolo-store/main may not yet carry the
-  # re-authored manifest during local dev.
-  local APP_NAME="convertx"
+  # Inline a small new-shape service manifest for resource stewardship.
+  # Keep this fixture lightweight: this stage validates systemd/cgroup resource
+  # enforcement, not the behavior of a large catalog app image.
+  local APP_NAME="stewardship"
   local template_yaml
   template_yaml=$(cat <<'EOF'
-inputs:
-  jwt_secret:
-    type: password
-    label: "JWT Secret"
-    generate: true
-    required: true
-  account_registration:
-    type: string
-    label: "Account Registration"
-    default: "false"
-    required: false
-  allow_unauthenticated:
-    type: string
-    label: "Allow Unauthenticated"
-    default: "false"
-    required: false
-
 services:
   main:
-    image: ghcr.io/c4illin/convertx:v0.16.1
-    bind_ports: [3000]
-    environment:
-      JWT_SECRET: "{{ .Inputs.jwt_secret }}"
-      ACCOUNT_REGISTRATION: "{{ .Inputs.account_registration }}"
-      ALLOW_UNAUTHENTICATED: "{{ .Inputs.allow_unauthenticated }}"
-      HTTP_ALLOWED: "true"
-    storage:
-      persistent:
-        data:
-          container: /app/data
-          size_limit: 10GB
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
 
 listeners:
   - name: __primary
-    guest_port: 3000
+    guest_port: 80
     flow: tcp
     protocol: http
 
@@ -1261,9 +1247,9 @@ EOF
   # Pre-check: inlined manifest should carry new-shape resources (app-level).
   check "11.0" "Inlined manifest declares new-shape resources" "$template_yaml" "min_required"
 
-  # Install convertx with its new-shape manifest. convertx declares three
-  # password-type inputs (jwt_secret, account_registration, allow_unauthenticated);
-  # we supply all three so the template renders without missing-key errors.
+  # Install the new-shape manifest. The whoami image is already exercised by
+  # earlier alpha stages, so this avoids making resource stewardship depend on
+  # a large WAN pull.
   local payload
   payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
 import json, os
@@ -1271,18 +1257,14 @@ print(json.dumps({
     'app_definition': os.environ['YAML'],
     'inputs': {
         '__app_address__': os.environ['NAME'],
-        'jwt_secret': 'e2e-test-jwt-2026',
-        'account_registration': 'false',
-        'allow_unauthenticated': 'false',
     },
-    'catalog_source': 'convertx'
+    'catalog_source': 'none'
 }))")
 
   local token
   token=$(csrf)
-  # Larger timeout: convertx image pull from ghcr.io can be slow over WAN.
   local install_http
-  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 600 \
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 180 \
     -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
     -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
@@ -1319,7 +1301,7 @@ except: print('')" 2>/dev/null)
   local dropin_path="/etc/systemd/system/user-${pa_uid}.slice.d/piccolo-resources.conf"
   check_ssh_ok "11.3" "Slice drop-in file exists" "test -f $dropin_path"
 
-  # Drop-in content: convertx manifest has min_required=512MB, profile=bounded.
+  # Drop-in content: fixture manifest has min_required=512MB, profile=bounded.
   # Bounded: MemoryHigh = 512*1.25 = 640 MB (in bytes: 640000000).
   #          MemoryMax  = 512*2    = 1024 MB = 1 GB (in bytes: 1024000000).
   # Priority normal → CPUWeight 100.
@@ -1407,13 +1389,13 @@ print(json.dumps({
     -d "$legacy_payload" "http://$IP/api/v1/apps" 2>&1)
   check "11.15" "Legacy manifest rejected with catalog-sync hint" "$legacy_err" "catalog sync"
 
-  # Uninstall convertx and verify drop-in cleanup.
+  # Uninstall the fixture app and verify drop-in cleanup.
   token=$(csrf)
   local uninstall_code
   uninstall_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
     -b "$COOKIE_JAR" -X DELETE -H "X-CSRF-Token: $token" \
     "http://$IP/api/v1/apps/$APP_NAME" 2>/dev/null)
-  check "11.16" "Convertx uninstalled" "$uninstall_code" "200"
+  check "11.16" "Stewardship fixture uninstalled" "$uninstall_code" "200"
 
   sleep 3
   check_ssh_fail "11.17" "Drop-in removed on uninstall" "test -f $dropin_path"

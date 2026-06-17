@@ -57,7 +57,29 @@ class AppDetailView extends StatefulWidget {
   State<AppDetailView> createState() => _AppDetailViewState();
 }
 
-enum _AppMenuAction { applyYaml, reviewCatalogUpdate, rollback, uninstall }
+enum _AppMenuAction { modifyApp, rollback, uninstall }
+
+enum _UpdateRoute { refreshImage, configReview, manifestReview, blocked }
+
+class _UpdateAction {
+  const _UpdateAction({
+    required this.route,
+    required this.label,
+    required this.enabled,
+    required this.icon,
+    required this.stateLabel,
+    this.reason = '',
+    this.source = '',
+  });
+
+  final _UpdateRoute route;
+  final String label;
+  final bool enabled;
+  final IconData icon;
+  final String stateLabel;
+  final String reason;
+  final String source;
+}
 
 class _ReadinessObservation {
   const _ReadinessObservation({
@@ -227,6 +249,7 @@ class _AppDetailViewState extends State<AppDetailView>
   String? _error;
 
   bool _snapshotAvailable = false;
+  String _imageUpdateBlockedReason = '';
   DateTime? _lastDetailRefreshAt;
 
   TrackedAppOperation? _activeOperation;
@@ -342,6 +365,7 @@ class _AppDetailViewState extends State<AppDetailView>
         _listeners = detail.listeners;
         _containers = detail.containers;
         _snapshotAvailable = detail.snapshotAvailable;
+        _imageUpdateBlockedReason = detail.imageUpdateBlockedReason;
         _primaryHealth = detail.app.primaryListenerHealth;
         // Identify the primary listener name for stream filtering
         _primaryListenerName = _findPrimaryListenerName(detail.listeners);
@@ -369,6 +393,8 @@ class _AppDetailViewState extends State<AppDetailView>
   Future<_OperationSubmitResult> _handleActionWithProgress({
     required AppOperationType type,
     required Future<void> Function(String taskId) action,
+    String? displayLabel,
+    String? displaySource,
     void Function(TrackedAppOperation operation)? onSubmitted,
   }) async {
     if (!mounted) return const _OperationSubmitResult(accepted: false);
@@ -376,7 +402,7 @@ class _AppDetailViewState extends State<AppDetailView>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            '${_activeOperation!.type.policy.label} is already in progress.',
+            '${_activeOperation!.label} is already in progress.',
           ),
         ),
       );
@@ -390,11 +416,15 @@ class _AppDetailViewState extends State<AppDetailView>
     final submittedOperation = _beginSubmittedOperation(
       taskId: taskId,
       type: type,
+      displayLabel: displayLabel,
+      displaySource: displaySource,
     );
     onSubmitted?.call(submittedOperation);
     final dialogHandle = _showOperationDialog(
       taskId: taskId,
       type: type,
+      label: submittedOperation.label,
+      source: submittedOperation.displaySource,
     );
 
     Object? actionError;
@@ -437,7 +467,7 @@ class _AppDetailViewState extends State<AppDetailView>
       }
       if (!mounted) return const _OperationSubmitResult(accepted: false);
       final message = trackingAvailable
-          ? 'Request status is unclear; continuing to track ${type.policy.label.toLowerCase()}.'
+          ? 'Request status is unclear; continuing to track ${operation.label.toLowerCase()}.'
           : 'Action failed: $actionError';
       ScaffoldMessenger.of(
         context,
@@ -500,11 +530,18 @@ class _AppDetailViewState extends State<AppDetailView>
         final task = matching.first;
         final type = appOperationTypeFromTaskType(task.taskType);
         if (type == null) return;
+        final recent = _readRecentSubmission();
         _adoptOperation(
           taskId: task.taskId,
           type: type,
           phase: AppOperationPhase.running,
           submittedAt: task.timestamp ?? DateTime.now(),
+          displayLabel: recent?.taskId == task.taskId
+              ? recent?.displayLabel
+              : null,
+          displaySource: recent?.taskId == task.taskId
+              ? recent?.displaySource
+              : null,
           latest: task,
         );
         return;
@@ -522,6 +559,8 @@ class _AppDetailViewState extends State<AppDetailView>
         type: recent.type,
         phase: AppOperationPhase.submitting,
         submittedAt: recent.submittedAt,
+        displayLabel: recent.displayLabel,
+        displaySource: recent.displaySource,
       );
     } on Object catch (e) {
       debugPrint('Failed to sync active operation: $e');
@@ -531,6 +570,8 @@ class _AppDetailViewState extends State<AppDetailView>
   TrackedAppOperation _beginSubmittedOperation({
     required String taskId,
     required AppOperationType type,
+    String? displayLabel,
+    String? displaySource,
   }) {
     _cancelReadinessObservation();
     final now = DateTime.now();
@@ -539,12 +580,16 @@ class _AppDetailViewState extends State<AppDetailView>
       type: type,
       phase: AppOperationPhase.submitting,
       submittedAt: now,
+      displayLabel: displayLabel,
+      displaySource: displaySource,
     );
     _writeRecentSubmission(
       RecentAppOperation(
         appId: widget.appId,
         taskId: taskId,
         type: type,
+        displayLabel: displayLabel,
+        displaySource: displaySource,
         submittedAt: now,
         expiresAt: now.add(_recentSubmissionTtl),
       ),
@@ -554,6 +599,8 @@ class _AppDetailViewState extends State<AppDetailView>
       type: operation.type,
       phase: operation.phase,
       submittedAt: operation.submittedAt,
+      displayLabel: operation.displayLabel,
+      displaySource: operation.displaySource,
     );
     return operation;
   }
@@ -561,10 +608,17 @@ class _AppDetailViewState extends State<AppDetailView>
   void _adoptWizardOperation({
     required String taskId,
     required String taskType,
+    String? displayLabel,
+    String? displaySource,
   }) {
     final type = appOperationTypeFromTaskType(taskType);
     if (type == null) return;
-    _beginSubmittedOperation(taskId: taskId, type: type);
+    _beginSubmittedOperation(
+      taskId: taskId,
+      type: type,
+      displayLabel: displayLabel,
+      displaySource: displaySource,
+    );
   }
 
   void _adoptOperation({
@@ -572,6 +626,8 @@ class _AppDetailViewState extends State<AppDetailView>
     required AppOperationType type,
     required AppOperationPhase phase,
     required DateTime submittedAt,
+    String? displayLabel,
+    String? displaySource,
     TaskProgressEvent? latest,
   }) {
     if (_terminallySettledTaskIds.contains(taskId)) return;
@@ -593,6 +649,8 @@ class _AppDetailViewState extends State<AppDetailView>
         type: type,
         phase: phase,
         submittedAt: submittedAt,
+        displayLabel: displayLabel,
+        displaySource: displaySource,
         latest: latest,
       );
     });
@@ -649,7 +707,7 @@ class _AppDetailViewState extends State<AppDetailView>
     TrackedAppOperation operation,
     TaskProgressEvent event,
   ) async {
-    final label = operation.type.policy.label;
+    final label = operation.label;
     final error = event.error ?? 'Operation failed.';
     final pendingListenerSave =
         operation.type == AppOperationType.updateListeners
@@ -715,7 +773,7 @@ class _AppDetailViewState extends State<AppDetailView>
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
             content: Text(
-              'Still waiting for ${operation.type.policy.label.toLowerCase()} to be accepted. Continuing to track status.',
+              'Still waiting for ${operation.label.toLowerCase()} to be accepted. Continuing to track status.',
             ),
           ),
         );
@@ -729,7 +787,7 @@ class _AppDetailViewState extends State<AppDetailView>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Could not confirm ${operation.type.policy.label.toLowerCase()} progress. Refreshed app state.',
+            'Could not confirm ${operation.label.toLowerCase()} progress. Refreshed app state.',
           ),
         ),
       );
@@ -747,7 +805,7 @@ class _AppDetailViewState extends State<AppDetailView>
         if (!applied || !mounted || pendingListenerSave == null) return;
         setState(() {
           _recentOperationFailure = _RecentOperationFailure(
-            title: '${operation.type.policy.label} status unclear',
+            title: '${operation.label} status unclear',
             message:
                 'Could not attach to progress. Your changes are preserved; refresh was attempted before retrying.',
             severity: BannerSeverity.warning,
@@ -760,7 +818,7 @@ class _AppDetailViewState extends State<AppDetailView>
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
           content: Text(
-            'Could not attach to ${operation.type.policy.label} progress. Refreshed app state.',
+            'Could not attach to ${operation.label} progress. Refreshed app state.',
           ),
         ),
       );
@@ -830,6 +888,7 @@ class _AppDetailViewState extends State<AppDetailView>
       _containers = [];
       _selectedService = null;
       _snapshotAvailable = false;
+      _imageUpdateBlockedReason = '';
       _primaryHealth = null;
       _primaryListenerName = null;
       _error = null;
@@ -885,6 +944,8 @@ class _AppDetailViewState extends State<AppDetailView>
   _OperationDialogHandle _showOperationDialog({
     required String taskId,
     required AppOperationType type,
+    String? label,
+    String? source,
   }) {
     final handle = _OperationDialogHandle();
     _operationDialogHandle = handle;
@@ -894,16 +955,32 @@ class _AppDetailViewState extends State<AppDetailView>
         builder: (dialogContext) {
           handle.attach(dialogContext);
           return AlertDialog(
-            title: Text(type.policy.label),
+            title: Text(label ?? type.policy.label),
             content: SizedBox(
               width: 520,
-              child: TaskProgressPanel(
-                taskId: taskId,
-                taskType: type.policy.taskType,
-                onComplete: (event) {
-                  if (event.error != null && event.error!.isNotEmpty) return;
-                  handle.close();
-                },
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  if (source?.trim().isNotEmpty ?? false) ...[
+                    Text(
+                      source!.trim(),
+                      style: PiccoloTheme.textTheme.labelSmall,
+                    ),
+                    const SizedBox(height: Spacing.sm),
+                  ],
+                  TaskProgressPanel(
+                    taskId: taskId,
+                    taskType: type.policy.taskType,
+                    label: label ?? type.policy.label,
+                    onComplete: (event) {
+                      if (event.error != null && event.error!.isNotEmpty) {
+                        return;
+                      }
+                      handle.close();
+                    },
+                  ),
+                ],
               ),
             ),
             actions: [
@@ -964,12 +1041,128 @@ class _AppDetailViewState extends State<AppDetailView>
     } on Object catch (_) {}
   }
 
-  Future<void> _handleUpdate() async {
-    await _handleActionWithProgress(
-      type: AppOperationType.updateImage,
-      action: (taskId) =>
-          widget.appService.updateApp(widget.appId, taskId: taskId),
+  _UpdateAction _currentUpdateAction(App app) {
+    if (app.isWorkspace) {
+      return const _UpdateAction(
+        route: _UpdateRoute.blocked,
+        label: 'Update blocked',
+        enabled: false,
+        icon: PiccoloIcons.error,
+        stateLabel: 'Update blocked',
+        reason:
+            'Workspace apps are updated by reinstalling with a new base image.',
+      );
+    }
+    if (_mutatingActionsPaused) {
+      return _UpdateAction(
+        route: _UpdateRoute.blocked,
+        label: 'Update',
+        enabled: false,
+        icon: PiccoloIcons.refresh,
+        stateLabel: 'Update paused',
+        reason: '${_activeOperation!.label} is in progress',
+      );
+    }
+    if (app.catalogUpdatePending) {
+      switch (app.catalogUpdatePendingFlow.toLowerCase()) {
+        case 'config':
+          return const _UpdateAction(
+            route: _UpdateRoute.configReview,
+            label: 'Update',
+            enabled: true,
+            icon: PiccoloIcons.settings,
+            stateLabel: 'Update needs config values',
+            reason: 'Update needs config values.',
+            source: 'Source: app catalog',
+          );
+        case 'manifest_review':
+          if (!app.isRunning) {
+            return const _UpdateAction(
+              route: _UpdateRoute.blocked,
+              label: 'Update',
+              enabled: false,
+              icon: PiccoloIcons.fileText,
+              stateLabel: 'Update needs review',
+              reason: 'Start the app before reviewing this update.',
+              source: 'Source: app catalog',
+            );
+          }
+          return const _UpdateAction(
+            route: _UpdateRoute.manifestReview,
+            label: 'Update',
+            enabled: true,
+            icon: PiccoloIcons.fileText,
+            stateLabel: 'Update needs review',
+            reason: 'Update needs review.',
+            source: 'Source: app catalog',
+          );
+        default:
+          return const _UpdateAction(
+            route: _UpdateRoute.blocked,
+            label: 'Update blocked',
+            enabled: false,
+            icon: PiccoloIcons.error,
+            stateLabel: 'Update blocked',
+            reason:
+                'This update cannot be reviewed here yet. Refresh and try again.',
+            source: 'Source: app catalog',
+          );
+      }
+    }
+    final blockedReason = _imageUpdateBlockedReason.trim();
+    if (blockedReason.isNotEmpty) {
+      return _UpdateAction(
+        route: _UpdateRoute.blocked,
+        label: 'Update blocked',
+        enabled: false,
+        icon: PiccoloIcons.error,
+        stateLabel: 'Update blocked',
+        reason: blockedReason,
+        source: 'Source: current app definition',
+      );
+    }
+    if (!app.isRunning) {
+      return const _UpdateAction(
+        route: _UpdateRoute.blocked,
+        label: 'Update',
+        enabled: false,
+        icon: PiccoloIcons.refresh,
+        stateLabel: 'Refresh current image',
+        reason: 'Start the app before updating.',
+        source: 'Source: current app definition',
+      );
+    }
+    return const _UpdateAction(
+      route: _UpdateRoute.refreshImage,
+      label: 'Update',
+      enabled: true,
+      icon: PiccoloIcons.refresh,
+      stateLabel: 'Refresh current image',
+      source: 'Source: current app definition',
     );
+  }
+
+  Future<void> _handleUpdate() async {
+    final app = _app;
+    if (app == null) return;
+    final action = _currentUpdateAction(app);
+    if (!action.enabled) return;
+    switch (action.route) {
+      case _UpdateRoute.refreshImage:
+        await _handleActionWithProgress(
+          type: AppOperationType.updateImage,
+          displayLabel: action.stateLabel,
+          displaySource: action.source,
+          action: (taskId) =>
+              widget.appService.updateApp(widget.appId, taskId: taskId),
+        );
+      case _UpdateRoute.configReview:
+        _showInstalledConfigWizard(pendingCatalogUpdate: true);
+      case _UpdateRoute.manifestReview:
+        _showManifestUpdateWizard(catalogPending: true);
+      case _UpdateRoute.blocked:
+        return;
+    }
   }
 
   void _showManifestUpdateWizard({bool catalogPending = false}) {
@@ -982,8 +1175,14 @@ class _AppDetailViewState extends State<AppDetailView>
           appId: _app!.name,
           appService: widget.appService,
           catalogPending: catalogPending,
-          onTaskStarted: (taskId, taskType) =>
-              _adoptWizardOperation(taskId: taskId, taskType: taskType),
+          onTaskStarted: (taskId, taskType, label) => _adoptWizardOperation(
+            taskId: taskId,
+            taskType: taskType,
+            displayLabel: label,
+            displaySource: catalogPending
+                ? 'Source: app catalog'
+                : 'Source: pasted manifest YAML',
+          ),
           onApplied: () => _settleWizardHttpSuccess(
             fallbackType: AppOperationType.updateManifest,
           ),
@@ -992,7 +1191,7 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
-  void _showInstalledConfigWizard() {
+  void _showInstalledConfigWizard({bool pendingCatalogUpdate = false}) {
     if (_app == null) return;
     unawaited(
       showDialog<void>(
@@ -1001,8 +1200,15 @@ class _AppDetailViewState extends State<AppDetailView>
         builder: (context) => InstalledConfigWizard(
           appId: _app!.name,
           appService: widget.appService,
-          onTaskStarted: (taskId, taskType) =>
-              _adoptWizardOperation(taskId: taskId, taskType: taskType),
+          pendingCatalogUpdate: pendingCatalogUpdate,
+          onTaskStarted: (taskId, taskType, label) => _adoptWizardOperation(
+            taskId: taskId,
+            taskType: taskType,
+            displayLabel: label,
+            displaySource: pendingCatalogUpdate
+                ? 'Source: app catalog'
+                : 'Source: current app definition',
+          ),
           onApplied: () => _settleWizardHttpSuccess(
             fallbackType: AppOperationType.updateConfig,
           ),
@@ -1430,12 +1636,18 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildActionToolbar() {
     final paused = _mutatingActionsPaused;
     final pauseReason = paused
-        ? '${_activeOperation!.type.policy.label} is in progress'
+        ? '${_activeOperation!.label} is in progress'
         : null;
+    final updateAction = _currentUpdateAction(_app!);
 
     Widget pausedTooltip(Widget child) {
       if (!paused || pauseReason == null) return child;
       return Tooltip(message: pauseReason, child: child);
+    }
+
+    Widget actionTooltip(_UpdateAction action, Widget child) {
+      if (action.reason.trim().isEmpty) return child;
+      return Tooltip(message: action.reason, child: child);
     }
 
     return Wrap(
@@ -1452,7 +1664,7 @@ class _AppDetailViewState extends State<AppDetailView>
               backgroundColor: PiccoloTheme.cobalt600,
             ),
           ),
-        if (!_app!.isWorkspace)
+        if (!_app!.isWorkspace && !_app!.hasConfigReviewCatalogUpdate)
           pausedTooltip(
             OutlinedButton.icon(
               onPressed: paused ? null : _showInstalledConfigWizard,
@@ -1460,17 +1672,19 @@ class _AppDetailViewState extends State<AppDetailView>
               label: const Text('Edit Config'),
             ),
           ),
-        if (!_app!.isWorkspace && _app!.isRunning)
-          pausedTooltip(
+        if (!_app!.isWorkspace)
+          actionTooltip(
+            updateAction,
             FilledButton.icon(
-              onPressed: paused ? null : _handleUpdate,
-              icon: const Icon(PiccoloIcons.refresh),
-              label: const Text('Update Image'),
+              onPressed: updateAction.enabled ? _handleUpdate : null,
+              icon: Icon(updateAction.icon),
+              label: Text(updateAction.label),
               style: FilledButton.styleFrom(
                 backgroundColor: PiccoloTheme.cobalt600,
               ),
             ),
           ),
+        if (!_app!.isWorkspace) _buildUpdateStatePill(updateAction),
         pausedTooltip(
           _app!.isRunning
               ? FilledButton.icon(
@@ -1511,24 +1725,16 @@ class _AppDetailViewState extends State<AppDetailView>
           enabled: !paused,
           onSelected: _handleOverflowAction,
           itemBuilder: (context) => [
-            if (!_app!.isWorkspace &&
-                _app!.isRunning &&
-                _app!.catalogSource.isEmpty)
-              const PopupMenuItem(
-                value: _AppMenuAction.applyYaml,
+            if (!_app!.isWorkspace && _app!.catalogSource.isEmpty)
+              PopupMenuItem(
+                value: _AppMenuAction.modifyApp,
+                enabled: _app!.isRunning,
                 child: ListTile(
-                  leading: Icon(PiccoloIcons.fileText),
-                  title: Text('Review App Update'),
-                ),
-              ),
-            if (!_app!.isWorkspace &&
-                _app!.isRunning &&
-                _app!.hasManifestReviewCatalogUpdate)
-              const PopupMenuItem(
-                value: _AppMenuAction.reviewCatalogUpdate,
-                child: ListTile(
-                  leading: Icon(PiccoloIcons.fileText),
-                  title: Text('Review Catalog Update'),
+                  leading: const Icon(PiccoloIcons.fileText),
+                  title: const Text('Modify App'),
+                  subtitle: _app!.isRunning
+                      ? null
+                      : const Text('Start the app before modifying'),
                 ),
               ),
             if (_snapshotAvailable && !_app!.isWorkspace)
@@ -1584,12 +1790,66 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  Widget _buildUpdateStatePill(_UpdateAction action) {
+    final pieces = [
+      action.stateLabel,
+      if (action.source.trim().isNotEmpty) action.source.trim(),
+    ];
+    final reason = action.reason.trim();
+    return Tooltip(
+      message: reason.isEmpty
+          ? pieces.join('\n')
+          : '${pieces.join('\n')}\n$reason',
+      child: DecoratedBox(
+        decoration: BoxDecoration(
+          color: PiccoloTheme.mist,
+          border: Border.all(color: PiccoloTheme.hairline),
+          borderRadius: BorderRadius.circular(Radii.sm),
+        ),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: Spacing.sm,
+            vertical: Spacing.xs,
+          ),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(action.icon, size: 14, color: PiccoloTheme.inkMuted),
+                  const SizedBox(width: Spacing.xs),
+                  Text(
+                    pieces.join(' · '),
+                    style: PiccoloTheme.textTheme.labelSmall,
+                  ),
+                ],
+              ),
+              if (reason.isNotEmpty) ...[
+                const SizedBox(height: 2),
+                ConstrainedBox(
+                  constraints: const BoxConstraints(maxWidth: 360),
+                  child: Text(
+                    reason,
+                    style: PiccoloTheme.textTheme.labelSmall?.copyWith(
+                      color: PiccoloTheme.inkMuted,
+                    ),
+                    softWrap: true,
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   void _handleOverflowAction(_AppMenuAction action) {
     switch (action) {
-      case _AppMenuAction.applyYaml:
+      case _AppMenuAction.modifyApp:
         _showManifestUpdateWizard();
-      case _AppMenuAction.reviewCatalogUpdate:
-        _showManifestUpdateWizard(catalogPending: true);
       case _AppMenuAction.rollback:
         unawaited(_confirmRollback());
       case _AppMenuAction.uninstall:
@@ -1600,7 +1860,7 @@ class _AppDetailViewState extends State<AppDetailView>
   Widget _buildOperationBanner(TrackedAppOperation operation) {
     final latest = operation.latest;
     final progress = latest?.progress ?? -1;
-    final label = operation.type.policy.label;
+    final label = operation.label;
     final message = latest?.message.isNotEmpty ?? false
         ? latest!.message
         : operation.phase == AppOperationPhase.submitting
@@ -1647,6 +1907,13 @@ class _AppDetailViewState extends State<AppDetailView>
                         : PiccoloTheme.cobalt600,
                   ),
                 ),
+                if (operation.displaySource?.trim().isNotEmpty ?? false) ...[
+                  const SizedBox(height: 2),
+                  Text(
+                    operation.displaySource!.trim(),
+                    style: PiccoloTheme.textTheme.labelSmall,
+                  ),
+                ],
                 const SizedBox(height: Spacing.xs),
                 Text(
                   isError && latest?.error != null && latest!.error!.isNotEmpty
@@ -1671,6 +1938,8 @@ class _AppDetailViewState extends State<AppDetailView>
             onPressed: () => _showOperationDialog(
               taskId: operation.taskId,
               type: operation.type,
+              label: operation.label,
+              source: operation.displaySource,
             ),
             child: const Text('Details'),
           ),
@@ -1681,41 +1950,43 @@ class _AppDetailViewState extends State<AppDetailView>
 
   Widget _buildCatalogUpdatePendingBanner() {
     final app = _app!;
-    final isConfigReview = app.hasConfigReviewCatalogUpdate;
-    final canReview =
-        !app.isWorkspace &&
-        !_mutatingActionsPaused &&
-        (isConfigReview || app.isRunning);
-    final reason = app.catalogUpdatePendingReason.trim();
-    final baseMessage = reason.isEmpty
-        ? 'A catalog update is waiting for review.'
-        : reason;
-    final message = canReview
-        ? baseMessage
-        : _mutatingActionsPaused
-        ? '$baseMessage Current operation must finish before review.'
-        : '$baseMessage Start app to review this catalog update.';
-    final actionLabel = isConfigReview
-        ? 'Edit Config'
-        : 'Review Catalog Update';
+    final action = _currentUpdateAction(app);
+    final canContinue = action.enabled && action.route != _UpdateRoute.blocked;
+    final baseMessage = switch (app.catalogUpdatePendingFlow.toLowerCase()) {
+      'config' => 'This update needs values before it can continue.',
+      'manifest_review' =>
+        'This update changes app behavior and needs your review before applying.',
+      _ =>
+        action.route == _UpdateRoute.blocked
+            ? 'This update cannot continue from the current state.'
+            : 'An update is waiting.',
+    };
+    final actionReason = action.reason.trim();
+    final source = action.source.trim();
+    final withSource = source.isEmpty ? baseMessage : '$baseMessage $source.';
+    final message = canContinue || actionReason.isEmpty
+        ? withSource
+        : '$withSource $actionReason';
+    final title = switch (app.catalogUpdatePendingFlow.toLowerCase()) {
+      'config' => 'Update needs config values',
+      'manifest_review' => 'Update needs review',
+      _ =>
+        action.route == _UpdateRoute.blocked
+            ? 'Update blocked'
+            : 'Update available',
+    };
     return StatusBanner(
       severity: BannerSeverity.info,
-      icon: PiccoloIcons.fileText,
-      title: 'Catalog update pending',
+      icon: action.icon,
+      title: title,
       message: message,
-      action: canReview
+      action: canContinue
           ? Align(
               alignment: Alignment.centerLeft,
               child: TextButton.icon(
-                onPressed: isConfigReview
-                    ? _showInstalledConfigWizard
-                    : () => _showManifestUpdateWizard(catalogPending: true),
-                icon: Icon(
-                  isConfigReview
-                      ? PiccoloIcons.settings
-                      : PiccoloIcons.fileText,
-                ),
-                label: Text(actionLabel),
+                onPressed: _handleUpdate,
+                icon: Icon(action.icon),
+                label: const Text('Continue Update'),
               ),
             )
           : null,
@@ -1723,9 +1994,11 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildAccessRepairPendingBanner() {
-    final message = _app!.accessRepairMessage.trim().isEmpty
-        ? 'Update committed, but listener routes, auth, or public access may not match the new manifest until access publication is repaired.'
+    final detail = _app!.accessRepairMessage.trim().isEmpty
+        ? 'Listener routes, auth, or public access may not match the new manifest until publication is repaired.'
         : _app!.accessRepairMessage.trim();
+    final message =
+        '$detail Starting a new update will not repair the current access state.';
     return StatusBanner(
       severity: BannerSeverity.warning,
       icon: PiccoloIcons.warning,

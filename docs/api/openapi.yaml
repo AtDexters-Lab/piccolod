@@ -1352,6 +1352,9 @@ components:
         regenerate_inputs:
           type: array
           items: { type: string }
+        clear_inputs:
+          type: array
+          items: { type: string }
     ManifestUpdateApplyRequest:
       type: object
       required: [dry_run_token]
@@ -1366,6 +1369,9 @@ components:
           type: object
           additionalProperties: true
         regenerate_inputs:
+          type: array
+          items: { type: string }
+        clear_inputs:
           type: array
           items: { type: string }
         confirmations:
@@ -1416,12 +1422,14 @@ components:
       properties:
         name: { type: string }
         type: { type: string }
-        provenance:
-          type: string
-          enum: [Locked current value, Re-enter required, New manifest default, Entered now]
+        provenance: { type: string }
         required: { type: boolean }
         generate: { type: boolean }
         locked: { type: boolean }
+        sensitive: { type: boolean }
+        has_current_value: { type: boolean }
+        current_value_sensitive: { type: boolean }
+        current_value_display: { type: string }
     ManifestUpdateSummary:
       type: object
       properties:
@@ -1458,6 +1466,28 @@ components:
         old: { type: string }
         new: { type: string }
         confirmation: { type: string }
+    ManifestUpdateKeptValueReviewItem:
+      type: object
+      properties:
+        field: { type: string }
+        risk_kind: { type: string }
+        old_semantic:
+          type: array
+          items: { type: string }
+        new_semantic:
+          type: array
+          items: { type: string }
+        semantic_delta:
+          type: array
+          items: { type: string }
+        old_usage:
+          type: array
+          items: { type: string }
+        new_usage:
+          type: array
+          items: { type: string }
+        confirmation: { type: string }
+        blocking_reason: { type: string }
     ManifestUpdateDataSafetySummary:
       type: object
       properties:
@@ -1491,6 +1521,9 @@ components:
         exposure_review:
           type: array
           items: { $ref: '#/components/schemas/ManifestUpdateReviewItem' }
+        kept_value_review:
+          type: array
+          items: { $ref: '#/components/schemas/ManifestUpdateKeptValueReviewItem' }
         required_confirmations:
           type: array
           items: { type: string }
@@ -1549,7 +1582,7 @@ components:
         display: {}
         provenance:
           type: string
-          enum: [operator, catalog_default, generated, system, legacy_unknown]
+          enum: [operator, catalog_default, generated, system, legacy_unknown, absent_sensitive]
         editable: { type: boolean }
         actions:
           type: array
@@ -1647,6 +1680,7 @@ components:
             containers:
               type: array
               items: { $ref: '#/components/schemas/AppContainerStatus' }
+            image_update_blocked_reason: { type: string }
     AppContainerStatus:
       type: object
       properties:

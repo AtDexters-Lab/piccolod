@@ -436,6 +436,7 @@ func (s *GinServer) handleGinAppManifestDryRun(c *gin.Context) {
 		AppDefinition    string                 `json:"app_definition"`
 		Inputs           map[string]interface{} `json:"inputs"`
 		RegenerateInputs []string               `json:"regenerate_inputs"`
+		ClearInputs      []string               `json:"clear_inputs"`
 		CatalogPending   bool                   `json:"catalog_pending"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || (strings.TrimSpace(req.AppDefinition) == "" && !req.CatalogPending) {
@@ -447,6 +448,7 @@ func (s *GinServer) handleGinAppManifestDryRun(c *gin.Context) {
 		RawTemplate:      []byte(req.AppDefinition),
 		Inputs:           req.Inputs,
 		RegenerateInputs: req.RegenerateInputs,
+		ClearInputs:      req.ClearInputs,
 		CatalogPending:   req.CatalogPending,
 		SystemContext:    s.buildInstallSystemContext(),
 	})
@@ -469,6 +471,7 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		AppDefinition      string                 `json:"app_definition"`
 		Inputs             map[string]interface{} `json:"inputs"`
 		RegenerateInputs   []string               `json:"regenerate_inputs"`
+		ClearInputs        []string               `json:"clear_inputs"`
 		Confirmations      []string               `json:"confirmations"`
 		CatalogPending     bool                   `json:"catalog_pending"`
 		BaseManifestHash   string                 `json:"base_manifest_hash"`
@@ -486,6 +489,7 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		RawTemplate:        []byte(req.AppDefinition),
 		Inputs:             req.Inputs,
 		RegenerateInputs:   req.RegenerateInputs,
+		ClearInputs:        req.ClearInputs,
 		Confirmations:      req.Confirmations,
 		CatalogPending:     req.CatalogPending,
 		SystemContext:      s.buildInstallSystemContext(),
@@ -983,7 +987,8 @@ func (s *GinServer) handleGinAppGet(c *gin.Context) {
 		log.Printf("WARN: app get %s: container status unavailable: %v", appName, err)
 	}
 	snapshotAvailable := s.appManager.HasSnapshotAvailable(c.Request.Context(), appName)
-	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus, "snapshot_available": snapshotAvailable}, "")
+	imageUpdateBlockedReason := s.appManager.ImageUpdateBlockedReason(c.Request.Context(), appName)
+	writeGinSuccess(c, gin.H{"app": appInstance, "listeners": listenerStatus, "containers": containerStatus, "snapshot_available": snapshotAvailable, "image_update_blocked_reason": imageUpdateBlockedReason}, "")
 }
 
 // handleGinAppLogs returns recent container logs for an app instance.
@@ -1207,6 +1212,8 @@ func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 			writeGinError(c, http.StatusNotFound, errMsg)
 		case strings.Contains(errMsg, "workspace"):
 			writeGinError(c, http.StatusBadRequest, errMsg)
+		case errors.Is(err, app.ErrImageUpdateRejected):
+			writeGinError(c, http.StatusConflict, errMsg)
 		default:
 			writeGinError(c, http.StatusInternalServerError, "Update failed: "+errMsg)
 		}

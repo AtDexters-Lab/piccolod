@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -443,8 +444,8 @@ func TestEditConfigSurfacesPendingCatalogRequiredInput(t *testing.T) {
 	if pendingField.Present {
 		t.Fatalf("pending field should not be marked present")
 	}
-	if len(read.Warnings) == 0 || !strings.Contains(strings.Join(read.Warnings, " "), "pending catalog update") {
-		t.Fatalf("expected pending catalog warning, got %v", read.Warnings)
+	if len(read.Warnings) == 0 || !strings.Contains(strings.Join(read.Warnings, " "), "Update needs attention") {
+		t.Fatalf("expected pending update warning, got %v", read.Warnings)
 	}
 
 	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
@@ -644,6 +645,19 @@ func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *test
 	oldHash := Sha256Hex(raw)
 	newRaw := []byte(strings.Replace(string(raw), "docker.io/example/piclu:stable", "docker.io/example/piclu:new", 1))
 	newRaw = []byte(strings.Replace(string(newRaw),
+		`  diag_dir:
+    type: string
+    label: Diagnostics directory
+    default: /diagnostics`,
+		`  diag_dir:
+    type: string
+    label: "Diagnostics {{ .Inputs.diag_dir }}"
+    description: "Diagnostics {{ .Inputs.diag_dir }}"
+    default: "{{ .Inputs.diag_dir }}"
+    validation:
+      regex: "^.*$"
+      message: "Diagnostics {{ .Inputs.diag_dir }}"`, 1))
+	newRaw = []byte(strings.Replace(string(newRaw),
 		`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"`,
 		`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
 {{ if .Inputs.gemini_api_key }}
@@ -668,6 +682,7 @@ func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *test
 	if installSt.InstallInputs == nil {
 		installSt.InstallInputs = map[string]any{}
 	}
+	installSt.InstallInputs["gemini_api_key"] = "opaque123"
 	installSt.InstallInputs["diag_dir"] = "/diagnostics"
 	if installSt.InputProvenance == nil {
 		installSt.InputProvenance = map[string]string{}
@@ -718,6 +733,13 @@ func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *test
 	}
 	if _, ok := configured.Inputs["gemini_api_key"]; !ok {
 		t.Fatalf("configured inputs missing gemini_api_key: %v", configured.Inputs)
+	}
+	diagSchema, ok := configured.Inputs["diag_dir"]
+	if !ok {
+		t.Fatalf("configured inputs missing diag_dir: %v", configured.Inputs)
+	}
+	if diagSchema.Label != "" || diagSchema.Description != "" || diagSchema.Default != nil || diagSchema.Validation != nil {
+		t.Fatalf("rendered manifest configure leaked display metadata: %+v", diagSchema)
 	}
 	appInst, exists := state.GetApp("piclu")
 	if !exists {
@@ -777,6 +799,204 @@ func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *test
 	}
 	if read.SourceHash != newHash {
 		t.Fatalf("read source hash = %q, want %q", read.SourceHash, newHash)
+	}
+	checkedDiagDir := false
+	for i := range read.Fields {
+		if read.Fields[i].Name != "diag_dir" {
+			continue
+		}
+		checkedDiagDir = true
+		if read.Fields[i].Label != "" || read.Fields[i].Description != "" {
+			t.Fatalf("rendered installed config leaked field metadata: %+v", read.Fields[i])
+		}
+		if read.Fields[i].Schema != nil && (read.Fields[i].Schema.Default != nil || read.Fields[i].Schema.Label != "" || read.Fields[i].Schema.Description != "" || read.Fields[i].Schema.Validation != nil) {
+			t.Fatalf("rendered installed config leaked schema metadata: %+v", read.Fields[i].Schema)
+		}
+		if strings.Contains(strings.Join([]string{read.Fields[i].Label, read.Fields[i].Description, fmt.Sprint(read.Fields[i].Display)}, " "), "opaque123") {
+			t.Fatalf("rendered installed config leaked stored secret in field: %+v", read.Fields[i])
+		}
+	}
+	if !checkedDiagDir {
+		t.Fatalf("read fields missing diag_dir: %+v", read.Fields)
+	}
+}
+
+func TestRenderedOnlySchemaRejectsStoredValueInputNames(t *testing.T) {
+	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
+	unsafeRaw := []byte(`type: user
+inputs:
+  gemini_api_key:
+    type: password
+    required: true
+{{ if .Inputs.gemini_api_key }}
+  leak_{{ printf "%.4s" .Inputs.gemini_api_key }}:
+    type: string
+    default: hidden
+{{ end }}
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      GEMINI_API_KEY: "{{ .Inputs.gemini_api_key }}"
+x-piccolo:
+  mode: service
+`)
+	if _, err := ParseAppSchema(unsafeRaw); err == nil {
+		t.Fatalf("test template should require render before schema parse")
+	}
+	inputs["gemini_api_key"] = "opaque123"
+	if _, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   unsafeRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil); err != nil {
+		t.Fatalf("rendered unsafe template should otherwise render: %v", err)
+	}
+
+	committed := NewV2InstallState("piclu", InstallSourceKindCustom, "", unsafeRaw, inputs, systemCtx, nil, false)
+	if err := state.StoreInstallState("piclu", committed); err != nil {
+		t.Fatalf("store unsafe rendered install state: %v", err)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	if read.LedgerHealth != "unrecoverable" {
+		t.Fatalf("ledger health = %q, want unrecoverable", read.LedgerHealth)
+	}
+	if strings.Contains(fmt.Sprint(read), "opaque123") {
+		t.Fatalf("read installed config leaked rendered input name: %+v", read)
+	}
+	if strings.Contains(fmt.Sprint(read), "opaq") {
+		t.Fatalf("read installed config leaked rendered input-name fragment: %+v", read)
+	}
+
+	pending := NewV2InstallState("piclu", InstallSourceKindCustom, "", raw, inputs, systemCtx, nil, false)
+	pending.markPendingCatalogSourceForFlow("piclu", unsafeRaw, "operator review", pendingCatalogReviewFlowManifest)
+	if err := state.StoreInstallState("piclu", pending); err != nil {
+		t.Fatalf("store unsafe pending install state: %v", err)
+	}
+	_, err = mgr.ConfigureCustomManifestUpdate(context.Background(), "piclu", nil, true)
+	if err == nil {
+		t.Fatalf("expected unsafe pending manifest configure to fail")
+	}
+	if strings.Contains(err.Error(), "opaque123") {
+		t.Fatalf("configure error leaked rendered input name: %v", err)
+	}
+	if strings.Contains(err.Error(), "opaq") {
+		t.Fatalf("configure error leaked rendered input-name fragment: %v", err)
+	}
+}
+
+func TestRenderedOnlySchemaRejectsStickySensitiveInputNameFragments(t *testing.T) {
+	mgr, state, _, _, systemCtx := installedConfigTestApp(t)
+	raw := []byte(`type: user
+inputs:
+  license:
+    type: string
+    required: true
+{{ if .Inputs.license }}
+  leak_{{ printf "%.4s" .Inputs.license }}:
+    type: string
+    default: hidden
+{{ end }}
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      LICENSE: "{{ .Inputs.license }}"
+x-piccolo:
+  mode: service
+`)
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"license":         "secret-license",
+	}
+	committed := NewV2InstallState("piclu", InstallSourceKindCustom, "", raw, inputs, systemCtx, nil, false)
+	committed.InputSensitive = map[string]bool{"license": true}
+	if err := state.StoreInstallState("piclu", committed); err != nil {
+		t.Fatalf("store sticky-sensitive rendered install state: %v", err)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	if read.LedgerHealth != "unrecoverable" {
+		t.Fatalf("ledger health = %q warnings=%v, want unrecoverable", read.LedgerHealth, read.Warnings)
+	}
+	if strings.Contains(fmt.Sprint(read), "secret-license") || strings.Contains(fmt.Sprint(read), "secr") {
+		t.Fatalf("read installed config leaked sticky-sensitive rendered fragment: %+v", read)
+	}
+}
+
+func TestRenderedOnlySchemaAllowsNonSecretValueStaticInputNames(t *testing.T) {
+	mgr, state, _, inputs, systemCtx := installedConfigTestApp(t)
+	raw := []byte(`type: user
+inputs:
+  gemini_api_key:
+    type: password
+    required: true
+  provider:
+    type: string
+{{ if .Inputs.provider }}
+  local_model:
+    type: string
+    default: gemma
+{{ end }}
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      GEMINI_API_KEY: "{{ .Inputs.gemini_api_key }}"
+x-piccolo:
+  mode: service
+`)
+	if _, err := ParseAppSchema(raw); err == nil {
+		t.Fatalf("test template should require render before schema parse")
+	}
+	inputs["provider"] = "local"
+	committed := NewV2InstallState("piclu", InstallSourceKindCustom, "", raw, inputs, systemCtx, nil, false)
+	if err := state.StoreInstallState("piclu", committed); err != nil {
+		t.Fatalf("store rendered install state: %v", err)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	if read.LedgerHealth != "complete" {
+		t.Fatalf("ledger health = %q warnings=%v, want complete", read.LedgerHealth, read.Warnings)
+	}
+	found := false
+	for _, field := range read.Fields {
+		if field.Name == "local_model" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("read fields missing local_model: %+v", read.Fields)
 	}
 }
 
@@ -1274,7 +1494,7 @@ func TestApplyInstalledConfigRejectsLedgerRawTemplateHashMismatchAfterDryRun(t *
 }
 
 func TestNormalizeInstalledConfigInputsDropsUndeclaredLedgerValues(t *testing.T) {
-	inputs, provenance, _, err := normalizeInstalledConfigInputs(
+	inputs, provenance, _, _, err := normalizeInstalledConfigInputs(
 		map[string]api.AppInput{
 			"provider": {Type: "string", Required: true},
 		},
@@ -1288,6 +1508,7 @@ func TestNormalizeInstalledConfigInputsDropsUndeclaredLedgerValues(t *testing.T)
 				"old_secret": InputProvenanceOperator,
 			},
 		},
+		&api.AppDefinition{Inputs: map[string]api.AppInput{"provider": {Type: "string"}}},
 		InstalledConfigUpdateRequest{},
 		"piclu",
 	)
@@ -1398,7 +1619,7 @@ func TestNormalizeInstalledConfigInputsKeepsAbsentDefaultsUntilEdited(t *testing
 		InputProvenance: map[string]string{},
 	}
 
-	inputs, provenance, actions, err := normalizeInstalledConfigInputs(declared, st, InstalledConfigUpdateRequest{}, "piclu")
+	inputs, provenance, _, actions, err := normalizeInstalledConfigInputs(declared, st, &api.AppDefinition{Inputs: declared}, InstalledConfigUpdateRequest{}, "piclu")
 	if err != nil {
 		t.Fatalf("normalize inputs: %v", err)
 	}
@@ -1415,9 +1636,10 @@ func TestNormalizeInstalledConfigInputsKeepsAbsentDefaultsUntilEdited(t *testing
 		t.Fatalf("absent defaults should not be reported as operator actions, got %+v", actions)
 	}
 
-	inputs, provenance, actions, err = normalizeInstalledConfigInputs(
+	inputs, provenance, _, actions, err = normalizeInstalledConfigInputs(
 		declared,
 		st,
+		&api.AppDefinition{Inputs: declared},
 		InstalledConfigUpdateRequest{Inputs: map[string]any{"diag_dir": ""}},
 		"piclu",
 	)
@@ -1435,6 +1657,243 @@ func TestNormalizeInstalledConfigInputsKeepsAbsentDefaultsUntilEdited(t *testing
 	}
 }
 
+func TestNormalizeInstalledConfigInputsUsesRequiredDefaults(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"region": {Type: "string", Required: true, Default: "local"},
+		"limit":  {Type: "int", Required: true, Default: 3},
+	}
+	st := &InstallState{
+		InstallInputs:   map[string]any{},
+		InputProvenance: map[string]string{},
+	}
+
+	inputs, provenance, _, actions, err := normalizeInstalledConfigInputs(declared, st, &api.AppDefinition{Inputs: declared}, InstalledConfigUpdateRequest{}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize required defaults: %v", err)
+	}
+	if got := inputs["region"]; got != "local" {
+		t.Fatalf("region = %v, want local", got)
+	}
+	if got := inputs["limit"]; got != float64(3) {
+		t.Fatalf("limit = %T(%v), want float64(3)", got, got)
+	}
+	if got := provenance["region"]; got != InputProvenanceCatalogDefault {
+		t.Fatalf("region provenance = %q, want catalog default", got)
+	}
+	if len(actions) != 0 {
+		t.Fatalf("required defaults should not report operator actions: %+v", actions)
+	}
+}
+
+func TestInstalledConfigKeepsReclassifiedStoredSecretWriteOnly(t *testing.T) {
+	previous := &api.AppDefinition{Inputs: map[string]api.AppInput{
+		"license": {Type: "password", Required: true},
+	}}
+	declared := map[string]api.AppInput{
+		"license": {Type: "string", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"license": "secret-license",
+		},
+		InputProvenance: map[string]string{
+			"license": InputProvenanceOperator,
+		},
+	}
+
+	fields := installedConfigFields(declared, st, previous, false)
+	if len(fields) != 1 {
+		t.Fatalf("fields len = %d, want 1", len(fields))
+	}
+	if !fields[0].Sensitive || fields[0].Display != nil || fields[0].Schema != nil {
+		t.Fatalf("reclassified stored secret should remain write-only: %+v", fields[0])
+	}
+	if !slices.Contains(fields[0].Actions, "keep") || !slices.Contains(fields[0].Actions, "replace") {
+		t.Fatalf("reclassified stored secret actions = %+v, want keep/replace", fields[0].Actions)
+	}
+
+	inputs, _, inputSensitive, actions, err := normalizeInstalledConfigInputs(declared, st, previous, InstalledConfigUpdateRequest{
+		Inputs:        map[string]any{"license": "new-license"},
+		SecretActions: map[string]string{"license": "replace"},
+	}, "piclu")
+	if err != nil {
+		t.Fatalf("replace reclassified secret: %v", err)
+	}
+	if got := inputs["license"]; got != "new-license" {
+		t.Fatalf("license = %v, want replacement", got)
+	}
+	if inputSensitive["license"] {
+		t.Fatalf("replacement under plain schema should clear sticky sensitivity")
+	}
+	if len(actions) != 1 || !actions[0].Sensitive || actions[0].OldDisplay != nil || actions[0].NewDisplay != nil {
+		t.Fatalf("replace action leaked display values: %+v", actions)
+	}
+	if strings.Contains(fmt.Sprint(actions), "secret-license") || strings.Contains(fmt.Sprint(actions), "new-license") {
+		t.Fatalf("replace action leaked secret values: %+v", actions)
+	}
+}
+
+func TestInstalledConfigRejectsIncompatibleKeptSecretWithoutEcho(t *testing.T) {
+	previous := &api.AppDefinition{Inputs: map[string]api.AppInput{
+		"license": {Type: "password", Required: true},
+	}}
+	declared := map[string]api.AppInput{
+		"license": {Type: "boolean", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"license": "secret-license",
+		},
+		InputProvenance: map[string]string{
+			"license": InputProvenanceOperator,
+		},
+		InputSensitive: map[string]bool{
+			"license": true,
+		},
+	}
+
+	_, _, _, _, err := normalizeInstalledConfigInputs(declared, st, previous, InstalledConfigUpdateRequest{
+		SecretActions: map[string]string{"license": "keep"},
+	}, "piclu")
+	if err == nil {
+		t.Fatalf("expected incompatible kept secret to fail")
+	}
+	if strings.Contains(err.Error(), "secret-license") || strings.Contains(err.Error(), "expected boolean") {
+		t.Fatalf("error leaked kept secret or validator detail: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be safely reused") {
+		t.Fatalf("error = %v, want generic safe-reuse failure", err)
+	}
+}
+
+func TestDryRunInstalledConfigRejectsStickySensitiveStructuralKeys(t *testing.T) {
+	mgr, state, raw, _, _ := installedConfigTestApp(t)
+	pendingRaw := bytes.Replace(raw,
+		[]byte(`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"`),
+		[]byte(`      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
+      '{{ printf "%.4s" .Inputs.gemini_api_key }}_KEY': "1"
+      '{{ printf "%x" .Inputs.gemini_api_key }}_HEX': "1"
+      '{{ printf "%q" .Inputs.gemini_api_key }}_QUOTE': "1"`),
+		1,
+	)
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	st.InstallInputs["gemini_api_key"] = "zzzz-token"
+	st.InputSensitive["gemini_api_key"] = true
+	if !st.markPendingCatalogSourceForFlow("piclu", pendingRaw, "pending config review", pendingCatalogReviewFlowConfig) {
+		t.Fatalf("mark pending catalog source returned false")
+	}
+	if err := state.StoreInstallState("piclu", st); err != nil {
+		t.Fatalf("store pending install state: %v", err)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run config: %v", err)
+	}
+	if dryRun.Applicable || dryRun.DryRunToken != "" {
+		t.Fatalf("dry run should reject sensitive structural keys without token, got applicable=%v token=%q result=%+v", dryRun.Applicable, dryRun.DryRunToken, dryRun)
+	}
+	if !strings.Contains(dryRun.BlockingReason, "sensitive or generated values cannot be used in manifest structure") {
+		t.Fatalf("blocking reason = %q", dryRun.BlockingReason)
+	}
+	joined := fmt.Sprint(dryRun)
+	for _, leaked := range []string{"zzzz-token", "zzzz_KEY", "zzzz", schemaInputNameSentinelPrefix, fmt.Sprintf("%x", "zzzz-token"), fmt.Sprintf("%q", "zzzz-token")} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("config dry-run result leaked %q: %+v", leaked, dryRun)
+		}
+	}
+}
+
+func TestDryRunInstalledConfigRedactsSensitiveRenderValidationError(t *testing.T) {
+	mgr, state, raw, _, _ := installedConfigTestApp(t)
+	pendingRaw := bytes.Replace(raw,
+		[]byte(`primary_service: main
+services:
+  main:`),
+		[]byte(`primary_service: "{{ .Inputs.gemini_api_key }}"
+services:
+  "{{ .Inputs.gemini_api_key }}":`),
+		1,
+	)
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	st.InstallInputs["gemini_api_key"] = "Bad.Secret"
+	st.InputSensitive["gemini_api_key"] = true
+	if !st.markPendingCatalogSourceForFlow("piclu", pendingRaw, "pending config review", pendingCatalogReviewFlowConfig) {
+		t.Fatalf("mark pending catalog source returned false")
+	}
+	if err := state.StoreInstallState("piclu", st); err != nil {
+		t.Fatalf("store pending install state: %v", err)
+	}
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run config returned raw error: %v", err)
+	}
+	if dryRun.Applicable || dryRun.DryRunToken != "" {
+		t.Fatalf("dry run should reject unsafe render failure without token, got applicable=%v token=%q result=%+v", dryRun.Applicable, dryRun.DryRunToken, dryRun)
+	}
+	if !strings.Contains(dryRun.BlockingReason, "sensitive or generated values cannot be used in manifest structure") {
+		t.Fatalf("blocking reason = %q", dryRun.BlockingReason)
+	}
+	if strings.Contains(fmt.Sprint(dryRun), "Bad.Secret") {
+		t.Fatalf("config dry-run result leaked rendered secret: %+v", dryRun)
+	}
+}
+
+func TestInstalledConfigTreatsBlankRequiredStoredSecretAsMissing(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key": {Type: "password", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"api_key": "",
+		},
+		InputProvenance: map[string]string{
+			"api_key": InputProvenanceOperator,
+		},
+		InputSensitive: map[string]bool{
+			"api_key": true,
+		},
+	}
+	fields := installedConfigFields(declared, st, &api.AppDefinition{Inputs: declared}, false)
+	if len(fields) != 1 {
+		t.Fatalf("fields len = %d, want 1", len(fields))
+	}
+	if fields[0].Present || !fields[0].Sensitive || !slices.Equal(fields[0].Actions, []string{"replace"}) {
+		t.Fatalf("blank stored secret should require replacement: %+v", fields[0])
+	}
+
+	_, _, _, _, err := normalizeInstalledConfigInputs(declared, st, &api.AppDefinition{Inputs: declared}, InstalledConfigUpdateRequest{
+		SecretActions: map[string]string{"api_key": "keep"},
+	}, "piclu")
+	if err == nil {
+		t.Fatalf("expected blank kept secret to fail")
+	}
+	if strings.Contains(err.Error(), "expected") || strings.Contains(err.Error(), "\"\"") {
+		t.Fatalf("error should be generic, got %v", err)
+	}
+}
+
 func TestNormalizeInstalledConfigInputsNormalizesNumericDefaults(t *testing.T) {
 	declared := map[string]api.AppInput{
 		"retry_count": {Type: "int", Default: 3},
@@ -1445,7 +1904,7 @@ func TestNormalizeInstalledConfigInputsNormalizesNumericDefaults(t *testing.T) {
 		InputProvenance: map[string]string{},
 	}
 
-	inputs, _, _, err := normalizeInstalledConfigInputs(declared, st, InstalledConfigUpdateRequest{}, "piclu")
+	inputs, _, _, _, err := normalizeInstalledConfigInputs(declared, st, &api.AppDefinition{Inputs: declared}, InstalledConfigUpdateRequest{}, "piclu")
 	if err != nil {
 		t.Fatalf("normalize inputs: %v", err)
 	}
@@ -1501,7 +1960,7 @@ func TestNormalizeInstalledConfigInputsKeepsAbsentOptionalSecretsByDefault(t *te
 		InputProvenance: map[string]string{},
 	}
 
-	inputs, provenance, actions, err := normalizeInstalledConfigInputs(declared, st, InstalledConfigUpdateRequest{}, "piclu")
+	inputs, provenance, _, actions, err := normalizeInstalledConfigInputs(declared, st, &api.AppDefinition{Inputs: declared}, InstalledConfigUpdateRequest{}, "piclu")
 	if err != nil {
 		t.Fatalf("normalize inputs: %v", err)
 	}
@@ -1516,6 +1975,58 @@ func TestNormalizeInstalledConfigInputsKeepsAbsentOptionalSecretsByDefault(t *te
 	}
 }
 
+func TestInstalledConfigFieldsShowAbsentOptionalSecretAsUnset(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"webhook_token": {Type: "string", Default: "default-token"},
+	}
+	fields := installedConfigFields(
+		declared,
+		&InstallState{
+			InstallInputs:   map[string]any{},
+			InputProvenance: map[string]string{},
+		},
+		&api.AppDefinition{Inputs: declared},
+		false,
+	)
+	if len(fields) != 1 {
+		t.Fatalf("fields len = %d, want 1", len(fields))
+	}
+	field := fields[0]
+	if field.Present || !field.Sensitive {
+		t.Fatalf("field = %+v, want absent sensitive", field)
+	}
+	if field.Provenance != "absent_sensitive" {
+		t.Fatalf("provenance = %q, want absent_sensitive", field.Provenance)
+	}
+	if !slices.Equal(field.Actions, []string{"keep", "replace"}) {
+		t.Fatalf("actions = %+v, want keep/replace", field.Actions)
+	}
+
+	fields = installedConfigFields(
+		declared,
+		&InstallState{
+			InstallInputs:   map[string]any{"webhook_token": ""},
+			InputProvenance: map[string]string{"webhook_token": InputProvenanceOperator},
+			InputSensitive:  map[string]bool{"webhook_token": true},
+		},
+		&api.AppDefinition{Inputs: declared},
+		false,
+	)
+	if len(fields) != 1 {
+		t.Fatalf("cleared fields len = %d, want 1", len(fields))
+	}
+	field = fields[0]
+	if field.Present || !field.Sensitive {
+		t.Fatalf("cleared field = %+v, want absent sensitive", field)
+	}
+	if field.Provenance != "absent_sensitive" {
+		t.Fatalf("cleared provenance = %q, want absent_sensitive", field.Provenance)
+	}
+	if !slices.Equal(field.Actions, []string{"keep", "replace"}) {
+		t.Fatalf("cleared actions = %+v, want keep/replace", field.Actions)
+	}
+}
+
 func TestNormalizeInstalledConfigInputsRejectsBlankSecretReplacement(t *testing.T) {
 	declared := map[string]api.AppInput{
 		"webhook_token": {Type: "string"},
@@ -1525,9 +2036,10 @@ func TestNormalizeInstalledConfigInputsRejectsBlankSecretReplacement(t *testing.
 		InputProvenance: map[string]string{},
 	}
 
-	_, _, _, err := normalizeInstalledConfigInputs(
+	_, _, _, _, err := normalizeInstalledConfigInputs(
 		declared,
 		st,
+		&api.AppDefinition{Inputs: declared},
 		InstalledConfigUpdateRequest{
 			Inputs:        map[string]any{"webhook_token": ""},
 			SecretActions: map[string]string{"webhook_token": "replace"},
@@ -1541,9 +2053,10 @@ func TestNormalizeInstalledConfigInputsRejectsBlankSecretReplacement(t *testing.
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	inputs, provenance, actions, err := normalizeInstalledConfigInputs(
+	inputs, provenance, _, actions, err := normalizeInstalledConfigInputs(
 		declared,
 		st,
+		&api.AppDefinition{Inputs: declared},
 		InstalledConfigUpdateRequest{
 			SecretActions: map[string]string{"webhook_token": "clear"},
 		},
@@ -1572,6 +2085,8 @@ func TestInstalledConfigFieldsShowsEffectiveDefaultForAbsentNonSensitiveInput(t 
 			InstallInputs:   map[string]any{},
 			InputProvenance: map[string]string{},
 		},
+		&api.AppDefinition{Inputs: map[string]api.AppInput{"diag_dir": {Type: "string", Default: "/diagnostics"}}},
+		false,
 	)
 	if len(fields) != 1 {
 		t.Fatalf("fields len = %d, want 1", len(fields))

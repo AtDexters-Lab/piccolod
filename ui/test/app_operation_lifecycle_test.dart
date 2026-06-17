@@ -200,6 +200,8 @@ void main() {
       appId: 'drawguess',
       taskId: 'task-1',
       type: AppOperationType.uninstall,
+      displayLabel: 'Removing app',
+      displaySource: 'Source: app detail',
       submittedAt: submittedAt,
       expiresAt: expiresAt,
     );
@@ -209,6 +211,8 @@ void main() {
     expect(restored.appId, 'drawguess');
     expect(restored.taskId, 'task-1');
     expect(restored.type, AppOperationType.uninstall);
+    expect(restored.displayLabel, 'Removing app');
+    expect(restored.displaySource, 'Source: app detail');
     expect(restored.submittedAt, submittedAt);
     expect(restored.expiresAt, expiresAt);
   });

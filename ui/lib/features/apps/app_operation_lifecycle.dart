@@ -185,6 +185,8 @@ class TrackedAppOperation {
     required this.type,
     required this.phase,
     required this.submittedAt,
+    this.displayLabel,
+    this.displaySource,
     this.latest,
   });
 
@@ -192,9 +194,16 @@ class TrackedAppOperation {
   final AppOperationType type;
   final AppOperationPhase phase;
   final DateTime submittedAt;
+  final String? displayLabel;
+  final String? displaySource;
   final TaskProgressEvent? latest;
 
   String get taskType => type.policy.taskType;
+  String get label {
+    final trimmed = displayLabel?.trim();
+    return (trimmed?.isNotEmpty ?? false) ? trimmed! : type.policy.label;
+  }
+
   bool get hasProgress => latest != null;
 
   TrackedAppOperation copyWith({
@@ -206,6 +215,8 @@ class TrackedAppOperation {
       type: type,
       phase: phase ?? this.phase,
       submittedAt: submittedAt,
+      displayLabel: displayLabel,
+      displaySource: displaySource,
       latest: latest ?? this.latest,
     );
   }
@@ -218,6 +229,8 @@ class RecentAppOperation {
     required this.type,
     required this.submittedAt,
     required this.expiresAt,
+    this.displayLabel,
+    this.displaySource,
   });
 
   factory RecentAppOperation.fromJson(Map<String, dynamic> json) {
@@ -237,6 +250,8 @@ class RecentAppOperation {
       expiresAt:
           DateTime.tryParse((json['expires_at'] ?? '').toString()) ??
           DateTime.fromMillisecondsSinceEpoch(0),
+      displayLabel: (json['display_label'] ?? '').toString(),
+      displaySource: (json['display_source'] ?? '').toString(),
     );
   }
 
@@ -245,13 +260,23 @@ class RecentAppOperation {
   final AppOperationType type;
   final DateTime submittedAt;
   final DateTime expiresAt;
+  final String? displayLabel;
+  final String? displaySource;
 
   bool get isExpired => DateTime.now().isAfter(expiresAt);
+  String get label {
+    final trimmed = displayLabel?.trim();
+    return (trimmed?.isNotEmpty ?? false) ? trimmed! : type.policy.label;
+  }
 
   Map<String, dynamic> toJson() => {
     'app_id': appId,
     'task_id': taskId,
     'task_type': type.policy.taskType,
+    if (displayLabel?.trim().isNotEmpty ?? false)
+      'display_label': displayLabel!.trim(),
+    if (displaySource?.trim().isNotEmpty ?? false)
+      'display_source': displaySource!.trim(),
     'submitted_at': submittedAt.toIso8601String(),
     'expires_at': expiresAt.toIso8601String(),
   };
@@ -261,7 +286,7 @@ const appOperationPolicies = <AppOperationType, AppOperationPolicy>{
   AppOperationType.updateImage: AppOperationPolicy(
     type: AppOperationType.updateImage,
     taskType: 'update_image',
-    label: 'Updating image',
+    label: 'Refresh current image',
     observesReadiness: true,
   ),
   AppOperationType.updateConfig: AppOperationPolicy(

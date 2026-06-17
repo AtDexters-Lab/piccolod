@@ -110,10 +110,11 @@ type AppManager struct {
 }
 
 var (
-	ErrLocked            = errors.New("app manager: persistence locked")
-	ErrNotLeader         = errors.New("app manager: not leader")
-	ErrVolumeUnavailable = errors.New("app manager: persistence volume not mounted")
-	ErrAppUninstalling   = errors.New("app manager: app is being uninstalled")
+	ErrLocked              = errors.New("app manager: persistence locked")
+	ErrNotLeader           = errors.New("app manager: not leader")
+	ErrVolumeUnavailable   = errors.New("app manager: persistence volume not mounted")
+	ErrAppUninstalling     = errors.New("app manager: app is being uninstalled")
+	ErrImageUpdateRejected = errors.New("image update rejected")
 )
 
 // LockStateReader exposes the control lock state.
@@ -2511,6 +2512,9 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		log.Printf("INFO: update image %s: all service images are digest-pinned; nothing to re-pull", instanceID)
 		return nil
 	}
+	if err := m.preflightImageRefreshRollbackSnapshot(ctx, instanceID, curDef); err != nil {
+		return err
+	}
 
 	// RollbackToSnapshot reads app.prev.yaml to restore pre-update state — keep
 	// it in sync even though Update itself doesn't mutate the manifest.
@@ -2535,6 +2539,42 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 	return nil
 }
 
+func (m *AppManager) ImageUpdateBlockedReason(ctx context.Context, instanceID string) string {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err.Error()
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return fmt.Sprintf("app instance not found: %s", instanceID)
+	}
+	def, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		return fmt.Sprintf("read current manifest: %v", err)
+	}
+	mode := piccoloModeFromExtensions(def.Extensions)
+	if mode != ModeService || !appHasPersistentStorage(def) {
+		return ""
+	}
+	hasRefreshableImage := false
+	for _, svc := range def.Services {
+		if strings.TrimSpace(svc.Image) != "" && !isDigestPinned(svc.Image) {
+			hasRefreshableImage = true
+			break
+		}
+	}
+	if !hasRefreshableImage {
+		return ""
+	}
+	if appInst != nil && !appInst.Enabled {
+		return ""
+	}
+	if err := m.preflightImageRefreshRollbackSnapshot(ctx, instanceID, def); err != nil {
+		return err.Error()
+	}
+	return ""
+}
+
 // isDigestPinned: refs of form "name@digest" are immutable, so re-pulling
 // them cannot produce a new digest.
 func isDigestPinned(img string) bool {
@@ -2554,6 +2594,22 @@ type dataSnapshotViabilityChecker interface {
 
 type dataSnapshotHealthChecker interface {
 	CheckDataSnapshotHealth(ctx context.Context, snapshotLVName string) error
+}
+
+func (m *AppManager) preflightImageRefreshRollbackSnapshot(ctx context.Context, instanceID string, def *api.AppDefinition) error {
+	if !appHasPersistentStorage(def) {
+		return nil
+	}
+	volumeManager := m.currentVolumeManager()
+	if _, ok := volumeManager.(dataVolumeSnapshotter); !ok {
+		return fmt.Errorf("%w: image refresh rollback snapshot required but volume manager does not support snapshots", ErrImageUpdateRejected)
+	}
+	if checker, ok := volumeManager.(dataSnapshotViabilityChecker); ok {
+		if err := checker.CheckDataSnapshotViability(ctx, instanceID); err != nil {
+			return fmt.Errorf("%w: image refresh rollback snapshot viability: %v", ErrImageUpdateRejected, err)
+		}
+	}
+	return nil
 }
 
 // dataVolumeRollbacker is a narrow interface for data volume rollback operations.
@@ -2584,6 +2640,7 @@ func (m *AppManager) updateServiceModeImage(
 	curDef := appInst.Definition
 	primary := primaryServiceFor(newDef, appInst)
 	mode := piccoloModeFromExtensions(newDef.Extensions)
+	rollbackSnapshotRequired := appHasPersistentStorage(newDef)
 
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
@@ -2681,6 +2738,14 @@ func (m *AppManager) updateServiceModeImage(
 			}
 		}
 	}
+	detachStagedChangedRootfs := func() {
+		for _, cs := range changed {
+			if appInst.ActiveRootfs != nil && appInst.ActiveRootfs[cs.svcName] == cs.volumeID {
+				continue
+			}
+			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		}
+	}
 
 	// 4. Read image config from golden LV for each changed service.
 	for i := range changed {
@@ -2700,12 +2765,28 @@ func (m *AppManager) updateServiceModeImage(
 		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
 	}
 
-	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseSnapshotting, 55, "Creating rollback snapshot", false, nil)
+	var tupleState *TupleState
+	snapshotOK := false
+	if rollbackSnapshotRequired {
+		m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseSnapshotting, 55, "Creating rollback snapshot", false, nil)
 
-	// 6. Tuple snapshot: capture pre-update state for rollback.
-	tupleState, snapshotOK := m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
-	if !snapshotOK {
-		log.Printf("WARN: update %s: proceeding without rollback capability", instanceID)
+		// 6. Tuple snapshot: capture pre-update state for rollback.
+		var snapshotErr error
+		tupleState, snapshotOK, snapshotErr = m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
+		if !snapshotOK {
+			if snapshotErr == nil {
+				snapshotErr = fmt.Errorf("snapshot was not created")
+			}
+			err := fmt.Errorf("create rollback snapshot for image refresh: %w", snapshotErr)
+			log.Printf("WARN: update %s: %v", instanceID, err)
+			detachStagedChangedRootfs()
+			if restartErr := m.startContainerGroup(ctx, state, appInst, curDef, layout, runtime); restartErr != nil {
+				m.setObservedStatus(instanceID, StatusError)
+				return errors.Join(err, fmt.Errorf("restart previous runtime after snapshot failure: %w", restartErr))
+			}
+			m.setObservedStatus(instanceID, StatusRunning)
+			return err
+		}
 	}
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseRemovingContainer, 60, "Removing containers", false, nil)
@@ -2809,18 +2890,17 @@ func (m *AppManager) updateServiceModeImage(
 
 // snapshotTupleBeforeUpdate captures pre-update state for rollback (RFC 20260302 Phase 2).
 // Returns the TupleState and whether the snapshot was successfully created.
-// On failure, the update proceeds in degraded mode (no rollback capability).
 func (m *AppManager) snapshotTupleBeforeUpdate(
 	ctx context.Context, state *FilesystemStateManager,
 	appInst *AppInstance, primary string,
-) (tupleState *TupleState, snapshotOK bool) {
+) (tupleState *TupleState, snapshotOK bool, err error) {
 	instanceID := appInst.InstanceID
 
 	// Load or create TupleState.
 	ts, err := state.LoadTupleState(instanceID)
 	if err != nil {
 		log.Printf("WARN: update %s: load tuple state: %v", instanceID, err)
-		return nil, false
+		return nil, false, fmt.Errorf("load tuple state: %w", err)
 	}
 	if ts == nil {
 		ts = &TupleState{
@@ -2855,6 +2935,7 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 	if snapshotter, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
 		if snapErr := snapshotter.SnapshotDataVolume(ctx, instanceID, snapshotLVName); snapErr != nil {
 			log.Printf("WARN: update %s: data snapshot failed: %v", instanceID, snapErr)
+			return ts, false, fmt.Errorf("create data snapshot: %w", snapErr)
 		} else {
 			dataSnapshotName = snapshotLVName
 			snapshotOK = true
@@ -2862,13 +2943,14 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 		}
 	} else {
 		log.Printf("WARN: update %s: volume manager does not support snapshots", instanceID)
+		return ts, false, fmt.Errorf("volume manager does not support snapshots")
 	}
 
 	// Only create a rollback-capable snapshot generation if the data snapshot succeeded.
 	// Without a data snapshot, rootfs-only rollback would run old rootfs against new data.
 	if dataSnapshotName == "" {
-		log.Printf("WARN: update %s: no data snapshot — update proceeds without rollback capability", instanceID)
-		return ts, false
+		log.Printf("WARN: update %s: no data snapshot", instanceID)
+		return ts, false, fmt.Errorf("data snapshot was not created")
 	}
 
 	// Deprecate existing active and snapshot generations.
@@ -2895,17 +2977,23 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 	if storeErr := state.StoreTupleState(instanceID, ts); storeErr != nil {
 		log.Printf("WARN: update %s: persist tuple state: %v", instanceID, storeErr)
 		// Clean up the orphaned snapshot LV since it won't be tracked in metadata.
+		var cleanupErr error
 		if dataSnapshotName != "" {
 			if cleanupSnap, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
 				if destroyErr := cleanupSnap.DestroyDataSnapshot(ctx, dataSnapshotName); destroyErr != nil {
 					log.Printf("WARN: update %s: cleanup orphaned snapshot %s: %v", instanceID, dataSnapshotName, destroyErr)
+					cleanupErr = fmt.Errorf("cleanup orphaned snapshot %s: %w", dataSnapshotName, destroyErr)
 				}
 			}
 		}
 		snapshotOK = false
+		if cleanupErr != nil {
+			return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), cleanupErr)
+		}
+		return ts, false, fmt.Errorf("persist tuple state: %w", storeErr)
 	}
 
-	return ts, snapshotOK
+	return ts, snapshotOK, nil
 }
 
 // recordPostUpdateGeneration records the new active generation after a successful update.

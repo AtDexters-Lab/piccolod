@@ -147,11 +147,14 @@ class AppService {
             .toList();
 
     final snapshotAvailable = json['snapshot_available'] == true;
+    final imageUpdateBlockedReason = (json['image_update_blocked_reason'] ?? '')
+        .toString();
     return AppDetail(
       app: app,
       listeners: listeners,
       containers: containers,
       snapshotAvailable: snapshotAvailable,
+      imageUpdateBlockedReason: imageUpdateBlockedReason,
     );
   }
 
@@ -283,6 +286,7 @@ class AppService {
     String yamlContent,
     Map<String, dynamic> inputs,
     List<String> regenerateInputs, {
+    List<String> clearInputs = const [],
     bool catalogPending = false,
   }) async {
     final data = await _client.post(
@@ -291,6 +295,7 @@ class AppService {
         'app_definition': yamlContent,
         'inputs': inputs,
         'regenerate_inputs': regenerateInputs,
+        'clear_inputs': clearInputs,
         if (catalogPending) 'catalog_pending': true,
       },
     );

@@ -136,6 +136,7 @@ type installedConfigPolicyResult struct {
 
 func NewV2InstallState(instanceID, sourceKind, sourceRef string, rawTemplate []byte, inputs map[string]interface{}, systemCtx InstallSystemContext, creds *OIDCCredentials, syncBlocked bool) *InstallState {
 	copiedInputs, provenance := initialInstallConfigLedger(instanceID, rawTemplate, inputs)
+	inputSensitive := initialInstallInputSensitive(instanceID, rawTemplate, copiedInputs, provenance)
 	rawCopy := append([]byte(nil), rawTemplate...)
 	return &InstallState{
 		InstanceID:        instanceID,
@@ -146,6 +147,7 @@ func NewV2InstallState(instanceID, sourceKind, sourceRef string, rawTemplate []b
 		RawTemplate:       rawCopy,
 		RawTemplateHash:   Sha256Hex(rawCopy),
 		InputProvenance:   provenance,
+		InputSensitive:    inputSensitive,
 		InstallInputs:     copiedInputs,
 		InstallSystemCtx:  &systemCtx,
 		OIDCCredentials:   creds,
@@ -181,6 +183,35 @@ func initialInstallConfigLedger(instanceID string, rawTemplate []byte, inputs ma
 		provenance[name] = prov
 	}
 	return persistedInstalledConfigLedger(copiedInputs, provenance)
+}
+
+func initialInstallInputSensitive(instanceID string, rawTemplate []byte, inputs map[string]any, provenance map[string]string) map[string]bool {
+	declared := map[string]api.AppInput{}
+	if schema, err := ParseAppSchema(rawTemplate); err == nil && schema != nil {
+		PrepareSmartDefaultsForUpdate(schema, instanceID)
+		declared = schema.Inputs
+	}
+	out := map[string]bool{}
+	for name := range inputs {
+		if name == "__app_address__" {
+			continue
+		}
+		if provenance != nil && provenance[name] == InputProvenanceGenerated {
+			out[name] = true
+			continue
+		}
+		if inputNameLooksSensitive(name) {
+			out[name] = true
+			continue
+		}
+		if spec, ok := declared[name]; ok && (inputIsSensitive(name, spec) || spec.Generate) {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func inputValueMatchesDefault(spec api.AppInput, value interface{}) bool {
@@ -392,6 +423,10 @@ func (st *InstallState) markCatalogSourceCommitted(instanceID, catalogSource str
 	if inputs, provenance, ok := filterInstallStateInputsForRawTemplate(instanceID, raw, st.InstallInputs, st.InputProvenance); ok {
 		st.InstallInputs = inputs
 		st.InputProvenance = provenance
+		st.InputSensitive = mergeInstallInputSensitive(
+			filterInstallInputSensitive(inputs, st.InputSensitive),
+			initialInstallInputSensitive(instanceID, raw, inputs, provenance),
+		)
 	}
 	if st.InputProvenance == nil {
 		st.InputProvenance = make(map[string]string, len(st.InstallInputs))
@@ -427,6 +462,37 @@ func filterInstallStateInputsForRawTemplate(instanceID string, raw []byte, input
 	return filteredInputs, filteredProvenance, true
 }
 
+func filterInstallInputSensitive(inputs map[string]any, sensitive map[string]bool) map[string]bool {
+	if len(inputs) == 0 || len(sensitive) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for name := range inputs {
+		if sensitive[name] {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+func mergeInstallInputSensitive(items ...map[string]bool) map[string]bool {
+	out := map[string]bool{}
+	for _, item := range items {
+		for name, sensitive := range item {
+			if sensitive {
+				out[name] = true
+			}
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 func catalogSyncRenderInputsForRawTemplate(instanceID string, raw []byte, inputs map[string]any) (map[string]any, bool) {
 	schema, err := ParseAppSchema(raw)
 	if err != nil || schema == nil {
@@ -453,13 +519,18 @@ func (schemaOnlyOIDCGenerator) GenerateCredentials() (string, string, error) {
 }
 
 func (m *AppManager) schemaForInstallStateRawTemplate(ctx context.Context, instanceID string, raw []byte, st *InstallState) (*api.AppDefinition, error) {
+	schema, _, err := m.schemaForInstallStateRawTemplateWithOrigin(ctx, instanceID, raw, st, nil)
+	return schema, err
+}
+
+func (m *AppManager) schemaForInstallStateRawTemplateWithOrigin(ctx context.Context, instanceID string, raw []byte, st *InstallState, previous *api.AppDefinition) (*api.AppDefinition, bool, error) {
 	schema, parseErr := ParseAppSchema(raw)
 	if parseErr == nil {
 		PrepareSmartDefaultsForUpdate(schema, instanceID)
-		return schema, nil
+		return schema, false, nil
 	}
 	if st == nil || st.InstallSystemCtx == nil {
-		return nil, parseErr
+		return nil, false, parseErr
 	}
 	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
 		RawTemplate:   raw,
@@ -469,10 +540,13 @@ func (m *AppManager) schemaForInstallStateRawTemplate(ctx context.Context, insta
 		ExistingOIDC:  st.OIDCCredentials,
 	}, schemaOnlyOIDCGenerator{}, m.syncSelfSkippingLister(instanceID))
 	if err != nil {
-		return nil, fmt.Errorf("parse raw schema: %v; render stored source for schema: %w", parseErr, err)
+		return nil, false, fmt.Errorf("parse raw schema: %v; render stored source for schema: %w", parseErr, err)
 	}
 	PrepareSmartDefaultsForUpdate(res.Definition, instanceID)
-	return res.Definition, nil
+	if !m.renderedSchemaInputSpecsStableWithSentinels(ctx, instanceID, raw, st, previous, res.Definition) {
+		return nil, false, fmt.Errorf("rendered stored source contains input names derived from stored values")
+	}
+	return res.Definition, true, nil
 }
 
 func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string) (*InstalledConfigReadResult, error) {
@@ -515,11 +589,12 @@ func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string)
 		sourceHash = pendingHash
 		pendingReason = reason
 	}
-	schema, err := m.schemaForInstallStateRawTemplate(ctx, instanceID, rawTemplate, st)
+	currentDef, _ := state.GetAppDefinition(instanceID)
+	schema, renderedSchema, err := m.schemaForInstallStateRawTemplateWithOrigin(ctx, instanceID, rawTemplate, st, currentDef)
 	if err != nil {
 		return unrecoverableInstalledConfig(instanceID, "stored app source cannot be parsed"), nil
 	}
-	fields := installedConfigFields(schema.Inputs, st)
+	fields := installedConfigFields(schema.Inputs, st, currentDef, renderedSchema)
 	result := &InstalledConfigReadResult{
 		InstanceID:      instanceID,
 		SourceKind:      st.SourceKind,
@@ -531,7 +606,7 @@ func (m *AppManager) ReadInstalledConfig(ctx context.Context, instanceID string)
 		Fields:          fields,
 	}
 	if pendingReason != "" {
-		result.Warnings = append(result.Warnings, "pending catalog update requires attention: "+pendingReason)
+		result.Warnings = append(result.Warnings, "Update needs attention: "+pendingReason)
 	}
 	if appInst.Mode() != ModeService {
 		result.Warnings = append(result.Warnings, "workspace config apply is not supported in v1")
@@ -548,6 +623,452 @@ func unrecoverableInstalledConfig(instanceID, warning string) *InstalledConfigRe
 		LedgerHealth: "unrecoverable",
 		Warnings:     []string{warning},
 	}
+}
+
+const (
+	schemaInputNameSentinelPrefix            = "__PICCOLO_SCHEMA_INPUT_NAME_SENTINEL_"
+	sensitiveStructuralRenderRejectedReason  = "sensitive or generated values cannot be used in manifest structure; use them only as field values"
+	sensitiveStructuralRenderRejectedSummary = "candidate manifest structure depends on sensitive or generated values"
+)
+
+func (m *AppManager) renderedSchemaInputSpecsStableWithSentinels(ctx context.Context, instanceID string, raw []byte, st *InstallState, previous *api.AppDefinition, rendered *api.AppDefinition) bool {
+	if st == nil || st.InstallSystemCtx == nil || rendered == nil {
+		return false
+	}
+	sentinelInputs, inputsChanged := renderedSchemaSentinelInputs(st, previous, rendered)
+	sentinelCreds, credsChanged := renderedSchemaSentinelOIDCCredentials(st.OIDCCredentials)
+	if !inputsChanged && !credsChanged {
+		return true
+	}
+	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
+		RawTemplate:   raw,
+		UserInputs:    sentinelInputs,
+		SystemContext: *st.InstallSystemCtx,
+		InstanceID:    instanceID,
+		ExistingOIDC:  sentinelCreds,
+	}, schemaOnlyOIDCGenerator{}, m.syncSelfSkippingLister(instanceID))
+	if err != nil {
+		return false
+	}
+	PrepareSmartDefaultsForUpdate(res.Definition, instanceID)
+	return inputSchemaHash(rendered.Inputs) == inputSchemaHash(res.Definition.Inputs)
+}
+
+func renderedSchemaSentinelInputs(st *InstallState, previous *api.AppDefinition, rendered *api.AppDefinition) (map[string]interface{}, bool) {
+	out := make(map[string]interface{}, len(st.InstallInputs))
+	for name, value := range st.InstallInputs {
+		out[name] = value
+	}
+	unsafe := displayUnsafeStoredInputNames(st, previous, rendered)
+	changed := false
+	for name := range unsafe {
+		if _, ok := out[name]; !ok {
+			continue
+		}
+		out[name] = schemaInputNameSentinelPrefix + Sha256Hex([]byte(name))[:16] + "__"
+		changed = true
+	}
+	return out, changed
+}
+
+func renderedSchemaSentinelOIDCCredentials(creds *OIDCCredentials) (*OIDCCredentials, bool) {
+	if creds == nil {
+		return nil, false
+	}
+	out := *creds
+	changed := false
+	if strings.TrimSpace(out.ClientID) != "" {
+		out.ClientID = schemaInputNameSentinelPrefix + "oidc_client_id__"
+		changed = true
+	}
+	if strings.TrimSpace(out.ClientSecret) != "" {
+		out.ClientSecret = schemaInputNameSentinelPrefix + "oidc_client_secret__"
+		changed = true
+	}
+	return &out, changed
+}
+
+func displayRenderSentinelInputs(st *InstallState, previous *api.AppDefinition, rendered *api.AppDefinition, inputs map[string]interface{}) (map[string]interface{}, bool) {
+	out := make(map[string]interface{}, len(inputs))
+	for name, value := range inputs {
+		out[name] = value
+	}
+	unsafe := displayUnsafeStoredInputNames(st, previous, rendered)
+	changed := false
+	for name := range unsafe {
+		if _, ok := out[name]; !ok {
+			continue
+		}
+		out[name] = schemaInputNameSentinelPrefix + Sha256Hex([]byte(name))[:16] + "__"
+		changed = true
+	}
+	return out, changed
+}
+
+func (m *AppManager) renderDisplayDefinitionWithSentinels(ctx context.Context, instanceID string, raw []byte, inputs map[string]interface{}, systemCtx InstallSystemContext, st *InstallState, previous *api.AppDefinition, rendered *api.AppDefinition, creds *OIDCCredentials) (*api.AppDefinition, bool, error) {
+	sentinelInputs, inputsChanged := displayRenderSentinelInputs(st, previous, rendered, inputs)
+	sentinelCreds, credsChanged := renderedSchemaSentinelOIDCCredentials(creds)
+	if !inputsChanged && !credsChanged {
+		return rendered, false, nil
+	}
+	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
+		RawTemplate:   raw,
+		UserInputs:    sentinelInputs,
+		SystemContext: systemCtx,
+		InstanceID:    instanceID,
+		ExistingOIDC:  sentinelCreds,
+	}, schemaOnlyOIDCGenerator{}, m.syncSelfSkippingLister(instanceID))
+	if err != nil {
+		return nil, false, err
+	}
+	return res.Definition, true, nil
+}
+
+func mergeCustomManifestDisplayPolicy(real, display customManifestPolicyResult) customManifestPolicyResult {
+	display.Allowed = real.Allowed
+	display.Stageable = real.Stageable
+	display.MetadataOnly = real.MetadataOnly
+	display.UpdateClass = real.UpdateClass
+	display.Classification.UpdateClass = real.Classification.UpdateClass
+	display.Classification.HasOperatorReview = real.Classification.HasOperatorReview
+	display.Classification.HasRejected = real.Classification.HasRejected
+	display.Classification.RequiresV2Apply = real.Classification.RequiresV2Apply
+	display.Classification.V1StructuralRestart = real.Classification.V1StructuralRestart
+	if !real.Stageable && strings.TrimSpace(display.Reason) == "" {
+		display.Reason = "candidate contains unsupported manifest changes"
+	}
+	if real.Stageable {
+		display.Reason = ""
+	}
+	return display
+}
+
+func mergeDisplaySummaryRuntimeSemantics(display, real ManifestUpdateSummary, genericChange string) ManifestUpdateSummary {
+	if summaryOnlySaysNoRuntimeChanges(display.WillChange) && !summaryOnlySaysNoRuntimeChanges(real.WillChange) {
+		display.WillChange = []string{genericChange}
+	}
+	if len(display.WillRestart) == 0 && len(real.WillRestart) > 0 {
+		display.WillRestart = append([]string(nil), real.WillRestart...)
+	}
+	if len(display.ExpectedInterruption) == 0 && len(real.ExpectedInterruption) > 0 {
+		display.ExpectedInterruption = append([]string(nil), real.ExpectedInterruption...)
+	}
+	display.WillPreserve = appendMissingStrings(display.WillPreserve, real.WillPreserve)
+	return display
+}
+
+func summaryOnlySaysNoRuntimeChanges(values []string) bool {
+	if len(values) == 0 {
+		return true
+	}
+	return len(values) == 1 && strings.TrimSpace(values[0]) == "no runtime changes"
+}
+
+func appendMissingStrings(values []string, additions []string) []string {
+	for _, value := range additions {
+		if strings.TrimSpace(value) == "" || slices.Contains(values, value) {
+			continue
+		}
+		values = append(values, value)
+	}
+	return values
+}
+
+func mergeInstalledConfigDisplayPolicy(real, display installedConfigPolicyResult) installedConfigPolicyResult {
+	display.Allowed = real.Allowed
+	display.MetadataOnly = real.MetadataOnly
+	display.RequiresSnapshot = real.RequiresSnapshot
+	if !real.Allowed && strings.TrimSpace(display.Reason) == "" {
+		display.Reason = "rendered candidate changes unsupported app structure; use manifest update or reinstall"
+	}
+	if real.Allowed {
+		display.Reason = ""
+	}
+	return display
+}
+
+func displayUnsafeStoredInputNames(st *InstallState, previous *api.AppDefinition, rendered *api.AppDefinition) map[string]struct{} {
+	unsafe := map[string]struct{}{}
+	addSchema := func(inputs map[string]api.AppInput) {
+		for name, spec := range inputs {
+			if inputIsSensitive(name, spec) || spec.Generate {
+				unsafe[name] = struct{}{}
+			}
+		}
+	}
+	if previous != nil {
+		addSchema(previous.Inputs)
+	}
+	if rendered != nil {
+		addSchema(rendered.Inputs)
+	}
+	if st == nil {
+		return unsafe
+	}
+	for name, sensitive := range st.InputSensitive {
+		if sensitive {
+			unsafe[name] = struct{}{}
+		}
+	}
+	for name, provenance := range st.InputProvenance {
+		if provenance == InputProvenanceGenerated {
+			unsafe[name] = struct{}{}
+		}
+	}
+	for name := range st.InstallInputs {
+		if inputNameLooksSensitive(name) {
+			unsafe[name] = struct{}{}
+		}
+	}
+	delete(unsafe, "__app_address__")
+	return unsafe
+}
+
+func manifestRenderHasUnsafeValues(st *InstallState, previous, rendered *api.AppDefinition, inputs map[string]interface{}, creds *OIDCCredentials) bool {
+	unsafeNames := displayUnsafeStoredInputNames(st, previous, rendered)
+	for name := range unsafeNames {
+		if inputs != nil {
+			if _, ok := inputs[name]; ok {
+				return true
+			}
+		}
+		if st != nil && st.InstallInputs != nil {
+			if _, ok := st.InstallInputs[name]; ok {
+				return true
+			}
+		}
+	}
+	return creds != nil && (strings.TrimSpace(creds.ClientID) != "" || strings.TrimSpace(creds.ClientSecret) != "")
+}
+
+func manifestUpdateUnsafeDisplayFragments(st *InstallState, previous, rendered *api.AppDefinition, inputs map[string]interface{}, creds *OIDCCredentials) []string {
+	unsafeNames := displayUnsafeStoredInputNames(st, previous, rendered)
+	fragments := map[string]struct{}{}
+	addValue := func(value any) {
+		for _, fragment := range unsafeDisplayFragments(value) {
+			fragments[fragment] = struct{}{}
+		}
+	}
+	for name := range unsafeNames {
+		if inputs != nil {
+			if value, ok := inputs[name]; ok {
+				addValue(value)
+			}
+		}
+		if st != nil && st.InstallInputs != nil {
+			if value, ok := st.InstallInputs[name]; ok {
+				addValue(value)
+			}
+		}
+	}
+	if creds != nil {
+		for _, fragment := range unsafeCredentialDisplayFragments(creds.ClientID) {
+			fragments[fragment] = struct{}{}
+		}
+		for _, fragment := range unsafeCredentialDisplayFragments(creds.ClientSecret) {
+			fragments[fragment] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(fragments))
+	for fragment := range fragments {
+		out = append(out, fragment)
+	}
+	slices.SortFunc(out, func(a, b string) int {
+		if len(a) > len(b) {
+			return -1
+		}
+		if len(a) < len(b) {
+			return 1
+		}
+		switch {
+		case a < b:
+			return -1
+		case a > b:
+			return 1
+		default:
+			return 0
+		}
+	})
+	return out
+}
+
+func unsafeDisplayFragments(value any) []string {
+	return unsafeDisplayFragmentsWithMinimums(value, 4, 8)
+}
+
+func unsafeCredentialDisplayFragments(value any) []string {
+	return unsafeDisplayFragmentsWithMinimums(value, 8, 12)
+}
+
+func unsafeDisplayFragmentsWithMinimums(value any, minPrefix, minInner int) []string {
+	raw := strings.TrimSpace(fmt.Sprint(value))
+	if len(raw) < minPrefix {
+		return nil
+	}
+	const maxUnsafeDisplaySource = 128
+	original := raw
+	if len(raw) > maxUnsafeDisplaySource {
+		raw = raw[:maxUnsafeDisplaySource]
+	}
+	fragments := map[string]struct{}{
+		original: {},
+		raw:      {},
+	}
+	addFragments := func(source string) {
+		if len(source) < minPrefix {
+			return
+		}
+		for end := minPrefix; end <= len(source); end++ {
+			fragments[source[:end]] = struct{}{}
+		}
+		for start := 1; start < len(source); start++ {
+			maxEnd := start + 32
+			if maxEnd > len(source) {
+				maxEnd = len(source)
+			}
+			for end := start + minInner; end <= maxEnd; end++ {
+				fragments[source[start:end]] = struct{}{}
+			}
+		}
+	}
+	addFragments(raw)
+	if len(original) > maxUnsafeDisplaySource {
+		addFragments(original[len(original)-maxUnsafeDisplaySource:])
+	}
+	out := make([]string, 0, len(fragments))
+	for fragment := range fragments {
+		out = append(out, fragment)
+	}
+	return out
+}
+
+func redactUnsafeDisplayText(text string, fragments []string) string {
+	if text == "" || len(fragments) == 0 {
+		return text
+	}
+	out := text
+	for _, fragment := range fragments {
+		if fragment == "" || fragment == "<redacted>" {
+			continue
+		}
+		out = strings.ReplaceAll(out, fragment, "<redacted>")
+	}
+	return out
+}
+
+func sanitizeManifestUpdateSummaryForDisplay(summary *ManifestUpdateSummary, fragments []string) {
+	if summary == nil || len(fragments) == 0 {
+		return
+	}
+	summary.WillChange = redactUnsafeDisplaySlice(summary.WillChange, fragments)
+	summary.WillRestart = redactUnsafeDisplaySlice(summary.WillRestart, fragments)
+	summary.WillPreserve = redactUnsafeDisplaySlice(summary.WillPreserve, fragments)
+	summary.ExpectedInterruption = redactUnsafeDisplaySlice(summary.ExpectedInterruption, fragments)
+	summary.Rejected = redactUnsafeDisplaySlice(summary.Rejected, fragments)
+}
+
+func sanitizeManifestUpdateClassificationForDisplay(classification *manifestUpdateClassification, fragments []string) {
+	if classification == nil || len(fragments) == 0 {
+		return
+	}
+	for i := range classification.Decisions {
+		classification.Decisions[i].Path = redactUnsafeDisplayText(classification.Decisions[i].Path, fragments)
+		classification.Decisions[i].Summary = redactUnsafeDisplayText(classification.Decisions[i].Summary, fragments)
+		classification.Decisions[i].Reason = redactUnsafeDisplayText(classification.Decisions[i].Reason, fragments)
+	}
+	for i := range classification.ExposureReview {
+		classification.ExposureReview[i].Path = redactUnsafeDisplayText(classification.ExposureReview[i].Path, fragments)
+		classification.ExposureReview[i].Old = redactUnsafeDisplayText(classification.ExposureReview[i].Old, fragments)
+		classification.ExposureReview[i].New = redactUnsafeDisplayText(classification.ExposureReview[i].New, fragments)
+		classification.ExposureReview[i].Confirmation = redactUnsafeDisplayText(classification.ExposureReview[i].Confirmation, fragments)
+	}
+	for i := range classification.KeptValueReview {
+		classification.KeptValueReview[i].Field = redactUnsafeDisplayText(classification.KeptValueReview[i].Field, fragments)
+		classification.KeptValueReview[i].OldSemantic = redactUnsafeDisplaySlice(classification.KeptValueReview[i].OldSemantic, fragments)
+		classification.KeptValueReview[i].NewSemantic = redactUnsafeDisplaySlice(classification.KeptValueReview[i].NewSemantic, fragments)
+		classification.KeptValueReview[i].SemanticDelta = redactUnsafeDisplaySlice(classification.KeptValueReview[i].SemanticDelta, fragments)
+		classification.KeptValueReview[i].OldUsage = redactUnsafeDisplaySlice(classification.KeptValueReview[i].OldUsage, fragments)
+		classification.KeptValueReview[i].NewUsage = redactUnsafeDisplaySlice(classification.KeptValueReview[i].NewUsage, fragments)
+		classification.KeptValueReview[i].Confirmation = redactUnsafeDisplayText(classification.KeptValueReview[i].Confirmation, fragments)
+		classification.KeptValueReview[i].BlockingReason = redactUnsafeDisplayText(classification.KeptValueReview[i].BlockingReason, fragments)
+	}
+	classification.RequiredConfirmations = redactUnsafeDisplaySlice(classification.RequiredConfirmations, fragments)
+	classification.RuntimeReadiness = redactUnsafeDisplaySlice(classification.RuntimeReadiness, fragments)
+	classification.StagedImageRootfs = redactUnsafeDisplaySlice(classification.StagedImageRootfs, fragments)
+	classification.ListenerRoutingAuth = redactUnsafeDisplaySlice(classification.ListenerRoutingAuth, fragments)
+	classification.StorageBoundary = redactUnsafeDisplaySlice(classification.StorageBoundary, fragments)
+	classification.FirstRejectedReason = redactUnsafeDisplayText(classification.FirstRejectedReason, fragments)
+	if classification.DataSafety != nil {
+		classification.DataSafety.Reason = redactUnsafeDisplayText(classification.DataSafety.Reason, fragments)
+		classification.DataSafety.FailureBehavior = redactUnsafeDisplayText(classification.DataSafety.FailureBehavior, fragments)
+		classification.DataSafety.RollbackLimit = redactUnsafeDisplayText(classification.DataSafety.RollbackLimit, fragments)
+	}
+}
+
+func redactUnsafeDisplaySlice(values []string, fragments []string) []string {
+	for i := range values {
+		values[i] = redactUnsafeDisplayText(values[i], fragments)
+	}
+	return values
+}
+
+func storedInputDisplaySensitive(name string, st *InstallState, previous *api.AppDefinition, candidate map[string]api.AppInput) bool {
+	if name == "__app_address__" {
+		return false
+	}
+	if spec, ok := candidate[name]; ok && (inputIsSensitive(name, spec) || spec.Generate) {
+		return true
+	}
+	if st == nil || st.InstallInputs == nil {
+		return false
+	}
+	if _, present := st.InstallInputs[name]; !present {
+		return false
+	}
+	if st.InputSensitive != nil && st.InputSensitive[name] {
+		return true
+	}
+	if st.InputProvenance != nil && st.InputProvenance[name] == InputProvenanceGenerated {
+		return true
+	}
+	if inputNameLooksSensitive(name) {
+		return true
+	}
+	if previous == nil {
+		return true
+	}
+	oldSpec, ok := previous.Inputs[name]
+	if !ok {
+		return true
+	}
+	return inputIsSensitive(name, oldSpec) || oldSpec.Generate
+}
+
+func installInputValueUsableForSchema(value any, spec api.AppInput) bool {
+	if value == nil {
+		return false
+	}
+	if spec.Generate || (spec.Required && inputTypeStringLike(spec)) {
+		text, ok := value.(string)
+		if !ok || strings.TrimSpace(text) == "" {
+			return false
+		}
+	}
+	return validateInputValue("__redacted__", spec, value) == nil
+}
+
+func inputTypeStringLike(spec api.AppInput) bool {
+	return spec.Type == "string" || spec.Type == "password"
+}
+
+func validateKeptInstallInputValue(name string, spec api.AppInput, value any, currentSensitive bool) error {
+	if currentSensitive && validateInputValue("__redacted__", spec, value) != nil {
+		return fmt.Errorf("input %q stored value cannot be safely reused with the new schema; replace or regenerate it", name)
+	}
+	if !installInputValueUsableForSchema(value, spec) {
+		return fmt.Errorf("input %q has no usable stored value; replace or regenerate it", name)
+	}
+	return nil
 }
 
 func (m *AppManager) tryRecoverCatalogInstallState(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, st *InstallState) (*InstallState, string) {
@@ -586,7 +1107,7 @@ func (m *AppManager) tryRecoverCatalogInstallState(ctx context.Context, state *F
 	return &next, ""
 }
 
-func installedConfigFields(inputs map[string]api.AppInput, st *InstallState) []InstalledConfigField {
+func installedConfigFields(inputs map[string]api.AppInput, st *InstallState, previous *api.AppDefinition, redactMetadata bool) []InstalledConfigField {
 	names := make([]string, 0, len(inputs))
 	for name := range inputs {
 		names = append(names, name)
@@ -595,36 +1116,45 @@ func installedConfigFields(inputs map[string]api.AppInput, st *InstallState) []I
 	fields := make([]InstalledConfigField, 0, len(names))
 	for _, name := range names {
 		spec := inputs[name]
-		sensitive := inputIsSensitive(name, spec)
+		currentSensitive := storedInputDisplaySensitive(name, st, previous, inputs)
+		sensitive := inputIsSensitive(name, spec) || spec.Generate || currentSensitive
+		displaySpec := clientDisplayInputSpec(name, spec, "", redactMetadata)
 		value, present := st.InstallInputs[name]
 		provenance := st.InputProvenance[name]
+		clearedOptionalSensitive := present && sensitive && !spec.Required && inputTypeStringLike(spec) && strings.TrimSpace(fmt.Sprint(value)) == ""
+		usablePresent := present && !clearedOptionalSensitive && installInputValueUsableForSchema(value, spec)
+		if clearedOptionalSensitive {
+			provenance = "absent_sensitive"
+		}
 		field := InstalledConfigField{
 			Name:        name,
 			Type:        spec.Type,
-			Label:       spec.Label,
-			Description: spec.Description,
+			Label:       displaySpec.Label,
+			Description: displaySpec.Description,
 			Required:    spec.Required,
 			Generate:    spec.Generate,
 			Sensitive:   sensitive,
-			Present:     present,
+			Present:     usablePresent,
 			Editable:    name != "__app_address__",
 		}
 		if provenance == "" {
-			if !present && !spec.Required && !spec.Generate && !sensitive {
+			if !usablePresent && spec.Default != nil && !spec.Generate && !sensitive {
 				provenance = InputProvenanceCatalogDefault
+			} else if !usablePresent && sensitive && !spec.Required {
+				provenance = "absent_sensitive"
 			} else {
 				provenance = InputProvenanceLegacyUnknown
 			}
 		}
 		field.Provenance = provenance
 		if !sensitive {
-			field.Schema = &spec
-			if present {
+			field.Schema = &displaySpec
+			if usablePresent {
 				field.Display = value
-			} else if !spec.Required && !spec.Generate {
-				if spec.Default != nil {
-					field.Display = spec.Default
-				} else {
+			} else if !spec.Generate {
+				if displaySpec.Default != nil {
+					field.Display = displaySpec.Default
+				} else if !spec.Required {
 					field.Display = zeroInputValue(spec.Type)
 				}
 			}
@@ -632,10 +1162,20 @@ func installedConfigFields(inputs map[string]api.AppInput, st *InstallState) []I
 		if name == "__app_address__" {
 			field.Actions = []string{"keep"}
 		} else if spec.Generate {
-			field.Actions = []string{"keep", "regenerate"}
+			if usablePresent {
+				field.Actions = []string{"keep", "regenerate"}
+			} else {
+				field.Actions = []string{"regenerate"}
+			}
 		} else if sensitive {
-			field.Actions = []string{"keep", "replace"}
-			if !spec.Required && (spec.Type == "string" || spec.Type == "password") {
+			if usablePresent {
+				field.Actions = []string{"keep", "replace"}
+			} else if spec.Required {
+				field.Actions = []string{"replace"}
+			} else {
+				field.Actions = []string{"keep", "replace"}
+			}
+			if usablePresent && !spec.Required && (spec.Type == "string" || spec.Type == "password") {
 				field.Actions = append(field.Actions, "clear")
 			}
 		} else {
@@ -876,7 +1416,11 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	if req.SourceHash != "" && req.SourceHash != sourceHash {
 		return nil, nil, fmt.Errorf("%w: app source changed; reload config form", ErrInstalledConfigConflict)
 	}
-	schema, err := m.schemaForInstallStateRawTemplate(ctx, instanceID, rawTemplate, st)
+	curDef, err := state.GetAppDefinition(instanceID)
+	if err != nil {
+		return nil, nil, fmt.Errorf("read current manifest: %w", err)
+	}
+	schema, _, err := m.schemaForInstallStateRawTemplateWithOrigin(ctx, instanceID, rawTemplate, st, curDef)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: parse stored source: %v", ErrInstalledConfigUnavailable, err)
 	}
@@ -885,23 +1429,9 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 		return nil, nil, fmt.Errorf("%w: input schema changed; reload config form", ErrInstalledConfigConflict)
 	}
 
-	inputs, provenance, actions, err := normalizeInstalledConfigInputs(schema.Inputs, st, req, instanceID)
+	inputs, provenance, inputSensitive, actions, err := normalizeInstalledConfigInputs(schema.Inputs, st, curDef, req, instanceID)
 	if err != nil {
 		return nil, nil, err
-	}
-	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
-		RawTemplate:   rawTemplate,
-		UserInputs:    inputs,
-		SystemContext: *st.InstallSystemCtx,
-		InstanceID:    instanceID,
-		ExistingOIDC:  st.OIDCCredentials,
-	}, nil, m.syncSelfSkippingLister(instanceID))
-	if err != nil {
-		return nil, nil, err
-	}
-	curDef, err := state.GetAppDefinition(instanceID)
-	if err != nil {
-		return nil, nil, fmt.Errorf("read current manifest: %w", err)
 	}
 	baseHash, err := canonicalManifestHash(curDef)
 	if err != nil {
@@ -917,7 +1447,68 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	if req.RuntimeFingerprint != "" && req.RuntimeFingerprint != runtimeFingerprint {
 		return nil, nil, fmt.Errorf("%w: runtime changed; rerun dry run", ErrInstalledConfigConflict)
 	}
-	policy, summary := evaluateInstalledConfigPolicy(curDef, res.Definition, appInst)
+	unsafeRender := manifestRenderHasUnsafeValues(st, curDef, schema, inputs, st.OIDCCredentials)
+	res, err := RunInstallPipeline(ctx, InstallPipelineInput{
+		RawTemplate:   rawTemplate,
+		UserInputs:    inputs,
+		SystemContext: *st.InstallSystemCtx,
+		InstanceID:    instanceID,
+		ExistingOIDC:  st.OIDCCredentials,
+	}, nil, m.syncSelfSkippingLister(instanceID))
+	if err != nil {
+		if unsafeRender {
+			reason := sensitiveStructuralRenderRejectedReason
+			return nil, &InstalledConfigUpdateResult{
+				InstanceID:         instanceID,
+				LedgerRevision:     st.Revision,
+				SourceHash:         sourceHash,
+				InputSchemaHash:    schemaHash,
+				BaseManifestHash:   baseHash,
+				RuntimeFingerprint: runtimeFingerprint,
+				DiffKind:           DiffKindStructuralNoImage.String(),
+				Applicable:         false,
+				BlockingReason:     reason,
+				Summary: ManifestUpdateSummary{
+					WillChange: []string{sensitiveStructuralRenderRejectedSummary},
+					Rejected:   []string{reason},
+				},
+			}, nil
+		}
+		return nil, nil, err
+	}
+	displayOldDef := curDef
+	displayNewDef := res.Definition
+	displayNew, displayChanged, err := m.renderDisplayDefinitionWithSentinels(ctx, instanceID, rawTemplate, inputs, *st.InstallSystemCtx, st, curDef, res.Definition, st.OIDCCredentials)
+	if err != nil {
+		return nil, nil, fmt.Errorf("render safe config display: %w", err)
+	}
+	if displayChanged {
+		displayNewDef = displayNew
+		displayOld, _, err := m.renderDisplayDefinitionWithSentinels(ctx, instanceID, st.RawTemplate, st.InstallInputs, *st.InstallSystemCtx, st, curDef, curDef, st.OIDCCredentials)
+		if err != nil {
+			return nil, nil, fmt.Errorf("render safe current config display: %w", err)
+		}
+		displayOldDef = displayOld
+	}
+	realPolicy, realSummary := evaluateInstalledConfigPolicy(curDef, res.Definition, appInst)
+	policy, summary := evaluateInstalledConfigPolicy(displayOldDef, displayNewDef, appInst)
+	if displayChanged {
+		policy = mergeInstalledConfigDisplayPolicy(realPolicy, policy)
+		summary = mergeDisplaySummaryRuntimeSemantics(summary, realSummary, "sensitive config value changed")
+		if reason := manifestSensitiveStructuralDriftReason(manifestSensitiveStructuralDrift(res.Definition, displayNewDef)); reason != "" {
+			policy.Allowed = false
+			if policy.Reason == "" {
+				policy.Reason = reason
+			}
+			scrubSensitiveStructuralDriftSummary(&summary, reason)
+		}
+	} else {
+		policy = realPolicy
+		summary = realSummary
+	}
+	unsafeDisplayFragments := manifestUpdateUnsafeDisplayFragments(st, curDef, res.Definition, inputs, st.OIDCCredentials)
+	sanitizeManifestUpdateSummaryForDisplay(&summary, unsafeDisplayFragments)
+	policy.Reason = redactUnsafeDisplayText(policy.Reason, unsafeDisplayFragments)
 	diffKind := classifyDiff(cloneDefinitionForCompare(curDef), cloneDefinitionForCompare(res.Definition))
 	candidateDigest := Sha256Hex(res.CanonicalBytes)
 	result := &InstalledConfigUpdateResult{
@@ -945,6 +1536,7 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 		nextState.clearPendingCatalogSource()
 	}
 	nextState.InstallInputs, nextState.InputProvenance = persistedInstalledConfigLedger(inputs, provenance)
+	nextState.InputSensitive = persistedInstallInputSensitive(nextState.InstallInputs, inputSensitive)
 	nextState.RawTemplateHash = Sha256Hex(nextState.RawTemplate)
 	cand := &installedConfigCandidate{
 		InstanceID:         instanceID,
@@ -965,9 +1557,10 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	return cand, result, nil
 }
 
-func normalizeInstalledConfigInputs(declared map[string]api.AppInput, st *InstallState, req InstalledConfigUpdateRequest, instanceID string) (map[string]any, map[string]string, []InstalledConfigActionSummary, error) {
+func normalizeInstalledConfigInputs(declared map[string]api.AppInput, st *InstallState, previous *api.AppDefinition, req InstalledConfigUpdateRequest, instanceID string) (map[string]any, map[string]string, map[string]bool, []InstalledConfigActionSummary, error) {
 	out := make(map[string]any, len(declared)+1)
 	provenance := make(map[string]string, len(declared)+1)
+	inputSensitive := map[string]bool{}
 	regen := map[string]bool{}
 	for _, name := range req.RegenerateInputs {
 		regen[name] = true
@@ -980,31 +1573,41 @@ func normalizeInstalledConfigInputs(declared map[string]api.AppInput, st *Instal
 	slices.Sort(names)
 	for _, name := range names {
 		spec := declared[name]
-		if value, exists := st.InstallInputs[name]; exists {
-			out[name] = value
+		oldValue, oldPresent := any(nil), false
+		if st != nil && st.InstallInputs != nil {
+			oldValue, oldPresent = st.InstallInputs[name]
 		}
+		oldUsable := oldPresent && installInputValueUsableForSchema(oldValue, spec)
 		if value := st.InputProvenance[name]; value != "" {
 			provenance[name] = value
 		}
-		oldValue, oldPresent := out[name]
 		if name == "__app_address__" {
 			out[name] = instanceID
 			provenance[name] = InputProvenanceSystem
 			continue
 		}
-		sensitive := inputIsSensitive(name, spec)
+		sensitive := inputIsSensitive(name, spec) || spec.Generate || storedInputDisplaySensitive(name, st, previous, declared)
 		switch {
 		case spec.Generate:
 			if regen[name] {
 				value, err := GenerateSecurePassword()
 				if err != nil {
-					return nil, nil, nil, fmt.Errorf("generate input %q: %w", name, err)
+					return nil, nil, nil, nil, fmt.Errorf("generate input %q: %w", name, err)
 				}
 				out[name] = value
 				provenance[name] = InputProvenanceGenerated
+				inputSensitive[name] = true
 				actions = append(actions, InstalledConfigActionSummary{Field: name, Action: "regenerate", Sensitive: true, Consequence: "existing sessions or integrations may be invalidated"})
-			} else if !oldPresent {
-				return nil, nil, nil, fmt.Errorf("input %q is missing and must be regenerated", name)
+			} else if !oldUsable {
+				if oldPresent {
+					if err := validateKeptInstallInputValue(name, spec, oldValue, true); err != nil {
+						return nil, nil, nil, nil, err
+					}
+				}
+				return nil, nil, nil, nil, fmt.Errorf("input %q is missing and must be regenerated", name)
+			} else {
+				out[name] = oldValue
+				inputSensitive[name] = true
 			}
 		case sensitive:
 			action := strings.TrimSpace(req.SecretActions[name])
@@ -1013,48 +1616,72 @@ func normalizeInstalledConfigInputs(declared map[string]api.AppInput, st *Instal
 			}
 			switch action {
 			case "keep":
-				if !oldPresent && spec.Required {
-					return nil, nil, nil, fmt.Errorf("input %q is missing and must be replaced", name)
+				if !oldUsable && spec.Required {
+					if oldPresent {
+						if err := validateKeptInstallInputValue(name, spec, oldValue, sensitive); err != nil {
+							return nil, nil, nil, nil, err
+						}
+					}
+					return nil, nil, nil, nil, fmt.Errorf("input %q is missing and must be replaced", name)
+				}
+				if oldUsable {
+					if err := validateKeptInstallInputValue(name, spec, oldValue, sensitive); err != nil {
+						return nil, nil, nil, nil, err
+					}
+					out[name] = oldValue
+					inputSensitive[name] = true
 				}
 			case "replace":
 				value, exists := req.Inputs[name]
 				if !exists {
-					return nil, nil, nil, fmt.Errorf("input %q replacement value is required", name)
+					return nil, nil, nil, nil, fmt.Errorf("input %q replacement value is required", name)
 				}
 				if strings.TrimSpace(fmt.Sprint(value)) == "" {
-					return nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty; use clear for optional secrets", name)
+					return nil, nil, nil, nil, fmt.Errorf("input %q replacement value cannot be empty; use clear for optional secrets", name)
 				}
 				out[name] = value
 				provenance[name] = InputProvenanceOperator
+				if inputIsSensitive(name, spec) || spec.Generate {
+					inputSensitive[name] = true
+				}
 				actions = append(actions, InstalledConfigActionSummary{Field: name, Action: "replace", Sensitive: true, Consequence: "external integrations may need the new value"})
 			case "clear":
 				if spec.Required || (spec.Type != "string" && spec.Type != "password") {
-					return nil, nil, nil, fmt.Errorf("input %q cannot be cleared", name)
+					return nil, nil, nil, nil, fmt.Errorf("input %q cannot be cleared", name)
 				}
 				out[name] = ""
 				provenance[name] = InputProvenanceOperator
 				actions = append(actions, InstalledConfigActionSummary{Field: name, Action: "clear", Sensitive: true, Consequence: "external integrations using this value may stop working"})
 			default:
-				return nil, nil, nil, fmt.Errorf("input %q has invalid secret action %q", name, action)
+				return nil, nil, nil, nil, fmt.Errorf("input %q has invalid secret action %q", name, action)
 			}
 		default:
 			if value, exists := req.Inputs[name]; exists {
 				out[name] = value
 				provenance[name] = InputProvenanceOperator
 				actions = append(actions, InstalledConfigActionSummary{
-					Field:      name,
-					Action:     "replace",
-					Sensitive:  false,
-					OldDisplay: oldValue,
+					Field:     name,
+					Action:    "replace",
+					Sensitive: false,
+					OldDisplay: func() any {
+						if oldUsable {
+							return oldValue
+						}
+						return nil
+					}(),
 					NewDisplay: value,
 				})
-			} else if !oldPresent {
-				if spec.Required {
-					return nil, nil, nil, fmt.Errorf("input %q is required", name)
+			} else if oldUsable {
+				if err := validateKeptInstallInputValue(name, spec, oldValue, sensitive); err != nil {
+					return nil, nil, nil, nil, err
 				}
+				out[name] = oldValue
+			} else {
 				if spec.Default != nil {
 					out[name] = normalizeInputValueForValidation(spec.Type, spec.Default)
 					provenance[name] = InputProvenanceCatalogDefault
+				} else if spec.Required {
+					return nil, nil, nil, nil, fmt.Errorf("input %q is required", name)
 				} else {
 					out[name] = zeroInputValue(spec.Type)
 					provenance[name] = InputProvenanceCatalogDefault
@@ -1063,9 +1690,9 @@ func normalizeInstalledConfigInputs(declared map[string]api.AppInput, st *Instal
 		}
 	}
 	if err := ValidateInputs(declared, out); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, nil, err
 	}
-	return out, provenance, actions, nil
+	return out, provenance, persistedInstallInputSensitive(out, inputSensitive), actions, nil
 }
 
 func persistedInstalledConfigLedger(inputs map[string]any, provenance map[string]string) (map[string]any, map[string]string) {
@@ -1087,6 +1714,22 @@ func persistedInstalledConfigLedger(inputs map[string]any, provenance map[string
 		persistedProvenance[name] = value
 	}
 	return persistedInputs, persistedProvenance
+}
+
+func persistedInstallInputSensitive(inputs map[string]any, sensitive map[string]bool) map[string]bool {
+	if len(inputs) == 0 || len(sensitive) == 0 {
+		return nil
+	}
+	out := map[string]bool{}
+	for name := range inputs {
+		if sensitive[name] {
+			out[name] = true
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 func evaluateInstalledConfigPolicy(oldDef, newDef *api.AppDefinition, appInst *AppInstance) (installedConfigPolicyResult, ManifestUpdateSummary) {
@@ -1209,7 +1852,26 @@ func inputIsSensitive(name string, spec api.AppInput) bool {
 	if spec.Type == "password" || spec.Generate {
 		return true
 	}
-	lower := strings.ToLower(name + " " + spec.Label + " " + spec.Description)
+	return inputNameLooksSensitive(name + " " + spec.Label + " " + spec.Description)
+}
+
+func clientDisplayInputSpec(name string, spec api.AppInput, instanceID string, redactMetadata bool) api.AppInput {
+	display := spec
+	if name == "__app_address__" && instanceID != "" {
+		display.Default = instanceID
+	} else if redactMetadata || inputIsSensitive(name, spec) || spec.Generate {
+		display.Default = nil
+	}
+	if redactMetadata {
+		display.Label = ""
+		display.Description = ""
+		display.Validation = nil
+	}
+	return display
+}
+
+func inputNameLooksSensitive(text string) bool {
+	lower := strings.ToLower(text)
 	for _, marker := range []string{"secret", "token", "key", "password", "credential"} {
 		if strings.Contains(lower, marker) {
 			return true

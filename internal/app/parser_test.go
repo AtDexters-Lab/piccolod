@@ -1338,6 +1338,18 @@ func TestValidateInputs(t *testing.T) {
 		}
 	})
 
+	t.Run("boolean_string_error_redacts_value", func(t *testing.T) {
+		err := ValidateInputs(map[string]api.AppInput{
+			"enabled": {Type: "boolean"},
+		}, map[string]interface{}{"enabled": "secret-license"})
+		if err == nil {
+			t.Fatal("expected error")
+		}
+		if strings.Contains(err.Error(), "secret-license") {
+			t.Fatalf("error leaked input value: %v", err)
+		}
+	})
+
 	t.Run("int_valid", func(t *testing.T) {
 		err := ValidateInputs(map[string]api.AppInput{
 			"port": {Type: "int"},

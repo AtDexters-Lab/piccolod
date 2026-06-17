@@ -15,9 +15,11 @@ class TaskProgressPanel extends StatefulWidget {
     this.onEvent,
     this.onComplete,
     this.urlPath,
+    this.label,
   });
   final String taskId;
   final String taskType;
+  final String? label;
   final void Function(TaskProgressEvent event)? onEvent;
   final void Function(TaskProgressEvent event)? onComplete;
 
@@ -143,6 +145,32 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
     }
   }
 
+  String _taskLabel() {
+    final explicit = widget.label?.trim();
+    if (explicit != null && explicit.isNotEmpty) return explicit;
+    switch (widget.taskType) {
+      case 'update_image':
+        return 'Updating image';
+      case 'update_config':
+        return 'Updating config';
+      case 'update_service_app':
+      case 'update_manifest':
+        return 'Updating app';
+      case 'update_listeners':
+        return 'Updating listeners';
+      case 'start_app':
+        return 'Starting app';
+      case 'stop_app':
+        return 'Stopping app';
+      case 'rollback_app':
+        return 'Rolling back app';
+      case 'uninstall_app':
+        return 'Uninstalling app';
+      default:
+        return 'Working';
+    }
+  }
+
   Color _statusColor() {
     final state = _client?.state ?? WebSocketConnectionState.disconnected;
     switch (state) {
@@ -191,7 +219,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
               const SizedBox(width: Spacing.sm),
               Expanded(
                 child: Text(
-                  '${widget.taskType} - ${_statusText()}',
+                  '${_taskLabel()} - ${_statusText()}',
                   style: PiccoloTheme.textTheme.labelMedium?.copyWith(
                     color: PiccoloTheme.inkMuted,
                   ),

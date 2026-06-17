@@ -464,11 +464,11 @@ func TestNormalizeManifestUpdateInputs_GeneratedValuesAreExplicitAndAppAddressPi
 		"api_key":         {Type: "password", Required: true, Generate: true},
 		"provider":        {Type: "string", Default: "local"},
 	}
-	if _, err := normalizeManifestUpdateInputs(declared, map[string]interface{}{}, nil, "piclu"); err == nil {
+	if _, _, err := normalizeManifestUpdateInputs(declared, nil, map[string]interface{}{}, nil, nil, "piclu"); err == nil {
 		t.Fatalf("expected missing generated input to fail")
 	}
 
-	inputs, err := normalizeManifestUpdateInputs(declared, map[string]interface{}{"__app_address__": "other"}, []string{"api_key"}, "piclu")
+	inputs, sensitive, err := normalizeManifestUpdateInputs(declared, nil, map[string]interface{}{"__app_address__": "other"}, []string{"api_key"}, nil, "piclu")
 	if err != nil {
 		t.Fatalf("normalize with regenerate: %v", err)
 	}
@@ -478,8 +478,384 @@ func TestNormalizeManifestUpdateInputs_GeneratedValuesAreExplicitAndAppAddressPi
 	if got := strings.TrimSpace(inputs["api_key"].(string)); got == "" {
 		t.Fatalf("regenerated api_key is empty")
 	}
+	if !sensitive["api_key"] {
+		t.Fatalf("regenerated api_key should be marked sensitive")
+	}
 	if got := inputs["provider"]; got != "local" {
 		t.Fatalf("provider = %v, want default", got)
+	}
+}
+
+func TestNormalizeManifestUpdateInputsPreservesExistingLedgerValues(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"__app_address__": {Type: "string", Required: true},
+		"api_key":         {Type: "password", Required: true},
+		"provider":        {Type: "string", Required: true},
+		"session_key":     {Type: "password", Required: true, Generate: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"api_key":     "kept-api-key",
+			"provider":    "kept-provider",
+			"session_key": "kept-session",
+		},
+	}
+	inputs, _, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{}, nil, nil, "piclu")
+	if err != nil {
+		t.Fatalf("normalize preserving ledger inputs: %v", err)
+	}
+	if got := inputs["api_key"]; got != "kept-api-key" {
+		t.Fatalf("api_key = %v, want existing value", got)
+	}
+	if got := inputs["provider"]; got != "kept-provider" {
+		t.Fatalf("provider = %v, want existing value", got)
+	}
+	if got := inputs["session_key"]; got != "kept-session" {
+		t.Fatalf("session_key = %v, want existing value", got)
+	}
+	if got := inputs["__app_address__"]; got != "piclu" {
+		t.Fatalf("__app_address__ = %v, want pinned piclu", got)
+	}
+}
+
+func TestNormalizeManifestUpdateInputsRejectsIncompatibleKeptSecretWithoutEcho(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"license": {Type: "boolean", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"license": "secret-license",
+		},
+		InputSensitive: map[string]bool{
+			"license": true,
+		},
+	}
+	_, _, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{}, nil, nil, "piclu")
+	if err == nil {
+		t.Fatalf("expected incompatible kept secret to fail")
+	}
+	if strings.Contains(err.Error(), "secret-license") || strings.Contains(err.Error(), "expected boolean") {
+		t.Fatalf("error leaked kept secret or validator detail: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be safely reused") {
+		t.Fatalf("error = %v, want generic safe-reuse failure", err)
+	}
+}
+
+func TestNormalizeManifestUpdateInputsRejectsBlankRequiredSecretReplacement(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key": {Type: "password", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"api_key": "kept-api-key",
+		},
+	}
+	if _, _, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{"api_key": ""}, nil, nil, "piclu"); err == nil {
+		t.Fatalf("expected blank required secret replacement to fail")
+	}
+}
+
+func TestNormalizeManifestUpdateInputsClearsOptionalSecretOnlyExplicitly(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key": {Type: "password", Default: "manifest-default"},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"api_key": "kept-api-key",
+		},
+	}
+	if _, _, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{"api_key": ""}, nil, nil, "piclu"); err == nil {
+		t.Fatalf("expected blank optional secret replacement to require explicit clear")
+	}
+	inputs, sensitive, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{}, nil, []string{"api_key"}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize with explicit clear: %v", err)
+	}
+	if got := inputs["api_key"]; got != "" {
+		t.Fatalf("api_key = %v, want cleared empty value", got)
+	}
+	if sensitive["api_key"] {
+		t.Fatalf("cleared api_key should not remain sensitive")
+	}
+}
+
+func TestManifestUpdateDisplayInputsRedactInferredSensitiveDefaults(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"__app_address__": {Type: "string"},
+		"api_key":         {Type: "string", Required: true, Default: "secret-default"},
+		"provider":        {Type: "string", Default: "local"},
+	}
+	display := manifestUpdateDisplayInputs(declared, "piclu", false)
+	if got := display["__app_address__"].Default; got != "piclu" {
+		t.Fatalf("__app_address__ default = %v, want piclu", got)
+	}
+	if got := display["api_key"].Default; got != nil {
+		t.Fatalf("api_key display default = %v, want redacted", got)
+	}
+	if got := display["provider"].Default; got != "local" {
+		t.Fatalf("provider display default = %v, want local", got)
+	}
+	if got := declared["api_key"].Default; got != "secret-default" {
+		t.Fatalf("declared api_key default mutated to %v", got)
+	}
+}
+
+func TestNormalizeManifestUpdateInputsClearsReclassifiedStoredSecret(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key": {Type: "string"},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  api_key:
+    type: password
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"api_key": "kept-api-key",
+		},
+	}
+	if _, _, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{"api_key": ""}, nil, nil, "piclu"); err == nil {
+		t.Fatalf("expected blank reclassified secret replacement to require explicit clear")
+	}
+	inputs, sensitive, err := normalizeManifestUpdateInputs(declared, st, map[string]interface{}{}, nil, []string{"api_key"}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize with explicit clear: %v", err)
+	}
+	if got := inputs["api_key"]; got != "" {
+		t.Fatalf("api_key = %v, want cleared zero value", got)
+	}
+	if sensitive["api_key"] {
+		t.Fatalf("cleared reclassified api_key should not remain sensitive")
+	}
+}
+
+func TestManifestUpdateInputFieldsDescribePreservedCurrentValues(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"__app_address__": {Type: "string", Required: true},
+		"api_key":         {Type: "password", Required: true},
+		"new_secret":      {Type: "password", Required: true},
+		"provider":        {Type: "string", Required: true},
+		"webhook_token":   {Type: "password"},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  api_key:
+    type: password
+    required: true
+  provider:
+    type: string
+    required: true
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"api_key":  "kept-api-key",
+			"provider": "kept-provider",
+		},
+	}
+	displayInputs, fields, preflight := manifestUpdateInputFields(declared, st, "piclu")
+	if got := displayInputs["provider"].Default; got != nil {
+		t.Fatalf("provider display default = %v, want current value hidden", got)
+	}
+	if got := displayInputs["api_key"].Default; got != nil {
+		t.Fatalf("api_key display default = %v, want hidden secret", got)
+	}
+	byName := map[string]ManifestUpdateInputField{}
+	for _, field := range fields {
+		byName[field.Name] = field
+	}
+	if got := byName["api_key"].Provenance; got != "Current stored value will be kept" {
+		t.Fatalf("api_key provenance = %q", got)
+	}
+	if !byName["api_key"].HasCurrentValue || !byName["api_key"].CurrentValueSensitive {
+		t.Fatalf("api_key current metadata = %+v, want sensitive current value", byName["api_key"])
+	}
+	if !byName["api_key"].Sensitive || !byName["new_secret"].Sensitive {
+		t.Fatalf("sensitive metadata = api_key:%+v new_secret:%+v, want sensitive fields", byName["api_key"], byName["new_secret"])
+	}
+	if got := byName["webhook_token"].Provenance; got != "Optional secret; leave blank to keep unset" {
+		t.Fatalf("webhook_token provenance = %q", got)
+	}
+	if got := byName["provider"].Provenance; got != "Current value will be kept" {
+		t.Fatalf("provider provenance = %q", got)
+	}
+	if !byName["provider"].HasCurrentValue || byName["provider"].CurrentValueSensitive {
+		t.Fatalf("provider current metadata = %+v, want non-sensitive current value", byName["provider"])
+	}
+	if got := byName["provider"].CurrentValueDisplay; got != "kept-provider" {
+		t.Fatalf("provider current display = %q, want kept-provider", got)
+	}
+	if len(preflight) != 1 || preflight[0] != "new_secret" {
+		t.Fatalf("preflight = %#v, want only new_secret", preflight)
+	}
+}
+
+func TestManifestUpdateCatalogPendingFieldsRedactInferredSensitiveDefaults(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key":       {Type: "string", Required: true, Default: "secret-default"},
+		"provider":      {Type: "string", Required: true, Default: "local"},
+		"webhook_token": {Type: "password"},
+	}
+	st := &InstallState{InstallInputs: map[string]any{}}
+	fields, preflight := manifestUpdateInputFieldsForCatalogPending(declared, st, "piclu")
+	byName := map[string]ManifestUpdateInputField{}
+	for _, field := range fields {
+		byName[field.Name] = field
+	}
+	if !byName["api_key"].Sensitive || byName["api_key"].Provenance != "Re-enter required" {
+		t.Fatalf("api_key field = %+v, want inferred-sensitive re-entry", byName["api_key"])
+	}
+	if byName["provider"].Sensitive || byName["provider"].Provenance != "Required for this update" {
+		t.Fatalf("provider field = %+v, want ordinary required catalog field", byName["provider"])
+	}
+	if got := byName["webhook_token"].Provenance; got != "Optional secret; leave blank to keep unset" {
+		t.Fatalf("webhook_token provenance = %q", got)
+	}
+	if !slices.Contains(preflight, "api_key") || slices.Contains(preflight, "provider") || slices.Contains(preflight, "webhook_token") {
+		t.Fatalf("preflight = %+v, want api_key only", preflight)
+	}
+	display := manifestUpdateDisplayInputs(declared, "piclu", false)
+	if got := display["api_key"].Default; got != nil {
+		t.Fatalf("api_key display default = %v, want redacted", got)
+	}
+}
+
+func TestManifestUpdateCatalogPendingFieldsSurfaceStickySensitiveCurrentValues(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"license":  {Type: "string", Required: true},
+		"provider": {Type: "string", Required: true},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  license:
+    type: string
+  provider:
+    type: string
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"license":  "secret-license",
+			"provider": "local",
+		},
+		InputSensitive: map[string]bool{
+			"license": true,
+		},
+	}
+	fields, preflight := manifestUpdateInputFieldsForCatalogPending(declared, st, "piclu")
+	byName := map[string]ManifestUpdateInputField{}
+	for _, field := range fields {
+		byName[field.Name] = field
+	}
+	license := byName["license"]
+	if license.Name == "" {
+		t.Fatalf("sticky-sensitive license field was hidden: %+v", fields)
+	}
+	if !license.HasCurrentValue || !license.CurrentValueSensitive || !license.Sensitive {
+		t.Fatalf("license current metadata = %+v, want sensitive current value", license)
+	}
+	if license.CurrentValueDisplay != "" {
+		t.Fatalf("license display leaked current value: %+v", license)
+	}
+	if _, ok := byName["provider"]; ok {
+		t.Fatalf("non-sensitive stored provider should stay hidden from pending form: %+v", byName["provider"])
+	}
+	if len(preflight) != 0 {
+		t.Fatalf("preflight = %+v, want none for reusable current value", preflight)
+	}
+}
+
+func TestManifestUpdateInputFieldsHideReclassifiedStoredSecret(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"session": {Type: "string", Required: true},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  session:
+    type: password
+    required: true
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"session": "super-secret-session",
+		},
+	}
+	displayInputs, fields, preflight := manifestUpdateInputFields(declared, st, "piclu")
+	if got := displayInputs["session"].Default; got != nil {
+		t.Fatalf("session display default = %v, want hidden reclassified secret", got)
+	}
+	if len(preflight) != 0 {
+		t.Fatalf("preflight = %#v, want none for preserved current value", preflight)
+	}
+	if len(fields) != 1 {
+		t.Fatalf("fields = %#v, want one", fields)
+	}
+	field := fields[0]
+	if !field.HasCurrentValue || !field.CurrentValueSensitive {
+		t.Fatalf("session field metadata = %+v, want sensitive current value", field)
+	}
+	if field.CurrentValueDisplay != "" {
+		t.Fatalf("session current display = %q, want hidden", field.CurrentValueDisplay)
+	}
+	if got := field.Provenance; got != "Current stored value will be kept" {
+		t.Fatalf("session provenance = %q", got)
+	}
+}
+
+func TestManifestUpdateInputFieldsHideStoredValueAbsentFromPreviousSchema(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"provider": {Type: "string", Required: true},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  model:
+    type: string
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"provider": "stored-provider-secret",
+		},
+	}
+	displayInputs, fields, preflight := manifestUpdateInputFields(declared, st, "piclu")
+	if got := displayInputs["provider"].Default; got != nil {
+		t.Fatalf("provider display default = %v, want hidden stored value", got)
+	}
+	if len(preflight) != 0 {
+		t.Fatalf("preflight = %#v, want none for preserved current value", preflight)
+	}
+	if len(fields) != 1 {
+		t.Fatalf("fields = %#v, want one", fields)
+	}
+	field := fields[0]
+	if !field.HasCurrentValue || !field.CurrentValueSensitive {
+		t.Fatalf("provider field metadata = %+v, want sensitive current value", field)
+	}
+	if field.CurrentValueDisplay != "" {
+		t.Fatalf("provider current display = %q, want hidden", field.CurrentValueDisplay)
 	}
 }
 
@@ -499,7 +875,7 @@ func TestNormalizePendingCatalogManifestReviewInputsAcceptsProvidedSecrets(t *te
 		},
 	}
 
-	inputs, provenance, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+	inputs, provenance, sensitive, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
 		Inputs: map[string]interface{}{
 			"api_key":     "typed-api-key",
 			"session_key": "typed-session-key",
@@ -520,6 +896,9 @@ func TestNormalizePendingCatalogManifestReviewInputsAcceptsProvidedSecrets(t *te
 	if got := provenance["session_key"]; got != InputProvenanceOperator {
 		t.Fatalf("session_key provenance = %q, want operator", got)
 	}
+	if !sensitive["api_key"] || !sensitive["session_key"] {
+		t.Fatalf("provided secrets should be marked sensitive: %+v", sensitive)
+	}
 	if _, ok := inputs["region"]; !ok {
 		t.Fatalf("region default missing from normalized inputs")
 	}
@@ -527,7 +906,7 @@ func TestNormalizePendingCatalogManifestReviewInputsAcceptsProvidedSecrets(t *te
 		t.Fatalf("region provenance = %q, want catalog default", got)
 	}
 
-	inputs, provenance, err = normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+	inputs, provenance, sensitive, err = normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
 		Inputs:           map[string]interface{}{"api_key": "typed-api-key"},
 		RegenerateInputs: []string{"session_key"},
 	}, "piclu")
@@ -539,6 +918,130 @@ func TestNormalizePendingCatalogManifestReviewInputsAcceptsProvidedSecrets(t *te
 	}
 	if got := provenance["session_key"]; got != InputProvenanceGenerated {
 		t.Fatalf("session_key regenerate provenance = %q, want generated", got)
+	}
+	if !sensitive["session_key"] {
+		t.Fatalf("regenerated session_key should be marked sensitive")
+	}
+}
+
+func TestNormalizePendingCatalogManifestReviewInputsRejectsIncompatibleKeptSecretWithoutEcho(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"license": {Type: "boolean", Required: true},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"license": "secret-license",
+		},
+		InputProvenance: map[string]string{
+			"license": InputProvenanceOperator,
+		},
+		InputSensitive: map[string]bool{
+			"license": true,
+		},
+	}
+	_, _, _, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{}, "piclu")
+	if err == nil {
+		t.Fatalf("expected incompatible kept catalog secret to fail")
+	}
+	if strings.Contains(err.Error(), "secret-license") || strings.Contains(err.Error(), "expected boolean") {
+		t.Fatalf("error leaked kept secret or validator detail: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cannot be safely reused") {
+		t.Fatalf("error = %v, want generic safe-reuse failure", err)
+	}
+}
+
+func TestNormalizePendingCatalogManifestReviewInputsClearsOptionalSecretsOnlyExplicitly(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key":     {Type: "password", Default: "manifest-default"},
+		"session_key": {Type: "password", Generate: true, Default: "session-default"},
+	}
+	st := &InstallState{
+		InstallInputs: map[string]any{
+			"api_key":     "kept-api-key",
+			"session_key": "kept-session-key",
+		},
+		InputProvenance: map[string]string{
+			"api_key":     InputProvenanceOperator,
+			"session_key": InputProvenanceGenerated,
+		},
+	}
+
+	if _, _, _, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		Inputs: map[string]interface{}{"api_key": ""},
+	}, "piclu"); err == nil {
+		t.Fatalf("expected blank optional catalog secret replacement to require explicit clear")
+	}
+	if _, _, _, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		Inputs: map[string]interface{}{"session_key": ""},
+	}, "piclu"); err == nil {
+		t.Fatalf("expected blank optional generated catalog replacement to require explicit clear or regenerate")
+	}
+
+	inputs, provenance, sensitive, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		ClearInputs: []string{"api_key", "session_key"},
+	}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize pending catalog review with explicit clear: %v", err)
+	}
+	if got := inputs["api_key"]; got != "" {
+		t.Fatalf("api_key = %v, want cleared empty value", got)
+	}
+	if got := provenance["api_key"]; got != InputProvenanceOperator {
+		t.Fatalf("api_key provenance = %q, want operator", got)
+	}
+	if got := inputs["session_key"]; got != "" {
+		t.Fatalf("session_key = %v, want cleared empty value", got)
+	}
+	if got := provenance["session_key"]; got != InputProvenanceOperator {
+		t.Fatalf("session_key provenance = %q, want operator", got)
+	}
+	if sensitive["api_key"] || sensitive["session_key"] {
+		t.Fatalf("cleared secrets should not remain sensitive: %+v", sensitive)
+	}
+}
+
+func TestNormalizePendingCatalogManifestReviewInputsClearsReclassifiedStoredSecret(t *testing.T) {
+	declared := map[string]api.AppInput{
+		"api_key": {Type: "string"},
+	}
+	st := &InstallState{
+		RawTemplate: []byte(`type: user
+inputs:
+  api_key:
+    type: password
+services:
+  main:
+    image: docker.io/example/piclu:stable
+x-piccolo:
+  mode: service
+`),
+		InstallInputs: map[string]any{
+			"api_key": "kept-api-key",
+		},
+		InputProvenance: map[string]string{
+			"api_key": InputProvenanceOperator,
+		},
+	}
+	if _, _, _, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		Inputs: map[string]interface{}{"api_key": ""},
+	}, "piclu"); err == nil {
+		t.Fatalf("expected blank catalog reclassified secret replacement to require explicit clear")
+	}
+	inputs, provenance, sensitive, err := normalizePendingCatalogManifestReviewInputs(declared, st, ManifestUpdateRequest{
+		ClearInputs: []string{"api_key"},
+	}, "piclu")
+	if err != nil {
+		t.Fatalf("normalize catalog with explicit clear: %v", err)
+	}
+	if got := inputs["api_key"]; got != "" {
+		t.Fatalf("api_key = %v, want cleared zero value", got)
+	}
+	if got := provenance["api_key"]; got != InputProvenanceOperator {
+		t.Fatalf("api_key provenance = %q, want operator", got)
+	}
+	if sensitive["api_key"] {
+		t.Fatalf("cleared reclassified api_key should not remain sensitive")
 	}
 }
 
@@ -2404,6 +2907,1240 @@ x-piccolo:
 	}
 }
 
+func TestDryRunCustomManifestUpdateSurfacesKeptSecretSemanticReview(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	mgr.SetMountVerifier(func(string) error { return nil })
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := customManifestKeptSecretRaw("Gemini API key", "Key for Gemini extraction", "PICLU_API_KEY")
+	newRaw := customManifestKeptSecretRaw("OpenAI compatible API key", "Key for OpenAI-compatible extraction", "OPENAI_COMPATIBLE_API_KEY")
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"gemini_api_key":  "stored-secret",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.KeptValueReview) != 1 {
+		t.Fatalf("kept value review = %+v, want one item", dryRun.KeptValueReview)
+	}
+	item := dryRun.KeptValueReview[0]
+	if item.Field != "gemini_api_key" {
+		t.Fatalf("field = %q, want gemini_api_key", item.Field)
+	}
+	if item.RiskKind != "kept_secret_semantic_changed" {
+		t.Fatalf("risk kind = %q", item.RiskKind)
+	}
+	if item.Confirmation == "" || !slices.Contains(dryRun.RequiredConfirmations, item.Confirmation) {
+		t.Fatalf("required confirmations %v do not include kept value confirmation %q", dryRun.RequiredConfirmations, item.Confirmation)
+	}
+	if !slices.Contains(item.SemanticDelta, "label changed") || !slices.Contains(item.SemanticDelta, "description changed") || !slices.Contains(item.SemanticDelta, "template usage changed") {
+		t.Fatalf("semantic delta = %+v", item.SemanticDelta)
+	}
+	if len(item.OldUsage) == 0 || len(item.NewUsage) == 0 {
+		t.Fatalf("usage refs missing: old=%v new=%v", item.OldUsage, item.NewUsage)
+	}
+	if item.BlockingReason != "" {
+		t.Fatalf("confirmable kept value review should not have blocking reason: %+v", item)
+	}
+}
+
+func TestApplyCustomManifestUpdateKeepsReclassifiedSecretWriteOnly(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	mgr.SetMountVerifier(func(string) error { return nil })
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := customManifestReclassifiedSecretRaw("password")
+	newRaw := customManifestReclassifiedSecretRaw("string")
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"license":         "zzzz-license",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.KeptValueReview) != 1 {
+		t.Fatalf("kept value review = %+v, want one item", dryRun.KeptValueReview)
+	}
+	if dryRun.KeptValueReview[0].RiskKind != "kept_secret_semantic_changed" {
+		t.Fatalf("risk kind = %q", dryRun.KeptValueReview[0].RiskKind)
+	}
+	if !slices.Contains(dryRun.RequiredConfirmations, dryRun.KeptValueReview[0].Confirmation) {
+		t.Fatalf("required confirmations %v missing kept value confirmation %q", dryRun.RequiredConfirmations, dryRun.KeptValueReview[0].Confirmation)
+	}
+
+	if _, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		DryRunToken:        dryRun.DryRunToken,
+		Confirmations:      dryRun.RequiredConfirmations,
+	}); err != nil {
+		t.Fatalf("apply manifest update: %v", err)
+	}
+	nextLedger, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load updated install state: %v", err)
+	}
+	if !nextLedger.InputSensitive["license"] {
+		t.Fatalf("updated ledger did not preserve sticky sensitivity: %+v", nextLedger.InputSensitive)
+	}
+
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	var licenseField *InstalledConfigField
+	for i := range read.Fields {
+		if read.Fields[i].Name == "license" {
+			licenseField = &read.Fields[i]
+			break
+		}
+	}
+	if licenseField == nil {
+		t.Fatalf("license field missing from read config: %+v", read.Fields)
+	}
+	if !licenseField.Sensitive || licenseField.Display != nil || licenseField.Schema != nil {
+		t.Fatalf("reclassified stored secret should remain write-only after apply: %+v", licenseField)
+	}
+	if strings.Contains(fmt.Sprint(read), "secret-license") {
+		t.Fatalf("read installed config leaked reclassified secret: %+v", read)
+	}
+}
+
+func TestDryRunCustomManifestUpdateSurfacesKeptValueDefaultReview(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  provider:
+    type: string
+    required: true
+    default: local
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  provider:
+    type: string
+    required: true
+    default: cloud
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"provider":        "local",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.KeptValueReview) != 1 {
+		t.Fatalf("kept value review = %+v, want one item", dryRun.KeptValueReview)
+	}
+	item := dryRun.KeptValueReview[0]
+	if item.Field != "provider" {
+		t.Fatalf("field = %q, want provider", item.Field)
+	}
+	if !slices.Contains(item.SemanticDelta, "default changed") {
+		t.Fatalf("semantic delta = %+v, want default changed", item.SemanticDelta)
+	}
+	if item.RiskKind != "kept_value_semantic_changed" {
+		t.Fatalf("risk kind = %q, want kept_value_semantic_changed", item.RiskKind)
+	}
+}
+
+func TestDryRunCustomManifestUpdateRedactsSensitiveDefaultReview(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: string
+    required: true
+    default: old-secret-default
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      API_KEY: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: string
+    required: true
+    default: new-secret-default
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      API_KEY: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"api_key":         "stored-secret",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.KeptValueReview) != 1 {
+		t.Fatalf("kept value review = %+v, want one item", dryRun.KeptValueReview)
+	}
+	item := dryRun.KeptValueReview[0]
+	if item.Field != "api_key" {
+		t.Fatalf("field = %q, want api_key", item.Field)
+	}
+	if item.RiskKind != "kept_secret_semantic_changed" {
+		t.Fatalf("risk kind = %q, want kept_secret_semantic_changed", item.RiskKind)
+	}
+	if !slices.Contains(item.SemanticDelta, "default changed") {
+		t.Fatalf("semantic delta = %+v, want default changed", item.SemanticDelta)
+	}
+	for _, semantic := range append(append([]string{}, item.OldSemantic...), item.NewSemantic...) {
+		if strings.Contains(semantic, "old-secret-default") || strings.Contains(semantic, "new-secret-default") {
+			t.Fatalf("sensitive default leaked in semantic summary: old=%v new=%v", item.OldSemantic, item.NewSemantic)
+		}
+	}
+	if !slices.Contains(item.OldSemantic, "default=<redacted>") || !slices.Contains(item.NewSemantic, "default=<redacted>") {
+		t.Fatalf("semantic summary = old=%v new=%v, want redacted defaults", item.OldSemantic, item.NewSemantic)
+	}
+}
+
+func TestDryRunCustomManifestUpdateRedactsRenderedSemanticMetadata(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+    required: true
+  provider:
+    type: string
+    required: true
+    label: "Provider {{ .Inputs.api_key }}"
+    description: "Provider secret {{ .Inputs.api_key }}"
+    validation:
+      regex: "^.*$"
+      message: "Must match {{ .Inputs.api_key }}"
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+    required: true
+  provider:
+    type: string
+    required: true
+    label: "Provider changed {{ .Inputs.api_key }}"
+    description: "Provider secret changed {{ .Inputs.api_key }}"
+    validation:
+      regex: "^.+$"
+      message: "Must match changed {{ .Inputs.api_key }}"
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"api_key":         "stored-secret",
+		"provider":        "local",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	var item *ManifestUpdateKeptValueReviewItem
+	for i := range dryRun.KeptValueReview {
+		if dryRun.KeptValueReview[i].Field == "provider" {
+			item = &dryRun.KeptValueReview[i]
+			break
+		}
+	}
+	if item == nil {
+		t.Fatalf("kept value review = %+v, want provider item", dryRun.KeptValueReview)
+	}
+	for _, want := range []string{"label changed", "description changed", "validation changed"} {
+		if !slices.Contains(item.SemanticDelta, want) {
+			t.Fatalf("semantic delta = %+v, want %q", item.SemanticDelta, want)
+		}
+	}
+	allSemantic := strings.Join(append(append([]string{}, item.OldSemantic...), item.NewSemantic...), "\n")
+	if strings.Contains(allSemantic, "stored-secret") {
+		t.Fatalf("semantic summary leaked stored secret: old=%v new=%v", item.OldSemantic, item.NewSemantic)
+	}
+	for _, want := range []string{"label=<present>", "description=<present>", "validation_regex=<present>", "validation_message=<present>"} {
+		if !strings.Contains(allSemantic, want) {
+			t.Fatalf("semantic summary = %q, want %q", allSemantic, want)
+		}
+	}
+}
+
+func TestDryRunCustomManifestUpdateRejectsRenderedOnlySecretDerivedInputSpecs(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+    required: true
+{{ if .Inputs.api_key }}
+  provider:
+    type: string
+    required: true
+    default: "{{ .Inputs.api_key }}"
+{{ end }}
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+    required: true
+{{ if .Inputs.api_key }}
+  provider:
+    type: string
+    required: true
+    default: "changed-{{ .Inputs.api_key }}"
+{{ end }}
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PROVIDER: "{{ .Inputs.provider }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"api_key":         "stored-secret",
+		"provider":        "local",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	_, err = mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err == nil {
+		t.Fatalf("expected secret-derived rendered input specs to fail closed")
+	}
+	if strings.Contains(err.Error(), "stored-secret") {
+		t.Fatalf("dry-run error leaked stored secret: %v", err)
+	}
+}
+
+func TestDryRunCustomManifestUpdateRejectsStickySensitiveStructuralKeys(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  license:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      SAFE_KEY: "1"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  license:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      SAFE_KEY: "1"
+      '{{ printf "%.4s" .Inputs.license }}_KEY': "1"
+      '{{ printf "%x" .Inputs.license }}_HEX': "1"
+      '{{ printf "%q" .Inputs.license }}_QUOTE': "1"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"license":         "secret-license",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if dryRun.Applicable || dryRun.DryRunToken != "" {
+		t.Fatalf("dry run should reject sensitive structural keys without token, got applicable=%v token=%q result=%+v", dryRun.Applicable, dryRun.DryRunToken, dryRun)
+	}
+	if !strings.Contains(dryRun.BlockingReason, "sensitive or generated values cannot be used in manifest structure") {
+		t.Fatalf("blocking reason = %q", dryRun.BlockingReason)
+	}
+	joined := fmt.Sprint(dryRun)
+	for _, leaked := range []string{"zzzz-license", "zzzz_KEY", "services.zzzz", "zzzz", schemaInputNameSentinelPrefix, fmt.Sprintf("%x", "zzzz-license"), fmt.Sprintf("%q", "zzzz-license")} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("dry-run result leaked %q: %+v", leaked, dryRun)
+		}
+	}
+}
+
+func TestDryRunCustomManifestUpdateRedactsSensitiveRenderValidationError(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  license:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      SAFE_KEY: "1"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  license:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: "{{ .Inputs.license }}"
+services:
+  "{{ .Inputs.license }}":
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      SAFE_KEY: "1"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"__app_address__": "piclu",
+		"license":         "Bad.Secret",
+	}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run returned raw error: %v", err)
+	}
+	if dryRun.Applicable || dryRun.DryRunToken != "" {
+		t.Fatalf("dry run should reject unsafe render failure without token, got applicable=%v token=%q result=%+v", dryRun.Applicable, dryRun.DryRunToken, dryRun)
+	}
+	if !strings.Contains(dryRun.BlockingReason, "sensitive or generated values cannot be used in manifest structure") {
+		t.Fatalf("blocking reason = %q", dryRun.BlockingReason)
+	}
+	if strings.Contains(fmt.Sprint(dryRun), "Bad.Secret") {
+		t.Fatalf("dry-run result leaked rendered secret: %+v", dryRun)
+	}
+}
+
+func TestManifestRenderedInputUsageRefsRedactsSecretRenderedKeys(t *testing.T) {
+	raw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+  provider:
+    type: string
+metadata:
+  "{{ .System.Auth.ClientSecret }}":
+    "{{ .Inputs.provider }}": "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := &InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC", IssuerHint: "https://issuer.local"}
+	refs, ok := manifestRenderedInputUsageRefs(raw, map[string]interface{}{
+		"api_key":  "stored-api-key",
+		"provider": "rendered-provider",
+	}, systemCtx, &OIDCCredentials{
+		ClientID:     "client-id",
+		ClientSecret: "oidc-client-secret",
+	}, "api_key", map[string]struct{}{"provider": {}})
+	if !ok || len(refs) == 0 {
+		t.Fatalf("usage refs = %v ok=%v, want rendered refs", refs, ok)
+	}
+	for _, ref := range refs {
+		if strings.Contains(ref, "oidc-client-secret") || strings.Contains(ref, "rendered-provider") || strings.Contains(ref, "stored-api-key") {
+			t.Fatalf("usage ref leaked rendered secret/input value: %q", ref)
+		}
+	}
+	if !strings.Contains(strings.Join(refs, " "), "<key") {
+		t.Fatalf("usage refs = %v, want structural key labels", refs)
+	}
+}
+
+func TestManifestRenderedInputUsageRefsRedactsOIDCClientIDKeys(t *testing.T) {
+	raw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+metadata:
+  "{{ .System.Auth.ClientID }}":
+    value: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := &InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC", IssuerHint: "https://issuer.local"}
+	refs, ok := manifestRenderedInputUsageRefs(raw, map[string]interface{}{
+		"api_key": "stored-api-key",
+	}, systemCtx, &OIDCCredentials{
+		ClientID:     "oidc-client-id",
+		ClientSecret: "oidc-client-secret",
+	}, "api_key", nil)
+	if !ok || len(refs) == 0 {
+		t.Fatalf("usage refs = %v ok=%v, want rendered refs", refs, ok)
+	}
+	joined := strings.Join(refs, " ")
+	for _, leaked := range []string{"oidc-client-id", "oidc-client-secret", "stored-api-key"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("usage refs leaked %q: %v", leaked, refs)
+		}
+	}
+	if !strings.Contains(joined, "<key") || !strings.Contains(joined, "#") {
+		t.Fatalf("usage refs = %v, want hashed structural key labels", refs)
+	}
+}
+
+func TestManifestRenderedInputUsageRefsRedactsPartialUnsafeInputKeys(t *testing.T) {
+	raw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+  license:
+    type: string
+metadata:
+  "{{ printf "%.4s" .Inputs.license }}":
+    value: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := &InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	refs, ok := manifestRenderedInputUsageRefs(raw, map[string]interface{}{
+		"api_key": "stored-api-key",
+		"license": "secret-license",
+	}, systemCtx, nil, "api_key", map[string]struct{}{"license": {}})
+	if !ok || len(refs) == 0 {
+		t.Fatalf("usage refs = %v ok=%v, want rendered refs", refs, ok)
+	}
+	joined := strings.Join(refs, " ")
+	for _, leaked := range []string{"secret-license", "secr", "stored-api-key"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("usage refs leaked %q: %v", leaked, refs)
+		}
+	}
+	if !strings.Contains(joined, "<key") || !strings.Contains(joined, "#") {
+		t.Fatalf("usage refs = %v, want hashed structural key labels", refs)
+	}
+}
+
+func TestManifestRenderedInputUsageRefsPreserveStaticKeyPrecision(t *testing.T) {
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    environment:
+      OLD_KEY: |
+        {{ .Inputs.api_key }}
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    environment:
+      NEW_KEY: |
+        {{ .Inputs.api_key }}
+x-piccolo:
+  mode: service
+`)
+	systemCtx := &InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{"api_key": "stored-api-key"}
+	oldRefs, oldOK := manifestRenderedInputUsageRefs(oldRaw, inputs, systemCtx, nil, "api_key", nil)
+	newRefs, newOK := manifestRenderedInputUsageRefs(newRaw, inputs, systemCtx, nil, "api_key", nil)
+	if !oldOK || !newOK {
+		t.Fatalf("usage refs ok = old:%v new:%v", oldOK, newOK)
+	}
+	if slices.Equal(oldRefs, newRefs) {
+		t.Fatalf("usage refs should differ when static parent key changes: old=%v new=%v", oldRefs, newRefs)
+	}
+	if !strings.Contains(strings.Join(oldRefs, " "), "OLD_KEY") || !strings.Contains(strings.Join(newRefs, " "), "NEW_KEY") {
+		t.Fatalf("usage refs did not preserve static key names: old=%v new=%v", oldRefs, newRefs)
+	}
+	if strings.Contains(strings.Join(append(oldRefs, newRefs...), " "), "stored-api-key") {
+		t.Fatalf("usage refs leaked stored value: old=%v new=%v", oldRefs, newRefs)
+	}
+}
+
+func TestManifestRenderedInputUsageRefsPreserveRedactedDynamicKeyPrecision(t *testing.T) {
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+  provider:
+    type: string
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    environment:
+      "OLD_{{ .Inputs.provider }}": |
+        {{ .Inputs.api_key }}
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+  provider:
+    type: string
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    environment:
+      "NEW_{{ .Inputs.provider }}": |
+        {{ .Inputs.api_key }}
+x-piccolo:
+  mode: service
+`)
+	systemCtx := &InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	inputs := map[string]interface{}{
+		"api_key":  "stored-api-key",
+		"provider": "rendered-provider",
+	}
+	oldRefs, oldOK := manifestRenderedInputUsageRefs(oldRaw, inputs, systemCtx, nil, "api_key", map[string]struct{}{"provider": {}})
+	newRefs, newOK := manifestRenderedInputUsageRefs(newRaw, inputs, systemCtx, nil, "api_key", map[string]struct{}{"provider": {}})
+	if !oldOK || !newOK {
+		t.Fatalf("usage refs ok = old:%v new:%v", oldOK, newOK)
+	}
+	if slices.Equal(oldRefs, newRefs) {
+		t.Fatalf("usage refs should differ when dynamic parent key prefix changes: old=%v new=%v", oldRefs, newRefs)
+	}
+	joined := strings.Join(append(oldRefs, newRefs...), " ")
+	for _, leaked := range []string{"stored-api-key", "rendered-provider", "OLD_rendered-provider", "NEW_rendered-provider"} {
+		if strings.Contains(joined, leaked) {
+			t.Fatalf("usage refs leaked rendered value %q: old=%v new=%v", leaked, oldRefs, newRefs)
+		}
+	}
+	if !strings.Contains(joined, "<key") || !strings.Contains(joined, "#") {
+		t.Fatalf("usage refs = old:%v new:%v, want redacted key identity hash", oldRefs, newRefs)
+	}
+}
+
+func TestDryRunCustomManifestUpdateFailsClosedOnAmbiguousKeptSecretReuse(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  gemini_api_key:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      GEMINI_API_KEY: "{{ .Inputs.gemini_api_key }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  gemini_api_key:
+    type: password
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      NEW_GEMINI_API_KEY: "{{ .Inputs.gemini_api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    map[string]interface{}{"__app_address__": "piclu", "gemini_api_key": "stored-secret"},
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	installState := NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, map[string]interface{}{"__app_address__": "piclu", "gemini_api_key": "stored-secret"}, systemCtx, nil, false)
+	installState.RawTemplate = []byte("not: [valid")
+	installState.RawTemplateHash = Sha256Hex(installState.RawTemplate)
+	if err := state.StoreInstallState("piclu", installState); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if dryRun.Applicable {
+		t.Fatalf("dry run should reject ambiguous kept secret reuse: %+v", dryRun)
+	}
+	if !strings.Contains(dryRun.BlockingReason, "previous source schema unavailable") {
+		t.Fatalf("blocking reason = %q, want previous source schema unavailable", dryRun.BlockingReason)
+	}
+	if len(dryRun.KeptValueReview) != 1 {
+		t.Fatalf("kept value review = %+v, want one item", dryRun.KeptValueReview)
+	}
+	if dryRun.KeptValueReview[0].RiskKind != "kept_secret_semantic_changed" {
+		t.Fatalf("risk kind = %q, want kept_secret_semantic_changed", dryRun.KeptValueReview[0].RiskKind)
+	}
+}
+
+func TestDryRunCustomManifestUpdateSkipsKeptReviewForClearedStoredSecret(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	oldRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: password
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      API_KEY: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	newRaw := []byte(`type: user
+inputs:
+  api_key:
+    type: string
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      API_KEY: "{{ .Inputs.api_key }}"
+x-piccolo:
+  mode: service
+`)
+	systemCtx := InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"}
+	oldRes, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    map[string]interface{}{"__app_address__": "piclu", "api_key": "stored-secret"},
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render old manifest: %v", err)
+	}
+	now := time.Now().UTC()
+	if err := state.StoreApp(&AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     oldRes.Definition,
+	}); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCustom, "", oldRaw, map[string]interface{}{"__app_address__": "piclu", "api_key": "stored-secret"}, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store install state: %v", err)
+	}
+
+	dryRun, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   newRaw,
+		ClearInputs:   []string{"api_key"},
+		SystemContext: systemCtx,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if len(dryRun.KeptValueReview) != 0 {
+		t.Fatalf("kept value review = %+v, want none for cleared value", dryRun.KeptValueReview)
+	}
+	if slices.Contains(dryRun.Summary.WillPreserve, "current value for input api_key after review") {
+		t.Fatalf("summary incorrectly preserves cleared api_key: %+v", dryRun.Summary.WillPreserve)
+	}
+}
+
 func TestApplyCustomManifestUpdateConflictsOnStaleConfigLedger(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
@@ -3532,6 +5269,69 @@ func customManifestPolicyClone(t *testing.T, def *api.AppDefinition) *api.AppDef
 		t.Fatalf("parse clone: %v", err)
 	}
 	return clone
+}
+
+func customManifestKeptSecretRaw(label, description, envName string) []byte {
+	return []byte(fmt.Sprintf(`type: user
+inputs:
+  gemini_api_key:
+    type: password
+    label: %s
+    description: %s
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      %s: "{{ .Inputs.gemini_api_key }}"
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`, label, description, envName))
+}
+
+func customManifestReclassifiedSecretRaw(inputType string) []byte {
+	return []byte(fmt.Sprintf(`type: user
+inputs:
+  license:
+    type: %s
+    label: License
+    required: true
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      LICENSE: "{{ .Inputs.license }}"
+x-piccolo:
+  mode: service
+`, inputType))
 }
 
 func findManifestDecision(decisions []ManifestUpdateDecision, flag string) *ManifestUpdateDecision {

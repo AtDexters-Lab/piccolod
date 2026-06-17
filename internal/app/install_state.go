@@ -40,6 +40,7 @@ type InstallState struct {
 	PendingReason          string                `json:"pending_reason,omitempty"`
 	PendingReviewFlow      string                `json:"pending_review_flow,omitempty"`
 	InputProvenance        map[string]string     `json:"input_provenance,omitempty"`
+	InputSensitive         map[string]bool       `json:"input_sensitive,omitempty"`
 	IsLegacyBackfill       bool                  `json:"is_legacy_backfill,omitempty"`
 	InstallInputs          map[string]any        `json:"install_inputs,omitempty"`
 	InstallSystemCtx       *InstallSystemContext `json:"install_system_context,omitempty"`

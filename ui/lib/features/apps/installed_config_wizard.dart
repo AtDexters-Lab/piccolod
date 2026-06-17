@@ -16,13 +16,16 @@ class InstalledConfigWizard extends StatefulWidget {
     required this.appService,
     required this.onApplied,
     super.key,
+    this.pendingCatalogUpdate = false,
     this.onTaskStarted,
   });
 
   final String appId;
   final AppService appService;
   final Future<void> Function() onApplied;
-  final void Function(String taskId, String taskType)? onTaskStarted;
+  final bool pendingCatalogUpdate;
+  final void Function(String taskId, String taskType, String label)?
+  onTaskStarted;
 
   @override
   State<InstalledConfigWizard> createState() => _InstalledConfigWizardState();
@@ -55,7 +58,46 @@ bool installedConfigShouldSubmitPlainField(
   required bool changed,
 }) {
   if (changed) return true;
+  if (field.required && !field.present && field.display != null) return true;
   return field.type == 'boolean' && field.required && !field.present;
+}
+
+String installedConfigActionLabel(String action, InstalledConfigField field) {
+  switch (action) {
+    case 'keep':
+      return field.present ? 'Keep current value' : 'Leave unset';
+    case 'replace':
+      return field.present ? 'Replace value' : 'Set value';
+    case 'regenerate':
+      return field.generate && !field.present
+          ? 'Generate value'
+          : 'Regenerate value';
+    case 'clear':
+      return field.present ? 'Clear value' : 'Leave unset';
+    default:
+      return action;
+  }
+}
+
+String installedConfigEffectiveSecretAction(
+  InstalledConfigField field,
+  String? requested,
+) {
+  final actions = field.actions;
+  if (requested != null && (actions.isEmpty || actions.contains(requested))) {
+    return requested;
+  }
+
+  String preferred;
+  if (field.generate) {
+    preferred = field.present ? 'keep' : 'regenerate';
+  } else if (field.sensitive) {
+    preferred = field.present || !field.required ? 'keep' : 'replace';
+  } else {
+    preferred = 'keep';
+  }
+  if (actions.isEmpty || actions.contains(preferred)) return preferred;
+  return actions.first;
 }
 
 class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
@@ -112,11 +154,15 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
         _controllers[field.name] = TextEditingController(text: text);
         _initialText[field.name] = text;
         if (field.generate) {
-          _secretActions[field.name] = field.present ? 'keep' : 'regenerate';
+          _secretActions[field.name] = installedConfigEffectiveSecretAction(
+            field,
+            null,
+          );
         } else if (field.sensitive) {
-          _secretActions[field.name] = field.present || !field.required
-              ? 'keep'
-              : 'replace';
+          _secretActions[field.name] = installedConfigEffectiveSecretAction(
+            field,
+            null,
+          );
         }
       }
       if (!mounted) return;
@@ -169,7 +215,10 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
 
     for (final field in config.fields) {
       if (!field.editable) continue;
-      final action = _secretActions[field.name] ?? 'keep';
+      final action = installedConfigEffectiveSecretAction(
+        field,
+        _secretActions[field.name],
+      );
       if (field.generate) {
         if (action == 'regenerate') regenerateInputs.add(field.name);
         continue;
@@ -280,7 +329,11 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       _applyResponsePending = true;
       _applyTaskSucceeded = false;
     });
-    widget.onTaskStarted?.call(taskId, 'update_config');
+    widget.onTaskStarted?.call(
+      taskId,
+      'update_config',
+      widget.pendingCatalogUpdate ? 'Updating app' : 'Updating config',
+    );
     _revealTaskProgress();
     try {
       final result = await widget.appService.applyInstalledConfigUpdate(
@@ -355,7 +408,9 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('Edit Config'),
+      title: Text(
+        widget.pendingCatalogUpdate ? 'Continue App Update' : 'Edit Config',
+      ),
       content: SizedBox(
         width: 720,
         child: ConstrainedBox(
@@ -387,7 +442,11 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
                   height: 18,
                   child: CircularProgressIndicator(strokeWidth: 2),
                 ),
-          label: Text(_taskId == null ? 'Apply' : 'Applying'),
+          label: Text(
+            _taskId == null
+                ? (widget.pendingCatalogUpdate ? 'Apply Update' : 'Apply')
+                : (widget.pendingCatalogUpdate ? 'Updating...' : 'Applying...'),
+          ),
         ),
       ],
     );
@@ -409,6 +468,18 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       mainAxisSize: MainAxisSize.min,
       children: [
+        if (widget.pendingCatalogUpdate)
+          const Padding(
+            padding: EdgeInsets.only(bottom: Spacing.md),
+            child: _ConfigContextBanner(),
+          ),
+        if (widget.pendingCatalogUpdate) ...[
+          Text(
+            'Values needed for this update',
+            style: PiccoloTheme.textTheme.titleMedium,
+          ),
+          const SizedBox(height: Spacing.sm),
+        ],
         for (final warning in config.warnings)
           _Banner(
             icon: config.recoverable
@@ -438,7 +509,9 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   : const Icon(PiccoloIcons.search),
-              label: Text(_dryRunning ? 'Running Dry Run' : 'Dry Run'),
+              label: Text(
+                _dryRunning ? 'Previewing Changes' : 'Preview Changes',
+              ),
             ),
           ),
           if (_dryRunning || _dryRun != null) ...[
@@ -470,6 +543,9 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
             child: TaskProgressPanel(
               taskId: _taskId!,
               taskType: 'update_config',
+              label: widget.pendingCatalogUpdate
+                  ? 'Updating app'
+                  : 'Updating config',
               onComplete: (evt) => unawaited(_completeApply(evt)),
             ),
           ),
@@ -492,7 +568,11 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   Widget _buildField(InstalledConfigField field) {
     final label = field.label.isNotEmpty ? field.label : field.name;
     if (field.generate) {
-      return _buildActionField(field, label, const ['keep', 'regenerate']);
+      return _buildActionField(
+        field,
+        label,
+        field.present ? const ['keep', 'regenerate'] : const ['regenerate'],
+      );
     }
     if (field.sensitive) {
       final actions = field.actions.isNotEmpty
@@ -535,7 +615,10 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
     String label,
     List<String> actions,
   ) {
-    final currentAction = _secretActions[field.name] ?? actions.first;
+    final currentAction = installedConfigEffectiveSecretAction(
+      field,
+      _secretActions[field.name],
+    );
     final needsValue = currentAction == 'replace';
     return Padding(
       padding: const EdgeInsets.only(bottom: Spacing.sm),
@@ -550,7 +633,7 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
                 .map(
                   (action) => DropdownMenuItem<String>(
                     value: action,
-                    child: Text(_actionLabel(action)),
+                    child: Text(_actionLabel(action, field)),
                   ),
                 )
                 .toList(),
@@ -589,27 +672,40 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   }
 
   String _fieldSubtitle(InstalledConfigField field) {
+    final provenance = _provenanceLabel(field);
     final pieces = <String>[
       if (field.description.isNotEmpty) field.description,
-      field.provenance,
+      if (provenance.isNotEmpty) provenance,
       if (field.required) 'required',
     ];
     return pieces.join(' | ');
   }
 
-  String _actionLabel(String action) {
-    switch (action) {
-      case 'keep':
-        return 'Keep current value';
-      case 'replace':
-        return 'Replace value';
-      case 'regenerate':
-        return 'Regenerate value';
-      case 'clear':
-        return 'Clear value';
+  String _provenanceLabel(InstalledConfigField field) {
+    switch (field.provenance) {
+      case 'operator':
+        return field.sensitive
+            ? 'Stored secret will be kept and is not shown'
+            : 'Stored value will be kept';
+      case 'generated':
+        return 'Generated value will be kept';
+      case 'system':
+        return 'Locked current value';
+      case 'catalog_default':
+        return 'Default from the app catalog';
+      case 'legacy_unknown':
+        return 'Required once because this app predates stored config';
+      case 'absent_sensitive':
+        return 'No current value; leave unset or set a value';
+      case '':
+        return '';
       default:
-        return action;
+        return field.provenance;
     }
+  }
+
+  String _actionLabel(String action, InstalledConfigField field) {
+    return installedConfigActionLabel(action, field);
   }
 
   Widget _buildDryRunSummary(InstalledConfigUpdateResult result) {
@@ -663,7 +759,7 @@ class _DryRunStatusStrip extends StatelessWidget {
         : applicable
         ? PiccoloIcons.check
         : PiccoloIcons.error;
-    final text = running ? 'Running dry run...' : _summaryText(result);
+    final text = running ? 'Previewing changes...' : _summaryText(result);
 
     return Container(
       padding: const EdgeInsets.symmetric(
@@ -692,15 +788,15 @@ class _DryRunStatusStrip extends StatelessWidget {
 
   String _summaryText(InstalledConfigUpdateResult? result) {
     if (result == null) return '';
-    if (!result.applicable) return 'Dry run rejected';
+    if (!result.applicable) return 'Preview rejected';
     final summary = result.summary;
     final changeCount =
         result.actions.length +
         summary.willChange.length +
         summary.willRestart.length +
         summary.expectedInterruption.length;
-    if (changeCount == 0) return 'Dry run complete: no runtime changes';
-    return 'Dry run complete: $changeCount change${changeCount == 1 ? '' : 's'}';
+    if (changeCount == 0) return 'Preview ready: no runtime changes';
+    return 'Preview ready: $changeCount change${changeCount == 1 ? '' : 's'}';
   }
 }
 
@@ -780,6 +876,19 @@ class _Banner extends StatelessWidget {
           Expanded(child: Text(text)),
         ],
       ),
+    );
+  }
+}
+
+class _ConfigContextBanner extends StatelessWidget {
+  const _ConfigContextBanner();
+
+  @override
+  Widget build(BuildContext context) {
+    return const _Banner(
+      icon: PiccoloIcons.settings,
+      color: PiccoloTheme.cobalt600,
+      text: 'Update needs config values. Source: app catalog.',
     );
   }
 }

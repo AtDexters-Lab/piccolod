@@ -705,6 +705,48 @@ func TestGinAppAPI_FullLifecycle(t *testing.T) {
 	}
 }
 
+func TestGinAppUpdatePersistentDataSnapshotBlockReturnsConflict(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	srv := createGinTestServer(t, t.TempDir())
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	def := &api.AppDefinition{
+		Type:           "user",
+		PrimaryService: "main",
+		Listeners: []api.AppListener{{
+			Name:      "persistapp",
+			GuestPort: 80,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+			Primary:   true,
+		}},
+		Services: map[string]api.AppService{
+			"main": {
+				Image:     "alpine:3.18",
+				BindPorts: []int{80},
+				Storage: &api.AppStorage{Persistent: map[string]api.AppVolume{
+					"data": {Container: "/data"},
+				}},
+			},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	if _, err := srv.appManager.Install(context.Background(), def); err != nil {
+		t.Fatalf("install persistent app: %v", err)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(http.MethodPost, "/api/v1/apps/persistapp/update", nil)
+	attachAuth(req, sessionCookie, csrfToken)
+	srv.router.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("update status = %d, want %d body=%s", w.Code, http.StatusConflict, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "rollback snapshot required") {
+		t.Fatalf("update body = %s, want snapshot requirement", w.Body.String())
+	}
+}
+
 // TestGinAppAPI_Uninstall tests DELETE /api/v1/apps/:name endpoint with Gin
 func TestGinAppAPI_Uninstall(t *testing.T) {
 	gin.SetMode(gin.TestMode)

@@ -245,11 +245,13 @@ class AppDetail {
     this.listeners = const [],
     this.containers = const [],
     this.snapshotAvailable = false,
+    this.imageUpdateBlockedReason = '',
   });
   final App app;
   final List<ServiceEndpoint> listeners;
   final List<AppContainerStatus> containers;
   final bool snapshotAvailable;
+  final String imageUpdateBlockedReason;
 }
 
 class ManifestUpdateConfigureResult {
@@ -301,6 +303,10 @@ class ManifestUpdateInputField {
     required this.required,
     required this.generate,
     required this.locked,
+    this.sensitive = false,
+    this.hasCurrentValue = false,
+    this.currentValueSensitive = false,
+    this.currentValueDisplay = '',
   });
 
   factory ManifestUpdateInputField.fromJson(Map<String, dynamic> json) {
@@ -311,6 +317,10 @@ class ManifestUpdateInputField {
       required: json['required'] == true,
       generate: json['generate'] == true,
       locked: json['locked'] == true,
+      sensitive: json['sensitive'] == true,
+      hasCurrentValue: json['has_current_value'] == true,
+      currentValueSensitive: json['current_value_sensitive'] == true,
+      currentValueDisplay: (json['current_value_display'] ?? '').toString(),
     );
   }
   final String name;
@@ -319,6 +329,10 @@ class ManifestUpdateInputField {
   final bool required;
   final bool generate;
   final bool locked;
+  final bool sensitive;
+  final bool hasCurrentValue;
+  final bool currentValueSensitive;
+  final String currentValueDisplay;
 }
 
 class ManifestUpdateSummary {
@@ -398,6 +412,46 @@ class ManifestUpdateReviewItem {
   final String confirmation;
 }
 
+class ManifestUpdateKeptValueReviewItem {
+  const ManifestUpdateKeptValueReviewItem({
+    required this.field,
+    required this.riskKind,
+    required this.confirmation,
+    this.oldSemantic = const [],
+    this.newSemantic = const [],
+    this.semanticDelta = const [],
+    this.oldUsage = const [],
+    this.newUsage = const [],
+    this.blockingReason = '',
+  });
+
+  factory ManifestUpdateKeptValueReviewItem.fromJson(
+    Map<String, dynamic> json,
+  ) {
+    return ManifestUpdateKeptValueReviewItem(
+      field: (json['field'] ?? '').toString(),
+      riskKind: (json['risk_kind'] ?? '').toString(),
+      oldSemantic: _readStringList(json, 'old_semantic'),
+      newSemantic: _readStringList(json, 'new_semantic'),
+      semanticDelta: _readStringList(json, 'semantic_delta'),
+      oldUsage: _readStringList(json, 'old_usage'),
+      newUsage: _readStringList(json, 'new_usage'),
+      confirmation: (json['confirmation'] ?? '').toString(),
+      blockingReason: (json['blocking_reason'] ?? '').toString(),
+    );
+  }
+
+  final String field;
+  final String riskKind;
+  final List<String> oldSemantic;
+  final List<String> newSemantic;
+  final List<String> semanticDelta;
+  final List<String> oldUsage;
+  final List<String> newUsage;
+  final String confirmation;
+  final String blockingReason;
+}
+
 class ManifestUpdateDataSafetySummary {
   const ManifestUpdateDataSafetySummary({
     required this.snapshotRequired,
@@ -438,6 +492,7 @@ class ManifestUpdateResult {
     this.accessRepairMessage = '',
     this.decisions = const [],
     this.exposureReview = const [],
+    this.keptValueReview = const [],
     this.requiredConfirmations = const [],
     this.operationRiskFlags = const [],
     this.runtimeReadiness = const [],
@@ -451,6 +506,7 @@ class ManifestUpdateResult {
     final rawSummary = json['summary'];
     final rawDecisions = json['decisions'];
     final rawExposureReview = json['exposure_review'];
+    final rawKeptValueReview = json['kept_value_review'];
     final rawDataSafety = json['data_safety'];
     return ManifestUpdateResult(
       instanceId: (json['instance_id'] ?? '').toString(),
@@ -490,6 +546,16 @@ class ManifestUpdateResult {
                 )
                 .toList()
           : const [],
+      keptValueReview: rawKeptValueReview is List<dynamic>
+          ? rawKeptValueReview
+                .whereType<Map<dynamic, dynamic>>()
+                .map(
+                  (e) => ManifestUpdateKeptValueReviewItem.fromJson(
+                    Map<String, dynamic>.from(e),
+                  ),
+                )
+                .toList()
+          : const [],
       requiredConfirmations: _readStringList(json, 'required_confirmations'),
       operationRiskFlags: _readStringList(json, 'operation_risk_flags'),
       runtimeReadiness: _readStringList(json, 'runtime_readiness'),
@@ -518,6 +584,7 @@ class ManifestUpdateResult {
   final ManifestUpdateSummary summary;
   final List<ManifestUpdateDecision> decisions;
   final List<ManifestUpdateReviewItem> exposureReview;
+  final List<ManifestUpdateKeptValueReviewItem> keptValueReview;
   final List<String> requiredConfirmations;
   final List<String> operationRiskFlags;
   final List<String> runtimeReadiness;

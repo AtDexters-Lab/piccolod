@@ -600,7 +600,7 @@ func validateInputValue(name string, spec api.AppInput, val interface{}) error {
 		case string:
 			v := val.(string)
 			if v != "true" && v != "false" {
-				return fmt.Errorf("input '%s': expected boolean, got string %q", name, v)
+				return fmt.Errorf("input '%s': expected boolean, got string value", name)
 			}
 		default:
 			return fmt.Errorf("input '%s': expected boolean, got %T", name, val)
