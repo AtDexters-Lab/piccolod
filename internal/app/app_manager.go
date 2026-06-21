@@ -1291,6 +1291,12 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 			}
 			continue
 		}
+		if m.imageUpdateServiceRestoreBlocked(state, app.InstanceID) {
+			if m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(app.InstanceID)
+			}
+			continue
+		}
 		// Respect desired state: disabled apps should not have proxies restored.
 		if !app.Enabled {
 			if m.serviceManager != nil {
@@ -1335,6 +1341,24 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		}
 		m.configureOIDCAuthorizePaths(app.InstanceID, def)
 		m.serviceManager.SetAppContainerID(app.InstanceID, publishCID)
+	}
+}
+
+func (m *AppManager) imageUpdateServiceRestoreBlocked(state *FilesystemStateManager, instanceID string) bool {
+	txn, err := state.LoadImageUpdateTransaction(instanceID)
+	if errors.Is(err, os.ErrNotExist) {
+		return false
+	}
+	if err != nil {
+		log.Printf("WARN: restore services: image update transaction unreadable for %s: %v", instanceID, err)
+		return true
+	}
+	switch txn.Phase {
+	case imageUpdatePhaseCommitted, imageUpdatePhaseCleanupPending:
+		return false
+	default:
+		log.Printf("INFO: restore services: skipping %s while image update recovery owns phase %s", instanceID, txn.Phase)
+		return true
 	}
 }
 
@@ -1385,6 +1409,7 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
+	imageUpdateBlocked := m.recoverPendingImageUpdates(ctx, state)
 	manifestUpdateBlocked := m.recoverPendingManifestUpdates(ctx, state)
 
 	// Clean up orphaned per-app users on first reconciliation.
@@ -1403,6 +1428,9 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 			return
 		}
 		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
+			continue
+		}
+		if imageUpdateBlocked[appInst.InstanceID] {
 			continue
 		}
 		if manifestUpdateBlocked[appInst.InstanceID] {
@@ -2150,6 +2178,16 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	if !exists {
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
+	if recovered, recoverErr := m.recoverPendingImageUpdateForApp(ctx, state, app); recoverErr != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recover pending image update before start: %w", recoverErr)
+	} else if recovered {
+		var ok bool
+		app, ok = state.GetApp(instanceID)
+		if !ok {
+			return fmt.Errorf("app instance not found after image update recovery: %s", instanceID)
+		}
+	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
@@ -2168,6 +2206,26 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 
 	// Unified start path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting containers", false, nil)
+	if strings.TrimSpace(app.NetworkAnchorID) == "" {
+		app.Enabled = true
+		if err := state.UpdateAppEnabled(instanceID, true); err != nil {
+			log.Printf("WARN: start %s: failed to persist enabled state before recovery recreate: %v", instanceID, err)
+		}
+		bn, rootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app)
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+		if stopErr := m.stopContainersForMultiApp(ctx, app, def, runtime); stopErr != nil {
+			log.Printf("WARN: start %s: pre-recreate stop failed: %v", instanceID, stopErr)
+		}
+		if removeErr := m.removeContainersForMultiApp(ctx, app, def, runtime); removeErr != nil {
+			log.Printf("WARN: start %s: pre-recreate remove failed: %v", instanceID, removeErr)
+		}
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
+		return m.recreateMissingMultiContainer(ctx, state, app, def, layout, runtime, bn)
+	}
 	return m.startContainerGroup(ctx, state, app, def, layout, runtime)
 }
 
@@ -2635,16 +2693,32 @@ func (m *AppManager) updateServiceModeImage(
 	layout appVolumeLayout,
 	runtime container.PodmanRuntime,
 	updatedImages map[string]string, // svcName → newImage (only changed services)
-) error {
+) (err error) {
 	instanceID := appInst.InstanceID
 	curDef := appInst.Definition
 	primary := primaryServiceFor(newDef, appInst)
 	mode := piccoloModeFromExtensions(newDef.Extensions)
 	rollbackSnapshotRequired := appHasPersistentStorage(newDef)
+	var imageTxn *ImageUpdateTransaction
+	var plannedTupleState *TupleState
 
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return fmt.Errorf("rootfs volume manager not configured")
+	}
+	if rollbackSnapshotRequired {
+		imageTxn, plannedTupleState, err = m.planImageUpdateRollbackTransaction(ctx, state, appInst, primary)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err == nil || imageTxn == nil || imageTxn.RuntimeSwitchStarted {
+				return
+			}
+			if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
+				log.Printf("WARN: update %s: clear pre-switch image update transaction: %v", instanceID, clearErr)
+			}
+		}()
 	}
 
 	// Create ephemeral runtime for image pull + inspect (digest derivation).
@@ -2713,7 +2787,6 @@ func (m *AppManager) updateServiceModeImage(
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseCreatingRootfs, 30, "Creating root filesystem", false, nil)
 
 	// 3. For each changed service: create new rootfs (idempotent, while still running).
-	var err error
 	for i := range changed {
 		cs := &changed[i]
 		if rootfs.RootfsExists(cs.volumeID) {
@@ -2746,6 +2819,20 @@ func (m *AppManager) updateServiceModeImage(
 			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
 		}
 	}
+	restartPreviousRuntime := func(cause error) error {
+		detachStagedChangedRootfs()
+		if restartErr := m.startContainerGroup(ctx, state, appInst, curDef, layout, runtime); restartErr != nil {
+			m.setObservedStatus(instanceID, StatusError)
+			return errors.Join(cause, fmt.Errorf("restart previous runtime: %w", restartErr))
+		}
+		m.setObservedStatus(instanceID, StatusRunning)
+		if imageTxn != nil && !imageTxn.CandidateDataRisk && !imageTxn.CommitIntent {
+			if clearErr := m.clearImageUpdatePreCandidateAbort(ctx, state, instanceID, imageTxn); clearErr != nil {
+				return errors.Join(cause, fmt.Errorf("clear pre-candidate image update transaction: %w", clearErr))
+			}
+		}
+		return cause
+	}
 
 	// 4. Read image config from golden LV for each changed service.
 	for i := range changed {
@@ -2757,12 +2844,28 @@ func (m *AppManager) updateServiceModeImage(
 			cs.imgConfig = goldenCfg
 		}
 	}
+	if rollbackSnapshotRequired {
+		if checker, ok := m.currentVolumeManager().(dataSnapshotViabilityChecker); ok {
+			if err := checker.CheckDataSnapshotViability(ctx, instanceID); err != nil {
+				detachStagedChangedRootfs()
+				return fmt.Errorf("%w: image refresh rollback snapshot viability: %v", ErrImageUpdateRejected, err)
+			}
+		}
+	}
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseStopping, 50, "Stopping containers", false, nil)
 
 	// 5. Stop ALL containers (services in reverse dep order, then anchor).
 	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
 		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
+	}
+	if imageTxn != nil {
+		imageTxn.Phase = imageUpdatePhaseRuntimeSwitch
+		imageTxn.RuntimeSwitchStarted = true
+		imageTxn.LastError = ""
+		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
+			return restartPreviousRuntime(fmt.Errorf("store image update runtime switch marker: %w", storeErr))
+		}
 	}
 
 	var tupleState *TupleState
@@ -2772,20 +2875,59 @@ func (m *AppManager) updateServiceModeImage(
 
 		// 6. Tuple snapshot: capture pre-update state for rollback.
 		var snapshotErr error
-		tupleState, snapshotOK, snapshotErr = m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary)
+		tupleState, snapshotOK, snapshotErr = m.snapshotTupleBeforeUpdate(ctx, state, appInst, primary, imageTxn, plannedTupleState)
 		if !snapshotOK {
 			if snapshotErr == nil {
 				snapshotErr = fmt.Errorf("snapshot was not created")
 			}
 			err := fmt.Errorf("create rollback snapshot for image refresh: %w", snapshotErr)
 			log.Printf("WARN: update %s: %v", instanceID, err)
+			return restartPreviousRuntime(err)
+		}
+	}
+
+	// Build rootfs map: changed services use new rootfs, unchanged use existing.
+	changedMap := make(map[string]*rootfsMountInfo, len(changed))
+	for i := range changed {
+		cs := &changed[i]
+		changedMap[cs.svcName] = &rootfsMountInfo{handle: cs.handle, imgConfig: cs.imgConfig}
+	}
+
+	// Attach unchanged service rootfs volumes.
+	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
+	if err != nil {
+		return restartPreviousRuntime(fmt.Errorf("update %s: attach unchanged rootfs: %w", instanceID, err))
+	}
+
+	// Merge: changed services override unchanged.
+	prebuiltRootfs := make(map[string]*rootfsMountInfo, len(newDef.Services))
+	for svcName, info := range unchangedRootfs {
+		prebuiltRootfs[svcName] = info
+	}
+	for svcName, info := range changedMap {
+		prebuiltRootfs[svcName] = info
+	}
+	candidateActiveRootfs := cloneStringMap(appInst.ActiveRootfs)
+	if candidateActiveRootfs == nil {
+		candidateActiveRootfs = map[string]string{}
+	}
+	for _, cs := range changed {
+		candidateActiveRootfs[cs.svcName] = cs.volumeID
+	}
+	if imageTxn != nil {
+		imageTxn.Phase = imageUpdatePhaseCandidateDataRisk
+		imageTxn.CandidateDataRisk = true
+		imageTxn.CandidateActiveRootfs = cloneStringMap(candidateActiveRootfs)
+		imageTxn.LastError = ""
+		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
+			return restartPreviousRuntime(fmt.Errorf("store image update candidate data risk marker: %w", storeErr))
+		}
+		imageTxn.Phase = imageUpdatePhaseCommitIntent
+		imageTxn.CommitIntent = true
+		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
 			detachStagedChangedRootfs()
-			if restartErr := m.startContainerGroup(ctx, state, appInst, curDef, layout, runtime); restartErr != nil {
-				m.setObservedStatus(instanceID, StatusError)
-				return errors.Join(err, fmt.Errorf("restart previous runtime after snapshot failure: %w", restartErr))
-			}
-			m.setObservedStatus(instanceID, StatusRunning)
-			return err
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("store image update commit intent after candidate data risk marker: %w", storeErr)
 		}
 	}
 
@@ -2799,33 +2941,6 @@ func (m *AppManager) updateServiceModeImage(
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseRecreatingContainer, 70, "Recreating containers", false, nil)
 
 	// 8. Recreate ALL containers (anchor + services in start order).
-	// Build rootfs map: changed services use new rootfs, unchanged use existing.
-	changedMap := make(map[string]*rootfsMountInfo, len(changed))
-	for i := range changed {
-		cs := &changed[i]
-		changedMap[cs.svcName] = &rootfsMountInfo{handle: cs.handle, imgConfig: cs.imgConfig}
-	}
-
-	// Attach unchanged service rootfs volumes.
-	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
-	if err != nil {
-		// Unchanged rootfs attach failed — abort to prevent metadata/rootfs mismatch.
-		// Detach new rootfs volumes; reconciler handles recovery using old definition.
-		for _, cs := range changed {
-			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
-		}
-		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("update %s: attach unchanged rootfs: %w", instanceID, err)
-	}
-
-	// Merge: changed services override unchanged.
-	prebuiltRootfs := make(map[string]*rootfsMountInfo, len(newDef.Services))
-	for svcName, info := range unchangedRootfs {
-		prebuiltRootfs[svcName] = info
-	}
-	for svcName, info := range changedMap {
-		prebuiltRootfs[svcName] = info
-	}
 
 	// Get current service endpoints (ports should not change during update).
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
@@ -2865,6 +2980,12 @@ func (m *AppManager) updateServiceModeImage(
 	appInst.NetworkAnchorID = result.NetworkAnchorID
 	appInst.Containers = result.Containers
 	appInst.UpdatedAt = time.Now()
+	if imageTxn != nil {
+		imageTxn.CandidatePrimaryService = result.PrimaryService
+		imageTxn.CandidateNetworkAnchorID = result.NetworkAnchorID
+		imageTxn.CandidateContainers = cloneStringMap(result.Containers)
+		_ = state.StoreImageUpdateTransaction(instanceID, imageTxn)
+	}
 	if err := state.StoreApp(appInst); err != nil {
 		// Best-effort cleanup: remove containers created by installContainerGroup
 		// to prevent unmanaged containers running with stale on-disk metadata.
@@ -2880,7 +3001,25 @@ func (m *AppManager) updateServiceModeImage(
 
 	// 10. Post-update: record new active generation (only when snapshot exists for rollback).
 	if tupleState != nil && snapshotOK {
-		m.recordPostUpdateGeneration(state, appInst, tupleState)
+		if err := m.recordPostUpdateGeneration(state, appInst, tupleState); err != nil {
+			if imageTxn != nil {
+				imageTxn.Phase = imageUpdatePhaseCommitIntent
+				imageTxn.CommitIntent = true
+				imageTxn.LastError = fmt.Sprintf("record post-update generation: %v", err)
+				_ = state.StoreImageUpdateTransaction(instanceID, imageTxn)
+			}
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("record post-update generation: %w", err)
+		}
+	}
+	if imageTxn != nil {
+		imageTxn.Phase = imageUpdatePhaseCommitted
+		imageTxn.LastError = ""
+		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
+			log.Printf("WARN: update %s: mark image update committed: %v", instanceID, storeErr)
+		} else if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
+			log.Printf("WARN: update %s: clear committed image update transaction: %v", instanceID, clearErr)
+		}
 	}
 
 	m.setObservedStatus(instanceID, StatusRunning)
@@ -2893,14 +3032,21 @@ func (m *AppManager) updateServiceModeImage(
 func (m *AppManager) snapshotTupleBeforeUpdate(
 	ctx context.Context, state *FilesystemStateManager,
 	appInst *AppInstance, primary string,
+	imageTxn *ImageUpdateTransaction, plannedState *TupleState,
 ) (tupleState *TupleState, snapshotOK bool, err error) {
 	instanceID := appInst.InstanceID
+	if imageTxn == nil {
+		return nil, false, fmt.Errorf("image update transaction required")
+	}
 
 	// Load or create TupleState.
-	ts, err := state.LoadTupleState(instanceID)
-	if err != nil {
-		log.Printf("WARN: update %s: load tuple state: %v", instanceID, err)
-		return nil, false, fmt.Errorf("load tuple state: %w", err)
+	ts := plannedState
+	if ts == nil {
+		ts, err = state.LoadTupleState(instanceID)
+		if err != nil {
+			log.Printf("WARN: update %s: load tuple state: %v", instanceID, err)
+			return nil, false, fmt.Errorf("load tuple state: %w", err)
+		}
 	}
 	if ts == nil {
 		ts = &TupleState{
@@ -2913,14 +3059,19 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 	// The data volume may have accumulated writes since the last snapshot, so reusing an old one
 	// would lose data on rollback (e.g., update retry after partial failure).
 
-	// Allocate generation ID.
-	genID := ts.AllocateGenerationID()
-	// Extract generation number from ID for LV naming.
-	genNumber := ts.NextGenNumber - 1
+	genID := imageTxn.SnapshotGenerationID
+	if strings.TrimSpace(genID) == "" {
+		genID = fmt.Sprintf("gen-%d", imageTxn.SnapshotGenerationNumber)
+	}
+	snapshotLVName := strings.TrimSpace(imageTxn.SnapshotLVName)
+	if snapshotLVName == "" {
+		snapshotLVName = DataSnapshotLVName(instanceID, imageTxn.SnapshotGenerationNumber)
+	}
 
 	// Capture current rootfs state.
-	rootfsVolIDs := make(map[string]string)
+	rootfsVolIDs := cloneStringMap(imageTxn.PreviousActiveRootfs)
 	if appInst.ActiveRootfs != nil {
+		rootfsVolIDs = make(map[string]string)
 		for k, v := range appInst.ActiveRootfs {
 			rootfsVolIDs[k] = v
 		}
@@ -2930,7 +3081,6 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 	}
 
 	// Snapshot data volume.
-	snapshotLVName := DataSnapshotLVName(instanceID, genNumber)
 	dataSnapshotName := ""
 	if snapshotter, ok := m.currentVolumeManager().(dataVolumeSnapshotter); ok {
 		if snapErr := snapshotter.SnapshotDataVolume(ctx, instanceID, snapshotLVName); snapErr != nil {
@@ -2940,6 +3090,12 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 			dataSnapshotName = snapshotLVName
 			snapshotOK = true
 			log.Printf("INFO: update %s: data snapshot created: %s", instanceID, snapshotLVName)
+			imageTxn.Phase = imageUpdatePhaseSnapshotCreated
+			imageTxn.LastError = ""
+			if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
+				log.Printf("WARN: update %s: mark image update snapshot created: %v", instanceID, storeErr)
+				return ts, false, fmt.Errorf("mark image update snapshot created: %w", storeErr)
+			}
 		}
 	} else {
 		log.Printf("WARN: update %s: volume manager does not support snapshots", instanceID)
@@ -2990,6 +3146,11 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 		if cleanupErr != nil {
 			return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), cleanupErr)
 		}
+		if imageTxn != nil {
+			if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
+				return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), fmt.Errorf("clear image update transaction after snapshot cleanup: %w", clearErr))
+			}
+		}
 		return ts, false, fmt.Errorf("persist tuple state: %w", storeErr)
 	}
 
@@ -2997,7 +3158,7 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 }
 
 // recordPostUpdateGeneration records the new active generation after a successful update.
-func (m *AppManager) recordPostUpdateGeneration(state *FilesystemStateManager, appInst *AppInstance, ts *TupleState) {
+func (m *AppManager) recordPostUpdateGeneration(state *FilesystemStateManager, appInst *AppInstance, ts *TupleState) error {
 	genID := ts.AllocateGenerationID()
 
 	rootfsVolIDs := make(map[string]string)
@@ -3016,8 +3177,9 @@ func (m *AppManager) recordPostUpdateGeneration(state *FilesystemStateManager, a
 	ts.CurrentGeneration = genID
 
 	if err := state.StoreTupleState(appInst.InstanceID, ts); err != nil {
-		log.Printf("WARN: update %s: persist post-update generation: %v", appInst.InstanceID, err)
+		return fmt.Errorf("persist post-update generation: %w", err)
 	}
+	return nil
 }
 
 // mapsEqual compares two string maps for equality.
@@ -3053,6 +3215,16 @@ func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) 
 	if !exists {
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
+	if recovered, recoverErr := m.recoverPendingImageUpdateForApp(ctx, state, appInst); recoverErr != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recover pending image update before rollback: %w", recoverErr)
+	} else if recovered {
+		var ok bool
+		appInst, ok = state.GetApp(instanceID)
+		if !ok {
+			return fmt.Errorf("app instance not found after image update recovery: %s", instanceID)
+		}
+	}
 	return m.rollbackToSnapshotLocked(ctx, state, appInst)
 }
 
@@ -3060,6 +3232,11 @@ func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) 
 func (m *AppManager) HasSnapshotAvailable(ctx context.Context, instanceID string) bool {
 	state, err := m.ensureStateManager()
 	if err != nil {
+		return false
+	}
+	if txn, err := state.LoadImageUpdateTransaction(instanceID); err == nil && txn != nil {
+		return false
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return false
 	}
 	ts, err := state.LoadTupleState(instanceID)
@@ -3126,12 +3303,17 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 		activeGen := ts.ActiveGeneration()
 		failedGenNumber := ts.NextGenNumber - 1
 		if activeGen != nil {
-			if n, _ := fmt.Sscanf(activeGen.ID, "gen-%d", &failedGenNumber); n != 1 {
+			if parsed, ok := parseTupleGenerationNumber(activeGen.ID); ok {
+				failedGenNumber = parsed
+			} else {
 				log.Printf("WARN: rollback %s: could not parse gen number from %q, using fallback %d",
 					instanceID, activeGen.ID, failedGenNumber)
 			}
 		}
-		failedLVName := FailedDataLVName(instanceID, failedGenNumber)
+		failedLVName, err := m.allocateFailedDataLVName(ctx, state, instanceID, failedGenNumber, ts)
+		if err != nil {
+			return fmt.Errorf("allocate failed data LV name: %w", err)
+		}
 
 		renamesCommitted, snapshotPromoted, rollbackErr := rollbacker.RollbackDataVolume(ctx, instanceID, snap.DataSnapshot, failedLVName)
 		if rollbackErr != nil && !renamesCommitted {

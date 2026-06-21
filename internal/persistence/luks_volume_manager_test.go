@@ -685,15 +685,16 @@ func TestReconcileOrphanLVs(t *testing.T) {
 	// Stub lvs output: mix of known, orphan, snapshot, and failed-rollback LVs.
 	// Format: lv_name  lv_size  lv_attr  pool_lv
 	lvsOutput := strings.Join([]string{
-		"  eph-scratch       53687091200  Vwi-a-tz--  thinpool",           // known (has metadata)
-		"  vol-app-myapp     10737418240  Vwi-a-tz--  thinpool",           // known (has metadata)
-		"  golden-abc123     3221225472   Vwi---tz--  thinpool",           // known (has metadata)
-		"  eph-orphan        53687091200  Vwi---tz--  thinpool",           // orphan — should be removed
-		"  ws-old-install    5368709120   Vwi-a-tz--  thinpool",           // orphan (active) — should be deactivated + removed
-		"  snap-app-myapp--gen1  10737418240  Vwi---tz--  thinpool",       // tuple snapshot — skip
-		"  vol-app-myapp--failed-gen2  10737418240  Vwi---tz--  thinpool", // tuple failed rollback — skip
-		"  thinpool          214748364800  twi-a-t---  ",                  // thin pool itself — skip
-		"  foreign-lv        1073741824   -wi-a-----  ",                   // not in pool — ListLVs filters it
+		"  eph-scratch       53687091200  Vwi-a-tz--  thinpool",                   // known (has metadata)
+		"  vol-app-myapp     10737418240  Vwi-a-tz--  thinpool",                   // known (has metadata)
+		"  golden-abc123     3221225472   Vwi---tz--  thinpool",                   // known (has metadata)
+		"  eph-orphan        53687091200  Vwi---tz--  thinpool",                   // orphan — should be removed
+		"  ws-old-install    5368709120   Vwi-a-tz--  thinpool",                   // orphan (active) — should be deactivated + removed
+		"  snap-app-myapp--gen1  10737418240  Vwi---tz--  thinpool",               // tuple snapshot — skip
+		"  vol-app-myapp--failed-gen2  10737418240  Vwi---tz--  thinpool",         // tuple failed rollback — skip
+		"  vol-app-myapp--failed-manifest-op1  10737418240  Vwi---tz--  thinpool", // manifest failed rollback — skip
+		"  thinpool          214748364800  twi-a-t---  ",                          // thin pool itself — skip
+		"  foreign-lv        1073741824   -wi-a-----  ",                           // not in pool — ListLVs filters it
 	}, "\n")
 
 	lvsKey := testutil.BuildKey("lvs", []string{
@@ -794,6 +795,51 @@ func TestReconcileOrphanLVs(t *testing.T) {
 			if strings.Contains(call, "vol-app-myapp--failed-gen2") {
 				t.Error("tuple failed rollback LV should not be removed")
 			}
+			if strings.Contains(call, "vol-app-myapp--failed-manifest-op1") {
+				t.Error("manifest failed rollback LV should not be removed")
+			}
+		}
+	}
+}
+
+func TestListAppDataRollbackArtifacts(t *testing.T) {
+	lvsOutput := strings.Join([]string{
+		"  snap-app-piclu--gen1  10737418240  Vwi---tz--  thinpool",
+		"  snap-app-piclu--manifest-op1  10737418240  Vwi---tz--  thinpool",
+		"  vol-app-piclu--failed-gen2  10737418240  Vwi---tz--  thinpool",
+		"  vol-app-piclu--failed-manifest-op1  10737418240  Vwi---tz--  thinpool",
+		"  snap-app-other--gen1  10737418240  Vwi---tz--  thinpool",
+		"  vol-app-piclu  10737418240  Vwi-a-tz--  thinpool",
+	}, "\n")
+	lvsKey := testutil.BuildKey("lvs", []string{
+		"--noheadings", "--nosuffix", "--units", "b",
+		"-o", "lv_name,lv_size,lv_attr,pool_lv",
+		lvm.DefaultVGName,
+	})
+	run := &fakeRunner{Outputs: map[string]string{lvsKey: lvsOutput}}
+	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+	mgr := &luksVolumeManager{run: run, lvMgr: lvMgr}
+
+	got, err := mgr.ListAppDataRollbackArtifacts(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("ListAppDataRollbackArtifacts: %v", err)
+	}
+	want := map[string]bool{
+		"snap-app-piclu--gen1":               false,
+		"snap-app-piclu--manifest-op1":       false,
+		"vol-app-piclu--failed-gen2":         false,
+		"vol-app-piclu--failed-manifest-op1": false,
+	}
+	for _, name := range got {
+		if _, ok := want[name]; ok {
+			want[name] = true
+		} else {
+			t.Fatalf("unexpected artifact %q in %v", name, got)
+		}
+	}
+	for name, seen := range want {
+		if !seen {
+			t.Fatalf("missing artifact %q in %v", name, got)
 		}
 	}
 }
@@ -849,6 +895,46 @@ func TestRollbackDataVolumeResumesPartialRenameState(t *testing.T) {
 	}
 	if !foundRename {
 		t.Fatalf("resumed rollback did not promote snapshot, calls=%v", calls)
+	}
+}
+
+func TestRollbackDataVolumeResumesCompletedRenameState(t *testing.T) {
+	paths.SetRootsForTest(t)
+	activeLV := "vol-app-piclu"
+	snapshotLV := "snap-app-piclu--gen1"
+	failedLV := "vol-app-piclu--failed-gen1"
+	run := &fakeRunner{
+		Errs: map[string]error{
+			testutil.BuildKey("lvs", []string{"--noheadings", lvm.DefaultVGName + "/" + snapshotLV}): errors.New("snapshot LV missing"),
+		},
+	}
+	lvMgr := lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+	mgr := &luksVolumeManager{
+		run:              run,
+		lvMgr:            lvMgr,
+		kernelSnapshotFn: staticSnapshot(newSnap().build()),
+	}
+	metaDir := paths.VolumeMetaDir("app-piclu")
+	if err := os.MkdirAll(metaDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	meta := `{"version":2,"type":"luks-thinlv","wrapped_key":"wrapped","nonce":"nonce","lv_name":"` + activeLV + `","vg_name":"` + lvm.DefaultVGName + `","size_bytes":1073741824,"fs_type":"ext4"}`
+	if err := os.WriteFile(filepath.Join(metaDir, metadataV2File), []byte(meta), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	renamesCommitted, snapshotPromoted, _ := mgr.RollbackDataVolume(context.Background(), "piclu", snapshotLV, failedLV)
+	if !renamesCommitted || !snapshotPromoted {
+		t.Fatalf("rollback result = committed:%v promoted:%v, want true/true", renamesCommitted, snapshotPromoted)
+	}
+	calls := run.GetCalls()
+	for _, call := range calls {
+		if strings.Contains(call, "lvrename "+lvm.DefaultVGName+" "+activeLV+" "+failedLV) {
+			t.Fatalf("completed rollback retried active->failed rename: %v", calls)
+		}
+		if strings.Contains(call, "lvrename "+lvm.DefaultVGName+" "+snapshotLV+" "+activeLV) {
+			t.Fatalf("completed rollback retried consumed snapshot promotion: %v", calls)
+		}
 	}
 }
 

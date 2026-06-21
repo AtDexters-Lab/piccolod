@@ -17,6 +17,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> image-update-rollback # stage 20: image refresh rollback artifact lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
@@ -958,6 +959,222 @@ except: print('')" 2>/dev/null)
 
   cleanup_code=$(delete_app_if_present "$APP_NAME")
   check "19.14" "Resize test app uninstalled" "$cleanup_code" "200"
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 20: Image Refresh Rollback Artifact Lifecycle
+# ─────────────────────────────────────────────────────────
+stage20_wait_app_absent() {
+  local app_name="$1"
+  local code
+  for i in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$app_name" 2>/dev/null || true)
+    [[ "$code" == "404" ]] && return 0
+    sleep 2
+  done
+  return 1
+}
+
+stage20_rollback_lv_pattern() {
+  local app_name="$1"
+  printf '^(snap-app-%s--gen[0-9]+|snap-app-%s--manifest-.+|vol-app-%s--failed-gen[0-9]+|vol-app-%s--failed-manifest-.+)$' \
+    "$app_name" "$app_name" "$app_name" "$app_name"
+}
+
+stage20_list_test_rollback_lvs() {
+  local app_name="$1"
+  local pattern
+  pattern=$(stage20_rollback_lv_pattern "$app_name")
+  vssh "lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+\$//' | grep -E '$pattern' || true" 2>/dev/null
+}
+
+stage20_cleanup_test_rollback_lvs_if_absent() {
+  local app_name="$1"
+  local pattern
+  pattern=$(stage20_rollback_lv_pattern "$app_name")
+  stage20_wait_app_absent "$app_name" || return 1
+  vssh "for lv in \$(lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+\$//' | grep -E '$pattern' || true); do lvremove -y piccolo-data-vg/\$lv >/dev/null 2>&1 || exit 1; done" >/dev/null 2>&1
+}
+
+stage_image_update_rollback() {
+  echo -e "\n${CYAN}═══ Stage 20: Image Refresh Rollback Artifact Lifecycle ═══${NC}"
+  ensure_session
+
+  local APP_NAME="imageupdatetest"
+  local APP_VOLUME_ID="app-$APP_NAME"
+  local LV_NAME="vol-$APP_VOLUME_ID"
+  local STALE_SNAPSHOT="snap-app-$APP_NAME--gen1"
+  local EXPECTED_SNAPSHOT="snap-app-$APP_NAME--gen2"
+  local TXN_PATH="/piccolo-core/mounts/control-plane/apps/$APP_NAME/image_update_transaction.json"
+  local GENERATIONS_PATH="/piccolo-core/mounts/control-plane/apps/$APP_NAME/generations.json"
+
+  local cleanup_code
+  cleanup_code=$(delete_app_if_present "$APP_NAME")
+  if [[ "$cleanup_code" == "200" ]]; then
+    echo -e "  ${CYAN}INFO${NC} Removed existing $APP_NAME before image-refresh rollback regression"
+  elif [[ "$cleanup_code" != "404" ]]; then
+    echo -e "  ${RED}FAIL${NC} [20.0] Could not remove existing $APP_NAME before image-refresh rollback regression (HTTP $cleanup_code)"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  if ! stage20_cleanup_test_rollback_lvs_if_absent "$APP_NAME"; then
+    echo -e "  ${RED}FAIL${NC} [20.0] Existing $APP_NAME was not absent, or test rollback LV cleanup failed"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  local template_yaml
+  template_yaml=$(cat <<'EOF'
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+
+services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+    storage:
+      persistent:
+        data:
+          container: /data
+          size_limit: 1GB
+
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+
+x-piccolo:
+  mode: service
+EOF
+)
+
+  local payload
+  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': os.environ['NAME']},
+    'catalog_source': 'none'
+}))")
+
+  local token install_http
+  token=$(csrf)
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 300 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  check "20.1" "Image-refresh rollback test app installed" "$install_http" "201"
+  if [[ "$install_http" != "201" ]]; then
+    dump_logs "stage20-install-fail"
+    return
+  fi
+
+  local app_status=""
+  for i in $(seq 1 90); do
+    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except: print('')" 2>/dev/null)
+    [[ "$app_status" == "running" ]] && break
+    sleep 2
+  done
+  check "20.2" "Image-refresh rollback test app reaches running" "$app_status" "running"
+  if [[ "$app_status" != "running" ]]; then
+    dump_logs "stage20-running-fail"
+    delete_app_if_present "$APP_NAME" >/dev/null
+    return
+  fi
+
+  check_ssh_ok "20.3" "Active app data LV exists before planted stale snapshot" \
+    "lvs piccolo-data-vg/$LV_NAME --noheadings -o lv_name | grep -q '$LV_NAME'"
+  check_ssh_ok "20.4" "Planted stale rollback snapshot LV" \
+    "lvcreate --snapshot --name '$STALE_SNAPSHOT' --setactivationskip n piccolo-data-vg/$LV_NAME"
+
+  local resp_file update_code update_resp
+  resp_file=$(mktemp /tmp/claude-1000/image-update-resp-XXXXXX)
+  token=$(csrf)
+  update_code=$(curl -s -o "$resp_file" -w '%{http_code}' --connect-timeout 30 --max-time 300 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    "http://$IP/api/v1/apps/$APP_NAME/update" 2>/dev/null)
+  update_resp=$(cat "$resp_file" 2>/dev/null || true)
+  rm -f "$resp_file"
+  check "20.5" "Image refresh succeeds with stale rollback artifact present" "$update_code" "200"
+  if [[ "$update_code" != "200" ]]; then
+    echo "       response: $(echo "$update_resp" | head -c 200)"
+    dump_logs "stage20-update-fail"
+    delete_app_if_present "$APP_NAME" >/dev/null
+    if ! stage20_cleanup_test_rollback_lvs_if_absent "$APP_NAME"; then
+      local remaining_lvs
+      remaining_lvs=$(stage20_list_test_rollback_lvs "$APP_NAME")
+      if [[ -n "$remaining_lvs" ]]; then
+        echo "       remaining test-owned rollback artifacts after failed update:"
+        while IFS= read -r line; do echo "       $line"; done <<< "$remaining_lvs"
+      fi
+      vssh "lvremove -y piccolo-data-vg/$STALE_SNAPSHOT >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+    fi
+    return
+  fi
+
+  app_status=""
+  for i in $(seq 1 60); do
+    app_status=$(api "/api/v1/apps/$APP_NAME" | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except: print('')" 2>/dev/null)
+    [[ "$app_status" == "running" ]] && break
+    sleep 2
+  done
+  check "20.6" "App remains running after image refresh" "$app_status" "running"
+  check_ssh_ok "20.7" "Image refresh routed around stale gen1 and created gen2 snapshot" \
+    "lvs piccolo-data-vg/$EXPECTED_SNAPSHOT --noheadings -o lv_name | grep -q '$EXPECTED_SNAPSHOT'"
+  check_ssh_ok "20.8" "Stale gen1 rollback snapshot was not clobbered" \
+    "lvs piccolo-data-vg/$STALE_SNAPSHOT --noheadings -o lv_name | grep -q '$STALE_SNAPSHOT'"
+  check_ssh_ok "20.9" "Image update transaction cleared after successful refresh" \
+    "test ! -e '$TXN_PATH'"
+
+  local tuple_snapshot
+  tuple_snapshot=$(vssh "python3 -c 'import json; d=json.load(open(\"$GENERATIONS_PATH\")); snaps=[g.get(\"data_snapshot\",\"\") for g in d.get(\"generations\",[]) if g.get(\"status\")==\"snapshot\"]; print(snaps[-1] if snaps else \"\")'" 2>/dev/null || true)
+  check "20.10" "Tuple state records routed gen2 rollback snapshot" "$tuple_snapshot" "$EXPECTED_SNAPSHOT"
+
+  local failed_lvs
+  failed_lvs=$(vssh "lvs --noheadings -o lv_name piccolo-data-vg | grep -E 'vol-app-$APP_NAME--failed-|snap-app-$APP_NAME--manifest-' || true" 2>/dev/null)
+  if [[ -z "$failed_lvs" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [20.11] No failed rollback LVs created by successful image refresh"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [20.11] Unexpected failed rollback LVs:"
+    while IFS= read -r line; do echo "       $line"; done <<< "$failed_lvs"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  cleanup_code=$(delete_app_if_present "$APP_NAME")
+  check "20.12" "Image-refresh rollback test app uninstalled" "$cleanup_code" "200"
+  if stage20_cleanup_test_rollback_lvs_if_absent "$APP_NAME"; then
+    local leftover_lvs
+    leftover_lvs=$(stage20_list_test_rollback_lvs "$APP_NAME")
+    if [[ -z "$leftover_lvs" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [20.13] No test-owned rollback artifacts remain after cleanup"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [20.13] Test-owned rollback artifacts remain after cleanup:"
+      while IFS= read -r line; do echo "       $line"; done <<< "$leftover_lvs"
+      ((FAIL_COUNT++)) || true
+    fi
+  else
+    echo -e "  ${RED}FAIL${NC} [20.13] Could not prove app absence or clean test-owned rollback artifacts"
+    local remaining_lvs
+    remaining_lvs=$(stage20_list_test_rollback_lvs "$APP_NAME")
+    if [[ -n "$remaining_lvs" ]]; then
+      while IFS= read -r line; do echo "       $line"; done <<< "$remaining_lvs"
+    fi
+    ((FAIL_COUNT++)) || true
+    vssh "lvremove -y piccolo-data-vg/$STALE_SNAPSHOT >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  fi
 }
 
 # ─────────────────────────────────────────────────────────
@@ -2811,6 +3028,7 @@ case "$STAGE" in
   service-app)       stage_service_app ;;
   workspace-app)     stage_workspace_app ;;
   app-resize)        stage_app_resize ;;
+  image-update-rollback) stage_image_update_rollback ;;
   reboot)            stage_reboot ;;
   storage-post)      stage_storage_post ;;
   stewardship)       stage_stewardship ;;
@@ -2835,6 +3053,7 @@ case "$STAGE" in
     stage_rootfs_verify
     stage_service_app
     stage_app_resize
+    stage_image_update_rollback
     stage_workspace_app
     stage_stewardship
     stage_connection_auth
@@ -2849,7 +3068,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
     exit 1
     ;;
 esac

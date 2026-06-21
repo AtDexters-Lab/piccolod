@@ -5410,6 +5410,8 @@ type manifestUpdateSnapshotVolumeManager struct {
 	rollbackSnapshotPromoted bool
 	rollbackErr              error
 	snapshotHook             func(instanceID, snapshotLVName string) error
+	viabilityHook            func(instanceID string) error
+	artifacts                []string
 }
 
 func (m *manifestUpdateSnapshotVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
@@ -5421,7 +5423,11 @@ func (m *manifestUpdateSnapshotVolumeManager) EnsureVolume(ctx context.Context, 
 
 func (m *manifestUpdateSnapshotVolumeManager) CheckDataSnapshotViability(ctx context.Context, instanceID string) error {
 	_ = ctx
-	_ = instanceID
+	if m.viabilityHook != nil {
+		if err := m.viabilityHook(instanceID); err != nil {
+			return err
+		}
+	}
 	return m.viabilityErr
 }
 
@@ -5446,6 +5452,14 @@ func (m *manifestUpdateSnapshotVolumeManager) DestroyDataSnapshot(ctx context.Co
 	_ = ctx
 	m.destroyed = append(m.destroyed, snapshotLVName)
 	return m.destroyErr
+}
+
+func (m *manifestUpdateSnapshotVolumeManager) ListAppDataRollbackArtifacts(ctx context.Context, instanceID string) ([]string, error) {
+	_ = ctx
+	_ = instanceID
+	out := make([]string, len(m.artifacts))
+	copy(out, m.artifacts)
+	return out, nil
 }
 
 func (m *manifestUpdateSnapshotVolumeManager) RollbackDataVolume(ctx context.Context, instanceID string, snapshotLVName, failedLVName string) (bool, bool, error) {

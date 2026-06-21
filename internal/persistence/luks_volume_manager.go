@@ -317,11 +317,16 @@ func (m *luksVolumeManager) ReconcileOrphanLVs(ctx context.Context) error {
 		if lv.Name == lvm.DefaultThinPoolName {
 			continue
 		}
-		// Skip tuple-managed LVs: data snapshots and failed rollback LVs.
+		// Skip app rollback-shaped LVs. The app layer owns their lifecycle
+		// because only app metadata can distinguish user rollback points,
+		// transaction-private snapshots, and failed-data CoW dependencies.
 		if strings.HasPrefix(lv.Name, "snap-") {
 			continue
 		}
 		if strings.Contains(lv.Name, "--failed-gen") {
+			continue
+		}
+		if strings.Contains(lv.Name, "--failed-manifest-") {
 			continue
 		}
 		// Only touch LVs with known piccolo prefixes.
@@ -2030,6 +2035,41 @@ func (m *luksVolumeManager) CheckDataSnapshotHealth(ctx context.Context, snapsho
 	return nil
 }
 
+// ListAppDataRollbackArtifacts returns app rollback-shaped LV names. The app
+// layer owns classification; this low-level method only exposes observed LVM
+// names so allocation and cleanup can avoid blind pattern-only policy.
+func (m *luksVolumeManager) ListAppDataRollbackArtifacts(ctx context.Context, instanceID string) ([]string, error) {
+	if m.lvMgr == nil || strings.TrimSpace(instanceID) == "" {
+		return nil, nil
+	}
+	lvs, err := m.lvMgr.ListLVs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	snapGenPrefix := "snap-app-" + instanceID + "--gen"
+	snapManifestPrefix := "snap-app-" + instanceID + "--manifest-"
+	failedGenPrefix := "vol-app-" + instanceID + "--failed-gen"
+	failedManifestPrefix := "vol-app-" + instanceID + "--failed-manifest-"
+	out := make([]string, 0)
+	for _, lv := range lvs {
+		name := strings.TrimSpace(lv.Name)
+		if name == "" {
+			continue
+		}
+		switch {
+		case strings.HasPrefix(name, snapGenPrefix):
+			out = append(out, name)
+		case strings.HasPrefix(name, snapManifestPrefix):
+			out = append(out, name)
+		case strings.HasPrefix(name, failedGenPrefix):
+			out = append(out, name)
+		case strings.HasPrefix(name, failedManifestPrefix):
+			out = append(out, name)
+		}
+	}
+	return out, nil
+}
+
 // DestroyDataSnapshot removes a data volume snapshot LV.
 func (m *luksVolumeManager) DestroyDataSnapshot(ctx context.Context, snapshotLVName string) error {
 	if m.lvMgr != nil && !m.lvMgr.LVExists(ctx, snapshotLVName) {
@@ -2063,6 +2103,17 @@ func (m *luksVolumeManager) RollbackDataVolume(ctx context.Context, instanceID, 
 	volumeID := "app-" + instanceID
 	handle := VolumeHandle{ID: volumeID, MountDir: paths.MountDir(volumeID)}
 	activeLV := "vol-app-" + instanceID
+
+	if m.lvMgr != nil &&
+		m.lvMgr.LVExists(ctx, activeLV) &&
+		m.lvMgr.LVExists(ctx, failedLVName) &&
+		!m.lvMgr.LVExists(ctx, snapshotLVName) {
+		log.Printf("WARN: rollback data volume for %s: completing previously promoted snapshot state (failed=%s consumed_snapshot=%s)", instanceID, failedLVName, snapshotLVName)
+		if err := m.Attach(ctx, handle, AttachOptions{Role: VolumeRoleLeader}); err != nil {
+			return true, true, fmt.Errorf("re-attach data volume after completed rollback: %w", err)
+		}
+		return true, true, nil
+	}
 
 	resumingPartial := false
 	if m.lvMgr != nil &&

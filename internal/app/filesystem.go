@@ -38,6 +38,12 @@ type FilesystemStateManager struct {
 	// Test hook for fault-injecting manifest update transaction writes.
 	storeManifestUpdateTransactionHook func(instanceID string, txn *ManifestUpdateTransaction) error
 
+	// Test hook for fault-injecting image update transaction writes.
+	storeImageUpdateTransactionHook func(instanceID string, txn *ImageUpdateTransaction) error
+
+	// Test hook for fault-injecting tuple generation writes.
+	storeTupleStateHook func(instanceID string, state *TupleState) error
+
 	// Test hook for fault-injecting StoreApp after app.yaml is written and
 	// before metadata.json is written.
 	storeAppMetadataHook func(instanceID string, app *AppInstance) error
@@ -592,6 +598,11 @@ func (fsm *FilesystemStateManager) LoadTupleState(instanceID string) (*TupleStat
 
 // StoreTupleState writes the tuple generation state for an app instance atomically.
 func (fsm *FilesystemStateManager) StoreTupleState(instanceID string, state *TupleState) error {
+	if fsm.storeTupleStateHook != nil {
+		if err := fsm.storeTupleStateHook(instanceID, state); err != nil {
+			return err
+		}
+	}
 	fsm.fsMu.Lock()
 	defer fsm.fsMu.Unlock()
 
