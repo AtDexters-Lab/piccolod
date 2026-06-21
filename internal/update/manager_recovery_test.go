@@ -24,6 +24,8 @@ type recoveryRunner struct {
 	distinct    bool // when true, each "show" reports a new failure timestamp
 	seq         int32
 	launchFails bool // when true, systemd-run fails to launch the transient unit
+	defaultID   string
+	unknownRoot bool
 }
 
 func (r *recoveryRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
@@ -53,10 +55,17 @@ func (r *recoveryRunner) Run(ctx context.Context, name string, args ...string) (
 		}
 		return "", "", 0, nil
 	case "findmnt":
+		if r.unknownRoot {
+			return "/dev/sda3[/@/root]", "", 0, nil
+		}
 		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
 	case "btrfs":
 		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
-			return "ID 5 (/.snapshots/5/snapshot)", "", 0, nil
+			defaultID := r.defaultID
+			if defaultID == "" {
+				defaultID = "5"
+			}
+			return "ID " + defaultID + " (/.snapshots/" + defaultID + "/snapshot)", "", 0, nil
 		}
 		return "", "", 0, nil // subvolume list -> empty -> snapperNumberFromID falls back to id
 	case "snapper":
@@ -286,6 +295,28 @@ func TestAutoRecoveryDedupsSameFailure(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&r.fires); got != 1 {
 		t.Fatalf("same failed run must trigger exactly one recovery, got %d fires", got)
+	}
+}
+
+func TestAutoRecoverySkipsWhenSnapshotStaged(t *testing.T) {
+	r := &recoveryRunner{lastRunExit: 1, defaultID: "7"}
+	m := newRecoveryBackend(t, r, 10<<30, nil, nil)
+
+	m.checkAndRecover(context.Background())
+
+	if got := atomic.LoadInt32(&r.fires); got != 0 {
+		t.Fatalf("auto-recovery must not fire when staged snapshot exists, got %d", got)
+	}
+}
+
+func TestAutoRecoverySkipsWhenSnapshotUnknown(t *testing.T) {
+	r := &recoveryRunner{lastRunExit: 1, unknownRoot: true}
+	m := newRecoveryBackend(t, r, 10<<30, nil, nil)
+
+	m.checkAndRecover(context.Background())
+
+	if got := atomic.LoadInt32(&r.fires); got != 0 {
+		t.Fatalf("auto-recovery must not fire when snapshot readiness is unknown, got %d", got)
 	}
 }
 

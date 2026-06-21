@@ -25,7 +25,9 @@ The normal operating state. No updates are pending.
 The system is actively downloading/installing updates. This happens automatically in the background (daily) OR because the user clicked "Check for Updates".
 
 *   **Detection:**
-    *   API calls return `429 Too Many Requests` (`"transactional-update in progress"`).
+    *   `GET /api/v1/updates/os` and mutating update calls return
+        `429 Too Many Requests` (`"transactional-update in progress"`) while
+        `transactional-update` or a Piccolo transactional-update unit is active.
     *   OR `rpm_updates_available` > 0 but `pending` is `false` (rare transient state before download completes).
 *   **UI:**
     *   Status: "Preparing updates..." or "Checking for updates...".
@@ -60,6 +62,10 @@ Allows the user to revert to the previous system state if the current update cau
 
 Returns the current state. Use this to drive the UI.
 
+If update production is active, this endpoint returns `429 Too Many Requests`
+with `Retry-After: 30`. The UI should keep showing the Preparing Update state
+and poll again.
+
 ```json
 {
   "current_version": "v0.1.0",
@@ -67,10 +73,26 @@ Returns the current state. Use this to drive the UI.
   "pending": true,                   // TRUE = Update is staged, waiting for reboot
   "requires_reboot": true,           // TRUE = Show "Restart Now" button
   "meta": {
-    "derived_outcome": "pending-reboot"
+    "derived_outcome": "pending-reboot",
+    "snapshot_readiness": "staged",
+    "active_snapshot_id": "5",
+    "default_snapshot_id": "7"
   }
 }
 ```
+
+`meta` may include best-effort diagnostic fields such as:
+
+* `snapshot_readiness`: one of `staged`, `absent`, `in_progress`, or `unknown`.
+* `active_snapshot_id` / `default_snapshot_id`: normalized snapper snapshot numbers.
+* `stale`, `refreshing`, `degraded`, `cache_empty`: cache/enrichment state.
+* `enrichment_backoff` and `enrichment_backoff_until`: snapper/zypper/RPM
+  enrichment is temporarily backed off. Fast snapshot readiness is still used
+  for `pending` and `requires_reboot`.
+
+Clients should treat these fields as diagnostic metadata. The stable UI
+contract is still `pending`, `requires_reboot`, and `429` while update
+production is active.
 
 ### 2. Force Check / Download
 `POST /api/v1/updates/os/apply`

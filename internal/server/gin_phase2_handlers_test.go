@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	apppkg "piccolod/internal/app"
 	"piccolod/internal/remote"
+	"piccolod/internal/update"
 	"strings"
 	"testing"
 )
@@ -40,6 +41,24 @@ func TestOSUpdateStatus_OK(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &m)
 	if _, ok := m["current_version"]; !ok {
 		t.Fatalf("missing current_version")
+	}
+}
+
+func TestOSUpdateStatus_InProgressReturns429(t *testing.T) {
+	srv := setupBasicServer(t)
+	srv.updateManager = &fakeOSUpdateMgr{statusErr: update.ErrInProgress}
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/updates/os", nil)
+	attachAuth(req, sessionCookie, csrfToken)
+
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("status %d, want 429", w.Code)
+	}
+	if got := w.Result().Header.Get("Retry-After"); got != "30" {
+		t.Fatalf("Retry-After = %q, want 30", got)
 	}
 }
 

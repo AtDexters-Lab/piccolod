@@ -85,6 +85,7 @@ type unlockReloader interface {
 
 type osUpdateManager interface {
 	Status(context.Context) (update.Status, error)
+	SnapshotState(context.Context) (update.SnapshotState, error)
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
@@ -1467,8 +1468,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	} else {
 		s.autounlockOrch = autounlockOrch
 		// Scheduler shares the same audit emit. Constructed alongside the
-		// orchestrator; spawned in Start. updateManager adapter wraps the
-		// existing osUpdateManager.Status to expose HasStagedUpdate.
+		// orchestrator; spawned in Start. updateManager adapter maps fast
+		// snapshot readiness into the scheduler's small interface.
 		s.autounlockScheduler = autounlock.NewScheduler(autounlock.SchedulerDeps{
 			UpdateManager: &osUpdateManagerAdapter{inner: func() osUpdateManager { return s.updateManager }},
 			PublishAudit:  s.publishBackgroundAuditEvent,

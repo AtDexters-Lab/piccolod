@@ -281,8 +281,8 @@ Snapper cleanup was not draining old snapshots. The device had 447 snapshots wit
 |------|--------|
 | Manual reboot applied staged `v0.2.29` | Done |
 | Evidence captured for snapperd thread/fd pileup and slow `snapper --json list` | Done |
-| Patch auto-reboot to use fast active/default snapshot check | Open |
-| Patch update status to compute reboot-required before snapper enrichment | Open |
-| Add snapper enrichment backoff/single-flight | Open |
-| Add scheduler skip observability | Open |
+| Patch auto-reboot to use fast active/default snapshot check | Implemented in `fix/update-status-fast-snapshot-gate` |
+| Patch update status to compute reboot-required before snapper enrichment | Implemented in `fix/update-status-fast-snapshot-gate` |
+| Add snapper enrichment backoff/single-flight | Implemented in `fix/update-status-fast-snapshot-gate` |
+| Add scheduler skip observability | Implemented in `fix/update-status-fast-snapshot-gate` |
 | Investigate snapper cleanup/qgroup policy and snapshot backlog | Open |
