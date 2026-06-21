@@ -13,9 +13,18 @@ import (
 // on. Defined here so the scheduler can be unit-tested without pulling the
 // real update package into tests.
 type UpdateManager interface {
-	HasStagedUpdate(ctx context.Context) bool
+	UpdateReadiness(ctx context.Context) (UpdateReadiness, error)
 	Reboot(ctx context.Context) error
 }
+
+type UpdateReadiness string
+
+const (
+	UpdateReadinessStaged     UpdateReadiness = "staged"
+	UpdateReadinessAbsent     UpdateReadiness = "absent"
+	UpdateReadinessInProgress UpdateReadiness = "in_progress"
+	UpdateReadinessUnknown    UpdateReadiness = "unknown"
+)
 
 // Audit kinds emitted by the scheduler.
 const (
@@ -28,11 +37,14 @@ const (
 // adds nothing.
 const schedulerTickRate = 60 * time.Second
 
+const defaultUpdateReadinessTimeout = 5 * time.Second
+
 // SchedulerDeps wires the scheduler to its environment.
 type SchedulerDeps struct {
-	UpdateManager UpdateManager
-	PublishAudit  AuditEmitter
-	Now           func() time.Time
+	UpdateManager          UpdateManager
+	UpdateReadinessTimeout time.Duration
+	PublishAudit           AuditEmitter
+	Now                    func() time.Time
 	// TZSafeToFire reports whether the system timezone has been configured
 	// away from UTC (the dangerous default). Optional; defaults to a
 	// /etc/localtime readlink probe when nil. Tests inject a fake.
@@ -43,7 +55,7 @@ type SchedulerDeps struct {
 //   - state.Enabled (auto-unlock itself)
 //   - state.AutoReboot.Enabled (overnight-apply opt-in)
 //   - current local hour ∈ [start, end) (with wrap-around)
-//   - updateManager.HasStagedUpdate
+//   - updateManager.UpdateReadiness == staged
 //   - alreadyTriedThisWindow flag (resets on window-cycle rollover)
 //
 // On fire: persists last_fired_at BEFORE calling Reboot (since Reboot may
@@ -62,6 +74,9 @@ type Scheduler struct {
 	// When the next tick computes a different tEdge the cycle has rolled
 	// over — alreadyTriedThisWindow gets cleared.
 	lastTEdge atomic.Int64
+
+	lastReadinessSkipEdge int64
+	lastReadinessSkipKind UpdateReadiness
 }
 
 // NewScheduler constructs a Scheduler. Caller must wire deps.TZSafeToFire —
@@ -75,6 +90,9 @@ func NewScheduler(deps SchedulerDeps) *Scheduler {
 	}
 	if deps.TZSafeToFire == nil {
 		panic("autounlock.NewScheduler: TZSafeToFire is required")
+	}
+	if deps.UpdateReadinessTimeout <= 0 {
+		deps.UpdateReadinessTimeout = defaultUpdateReadinessTimeout
 	}
 	return &Scheduler{deps: deps}
 }
@@ -155,7 +173,25 @@ func (s *Scheduler) tick(ctx context.Context) {
 	if s.alreadyTriedThisWindow.Load() {
 		return
 	}
-	if !s.deps.UpdateManager.HasStagedUpdate(ctx) {
+	if s.deps.UpdateManager == nil {
+		s.logReadinessSkip(curEdge, UpdateReadinessUnknown, errUpdateManagerMissing)
+		return
+	}
+	readinessCtx, cancel := context.WithTimeout(ctx, s.deps.UpdateReadinessTimeout)
+	readiness, err := s.deps.UpdateManager.UpdateReadiness(readinessCtx)
+	cancel()
+	if err != nil {
+		s.logReadinessSkip(curEdge, UpdateReadinessUnknown, err)
+		return
+	}
+	switch readiness {
+	case UpdateReadinessStaged:
+		// continue to fire
+	case UpdateReadinessAbsent, UpdateReadinessInProgress, UpdateReadinessUnknown:
+		s.logReadinessSkip(curEdge, readiness, nil)
+		return
+	default:
+		s.logReadinessSkip(curEdge, UpdateReadinessUnknown, nil)
 		return
 	}
 
@@ -189,6 +225,29 @@ func (s *Scheduler) tick(ctx context.Context) {
 				"error_kind": "reboot_failed",
 			})
 		}
+	}
+}
+
+var errUpdateManagerMissing = errors.New("autounlock scheduler: update manager unavailable")
+
+func (s *Scheduler) logReadinessSkip(edge time.Time, readiness UpdateReadiness, err error) {
+	if s.lastReadinessSkipEdge == edge.Unix() && s.lastReadinessSkipKind == readiness {
+		return
+	}
+	s.lastReadinessSkipEdge = edge.Unix()
+	s.lastReadinessSkipKind = readiness
+
+	switch readiness {
+	case UpdateReadinessAbsent:
+		log.Printf("INFO: autounlock scheduler: maintenance window skipped: no staged update")
+	case UpdateReadinessInProgress:
+		log.Printf("INFO: autounlock scheduler: maintenance window skipped: update still in progress")
+	default:
+		if err != nil {
+			log.Printf("WARN: autounlock scheduler: maintenance window skipped: snapshot readiness unknown: %v", err)
+			return
+		}
+		log.Printf("WARN: autounlock scheduler: maintenance window skipped: snapshot readiness unknown")
 	}
 }
 
@@ -268,4 +327,3 @@ func LoggedTZGate(probe func() bool) func() bool {
 		return ok
 	}
 }
-

@@ -5,12 +5,15 @@ import (
 	"errors"
 	"testing"
 
+	"piccolod/internal/autounlock"
 	"piccolod/internal/update"
 )
 
 type fakeOSUpdateMgr struct {
 	statusResp     update.Status
 	statusErr      error
+	snapshotResp   update.SnapshotState
+	snapshotErr    error
 	rollbackErr    error
 	rollbacked     int
 	rollbackTarget string
@@ -20,6 +23,9 @@ type fakeOSUpdateMgr struct {
 
 func (f *fakeOSUpdateMgr) Status(ctx context.Context) (update.Status, error) {
 	return f.statusResp, f.statusErr
+}
+func (f *fakeOSUpdateMgr) SnapshotState(ctx context.Context) (update.SnapshotState, error) {
+	return f.snapshotResp, f.snapshotErr
 }
 func (f *fakeOSUpdateMgr) Apply(ctx context.Context) error { return nil }
 func (f *fakeOSUpdateMgr) Rollback(ctx context.Context, target string) error {
@@ -35,34 +41,65 @@ func (f *fakeOSUpdateMgr) ForceReboot(ctx context.Context) error { return nil }
 func (f *fakeOSUpdateMgr) PowerOff(ctx context.Context) error    { return nil }
 func (f *fakeOSUpdateMgr) Watch(ctx context.Context) error       { return nil }
 
-func TestOSUpdateAdapter_HasStagedUpdate_NilInner(t *testing.T) {
+func TestOSUpdateAdapter_UpdateReadiness_NilInner(t *testing.T) {
 	a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return nil }}
-	if a.HasStagedUpdate(context.Background()) {
-		t.Errorf("nil inner should return false")
+	got, err := a.UpdateReadiness(context.Background())
+	if !errors.Is(err, errUpdateManagerUnavailable) {
+		t.Fatalf("nil inner should return errUpdateManagerUnavailable, got %v", err)
+	}
+	if got != autounlock.UpdateReadinessUnknown {
+		t.Errorf("nil inner readiness = %q, want unknown", got)
 	}
 }
 
-func TestOSUpdateAdapter_HasStagedUpdate_StatusError(t *testing.T) {
-	m := &fakeOSUpdateMgr{statusErr: errors.New("backend down")}
+func TestOSUpdateAdapter_UpdateReadiness_SnapshotError(t *testing.T) {
+	backendErr := errors.New("backend down")
+	m := &fakeOSUpdateMgr{snapshotErr: backendErr}
 	a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return m }}
-	if a.HasStagedUpdate(context.Background()) {
-		t.Errorf("Status error should return false (fail-closed)")
+	got, err := a.UpdateReadiness(context.Background())
+	if !errors.Is(err, backendErr) {
+		t.Fatalf("snapshot error should propagate, got %v", err)
+	}
+	if got != autounlock.UpdateReadinessUnknown {
+		t.Errorf("snapshot error readiness = %q, want unknown", got)
 	}
 }
 
-func TestOSUpdateAdapter_HasStagedUpdate_PendingReboot(t *testing.T) {
-	m := &fakeOSUpdateMgr{statusResp: update.Status{RequiresReboot: true}}
+func TestOSUpdateAdapter_UpdateReadiness_Staged(t *testing.T) {
+	m := &fakeOSUpdateMgr{snapshotResp: update.SnapshotState{Readiness: update.SnapshotReadinessStaged}}
 	a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return m }}
-	if !a.HasStagedUpdate(context.Background()) {
-		t.Errorf("RequiresReboot=true should propagate")
+	got, err := a.UpdateReadiness(context.Background())
+	if err != nil {
+		t.Fatalf("UpdateReadiness: %v", err)
+	}
+	if got != autounlock.UpdateReadinessStaged {
+		t.Errorf("staged readiness = %q", got)
 	}
 }
 
-func TestOSUpdateAdapter_HasStagedUpdate_NoReboot(t *testing.T) {
-	m := &fakeOSUpdateMgr{statusResp: update.Status{RequiresReboot: false}}
-	a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return m }}
-	if a.HasStagedUpdate(context.Background()) {
-		t.Errorf("RequiresReboot=false should return false")
+func TestOSUpdateAdapter_UpdateReadiness_MapsStates(t *testing.T) {
+	cases := []struct {
+		name string
+		in   update.SnapshotReadiness
+		want autounlock.UpdateReadiness
+	}{
+		{"absent", update.SnapshotReadinessAbsent, autounlock.UpdateReadinessAbsent},
+		{"in_progress", update.SnapshotReadinessInProgress, autounlock.UpdateReadinessInProgress},
+		{"unknown", update.SnapshotReadinessUnknown, autounlock.UpdateReadinessUnknown},
+		{"empty", "", autounlock.UpdateReadinessUnknown},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := &fakeOSUpdateMgr{snapshotResp: update.SnapshotState{Readiness: tc.in}}
+			a := &osUpdateManagerAdapter{inner: func() osUpdateManager { return m }}
+			got, err := a.UpdateReadiness(context.Background())
+			if err != nil {
+				t.Fatalf("UpdateReadiness: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("readiness = %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 

@@ -33,10 +33,11 @@ const (
 	// a bounded background refresh probes snapper/rpm/btrfs/journalctl/zypper.
 	// Apply/Rollback/Reboot invalidate freshness at the Manager facade so post-action
 	// UI does not present stale data as fresh.
-	statusSnapshotTTL     = 60 * time.Second
-	statusRefreshInterval = 30 * time.Second
-	statusRequestTimeout  = 5 * time.Second
-	statusRefreshTimeout  = 20 * time.Second
+	statusSnapshotTTL       = 60 * time.Second
+	statusRefreshInterval   = 30 * time.Second
+	statusRequestTimeout    = 5 * time.Second
+	statusRefreshTimeout    = 20 * time.Second
+	statusEnrichmentBackoff = 5 * time.Minute
 
 	// Auto-recovery circuit breaker: bound how often checkAndRecover may fire
 	// the agent-package fallback so a persistently-failing OS update can't loop
@@ -75,6 +76,30 @@ type Status struct {
 	Meta             map[string]interface{} `json:"meta,omitempty"`
 }
 
+// SnapshotReadiness is the fast-path staged-root state used before any
+// snapper/zypper/RPM enrichment is attempted.
+type SnapshotReadiness string
+
+const (
+	SnapshotReadinessStaged     SnapshotReadiness = "staged"
+	SnapshotReadinessAbsent     SnapshotReadiness = "absent"
+	SnapshotReadinessInProgress SnapshotReadiness = "in_progress"
+	SnapshotReadinessUnknown    SnapshotReadiness = "unknown"
+)
+
+// SnapshotState reports the authoritative active/default root relationship.
+// ActiveSnapshot and DefaultSnapshot are normalized snapper snapshot numbers
+// when Readiness is staged or absent.
+type SnapshotState struct {
+	ActiveSnapshot        string            `json:"active_snapshot,omitempty"`
+	DefaultSnapshot       string            `json:"default_snapshot,omitempty"`
+	ActiveSnapshotSource  string            `json:"active_snapshot_source,omitempty"`
+	DefaultSnapshotSource string            `json:"default_snapshot_source,omitempty"`
+	Readiness             SnapshotReadiness `json:"readiness"`
+	RequiresReboot        bool              `json:"requires_reboot"`
+	Source                string            `json:"source,omitempty"`
+}
+
 // Manager fronts the OS-specific backend (MicroOS today; pluggable later).
 type Manager struct {
 	backend osBackend
@@ -83,6 +108,7 @@ type Manager struct {
 // osBackend defines the per-platform surface.
 type osBackend interface {
 	Status(context.Context) (Status, error)
+	SnapshotState(context.Context) (SnapshotState, error)
 	Apply(context.Context) error
 	Rollback(context.Context, string) error
 	Reboot(context.Context) error
@@ -112,13 +138,15 @@ type microOSBackend struct {
 	// high-water mark for invalidation: a sample taken before this timestamp
 	// must NOT be published (would overwrite a concurrent invalidate from
 	// Apply/Rollback/Reboot with pre-mutation data).
-	statusMu             sync.RWMutex
-	statusCache          Status
-	statusCachedAt       time.Time
-	statusInvalidatedAt  time.Time
-	statusRefreshActive  bool
-	statusRequestTimeout time.Duration
-	statusRefreshTimeout time.Duration
+	statusMu                     sync.RWMutex
+	statusCache                  Status
+	statusCachedAt               time.Time
+	statusInvalidatedAt          time.Time
+	statusRefreshActive          bool
+	statusEnrichmentBackoffUntil time.Time
+	statusLastEnrichmentErr      string
+	statusRequestTimeout         time.Duration
+	statusRefreshTimeout         time.Duration
 
 	// Auto-recovery circuit breaker, guarded by mu. In-memory is authoritative;
 	// it is mirrored best-effort to recoveryPath so a reboot-loop accumulates
@@ -221,6 +249,12 @@ func NewManager(opts ...Option) (*Manager, error) {
 // Status returns the current OS update status (graceful on unsupported hosts).
 func (m *Manager) Status(ctx context.Context) (Status, error) { return m.backend.Status(ctx) }
 
+// SnapshotState returns the fast active/default snapshot relationship without
+// snapper/zypper/RPM enrichment.
+func (m *Manager) SnapshotState(ctx context.Context) (SnapshotState, error) {
+	return m.backend.SnapshotState(ctx)
+}
+
 // Apply, Rollback, and Reboot invalidate the status cache unconditionally on
 // return — including on no-op rejections like ErrInProgress. We accept one
 // extra readStatus over reaching into backend internals to discriminate
@@ -308,6 +342,15 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	return m, nil
 }
 
+func (m *microOSBackend) SnapshotState(ctx context.Context) (SnapshotState, error) {
+	if !m.supported {
+		return SnapshotState{Readiness: SnapshotReadinessUnknown, Source: "unsupported"}, ErrUnsupported
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, m.statusRequestTimeout)
+	defer cancel()
+	return m.snapshotState(probeCtx)
+}
+
 // Status returns the current OS update status (graceful on unsupported hosts).
 func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 	if !m.supported {
@@ -326,33 +369,41 @@ func (m *microOSBackend) Status(ctx context.Context) (Status, error) {
 	probeCtx, cancel := context.WithTimeout(ctx, m.statusRequestTimeout)
 	defer cancel()
 
-	// If an update is running, return 429 so clients know to poll/wait.
-	// This ensures multi-tab consistency (Tab A starts update, Tab B sees 429).
-	if m.isInProgress(probeCtx) {
+	snapshot, snapshotErr := m.snapshotState(probeCtx)
+	if snapshot.Readiness == SnapshotReadinessInProgress {
 		return Status{}, ErrInProgress
+	}
+	if snapshotErr != nil {
+		m.scheduleStatusRefresh()
+		return m.statusFallback(snapshotErr, snapshot, nil), nil
 	}
 
 	if st, ok := m.cachedStatus(false); ok {
-		return st, nil
+		return m.applySnapshotState(st, snapshot), nil
 	}
 	if st, ok := m.cachedStatus(true); ok {
 		m.scheduleStatusRefresh()
-		return st, nil
+		return m.applySnapshotState(st, snapshot), nil
 	}
 
 	sampleStart := time.Now()
+	if ok, fields := m.tryBeginStatusEnrichment(sampleStart); !ok {
+		return m.statusFallback(nil, snapshot, fields), nil
+	}
+	// Enrichment failures still return a partial Status; request cancellation
+	// can leave that sample incomplete, so don't pollute the 60s cache with it.
 	st, err := m.readStatus(probeCtx)
-	if err != nil {
+	if probeErr := probeCtx.Err(); probeErr != nil {
+		if errors.Is(probeErr, context.Canceled) {
+			m.finishStatusEnrichment(nil)
+		} else {
+			m.finishStatusEnrichment(err, probeErr)
+		}
 		m.scheduleStatusRefresh()
-		return m.statusFallback(err), nil
+		return m.statusFallback(firstNonNil(err, probeErr), snapshot, nil), nil
 	}
-	// readStatus's helpers swallow command errors — if the request ctx was
-	// cancelled mid-call, st may be a partial/empty sample. Don't pollute the
-	// 60s cache with that.
-	if probeCtx.Err() != nil {
-		m.scheduleStatusRefresh()
-		return m.statusFallback(probeCtx.Err()), nil
-	}
+	m.finishStatusEnrichment(err)
+	st = m.applySnapshotState(st, snapshot)
 	m.publishStatusSnapshot(st, sampleStart)
 	return st, nil
 }
@@ -389,17 +440,35 @@ func (m *microOSBackend) cachedStatus(allowStale bool) (Status, bool) {
 	return st, true
 }
 
-func (m *microOSBackend) statusFallback(err error) Status {
+func (m *microOSBackend) statusFallback(err error, snapshot SnapshotState, fields map[string]interface{}) Status {
 	if st, ok := m.cachedStatus(true); ok {
-		if err != nil {
-			st = withStatusMeta(st, map[string]interface{}{
-				"degraded":        true,
-				"degraded_reason": err.Error(),
-			})
-		}
-		return st
+		return m.decorateStatusWithSnapshot(st, snapshot, fields, err)
 	}
+	return m.minimalStatusFromSnapshot(snapshot, fields, err)
+}
 
+func (m *microOSBackend) fastCoreStatus(err error, snapshot SnapshotState, fields map[string]interface{}) Status {
+	if st, ok := m.cachedStatus(false); ok {
+		return m.decorateStatusWithSnapshot(st, snapshot, fields, err)
+	}
+	return m.minimalStatusFromSnapshot(snapshot, fields, err)
+}
+
+func (m *microOSBackend) decorateStatusWithSnapshot(st Status, snapshot SnapshotState, fields map[string]interface{}, err error) Status {
+	st = m.applySnapshotState(st, snapshot)
+	if err != nil {
+		fields = mergeMeta(fields, map[string]interface{}{
+			"degraded":        true,
+			"degraded_reason": err.Error(),
+		})
+	}
+	if len(fields) > 0 {
+		st = withStatusMeta(st, fields)
+	}
+	return st
+}
+
+func (m *microOSBackend) minimalStatusFromSnapshot(snapshot SnapshotState, fields map[string]interface{}, err error) Status {
 	currentVersion := m.currentVersion
 	if currentVersion == "" {
 		currentVersion = m.getOSReleaseVersion("")
@@ -407,12 +476,19 @@ func (m *microOSBackend) statusFallback(err error) Status {
 	if currentVersion == "" {
 		currentVersion = "unknown"
 	}
+	pending := snapshot.Readiness == SnapshotReadinessStaged
+	availableVersion := currentVersion
+	if pending && snapshot.DefaultSnapshot != "" {
+		availableVersion = fmt.Sprintf("%s (System Update %s)", currentVersion, snapshot.DefaultSnapshot)
+	}
 	meta := map[string]interface{}{
 		"supported":   true,
 		"degraded":    true,
 		"refreshing":  true,
 		"cache_empty": true,
 	}
+	meta = mergeMeta(meta, snapshotStatusMeta(snapshot))
+	meta = mergeMeta(meta, fields)
 	if err != nil {
 		meta["degraded_reason"] = err.Error()
 	}
@@ -421,45 +497,167 @@ func (m *microOSBackend) statusFallback(err error) Status {
 	}
 	return Status{
 		CurrentVersion:   currentVersion,
-		AvailableVersion: currentVersion,
-		Pending:          false,
-		RequiresReboot:   false,
+		AvailableVersion: availableVersion,
+		Pending:          pending,
+		RequiresReboot:   pending,
 		LastChecked:      m.clock(),
 		Meta:             meta,
 	}
 }
 
+func (m *microOSBackend) applySnapshotState(st Status, snapshot SnapshotState) Status {
+	switch snapshot.Readiness {
+	case SnapshotReadinessStaged:
+		st.Pending = true
+		st.RequiresReboot = true
+		if st.AvailableVersion == "" || st.AvailableVersion == st.CurrentVersion {
+			if snapshot.DefaultSnapshot != "" {
+				st.AvailableVersion = fmt.Sprintf("%s (System Update %s)", st.CurrentVersion, snapshot.DefaultSnapshot)
+			}
+		}
+	case SnapshotReadinessAbsent:
+		st.Pending = false
+		st.RequiresReboot = false
+	case SnapshotReadinessUnknown:
+		st.Pending = false
+		st.RequiresReboot = false
+		st = withStatusMeta(st, map[string]interface{}{
+			"degraded": true,
+		})
+	}
+	st.Meta = mergeMeta(st.Meta, snapshotStatusMeta(snapshot))
+	return st
+}
+
+func snapshotStatusMeta(snapshot SnapshotState) map[string]interface{} {
+	meta := map[string]interface{}{}
+	if snapshot.Readiness != "" {
+		meta["snapshot_readiness"] = string(snapshot.Readiness)
+	}
+	if snapshot.ActiveSnapshot != "" {
+		meta["active_snapshot_id"] = snapshot.ActiveSnapshot
+	}
+	if snapshot.DefaultSnapshot != "" {
+		meta["default_snapshot_id"] = snapshot.DefaultSnapshot
+	}
+	if snapshot.ActiveSnapshotSource != "" {
+		meta["active_snapshot_source"] = snapshot.ActiveSnapshotSource
+	}
+	if snapshot.DefaultSnapshotSource != "" {
+		meta["default_snapshot_source"] = snapshot.DefaultSnapshotSource
+	}
+	if snapshot.RequiresReboot {
+		meta["requires_reboot_source"] = "fast_snapshot"
+	}
+	return meta
+}
+
 func withStatusMeta(st Status, fields map[string]interface{}) Status {
-	meta := make(map[string]interface{}, len(st.Meta)+len(fields))
-	for k, v := range st.Meta {
+	st.Meta = mergeMeta(st.Meta, fields)
+	return st
+}
+
+func mergeMeta(base map[string]interface{}, fields map[string]interface{}) map[string]interface{} {
+	meta := make(map[string]interface{}, len(base)+len(fields))
+	for k, v := range base {
 		meta[k] = v
 	}
 	for k, v := range fields {
 		meta[k] = v
 	}
-	st.Meta = meta
-	return st
+	return meta
+}
+
+func firstNonNil(errs ...error) error {
+	for _, err := range errs {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type enrichmentErrorCollector struct {
+	errs []error
+}
+
+func (c *enrichmentErrorCollector) add(source string, err error) {
+	if err == nil {
+		return
+	}
+	c.errs = append(c.errs, fmt.Errorf("%s: %w", source, err))
+}
+
+func (c *enrichmentErrorCollector) err() error {
+	if len(c.errs) == 0 {
+		return nil
+	}
+	return fmt.Errorf("status enrichment failed: %w", errors.Join(c.errs...))
+}
+
+func commandFailure(stderr string, code int, err error) error {
+	msg := strings.TrimSpace(stderr)
+	if err != nil {
+		if msg != "" {
+			return fmt.Errorf("%s: %w", msg, err)
+		}
+		return err
+	}
+	if code != 0 {
+		if msg != "" {
+			return fmt.Errorf("exit code %d: %s", code, msg)
+		}
+		return fmt.Errorf("exit code %d", code)
+	}
+	return nil
 }
 
 func (m *microOSBackend) scheduleStatusRefresh() {
-	m.statusMu.Lock()
-	if m.statusRefreshActive {
-		m.statusMu.Unlock()
+	if ok, _ := m.tryBeginStatusEnrichment(time.Now()); !ok {
 		return
 	}
-	m.statusRefreshActive = true
-	m.statusMu.Unlock()
 
 	go func() {
-		defer func() {
-			m.statusMu.Lock()
-			m.statusRefreshActive = false
-			m.statusMu.Unlock()
-		}()
 		ctx, cancel := context.WithTimeout(context.Background(), m.statusRefreshTimeout)
 		defer cancel()
-		m.refreshStatusCache(ctx)
+		m.refreshStatusCacheLocked(ctx)
 	}()
+}
+
+func (m *microOSBackend) tryBeginStatusEnrichment(now time.Time) (bool, map[string]interface{}) {
+	m.statusMu.Lock()
+	defer m.statusMu.Unlock()
+	if m.statusRefreshActive {
+		return false, map[string]interface{}{"refreshing": true}
+	}
+	if !m.statusEnrichmentBackoffUntil.IsZero() && now.Before(m.statusEnrichmentBackoffUntil) {
+		fields := map[string]interface{}{
+			"degraded":                 true,
+			"enrichment_backoff":       true,
+			"enrichment_backoff_until": m.statusEnrichmentBackoffUntil.UTC().Format(time.RFC3339),
+		}
+		if m.statusLastEnrichmentErr != "" {
+			fields["degraded_reason"] = m.statusLastEnrichmentErr
+		}
+		return false, fields
+	}
+	m.statusRefreshActive = true
+	return true, nil
+}
+
+func (m *microOSBackend) finishStatusEnrichment(errs ...error) {
+	m.statusMu.Lock()
+	defer m.statusMu.Unlock()
+	m.statusRefreshActive = false
+	for _, err := range errs {
+		if err != nil {
+			m.statusEnrichmentBackoffUntil = m.clock().Add(statusEnrichmentBackoff)
+			m.statusLastEnrichmentErr = err.Error()
+			return
+		}
+	}
+	m.statusEnrichmentBackoffUntil = time.Time{}
+	m.statusLastEnrichmentErr = ""
 }
 
 // publishStatusSnapshot writes a freshly-sampled status under statusMu, but
@@ -498,7 +696,7 @@ func (m *microOSBackend) Rollback(ctx context.Context, targetID string) error {
 		return ErrUnsupported
 	}
 	targetID = strings.TrimSpace(targetID)
-	snaps := m.snapperSnapshots(ctx)
+	snaps, _ := m.snapperSnapshots(ctx)
 	if targetID == "" {
 		// best-effort: pick the newest non-active snapshot
 		targetID = m.pickRollbackTarget(ctx)
@@ -606,16 +804,52 @@ func (m *microOSBackend) Watch(ctx context.Context) error {
 }
 
 func (m *microOSBackend) refreshStatusCache(ctx context.Context) {
-	if m.isInProgress(ctx) {
-		return
-	}
 	sampleStart := time.Now()
 	probeCtx, cancel := context.WithTimeout(ctx, m.statusRefreshTimeout)
 	defer cancel()
-	st, err := m.readStatus(probeCtx)
-	if err != nil || probeCtx.Err() != nil {
+
+	snapshot, snapshotErr := m.snapshotState(probeCtx)
+	if snapshot.Readiness == SnapshotReadinessInProgress {
 		return
 	}
+	if snapshotErr != nil {
+		m.publishStatusSnapshot(m.fastCoreStatus(snapshotErr, snapshot, nil), sampleStart)
+		return
+	}
+
+	if ok, fields := m.tryBeginStatusEnrichment(time.Now()); !ok {
+		m.publishStatusSnapshot(m.fastCoreStatus(nil, snapshot, fields), sampleStart)
+		return
+	}
+	m.refreshStatusCacheEnrichment(probeCtx, sampleStart, snapshot)
+}
+
+func (m *microOSBackend) refreshStatusCacheLocked(ctx context.Context) {
+	sampleStart := time.Now()
+	probeCtx, cancel := context.WithTimeout(ctx, m.statusRefreshTimeout)
+	defer cancel()
+	snapshot, snapshotErr := m.snapshotState(probeCtx)
+	if snapshot.Readiness == SnapshotReadinessInProgress {
+		m.finishStatusEnrichment(nil)
+		return
+	}
+	if snapshotErr != nil {
+		m.finishStatusEnrichment(nil)
+		m.publishStatusSnapshot(m.fastCoreStatus(snapshotErr, snapshot, nil), sampleStart)
+		return
+	}
+	m.refreshStatusCacheEnrichment(probeCtx, sampleStart, snapshot)
+}
+
+func (m *microOSBackend) refreshStatusCacheEnrichment(ctx context.Context, sampleStart time.Time, snapshot SnapshotState) {
+	st, err := m.readStatus(ctx)
+	if ctx.Err() != nil {
+		m.finishStatusEnrichment(err, ctx.Err())
+		m.publishStatusSnapshot(m.fastCoreStatus(firstNonNil(err, ctx.Err()), snapshot, nil), sampleStart)
+		return
+	}
+	m.finishStatusEnrichment(err)
+	st = m.applySnapshotState(st, snapshot)
 	m.publishStatusSnapshot(st, sampleStart)
 }
 
@@ -645,29 +879,25 @@ func (m *microOSBackend) watchSnapshots(ctx context.Context) {
 }
 
 func (m *microOSBackend) checkAndRecover(ctx context.Context) {
-	// 1. Already running something — nothing to do.
-	if m.isInProgress(ctx) {
-		return
-	}
+	probeCtx, cancel := context.WithTimeout(ctx, m.statusRefreshTimeout)
+	defer cancel()
 
-	// 2. Sample current status.
-	status, err := m.readStatus(ctx)
+	// 1. Sample fast snapshot readiness. Recovery only proceeds when we have a
+	// proven absent staged snapshot; unknown/in-progress/staged all pause.
+	snapshot, err := m.snapshotState(probeCtx)
 	if err != nil {
 		return
 	}
 
-	// 3. An update is staged awaiting reboot — a recovery candidate already
-	//    exists; firing again would stack snapshots. This is NOT a success
-	//    signal (a failed dup also stages a snapshot), so we do not reset the
-	//    breaker here.
-	if status.Pending {
+	if snapshot.Readiness != SnapshotReadinessAbsent {
 		return
 	}
 
-	// 4. Did the last OS update fail? last_run reflects transactional-update.service
-	//    (the OS timer's unit) — the signal piccolod reacts to.
-	lastRun, ok := status.Meta["last_run"].(*lastRunInfo)
-	if !ok || lastRun == nil || lastRun.RanAt == nil {
+	// 2. Did the last OS update fail? last_run reflects transactional-update.service
+	//    (the OS timer's unit) — the signal piccolod reacts to. This must be a
+	//    fresh bounded probe, not stale status enrichment.
+	lastRun := m.lastRunInfo(probeCtx)
+	if probeCtx.Err() != nil || lastRun == nil || lastRun.RanAt == nil {
 		return
 	}
 	if lastRun.ExitCode == 0 {
@@ -1011,6 +1241,7 @@ func (m *microOSBackend) detectSupported() bool {
 }
 
 func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
+	var enrichmentErrs enrichmentErrorCollector
 	meta := make(map[string]interface{})
 	meta["supported"] = true
 
@@ -1022,7 +1253,8 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 	meta["active_snapshot_id"] = activeID
 	meta["default_snapshot_id"] = defaultID
 
-	snapshots := m.snapperSnapshots(ctx)
+	snapshots, err := m.snapperSnapshots(ctx)
+	enrichmentErrs.add("snapper --json list", err)
 	if active, ok := snapshots[activeID]; ok {
 		meta["active_snapshot"] = active
 	}
@@ -1043,17 +1275,22 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 		meta["last_run"] = lastRun
 	}
 
-	if cnt, ok := m.rpmUpdateCount(ctx); ok {
+	if cnt, ok, err := m.rpmUpdateCount(ctx); err != nil {
+		enrichmentErrs.add("zypper --xmlout lu", err)
+	} else if ok {
 		meta["rpm_updates_available"] = cnt
 	}
 
-	activePiccolo := m.queryRPM(ctx, "piccolod", "")
+	activePiccolo, err := m.queryRPM(ctx, "piccolod", "")
+	enrichmentErrs.add("rpm -q piccolod", err)
 	if activePiccolo != "" {
 		meta["piccolod_active"] = activePiccolo
 	}
 	if stagedID != "" {
 		stagedRoot := filepath.Join(m.snapshotsDir, stagedID, "snapshot")
-		if stagedPiccolo := m.queryRPM(ctx, "piccolod", stagedRoot); stagedPiccolo != "" && stagedPiccolo != activePiccolo {
+		stagedPiccolo, err := m.queryRPM(ctx, "piccolod", stagedRoot)
+		enrichmentErrs.add("rpm --root staged -q piccolod", err)
+		if stagedPiccolo != "" && stagedPiccolo != activePiccolo {
 			meta["piccolod_staged"] = stagedPiccolo
 		}
 	}
@@ -1109,14 +1346,22 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 		}
 	}
 
-	return Status{
+	st := Status{
 		CurrentVersion:   currentVersion,
 		AvailableVersion: availableVersion,
 		Pending:          pending,
 		RequiresReboot:   pending,
 		LastChecked:      m.clock(),
 		Meta:             meta,
-	}, nil
+	}
+	if err := enrichmentErrs.err(); err != nil {
+		st = withStatusMeta(st, map[string]interface{}{
+			"degraded":        true,
+			"degraded_reason": err.Error(),
+		})
+		return st, err
+	}
+	return st, nil
 }
 
 func (m *microOSBackend) getOSReleaseVersion(root string) string {
@@ -1203,12 +1448,15 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	}
 
 	targetID := targetHint
-	// Refresh status to capture new default snapshot (best-effort)
-	status, _ := m.readStatus(context.Background())
 	if targetID == "" {
-		if staged, ok := status.Meta["default_snapshot_id"].(string); ok {
-			targetID = staged
+		// Best-effort bounded fast probe; do not enter the snapper/zypper/RPM
+		// status path while a just-launched transactional update may still own
+		// the snapshot producer state.
+		targetCtx, cancelTarget := context.WithTimeout(context.Background(), m.statusRequestTimeout)
+		if defaultID, _, err := m.defaultSnapshotNumber(targetCtx); err == nil && defaultID != "" {
+			targetID = defaultID
 		}
+		cancelTarget()
 	}
 	msg := strings.TrimSpace(stdout)
 	if msg == "" {
@@ -1303,22 +1551,100 @@ func (m *microOSBackend) deriveOutcome(activeID, defaultID string, ps *persisted
 	return "not-applied"
 }
 
+func (m *microOSBackend) snapshotState(ctx context.Context) (SnapshotState, error) {
+	state := SnapshotState{
+		Readiness: SnapshotReadinessUnknown,
+		Source:    "btrfs",
+	}
+	if m.isInProgress(ctx) {
+		state.Readiness = SnapshotReadinessInProgress
+		return state, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return state, err
+	}
+
+	activeID, activeSrc := m.activeSnapshot(ctx)
+	state.ActiveSnapshot = activeID
+	state.ActiveSnapshotSource = activeSrc
+	if err := ctx.Err(); err != nil {
+		return state, err
+	}
+	if activeID == "" || activeID == activeSrc {
+		return state, fmt.Errorf("cannot normalize active snapshot")
+	}
+
+	defaultID, defaultSrc, err := m.defaultSnapshotNumber(ctx)
+	state.DefaultSnapshot = defaultID
+	state.DefaultSnapshotSource = defaultSrc
+	if err != nil {
+		return state, err
+	}
+	if err := ctx.Err(); err != nil {
+		return state, err
+	}
+	if defaultID == "" {
+		return state, fmt.Errorf("cannot normalize default snapshot")
+	}
+
+	if defaultID == activeID {
+		state.Readiness = SnapshotReadinessAbsent
+		state.RequiresReboot = false
+		return state, nil
+	}
+	state.Readiness = SnapshotReadinessStaged
+	state.RequiresReboot = true
+	return state, nil
+}
+
 func (m *microOSBackend) snapperNumberFromID(ctx context.Context, id string) string {
+	if snapperID, ok := m.snapperNumberFromBtrfsID(ctx, id); ok {
+		return snapperID
+	}
+	return id
+}
+
+func (m *microOSBackend) snapperNumberFromBtrfsID(ctx context.Context, id string) (string, bool) {
 	// btrfs subvolume list output example:
 	// ID 269 gen 59 top level 257 path @/.snapshots/2/snapshot
 	stdout, _, _, err := m.runner.Run(ctx, "btrfs", "subvolume", "list", "/")
 	if err != nil {
-		return id // fallback
+		return "", false
 	}
 	lines := strings.Split(stdout, "\n")
 	for _, line := range lines {
 		if strings.Contains(line, fmt.Sprintf("ID %s ", id)) {
 			// Found the ID, now extract path
 			// path @/.snapshots/2/snapshot
-			return snapshotIDFromPath(line)
+			if snapperID, ok := snapshotNumberFromPath(line); ok {
+				return snapperID, true
+			}
+			return "", false
 		}
 	}
-	return id
+	return "", false
+}
+
+func (m *microOSBackend) defaultSnapshotNumber(ctx context.Context) (string, string, error) {
+	stdout, _, _, err := m.runner.Run(ctx, "btrfs", "subvolume", "get-default", "/")
+	if err != nil {
+		return "", strings.TrimSpace(stdout), err
+	}
+	src := strings.TrimSpace(stdout)
+	if src == "" {
+		return "", src, fmt.Errorf("cannot determine default snapshot")
+	}
+	if snapperID, ok := snapshotNumberFromPath(src); ok {
+		return snapperID, src, nil
+	}
+	re := regexp.MustCompile(`(?i)ID\s+(\d+)`)
+	if match := re.FindStringSubmatch(src); len(match) == 2 {
+		if snapperID, ok := m.snapperNumberFromBtrfsID(ctx, match[1]); ok {
+			return snapperID, src, nil
+		}
+		return "", src, fmt.Errorf("cannot normalize default snapshot ID %s", match[1])
+	}
+	return "", src, fmt.Errorf("cannot parse default snapshot")
 }
 
 func (m *microOSBackend) activeSnapshot(ctx context.Context) (string, string) {
@@ -1343,18 +1669,25 @@ func (m *microOSBackend) defaultSnapshot(ctx context.Context) string {
 }
 
 func snapshotIDFromPath(path string) string {
-	re := regexp.MustCompile(`/\.snapshots/(\d+)/snapshot`)
-	if match := re.FindStringSubmatch(path); len(match) == 2 {
-		return match[1]
+	if id, ok := snapshotNumberFromPath(path); ok {
+		return id
 	}
 	return path
 }
 
-// snapper --json list parser (best effort)
-func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapshotInfo {
-	stdout, _, _, err := m.runner.Run(ctx, "snapper", "--json", "list")
-	if err != nil {
-		return map[string]snapshotInfo{}
+func snapshotNumberFromPath(path string) (string, bool) {
+	re := regexp.MustCompile(`/\.snapshots/(\d+)/snapshot`)
+	if match := re.FindStringSubmatch(path); len(match) == 2 {
+		return match[1], true
+	}
+	return "", false
+}
+
+// snapper --json list parser (best effort, with failure signal for backoff).
+func (m *microOSBackend) snapperSnapshots(ctx context.Context) (map[string]snapshotInfo, error) {
+	stdout, stderr, code, err := m.runner.Run(ctx, "snapper", "--json", "list")
+	if err := commandFailure(stderr, code, err); err != nil {
+		return map[string]snapshotInfo{}, err
 	}
 
 	// Tumbleweed snapper returns: { "root": [ { "number": 0, ... } ] }
@@ -1374,7 +1707,8 @@ func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapsh
 		Type        string `json:"type"`
 	}
 
-	if err := json.Unmarshal([]byte(stdout), &simpleFormat); err == nil && len(simpleFormat["root"]) > 0 {
+	simpleErr := json.Unmarshal([]byte(stdout), &simpleFormat)
+	if simpleErr == nil && len(simpleFormat["root"]) > 0 {
 		chosen = simpleFormat["root"]
 	} else {
 		// Fallback to the nested "configs" format
@@ -1389,7 +1723,11 @@ func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapsh
 				} `json:"snapshots"`
 			} `json:"configs"`
 		}
-		if err := json.Unmarshal([]byte(stdout), &complexFormat); err == nil {
+		complexErr := json.Unmarshal([]byte(stdout), &complexFormat)
+		if complexErr != nil {
+			return map[string]snapshotInfo{}, fmt.Errorf("parse snapper list JSON: %w", firstNonNil(simpleErr, complexErr))
+		}
+		if complexErr == nil {
 			for _, cfg := range complexFormat.Configs {
 				if cfg.Config == "root" {
 					chosen = cfg.Snapshots
@@ -1413,13 +1751,13 @@ func (m *microOSBackend) snapperSnapshots(ctx context.Context) map[string]snapsh
 		}
 		out[id] = snapshotInfo{ID: id, Description: snap.Description, CreatedAt: ts}
 	}
-	return out
+	return out, nil
 }
 
 func (m *microOSBackend) pickRollbackTarget(ctx context.Context) string {
 	activeID, _ := m.activeSnapshot(ctx)
 	defaultID := m.defaultSnapshot(ctx)
-	snaps := m.snapperSnapshots(ctx)
+	snaps, _ := m.snapperSnapshots(ctx)
 	bestID := ""
 	bestNum := -1
 	for id := range snaps {
@@ -1491,26 +1829,26 @@ func (m *microOSBackend) readJournal(ctx context.Context, unit string) []string 
 	return lines
 }
 
-func (m *microOSBackend) rpmUpdateCount(ctx context.Context) (int, bool) {
-	stdout, _, _, err := m.runner.Run(ctx, "zypper", "--xmlout", "lu")
-	if err != nil {
-		return 0, false
+func (m *microOSBackend) rpmUpdateCount(ctx context.Context) (int, bool, error) {
+	stdout, stderr, code, err := m.runner.Run(ctx, "zypper", "--xmlout", "lu")
+	if err := commandFailure(stderr, code, err); err != nil {
+		return 0, false, err
 	}
 	count := strings.Count(stdout, "<update")
-	return count, true
+	return count, true, nil
 }
 
-func (m *microOSBackend) queryRPM(ctx context.Context, pkg, root string) string {
+func (m *microOSBackend) queryRPM(ctx context.Context, pkg, root string) (string, error) {
 	// Return clean "Version-Release" string (e.g. "0.1.0-1")
 	args := []string{"-q", "--qf", "%{VERSION}-%{RELEASE}", pkg}
 	if root != "" {
 		args = append([]string{"--root", root}, args...)
 	}
-	stdout, _, _, err := m.runner.Run(ctx, "rpm", args...)
-	if err != nil {
-		return ""
+	stdout, stderr, code, err := m.runner.Run(ctx, "rpm", args...)
+	if err := commandFailure(stderr, code, err); err != nil {
+		return "", err
 	}
-	return strings.TrimSpace(stdout)
+	return strings.TrimSpace(stdout), nil
 }
 
 // helpers

@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
-	"log"
+
+	"piccolod/internal/autounlock"
+	"piccolod/internal/update"
 )
 
 // errUpdateManagerUnavailable is returned by osUpdateManagerAdapter.Reboot
@@ -14,9 +16,9 @@ import (
 var errUpdateManagerUnavailable = errors.New("autounlock adapter: update manager unavailable")
 
 // osUpdateManagerAdapter bridges the autounlock.UpdateManager interface to the
-// existing GinServer.updateManager surface. The osUpdateManager already has
-// Status() returning a RequiresReboot bool — adapter exposes that as
-// HasStagedUpdate so autounlock doesn't depend on the update package types.
+// existing GinServer.updateManager surface. It maps update's richer snapshot
+// state into autounlock's small readiness enum so the scheduler can distinguish
+// absent, in-progress, unknown, and staged states.
 //
 // `inner` is captured by closure so the value is read at call time —
 // updateManager is set during NewGinServer AFTER autounlock construction in
@@ -25,17 +27,25 @@ type osUpdateManagerAdapter struct {
 	inner func() osUpdateManager
 }
 
-func (a *osUpdateManagerAdapter) HasStagedUpdate(ctx context.Context) bool {
+func (a *osUpdateManagerAdapter) UpdateReadiness(ctx context.Context) (autounlock.UpdateReadiness, error) {
 	m := a.inner()
 	if m == nil {
-		return false
+		return autounlock.UpdateReadinessUnknown, errUpdateManagerUnavailable
 	}
-	st, err := m.Status(ctx)
+	st, err := m.SnapshotState(ctx)
 	if err != nil {
-		log.Printf("WARN: autounlock adapter: update Status: %v", err)
-		return false
+		return autounlock.UpdateReadinessUnknown, err
 	}
-	return st.RequiresReboot
+	switch st.Readiness {
+	case update.SnapshotReadinessStaged:
+		return autounlock.UpdateReadinessStaged, nil
+	case update.SnapshotReadinessAbsent:
+		return autounlock.UpdateReadinessAbsent, nil
+	case update.SnapshotReadinessInProgress:
+		return autounlock.UpdateReadinessInProgress, nil
+	default:
+		return autounlock.UpdateReadinessUnknown, nil
+	}
 }
 
 func (a *osUpdateManagerAdapter) Reboot(ctx context.Context) error {

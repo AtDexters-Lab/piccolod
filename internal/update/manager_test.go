@@ -385,6 +385,829 @@ func (r *validationRunner) hasCall(name string, argSubstrings ...string) bool {
 	return false
 }
 
+func (r *validationRunner) countCalls(name string, argSubstrings ...string) int {
+	count := 0
+	for _, c := range r.calls {
+		if c.name != name {
+			continue
+		}
+		joined := strings.Join(c.args, " ")
+		match := true
+		for _, sub := range argSubstrings {
+			if !strings.Contains(joined, sub) {
+				match = false
+				break
+			}
+		}
+		if match {
+			count++
+		}
+	}
+	return count
+}
+
+func TestSnapshotStateFastPath(t *testing.T) {
+	t.Run("staged_without_snapper", func(t *testing.T) {
+		r := &validationRunner{activeID: "5", defaultID: "7"}
+		m, err := newMicroOSBackend(
+			WithRunner(r),
+			WithStateDir(t.TempDir()),
+			WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+			WithSupportOverride(true),
+		)
+		if err != nil {
+			t.Fatalf("backend: %v", err)
+		}
+
+		st, err := m.SnapshotState(context.Background())
+		if err != nil {
+			t.Fatalf("SnapshotState: %v", err)
+		}
+		if st.Readiness != SnapshotReadinessStaged || !st.RequiresReboot {
+			t.Fatalf("SnapshotState = %+v, want staged/reboot", st)
+		}
+		if st.ActiveSnapshot != "5" || st.DefaultSnapshot != "7" {
+			t.Fatalf("unexpected snapshots: %+v", st)
+		}
+		if r.hasCall("snapper") || r.hasCall("zypper") || r.hasCall("rpm") {
+			t.Fatalf("fast snapshot path must not call enrichment tools: %#v", r.calls)
+		}
+	})
+
+	t.Run("absent", func(t *testing.T) {
+		r := &validationRunner{activeID: "5", defaultID: "5"}
+		m, err := newMicroOSBackend(
+			WithRunner(r),
+			WithStateDir(t.TempDir()),
+			WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+			WithSupportOverride(true),
+		)
+		if err != nil {
+			t.Fatalf("backend: %v", err)
+		}
+
+		st, err := m.SnapshotState(context.Background())
+		if err != nil {
+			t.Fatalf("SnapshotState: %v", err)
+		}
+		if st.Readiness != SnapshotReadinessAbsent || st.RequiresReboot {
+			t.Fatalf("SnapshotState = %+v, want absent/no reboot", st)
+		}
+	})
+
+	t.Run("in_progress_preempts_mismatch", func(t *testing.T) {
+		r := &validationRunner{activeID: "5", defaultID: "7", inProgress: true}
+		m, err := newMicroOSBackend(
+			WithRunner(r),
+			WithStateDir(t.TempDir()),
+			WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+			WithSupportOverride(true),
+		)
+		if err != nil {
+			t.Fatalf("backend: %v", err)
+		}
+
+		st, err := m.SnapshotState(context.Background())
+		if err != nil {
+			t.Fatalf("SnapshotState: %v", err)
+		}
+		if st.Readiness != SnapshotReadinessInProgress || st.RequiresReboot {
+			t.Fatalf("SnapshotState = %+v, want in_progress/no reboot", st)
+		}
+		if r.hasCall("findmnt") {
+			t.Fatalf("in-progress state should preempt snapshot comparison: %#v", r.calls)
+		}
+	})
+}
+
+type rawDefaultNoMappingRunner struct{ validationRunner }
+
+func (r *rawDefaultNoMappingRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+	switch name {
+	case "findmnt":
+		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
+	case "btrfs":
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
+			return "ID 2716 gen 158761 top level 257", "", 0, nil
+		}
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "list" {
+			return "ID 999 gen 1 top level 257 path @/.snapshots/5/snapshot\n", "", 0, nil
+		}
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+	}
+	return "", "", 0, nil
+}
+
+func TestSnapshotStateUnknownWhenDefaultCannotNormalize(t *testing.T) {
+	r := &rawDefaultNoMappingRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	st, err := m.SnapshotState(context.Background())
+	if err == nil {
+		t.Fatal("SnapshotState should error when default ID cannot normalize")
+	}
+	if st.Readiness != SnapshotReadinessUnknown {
+		t.Fatalf("readiness = %q, want unknown", st.Readiness)
+	}
+}
+
+func TestSnapshotStateUsesRequestTimeout(t *testing.T) {
+	m, err := newMicroOSBackend(
+		WithRunner(hangingStatusRunner{}),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithStatusRequestTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	start := time.Now()
+	st, err := m.SnapshotState(context.Background())
+	if err == nil {
+		t.Fatal("SnapshotState should return a timeout error")
+	}
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("SnapshotState took %v; expected bounded timeout", elapsed)
+	}
+	if st.Readiness != SnapshotReadinessUnknown {
+		t.Fatalf("readiness = %q, want unknown", st.Readiness)
+	}
+}
+
+func TestStatusPreservesErrInProgress(t *testing.T) {
+	m, err := newMicroOSBackend(
+		WithRunner(inProgressRunner{}),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	if _, err := m.Status(context.Background()); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("Status: want ErrInProgress, got %v", err)
+	}
+}
+
+type statusUnknownAfterCacheRunner struct {
+	validationRunner
+	unknown bool
+}
+
+func (r *statusUnknownAfterCacheRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	if !r.unknown {
+		return r.validationRunner.Run(ctx, name, args...)
+	}
+
+	r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+	switch name {
+	case "findmnt":
+		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
+	case "btrfs":
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
+			return "ID 2716 gen 158761 top level 257", "", 0, nil
+		}
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "list" {
+			return "ID 999 gen 1 top level 257 path @/.snapshots/5/snapshot\n", "", 0, nil
+		}
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+	}
+	return "", "", 0, nil
+}
+
+func TestStatusUnknownReadinessDoesNotReuseCachedRebootState(t *testing.T) {
+	r := &statusUnknownAfterCacheRunner{
+		validationRunner: validationRunner{activeID: "5", defaultID: "7"},
+	}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("prime Status: %v", err)
+	}
+	if !st.Pending || !st.RequiresReboot {
+		t.Fatalf("prime status should report staged update, got %+v", st)
+	}
+
+	r.unknown = true
+	st, err = m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("unknown Status should degrade instead of erroring: %v", err)
+	}
+	if st.Pending || st.RequiresReboot {
+		t.Fatalf("unknown readiness reused cached reboot flags: %+v", st)
+	}
+	if got := st.Meta["snapshot_readiness"]; got != string(SnapshotReadinessUnknown) {
+		t.Fatalf("snapshot_readiness = %v, want unknown; meta=%v", got, st.Meta)
+	}
+	if degraded, _ := st.Meta["degraded"].(bool); !degraded {
+		t.Fatalf("expected degraded meta, got %v", st.Meta)
+	}
+}
+
+type slowEnrichmentRunner struct {
+	validationRunner
+}
+
+func (r *slowEnrichmentRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	if name == "snapper" && len(args) >= 2 && args[0] == "--json" && args[1] == "list" {
+		r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+		<-ctx.Done()
+		return "", "", -1, ctx.Err()
+	}
+	return r.validationRunner.Run(ctx, name, args...)
+}
+
+func TestStatusKeepsRequiresRebootWhenEnrichmentTimesOut(t *testing.T) {
+	r := &slowEnrichmentRunner{validationRunner: validationRunner{activeID: "5", defaultID: "7"}}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(10*time.Millisecond),
+		WithStatusRefreshTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("Status should degrade instead of erroring: %v", err)
+	}
+	if !st.Pending || !st.RequiresReboot {
+		t.Fatalf("expected pending/requires_reboot from fast snapshot state, got %+v", st)
+	}
+	if degraded, _ := st.Meta["degraded"].(bool); !degraded {
+		t.Fatalf("expected degraded meta, got %v", st.Meta)
+	}
+	reason, _ := st.Meta["degraded_reason"].(string)
+	if !strings.Contains(reason, "deadline") {
+		t.Fatalf("degraded_reason = %q, want timeout detail", reason)
+	}
+}
+
+func TestStatusBackoffPreservesEnrichmentFailureReason(t *testing.T) {
+	r := &slowEnrichmentRunner{validationRunner: validationRunner{activeID: "5", defaultID: "7"}}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(10*time.Millisecond),
+		WithStatusRefreshTimeout(10*time.Millisecond),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	if _, err := m.Status(context.Background()); err != nil {
+		t.Fatalf("first Status should degrade instead of erroring: %v", err)
+	}
+	st, err := m.Status(context.Background())
+	if err != nil {
+		t.Fatalf("backoff Status should degrade instead of erroring: %v", err)
+	}
+	if backoff, _ := st.Meta["enrichment_backoff"].(bool); !backoff {
+		t.Fatalf("expected enrichment_backoff meta, got %v", st.Meta)
+	}
+	reason, _ := st.Meta["degraded_reason"].(string)
+	if reason == "" || strings.Contains(reason, "status enrichment unavailable") {
+		t.Fatalf("degraded_reason = %q, want original enrichment failure", reason)
+	}
+	if r.countCalls("snapper") != 1 {
+		t.Fatalf("backoff Status should not retry snapper, calls=%#v", r.calls)
+	}
+}
+
+type cancelingStatusRunner struct {
+	cancel       context.CancelFunc
+	snapperCalls atomic.Int32
+}
+
+func (r *cancelingStatusRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	switch name {
+	case "findmnt":
+		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
+	case "btrfs":
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
+			return "ID 7 gen 59 top level 257 path @/.snapshots/7/snapshot", "", 0, nil
+		}
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "list" {
+			return "ID 5 gen 50 top level 257 path @/.snapshots/5/snapshot\nID 7 gen 59 top level 257 path @/.snapshots/7/snapshot\n", "", 0, nil
+		}
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+		if len(args) > 0 && args[0] == "show" {
+			return "Result=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2025-11-24 09:59:01 UTC", "", 0, nil
+		}
+	case "journalctl":
+		return "", "", 0, nil
+	case "snapper":
+		if len(args) >= 2 && args[0] == "--json" && args[1] == "list" {
+			if r.snapperCalls.Add(1) == 1 {
+				r.cancel()
+				<-ctx.Done()
+				return "", "", -1, ctx.Err()
+			}
+			return `{"configs":[{"config":"root","snapshots":[{"number":5},{"number":7}]}]}`, "", 0, nil
+		}
+	case "zypper":
+		return "<update/>", "", 0, nil
+	case "rpm":
+		for i, a := range args {
+			if a == "--root" && i+1 < len(args) && args[i+1] != "" {
+				return "1.2.4-1\n", "", 0, nil
+			}
+		}
+		return "1.2.3-1\n", "", 0, nil
+	}
+	return "", "", 0, nil
+}
+
+func TestStatusClientCancellationDoesNotEnterEnrichmentBackoff(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	r := &cancelingStatusRunner{cancel: cancel}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+		WithStatusRequestTimeout(time.Second),
+		WithStatusRefreshTimeout(time.Second),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	st, err := m.Status(ctx)
+	if err != nil {
+		t.Fatalf("canceled Status should degrade locally instead of returning error: %v", err)
+	}
+	if !st.Pending || !st.RequiresReboot {
+		t.Fatalf("expected pending/requires_reboot from fast snapshot state, got %+v", st)
+	}
+
+	deadline := time.Now().Add(time.Second)
+	for {
+		m.statusMu.RLock()
+		cachedAt := m.statusCachedAt
+		refreshing := m.statusRefreshActive
+		backoffUntil := m.statusEnrichmentBackoffUntil
+		lastErr := m.statusLastEnrichmentErr
+		cached := m.statusCache
+		m.statusMu.RUnlock()
+
+		if !backoffUntil.IsZero() {
+			t.Fatalf("client cancellation should not set enrichment backoff: %v", backoffUntil)
+		}
+		if lastErr != "" {
+			t.Fatalf("client cancellation should not persist enrichment error: %q", lastErr)
+		}
+		if r.snapperCalls.Load() >= 2 && !refreshing && !cachedAt.IsZero() {
+			if backoff, _ := cached.Meta["enrichment_backoff"].(bool); backoff {
+				t.Fatalf("scheduled refresh published backoff metadata after client cancellation: %v", cached.Meta)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("scheduled refresh did not run after client cancellation; snapper_calls=%d refreshing=%v cached_at=%v", r.snapperCalls.Load(), refreshing, cachedAt)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+type quickEnrichmentFailureRunner struct {
+	calls []call
+	fail  string
+}
+
+func (r *quickEnrichmentFailureRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+	switch name {
+	case "findmnt":
+		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
+	case "btrfs":
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
+			return "ID 7 gen 59 top level 257 path @/.snapshots/7/snapshot", "", 0, nil
+		}
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "list" {
+			return "ID 5 gen 50 top level 257 path @/.snapshots/5/snapshot\nID 7 gen 59 top level 257 path @/.snapshots/7/snapshot\n", "", 0, nil
+		}
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+		if len(args) > 0 && args[0] == "show" {
+			return "Result=success\nExecMainStatus=0\nExecMainExitTimestamp=Mon 2025-11-24 09:59:01 UTC", "", 0, nil
+		}
+	case "journalctl":
+		return "", "", 0, nil
+	case "snapper":
+		if r.fail == "snapper" && len(args) >= 2 && args[0] == "--json" && args[1] == "list" {
+			return "", "Config is locked.", 1, fmt.Errorf("snapper failed")
+		}
+		return `{"configs":[{"config":"root","snapshots":[{"number":5},{"number":7}]}]}`, "", 0, nil
+	case "zypper":
+		if r.fail == "zypper" {
+			return "", "zypp lock is held", 1, fmt.Errorf("zypper failed")
+		}
+		return "<update/>", "", 0, nil
+	case "rpm":
+		if r.fail == "rpm" {
+			return "", "rpmdb is locked", 1, fmt.Errorf("rpm failed")
+		}
+		for i, a := range args {
+			if a == "--root" && i+1 < len(args) && args[i+1] != "" {
+				return "1.2.4-1\n", "", 0, nil
+			}
+		}
+		return "1.2.3-1\n", "", 0, nil
+	}
+	return "", "", 0, nil
+}
+
+func (r *quickEnrichmentFailureRunner) countCalls(name string, argSubstrings ...string) int {
+	count := 0
+	for _, c := range r.calls {
+		if c.name != name {
+			continue
+		}
+		joined := strings.Join(c.args, " ")
+		match := true
+		for _, sub := range argSubstrings {
+			if !strings.Contains(joined, sub) {
+				match = false
+				break
+			}
+		}
+		if match {
+			count++
+		}
+	}
+	return count
+}
+
+func TestStatusBackoffOnQuickEnrichmentFailures(t *testing.T) {
+	cases := []struct {
+		name          string
+		fail          string
+		command       string
+		argSubstrings []string
+		reason        string
+	}{
+		{name: "snapper", fail: "snapper", command: "snapper", argSubstrings: []string{"--json", "list"}, reason: "Config is locked"},
+		{name: "zypper", fail: "zypper", command: "zypper", argSubstrings: []string{"--xmlout", "lu"}, reason: "zypp lock"},
+		{name: "rpm", fail: "rpm", command: "rpm", argSubstrings: []string{"-q", "piccolod"}, reason: "rpmdb is locked"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &quickEnrichmentFailureRunner{fail: tc.fail}
+			m, err := newMicroOSBackend(
+				WithRunner(r),
+				WithStateDir(t.TempDir()),
+				WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+				WithSupportOverride(true),
+				WithCurrentVersion("v-test"),
+				WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+			)
+			if err != nil {
+				t.Fatalf("backend: %v", err)
+			}
+
+			st, err := m.Status(context.Background())
+			if err != nil {
+				t.Fatalf("Status should return degraded partial status, got error: %v", err)
+			}
+			if !st.Pending || !st.RequiresReboot {
+				t.Fatalf("expected pending/requires_reboot from fast snapshot state, got %+v", st)
+			}
+			if degraded, _ := st.Meta["degraded"].(bool); !degraded {
+				t.Fatalf("expected degraded meta, got %v", st.Meta)
+			}
+			reason, _ := st.Meta["degraded_reason"].(string)
+			if !strings.Contains(reason, tc.reason) {
+				t.Fatalf("degraded_reason = %q, want %q", reason, tc.reason)
+			}
+
+			initial := r.countCalls(tc.command, tc.argSubstrings...)
+			m.refreshStatusCache(context.Background())
+			if got := r.countCalls(tc.command, tc.argSubstrings...); got != initial {
+				t.Fatalf("refresh during backoff retried %s: before=%d after=%d calls=%#v", tc.command, initial, got, r.calls)
+			}
+
+			m.statusMu.RLock()
+			cached := m.statusCache
+			backoffUntil := m.statusEnrichmentBackoffUntil
+			lastErr := m.statusLastEnrichmentErr
+			m.statusMu.RUnlock()
+			if backoffUntil.IsZero() {
+				t.Fatal("quick enrichment failure should set enrichment backoff")
+			}
+			if !strings.Contains(lastErr, tc.reason) {
+				t.Fatalf("last enrichment error = %q, want %q", lastErr, tc.reason)
+			}
+			if backoff, _ := cached.Meta["enrichment_backoff"].(bool); !backoff {
+				t.Fatalf("refresh during backoff should publish backoff metadata, got %v", cached.Meta)
+			}
+		})
+	}
+}
+
+func TestStatusEnrichmentCoordinatorSingleFlight(t *testing.T) {
+	m, err := newMicroOSBackend(
+		WithRunner(fakeRunner{}),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	if ok, _ := m.tryBeginStatusEnrichment(time.Now()); !ok {
+		t.Fatal("first enrichment begin should succeed")
+	}
+	if ok, fields := m.tryBeginStatusEnrichment(time.Now()); ok {
+		t.Fatal("second enrichment begin should be denied")
+	} else if refreshing, _ := fields["refreshing"].(bool); !refreshing {
+		t.Fatalf("expected refreshing metadata, got %v", fields)
+	}
+	m.finishStatusEnrichment(nil)
+}
+
+func TestRefreshStatusCachePublishesFastCoreDuringEnrichmentBackoff(t *testing.T) {
+	r := &validationRunner{activeID: "5", defaultID: "7"}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+		WithCurrentVersion("v-test"),
+		WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	m.statusMu.Lock()
+	m.statusEnrichmentBackoffUntil = time.Now().Add(time.Minute)
+	m.statusLastEnrichmentErr = "snapper timed out"
+	m.statusMu.Unlock()
+
+	m.refreshStatusCache(context.Background())
+
+	m.statusMu.RLock()
+	st := m.statusCache
+	cachedAt := m.statusCachedAt
+	m.statusMu.RUnlock()
+	if cachedAt.IsZero() {
+		t.Fatal("refreshStatusCache should publish fast-core status during enrichment backoff")
+	}
+	if !st.Pending || !st.RequiresReboot {
+		t.Fatalf("expected pending/requires_reboot from fast snapshot state, got %+v", st)
+	}
+	if backoff, _ := st.Meta["enrichment_backoff"].(bool); !backoff {
+		t.Fatalf("expected enrichment_backoff meta, got %v", st.Meta)
+	}
+	if reason, _ := st.Meta["degraded_reason"].(string); reason != "snapper timed out" {
+		t.Fatalf("degraded_reason = %q, want snapper timed out", reason)
+	}
+	if r.hasCall("snapper") || r.hasCall("zypper") || r.hasCall("rpm") {
+		t.Fatalf("refresh during backoff should not call enrichment tools: %#v", r.calls)
+	}
+}
+
+func TestRefreshStatusCacheFastCoreSkipsInvalidatedCache(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(*microOSBackend)
+		assertMeta func(*testing.T, map[string]interface{})
+	}{
+		{
+			name: "backoff",
+			setup: func(m *microOSBackend) {
+				m.statusEnrichmentBackoffUntil = time.Now().Add(time.Minute)
+				m.statusLastEnrichmentErr = "snapper timed out"
+			},
+			assertMeta: func(t *testing.T, meta map[string]interface{}) {
+				t.Helper()
+				if backoff, _ := meta["enrichment_backoff"].(bool); !backoff {
+					t.Fatalf("expected enrichment_backoff meta, got %v", meta)
+				}
+				if reason, _ := meta["degraded_reason"].(string); reason != "snapper timed out" {
+					t.Fatalf("degraded_reason = %q, want snapper timed out", reason)
+				}
+			},
+		},
+		{
+			name: "active",
+			setup: func(m *microOSBackend) {
+				m.statusRefreshActive = true
+			},
+			assertMeta: func(t *testing.T, meta map[string]interface{}) {
+				t.Helper()
+				if refreshing, _ := meta["refreshing"].(bool); !refreshing {
+					t.Fatalf("expected refreshing meta, got %v", meta)
+				}
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &validationRunner{activeID: "7", defaultID: "7"}
+			m, err := newMicroOSBackend(
+				WithRunner(r),
+				WithStateDir(t.TempDir()),
+				WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+				WithSupportOverride(true),
+				WithCurrentVersion("v-current"),
+				WithReadFile(func(string) ([]byte, error) { return nil, os.ErrNotExist }),
+			)
+			if err != nil {
+				t.Fatalf("backend: %v", err)
+			}
+
+			invalidatedAt := time.Now()
+			m.statusMu.Lock()
+			m.statusCache = Status{
+				CurrentVersion:   "v-old",
+				AvailableVersion: "stale-available",
+				Pending:          true,
+				RequiresReboot:   true,
+				LastChecked:      time.Unix(100, 0),
+				Meta: map[string]interface{}{
+					"last_request":    persistedState{LastAction: "apply", TargetSnapshot: "42", RequestedAt: time.Unix(99, 0)},
+					"piccolod_staged": "stale-rpm",
+				},
+			}
+			m.statusCachedAt = invalidatedAt.Add(-time.Minute)
+			m.statusInvalidatedAt = invalidatedAt
+			tc.setup(m)
+			m.statusMu.Unlock()
+
+			m.refreshStatusCache(context.Background())
+
+			m.statusMu.RLock()
+			st := m.statusCache
+			cachedAt := m.statusCachedAt
+			m.statusMu.RUnlock()
+
+			if !cachedAt.After(invalidatedAt) {
+				t.Fatalf("refresh did not publish a post-invalidation sample: cachedAt=%v invalidatedAt=%v", cachedAt, invalidatedAt)
+			}
+			if st.CurrentVersion != "v-current" || st.AvailableVersion != "v-current" {
+				t.Fatalf("fast-core refresh reused stale version fields: %+v", st)
+			}
+			if st.Pending || st.RequiresReboot {
+				t.Fatalf("fast-core refresh reused stale reboot flags: %+v", st)
+			}
+			if _, ok := st.Meta["last_request"]; ok {
+				t.Fatalf("fast-core refresh reused stale last_request metadata: %v", st.Meta)
+			}
+			if _, ok := st.Meta["piccolod_staged"]; ok {
+				t.Fatalf("fast-core refresh reused stale staged RPM metadata: %v", st.Meta)
+			}
+			if got := st.Meta["snapshot_readiness"]; got != string(SnapshotReadinessAbsent) {
+				t.Fatalf("snapshot_readiness = %v, want absent; meta=%v", got, st.Meta)
+			}
+			tc.assertMeta(t, st.Meta)
+			if r.hasCall("snapper") || r.hasCall("zypper") || r.hasCall("rpm") {
+				t.Fatalf("fast-core refresh should not call enrichment tools: %#v", r.calls)
+			}
+		})
+	}
+}
+
+func TestRefreshStatusCacheInProgressDoesNotEnterEnrichmentBackoff(t *testing.T) {
+	r := &validationRunner{activeID: "5", defaultID: "7", inProgress: true}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+		WithSupportOverride(true),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	m.refreshStatusCache(context.Background())
+
+	m.statusMu.RLock()
+	backoffUntil := m.statusEnrichmentBackoffUntil
+	cachedAt := m.statusCachedAt
+	m.statusMu.RUnlock()
+	if !backoffUntil.IsZero() {
+		t.Fatalf("in-progress fast state should not set enrichment backoff: %v", backoffUntil)
+	}
+	if !cachedAt.IsZero() {
+		t.Fatalf("in-progress fast state should not publish a 200 status cache")
+	}
+}
+
+type targetCaptureRunner struct {
+	validationRunner
+}
+
+func (r *targetCaptureRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+	switch name {
+	case "systemd-run":
+		return "started", "", 0, nil
+	case "systemctl":
+		if len(args) > 0 && args[0] == "list-units" {
+			return "", "", 0, nil
+		}
+		if len(args) > 0 && args[0] == "is-active" {
+			return "", "", 3, nil
+		}
+	case "findmnt":
+		return "/dev/sda3[/@/.snapshots/5/snapshot]\n", "", 0, nil
+	case "btrfs":
+		if len(args) >= 2 && args[0] == "subvolume" && args[1] == "get-default" {
+			return "ID 7 gen 59 top level 257 path @/.snapshots/7/snapshot", "", 0, nil
+		}
+	}
+	return "", "", 0, nil
+}
+
+func TestRunTransactionalUpdateCapturesTargetWithoutFullStatus(t *testing.T) {
+	tmp := t.TempDir()
+	r := &targetCaptureRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithClock(func() time.Time { return time.Unix(1700000000, 0) }),
+		WithStateDir(tmp),
+		WithRuntimeDir(filepath.Join(tmp, "run")),
+		WithSupportOverride(true),
+		WithFreeBytesFn(func(string) (uint64, error) { return 10 << 30, nil }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	if err := m.runTransactionalUpdate(context.Background(), []string{"transactional-update", "dup"}, "apply", "", false); err != nil {
+		t.Fatalf("runTransactionalUpdate: %v", err)
+	}
+	if r.hasCall("snapper") || r.hasCall("zypper") || r.hasCall("rpm") {
+		t.Fatalf("target capture should not call full status/enrichment tools: %#v", r.calls)
+	}
+	ps := m.loadState()
+	if ps == nil || ps.TargetSnapshot != "7" {
+		t.Fatalf("persisted target = %+v, want snapshot 7", ps)
+	}
+	if _, err := os.Stat(filepath.Join(tmp, "run", "update.inprogress")); err != nil {
+		t.Fatalf("async target capture should leave in-progress marker intact: %v", err)
+	}
+}
+
 // createSnapshotDir creates a snapshot directory structure with the specified files present.
 func createSnapshotDir(t *testing.T, baseDir, snapshotID string, files []string) {
 	t.Helper()
@@ -709,11 +1532,11 @@ func (r *countingRunner) Run(ctx context.Context, name string, args ...string) (
 	return r.fakeRunner.Run(ctx, name, args...)
 }
 
-// expectedIsInProgressShellouts caps the runner-call overhead a Status() call
-// pays even when served from cache: it's the cost of the isInProgress probe
-// (a marker-file read can short-circuit; the shell-out fallbacks make 1–2 calls
-// to systemctl). If isInProgress grows new probes, this needs to follow.
-const expectedIsInProgressShellouts = 3
+// expectedFastStatusShellouts caps the runner-call overhead a Status() call
+// pays even when served from cache: the fast snapshot probe checks in-progress
+// state plus active/default roots. If SnapshotState grows new probes, this
+// needs to follow.
+const expectedFastStatusShellouts = 4
 
 func TestStatusServedFromSnapshotCache(t *testing.T) {
 	tmp := t.TempDir()
@@ -733,7 +1556,7 @@ func TestStatusServedFromSnapshotCache(t *testing.T) {
 		t.Fatalf("first Status: %v", err)
 	}
 	primingDelta := r.calls.Load()
-	if primingDelta <= expectedIsInProgressShellouts {
+	if primingDelta <= expectedFastStatusShellouts {
 		t.Fatalf("expected first Status to invoke many runner calls; got %d", primingDelta)
 	}
 
@@ -741,8 +1564,8 @@ func TestStatusServedFromSnapshotCache(t *testing.T) {
 		t.Fatalf("second Status: %v", err)
 	}
 	cachedDelta := r.calls.Load() - primingDelta
-	if cachedDelta > expectedIsInProgressShellouts {
-		t.Errorf("cached Status made %d runner calls; expected ≤%d (isInProgress overhead)", cachedDelta, expectedIsInProgressShellouts)
+	if cachedDelta > expectedFastStatusShellouts {
+		t.Errorf("cached Status made %d runner calls; expected ≤%d (fast snapshot overhead)", cachedDelta, expectedFastStatusShellouts)
 	}
 
 	m.invalidateStatusCache()
@@ -824,7 +1647,7 @@ func TestApplyInvalidatesStatusCache(t *testing.T) {
 	if _, err := m.Status(context.Background()); err != nil {
 		t.Fatalf("cached Status: %v", err)
 	}
-	if delta := r.calls.Load() - primingCalls; delta > expectedIsInProgressShellouts {
+	if delta := r.calls.Load() - primingCalls; delta > expectedFastStatusShellouts {
 		t.Fatalf("cache not primed: cached call made %d runner calls", delta)
 	}
 

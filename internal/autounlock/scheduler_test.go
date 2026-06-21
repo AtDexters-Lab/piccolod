@@ -11,22 +11,40 @@ import (
 )
 
 type fakeUpdateManager struct {
-	mu          sync.Mutex
-	hasStaged   bool
-	rebootErr   error
-	rebootCount int
+	mu           sync.Mutex
+	readiness    UpdateReadiness
+	readinessErr error
+	rebootErr    error
+	rebootCount  int
 }
 
-func (f *fakeUpdateManager) HasStagedUpdate(ctx context.Context) bool {
+func (f *fakeUpdateManager) UpdateReadiness(ctx context.Context) (UpdateReadiness, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.hasStaged
+	if f.readiness == "" {
+		return UpdateReadinessAbsent, f.readinessErr
+	}
+	return f.readiness, f.readinessErr
 }
 func (f *fakeUpdateManager) Reboot(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rebootCount++
 	return f.rebootErr
+}
+
+type blockingReadinessManager struct {
+	rebootCount int
+}
+
+func (b *blockingReadinessManager) UpdateReadiness(ctx context.Context) (UpdateReadiness, error) {
+	<-ctx.Done()
+	return UpdateReadinessUnknown, ctx.Err()
+}
+
+func (b *blockingReadinessManager) Reboot(ctx context.Context) error {
+	b.rebootCount++
+	return nil
 }
 
 func newScheduler(t *testing.T, now time.Time) (*Scheduler, *fakeUpdateManager, *[]capturedAudit) {
@@ -164,7 +182,7 @@ func TestTick_AutoRebootOffNoOp(t *testing.T) {
 func TestTick_OutOfWindowNoOp(t *testing.T) {
 	s, um, _ := newScheduler(t, time.Date(2026, 5, 2, 14, 0, 0, 0, time.UTC))
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.tick(context.Background())
 	if um.rebootCount != 0 {
 		t.Errorf("reboot called outside window")
@@ -174,10 +192,69 @@ func TestTick_OutOfWindowNoOp(t *testing.T) {
 func TestTick_NoStagedUpdateNoOp(t *testing.T) {
 	s, um, _ := newScheduler(t, time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC))
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = false
+	um.readiness = UpdateReadinessAbsent
 	s.tick(context.Background())
 	if um.rebootCount != 0 {
 		t.Errorf("reboot called with no staged update")
+	}
+	got, _ := LoadState()
+	if got.AutoReboot.LastFiredAt != nil {
+		t.Errorf("last_fired_at should not persist for absent update")
+	}
+}
+
+func TestTick_InProgressNoOp(t *testing.T) {
+	s, um, _ := newScheduler(t, time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC))
+	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
+	um.readiness = UpdateReadinessInProgress
+	s.tick(context.Background())
+	if um.rebootCount != 0 {
+		t.Errorf("reboot called while update in progress")
+	}
+	got, _ := LoadState()
+	if got.AutoReboot.LastFiredAt != nil {
+		t.Errorf("last_fired_at should not persist while update is in progress")
+	}
+}
+
+func TestTick_UnknownNoOp(t *testing.T) {
+	s, um, _ := newScheduler(t, time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC))
+	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
+	um.readiness = UpdateReadinessUnknown
+	um.readinessErr = errors.New("snapshot probe failed")
+	s.tick(context.Background())
+	if um.rebootCount != 0 {
+		t.Errorf("reboot called with unknown readiness")
+	}
+	got, _ := LoadState()
+	if got.AutoReboot.LastFiredAt != nil {
+		t.Errorf("last_fired_at should not persist for unknown readiness")
+	}
+}
+
+func TestTick_UpdateReadinessTimeoutNoFire(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
+	um := &blockingReadinessManager{}
+	s := NewScheduler(SchedulerDeps{
+		UpdateManager:          um,
+		UpdateReadinessTimeout: 10 * time.Millisecond,
+		Now:                    func() time.Time { return now },
+		TZSafeToFire:           func() bool { return true },
+	})
+	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
+
+	start := time.Now()
+	s.tick(context.Background())
+	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
+		t.Fatalf("tick blocked for %s despite readiness timeout", elapsed)
+	}
+	if um.rebootCount != 0 {
+		t.Fatalf("reboot called after readiness timeout")
+	}
+	got, _ := LoadState()
+	if got.AutoReboot.LastFiredAt != nil {
+		t.Fatalf("last_fired_at should not persist after readiness timeout")
 	}
 }
 
@@ -185,7 +262,7 @@ func TestTick_HappyPath(t *testing.T) {
 	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
 	s, um, audits := newScheduler(t, now)
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.tick(context.Background())
 	if um.rebootCount != 1 {
 		t.Errorf("reboot count = %d; want 1", um.rebootCount)
@@ -204,7 +281,7 @@ func TestTick_AlreadyTriedThisWindow(t *testing.T) {
 	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
 	s, um, _ := newScheduler(t, now)
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.tick(context.Background())
 	s.tick(context.Background())
 	if um.rebootCount != 1 {
@@ -216,7 +293,7 @@ func TestTick_RebootError_AuditsAndPersists(t *testing.T) {
 	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
 	s, um, audits := newScheduler(t, now)
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	um.rebootErr = errors.New("reboot fail")
 	s.tick(context.Background())
 	got, _ := LoadState()
@@ -236,7 +313,7 @@ func TestTick_WindowRolloverResetsFlag(t *testing.T) {
 	day1Hour4 := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
 	s, um, _ := newScheduler(t, day1Hour4)
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.tick(context.Background())
 	if um.rebootCount != 1 {
 		t.Errorf("first fire failed: %d", um.rebootCount)
@@ -244,7 +321,7 @@ func TestTick_WindowRolloverResetsFlag(t *testing.T) {
 	// Advance Now to next day, in window again.
 	day2Hour4 := day1Hour4.Add(24 * time.Hour)
 	s.deps.Now = func() time.Time { return day2Hour4 }
-	um.hasStaged = true // staged again
+	um.readiness = UpdateReadinessStaged // staged again
 	s.tick(context.Background())
 	if um.rebootCount != 2 {
 		t.Errorf("second-day fire failed: %d", um.rebootCount)
@@ -264,7 +341,7 @@ func TestRehydrate_LastFiredInCurrentWindow(t *testing.T) {
 			LastFiredAt:     &priorFire,
 		},
 	})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.rehydrate()
 	s.tick(context.Background())
 	if um.rebootCount != 0 {
@@ -282,7 +359,7 @@ func TestTick_TZUnsetGatesFire(t *testing.T) {
 		TZSafeToFire:  func() bool { return false },
 	})
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.tick(context.Background())
 	if um.rebootCount != 0 {
 		t.Errorf("TZ-unset gate failed to block fire; reboot count = %d", um.rebootCount)
@@ -293,7 +370,7 @@ func TestMarkWindowEdit_BlocksFire(t *testing.T) {
 	now := time.Date(2026, 5, 2, 4, 0, 0, 0, time.UTC)
 	s, um, _ := newScheduler(t, now)
 	SaveState(State{Enabled: true, AutoReboot: AutoReboot{Enabled: true, WindowStartHour: 3, WindowEndHour: 5}})
-	um.hasStaged = true
+	um.readiness = UpdateReadinessStaged
 	s.MarkWindowEdit()
 	s.tick(context.Background())
 	if um.rebootCount != 0 {

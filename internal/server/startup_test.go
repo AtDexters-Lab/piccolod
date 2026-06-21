@@ -20,11 +20,14 @@ type blockingUpdateManager struct{}
 func (m *blockingUpdateManager) Status(ctx context.Context) (update.Status, error) {
 	return update.Status{}, nil
 }
+func (m *blockingUpdateManager) SnapshotState(ctx context.Context) (update.SnapshotState, error) {
+	return update.SnapshotState{Readiness: update.SnapshotReadinessAbsent}, nil
+}
 func (m *blockingUpdateManager) Apply(ctx context.Context) error                     { return nil }
 func (m *blockingUpdateManager) Rollback(ctx context.Context, targetID string) error { return nil }
-func (m *blockingUpdateManager) Reboot(ctx context.Context) error      { return nil }
-func (m *blockingUpdateManager) ForceReboot(ctx context.Context) error { return nil }
-func (m *blockingUpdateManager) PowerOff(ctx context.Context) error    { return nil }
+func (m *blockingUpdateManager) Reboot(ctx context.Context) error                    { return nil }
+func (m *blockingUpdateManager) ForceReboot(ctx context.Context) error               { return nil }
+func (m *blockingUpdateManager) PowerOff(ctx context.Context) error                  { return nil }
 
 // Watch blocks until context is cancelled, simulating the real infinite loop.
 func (m *blockingUpdateManager) Watch(ctx context.Context) error {
