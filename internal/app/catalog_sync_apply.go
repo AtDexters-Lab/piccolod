@@ -34,10 +34,12 @@ const (
 	// (no image pull).
 	DiffKindStructuralNoImage
 	// DiffKindImageOnly — catalog changed an image tag with no other change.
-	// Sync skips; user runs UpdateImage explicitly.
+	// Sync stores a manifest-review pending source; UpdateImage only refreshes
+	// the currently committed source and must not consume catalog drift.
 	DiffKindImageOnly
 	// DiffKindStructuralWithImage — both image and structural fields changed.
-	// Sync skips; user runs UpdateImage first, sync re-classifies on next tick.
+	// Sync stores a manifest-review pending source when stageable, otherwise
+	// fails closed with the service-app update policy reason.
 	DiffKindStructuralWithImage
 )
 
@@ -251,23 +253,37 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		return nil
 	}
 
-	// Reject concurrent sync attempts on the same app (AR-2 mitigation).
-	m.syncStateMu.Lock()
-	if m.syncInFlight[instanceID] {
-		m.syncStateMu.Unlock()
-		return ErrSyncInProgress
+	finishSync, err := m.beginSyncAttempt(instanceID)
+	if err != nil {
+		return err
 	}
-	m.syncInFlight[instanceID] = true
-	m.syncStateMu.Unlock()
-	defer func() {
-		m.syncStateMu.Lock()
-		delete(m.syncInFlight, instanceID)
-		m.syncStateMu.Unlock()
-	}()
+	defer finishSync()
 
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 
+	return m.syncManifestIfDriftedLocked(ctx, host, instanceID, manual, stagedSystemCtx)
+}
+
+func (m *AppManager) beginSyncAttempt(instanceID string) (func(), error) {
+	m.syncStateMu.Lock()
+	if m.syncInFlight[instanceID] {
+		m.syncStateMu.Unlock()
+		return nil, ErrSyncInProgress
+	}
+	m.syncInFlight[instanceID] = true
+	m.syncStateMu.Unlock()
+
+	return func() {
+		m.syncStateMu.Lock()
+		delete(m.syncInFlight, instanceID)
+		m.syncStateMu.Unlock()
+	}, nil
+}
+
+// syncManifestIfDriftedLocked performs sync while the caller owns reconcileMu
+// and has registered the per-app sync attempt with beginSyncAttempt.
+func (m *AppManager) syncManifestIfDriftedLocked(ctx context.Context, host SyncHost, instanceID string, manual bool, stagedSystemCtx *InstallSystemContext) error {
 	if err := m.ensureUnlocked(); err != nil {
 		return nil
 	}
@@ -279,6 +295,12 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	appInst, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceCatalogSyncApply); err != nil {
+		if errors.Is(err, ErrTransitionInProgress) && !manual {
+			return nil
+		}
+		return err
 	}
 	if appInst.Definition == nil {
 		return nil
@@ -554,8 +576,11 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		}
 		return nil
 	case DiffKindImageOnly, DiffKindStructuralWithImage:
-		// Sync does not apply image diffs; user must run UpdateImage.
-		return m.recordSyncFailure(state, appInst, newHash, fmt.Errorf("image update available — run UpdateImage (%s)", diffKind))
+		reason := fmt.Errorf("update requires operator review: catalog %s includes image changes", diffKind)
+		if err := m.storePendingRenderedCatalogManifestReviewSource(state, instanceID, installSt, rawBytes, reason); err != nil {
+			log.Printf("WARN: catalog sync %s: store pending catalog image update source: %v", instanceID, err)
+		}
+		return m.recordSyncFailure(state, appInst, newHash, reason)
 	}
 
 	prevDef := curDef
@@ -574,6 +599,42 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	if freshOIDCCreds != nil {
 		nextInstallSt.OIDCCredentials = freshOIDCCreds
 	}
+	metadataOnly := diffKind == DiffKindOIDCLibraryOnly
+	legacyTransitionActive, err := transitionLegacyJournalExists(state, instanceID)
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
+	}
+	transitionPlan, err := PlanInstalledAppTransition(TransitionPlanInput{
+		OperationKind:           TransitionOperationCatalogAutoApply,
+		SourceKind:              TransitionSourceCatalogRendered,
+		Mode:                    appInst.Mode(),
+		Enabled:                 appInst.Enabled,
+		RuntimeChanging:         !metadataOnly,
+		LegacyTransactionActive: legacyTransitionActive,
+		BaseManifestHash:        prevManifestHash,
+		CandidateManifestHash:   candidateDigest,
+		LedgerRevision:          installSt.Revision,
+		SourceHash:              newHash,
+		Data: TransitionDataPolicy{
+			SnapshotRequired:      requiresPrecommitSnapshot,
+			CandidateMayTouchData: !metadataOnly,
+		},
+		Runtime: TransitionRuntimePolicy{
+			RuntimeFingerprint:   runtimeFingerprint,
+			PreviousActiveRootfs: cloneStringMap(appInst.ActiveRootfs),
+			PrimaryService:       primaryServiceFor(newDef, appInst),
+		},
+		Access: TransitionAccessPolicy{
+			PrepareRequired: !metadataOnly,
+		},
+	})
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
+	}
+	transitionPlanHash, err := transitionPlan.Hash()
+	if err != nil {
+		return m.recordSyncFailure(state, appInst, newHash, err)
+	}
 	applyTxn, err := m.beginInstalledAppApplyTransaction(ctx, state, installedAppApplyTransactionSpec{
 		OperationKind:             "catalog_sync",
 		TaskType:                  taskTypeUpdateManifest,
@@ -589,7 +650,9 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 		PreviousLedgerSourceHash:  installSt.RawTemplateHash,
 		CandidateLedgerSourceHash: nextInstallSt.RawTemplateHash,
 		RuntimeFingerprint:        runtimeFingerprint,
-		MetadataOnly:              diffKind == DiffKindOIDCLibraryOnly,
+		TransitionPlan:            *transitionPlan,
+		TransitionPlanHash:        transitionPlanHash,
+		MetadataOnly:              metadataOnly,
 		RequiresPrecommitSnapshot: requiresPrecommitSnapshot,
 		ApplyPhase:                taskPhaseApplyingManifest,
 		ApplyMessage:              "Persisting catalog manifest",

@@ -35,6 +35,9 @@ type installedAppApplyTransactionSpec struct {
 	CandidateLedgerSourceHash string
 	DryRunToken               string
 	RuntimeFingerprint        string
+	TransitionPlan            TransitionPlan
+	TransitionPlanHash        string
+	CatalogSourceSnapshot     *CatalogSourceSnapshot
 	ImagePlan                 []ManifestUpdateImagePlanItem
 	MetadataOnly              bool
 	RequiresPrecommitSnapshot bool
@@ -49,6 +52,7 @@ type installedAppApplyTransaction struct {
 	state        *FilesystemStateManager
 	spec         installedAppApplyTransactionSpec
 	txn          *ManifestUpdateTransaction
+	transition   *TransitionRecord
 	runtimeStage *manifestUpdateRuntimeStage
 	listenerPlan *services.PreparedReconcile
 }
@@ -67,18 +71,51 @@ func (m *AppManager) beginInstalledAppApplyTransaction(ctx context.Context, stat
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, fmt.Errorf("load existing manifest update transaction: %w", err)
 	}
+	if existingImage, err := state.LoadImageUpdateTransaction(spec.InstanceID); err == nil && existingImage != nil {
+		return nil, fmt.Errorf("%w: image update transaction already in progress (phase %s)", ErrManifestUpdateConflict, existingImage.Phase)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load existing image update transaction: %w", err)
+	}
+	if existingTransition, err := state.LoadTransitionRecord(spec.InstanceID); err == nil && existingTransition != nil && existingTransition.Phase != TransitionPhaseCommitted {
+		return nil, fmt.Errorf("%w: v2 transition already in progress (phase %s)", ErrManifestUpdateConflict, existingTransition.Phase)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("load existing v2 transition record: %w", err)
+	}
 
 	operationID, err := randomManifestUpdateToken()
 	if err != nil {
 		return nil, err
 	}
+	var transition *TransitionRecord
+	if spec.TransitionPlan.SchemaVersion != 0 {
+		transition = &TransitionRecord{
+			SchemaVersion: TransitionPlanSchemaVersion,
+			OperationID:   operationID,
+			InstanceID:    spec.InstanceID,
+			Phase:         TransitionPhasePrepared,
+			PlanHash:      spec.TransitionPlanHash,
+			Plan:          spec.TransitionPlan,
+			CatalogSourceSnapshot: cloneCatalogSourceSnapshot(
+				spec.CatalogSourceSnapshot,
+			),
+		}
+		if err := state.StoreTransitionRecord(spec.InstanceID, transition); err != nil {
+			return nil, fmt.Errorf("store v2 transition record: %w", err)
+		}
+	}
 	backupPath, err := state.BackupCurrentAppDefinitionForManifestUpdate(spec.InstanceID)
 	if err != nil {
+		if transition != nil {
+			_ = state.ClearTransitionRecord(spec.InstanceID)
+		}
 		return nil, fmt.Errorf("backup current manifest: %w", err)
 	}
 	backupInstallStatePath, err := state.BackupInstallStateForManifestUpdate(spec.InstanceID)
 	if err != nil {
 		_ = state.ClearManifestUpdateTransaction(spec.InstanceID, backupPath)
+		if transition != nil {
+			_ = state.ClearTransitionRecord(spec.InstanceID)
+		}
 		return nil, fmt.Errorf("backup install state: %w", err)
 	}
 	txn := &ManifestUpdateTransaction{
@@ -104,14 +141,18 @@ func (m *AppManager) beginInstalledAppApplyTransaction(ctx context.Context, stat
 	if err := state.StoreManifestUpdateTransaction(spec.InstanceID, txn); err != nil {
 		_ = state.ClearManifestUpdateTransaction(spec.InstanceID, backupPath)
 		_ = state.ClearInstallStateBackup(backupInstallStatePath)
+		if transition != nil {
+			_ = state.ClearTransitionRecord(spec.InstanceID)
+		}
 		return nil, fmt.Errorf("store apply transaction: %w", err)
 	}
 	return &installedAppApplyTransaction{
-		manager: m,
-		ctx:     ctx,
-		state:   state,
-		spec:    spec,
-		txn:     txn,
+		manager:    m,
+		ctx:        ctx,
+		state:      state,
+		spec:       spec,
+		txn:        txn,
+		transition: transition,
 	}, nil
 }
 
@@ -232,6 +273,13 @@ func (t *installedAppApplyTransaction) recreateRuntimeIfNeeded() error {
 		}
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
 	}
+	if err := t.storeTransitionPhase(t.txn.Phase); err != nil {
+		cause := fmt.Errorf("persist v2 runtime switch transaction marker: %w", err)
+		if restoreErr := t.rollback(cause); restoreErr != nil {
+			return restoreErr
+		}
+		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
+	}
 	if err := t.quiesceRuntimeForPrecommitDataSnapshotIfNeeded(); err != nil {
 		cause := fmt.Errorf("quiesce runtime before precommit data snapshot: %w", err)
 		if restoreErr := t.rollback(cause); restoreErr != nil {
@@ -246,10 +294,7 @@ func (t *installedAppApplyTransaction) recreateRuntimeIfNeeded() error {
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, err)
 	}
 	beforeInstall := func() error {
-		if err := markManifestTransactionRuntimeTouched(t.state, t.spec.InstanceID, t.txn); err != nil {
-			return fmt.Errorf("persist runtime transaction marker: %w", err)
-		}
-		return nil
+		return t.markRuntimeTouched()
 	}
 	recreate := t.manager.recreateContainersInPlace
 	if t.runtimeStage != nil {
@@ -478,6 +523,13 @@ func (t *installedAppApplyTransaction) markCreatedOIDCClient(clientID string) er
 		}
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
 	}
+	if err := t.storeTransitionPhase(t.txn.Phase); err != nil {
+		t.txn.CreatedOIDCClientID = prevClientID
+		if restoreErr := t.state.StoreManifestUpdateTransaction(t.spec.InstanceID, t.txn); restoreErr != nil {
+			return errors.Join(fmt.Errorf("persist v2 oidc client marker: %w", err), fmt.Errorf("restore oidc client transaction marker: %w", restoreErr))
+		}
+		return fmt.Errorf("persist v2 oidc client marker: %w", err)
+	}
 	return nil
 }
 
@@ -494,6 +546,23 @@ func (t *installedAppApplyTransaction) markProxyOIDCDeltaApplied() error {
 			return restoreErr
 		}
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
+	}
+	if err := t.storeTransitionPhase(t.txn.Phase); err != nil {
+		t.txn.ProxyOIDCDeltaApplied = prevApplied
+		if restoreErr := t.state.StoreManifestUpdateTransaction(t.spec.InstanceID, t.txn); restoreErr != nil {
+			return errors.Join(fmt.Errorf("persist v2 proxy oidc marker: %w", err), fmt.Errorf("restore proxy oidc transaction marker: %w", restoreErr))
+		}
+		return fmt.Errorf("persist v2 proxy oidc marker: %w", err)
+	}
+	return nil
+}
+
+func (t *installedAppApplyTransaction) markRuntimeTouched() error {
+	if err := markManifestTransactionRuntimeTouched(t.state, t.spec.InstanceID, t.txn); err != nil {
+		return fmt.Errorf("persist runtime transaction marker: %w", err)
+	}
+	if err := t.storeTransitionPhase("runtime_touched"); err != nil {
+		return fmt.Errorf("persist v2 runtime transaction marker: %w", err)
 	}
 	return nil
 }
@@ -519,6 +588,9 @@ func (t *installedAppApplyTransaction) commitLedger(nextState *InstallState) err
 			return restoreErr
 		}
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
+	}
+	if err := t.storePhase("ledger_committed"); err != nil {
+		return fmt.Errorf("persist ledger committed transaction marker: %w", err)
 	}
 	return nil
 }
@@ -598,6 +670,9 @@ func (t *installedAppApplyTransaction) markAccessRepairPending(cause error) stri
 	if err := t.state.StoreManifestUpdateTransaction(t.spec.InstanceID, t.txn); err != nil {
 		return message + fmt.Sprintf("; additionally failed to persist repair details: %v", err)
 	}
+	if err := t.storeTransitionPhase(t.txn.Phase); err != nil {
+		return message + fmt.Sprintf("; additionally failed to persist v2 repair details: %v", err)
+	}
 	return message
 }
 
@@ -610,6 +685,9 @@ func (t *installedAppApplyTransaction) markCatalogMetadataPending(cause error) {
 	t.txn.UpdatedAt = time.Now().UTC()
 	if err := t.state.StoreManifestUpdateTransaction(t.spec.InstanceID, t.txn); err != nil {
 		log.Printf("WARN: %s %s: persist catalog metadata retry marker: %v", t.spec.OperationKind, t.spec.InstanceID, err)
+	}
+	if err := t.storeTransitionPhase(t.txn.Phase); err != nil {
+		log.Printf("WARN: %s %s: persist v2 catalog metadata retry marker: %v", t.spec.OperationKind, t.spec.InstanceID, err)
 	}
 }
 
@@ -632,7 +710,108 @@ func (t *installedAppApplyTransaction) storePhase(phase string) error {
 		t.txn.UpdatedAt = prevUpdatedAt
 		return err
 	}
+	if err := t.storeTransitionPhase(phase); err != nil {
+		return err
+	}
 	return nil
+}
+
+func (t *installedAppApplyTransaction) storeTransitionPhase(manifestPhase string) error {
+	if t.transition == nil {
+		return nil
+	}
+	next := *t.transition
+	next.Phase = transitionPhaseForManifestPhase(manifestPhase)
+	next.Resources = transitionResourcesFromManifestTransaction(t.txn, t.spec.AppInst)
+	next.LastError = t.txn.LastError
+	if err := t.state.StoreTransitionRecord(t.spec.InstanceID, &next); err != nil {
+		return err
+	}
+	t.transition = &next
+	return nil
+}
+
+func transitionPhaseForManifestPhase(phase string) TransitionPhase {
+	switch phase {
+	case "prepared":
+		return TransitionPhasePrepared
+	case "rootfs_staging", "rootfs_staged", "listeners_prepared", "data_snapshot_planned", "data_snapshot_failed", "data_snapshot_created":
+		return TransitionPhaseResourcesPrepared
+	case "runtime_switch_started", "access_suspending", "access_suspended":
+		return TransitionPhaseSwitchingRuntime
+	case "runtime_touched":
+		return TransitionPhaseCandidateTouched
+	case "candidate_persisted", "ledger_committing":
+		return TransitionPhaseSourceCommitting
+	case "ledger_committed":
+		return TransitionPhaseSourceCommitted
+	case "publishing_access":
+		return TransitionPhasePublishingAccess
+	case "access_published":
+		return TransitionPhaseCommittedCleanupPending
+	case "committed_metadata_pending":
+		return TransitionPhaseCommittedMetadataPending
+	case "committed_cleanup_pending":
+		return TransitionPhaseCommittedCleanupPending
+	case "committed":
+		return TransitionPhaseCommitted
+	case "restoring_previous":
+		return TransitionPhaseRestoringPrevious
+	case "restore_failed":
+		return TransitionPhaseRestoreFailed
+	default:
+		return TransitionPhasePrepared
+	}
+}
+
+func transitionResourcesFromManifestTransaction(txn *ManifestUpdateTransaction, appInst *AppInstance) TransitionResources {
+	resources := TransitionResources{}
+	if txn == nil {
+		return resources
+	}
+	if len(txn.StagedRootfs) > 0 || len(txn.CreatedRootfs) > 0 {
+		resources.StagedRootfs = map[string]string{}
+		for _, id := range txn.StagedRootfs {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				resources.StagedRootfs[id] = id
+			}
+		}
+		for _, id := range txn.CreatedRootfs {
+			id = strings.TrimSpace(id)
+			if id != "" {
+				resources.StagedRootfs[id] = id
+			}
+		}
+	}
+	if strings.TrimSpace(txn.PrecommitDataSnapshotID) != "" {
+		resources.DataSnapshots = map[string]string{
+			txn.PrecommitDataSnapshotID: txn.PrecommitDataSnapshotID,
+		}
+	}
+	if strings.TrimSpace(txn.FailedDataLVName) != "" {
+		resources.FailedLVs = map[string]string{
+			txn.FailedDataLVName: txn.FailedDataLVName,
+		}
+	}
+	resources.PreparedEndpoints = transitionEndpointKeys(txn.PreparedListenerEndpoints)
+	if strings.TrimSpace(txn.CreatedOIDCClientID) != "" {
+		resources.GeneratedOIDCClients = map[string]string{
+			txn.CreatedOIDCClientID: txn.CreatedOIDCClientID,
+		}
+	}
+	if appInst != nil && len(appInst.Containers) > 0 {
+		resources.CandidateContainers = cloneStringMap(appInst.Containers)
+	}
+	return resources
+}
+
+func transitionEndpointKeys(endpoints []services.ServiceEndpoint) []string {
+	out := make([]string, 0, len(endpoints))
+	for _, ep := range endpoints {
+		out = append(out, fmt.Sprintf("%s/%s:%d:%d:%s:%s", ep.App, ep.Name, ep.HostBind, ep.PublicPort, ep.Flow, ep.Protocol))
+	}
+	return sortedUniqueStrings(out)
 }
 
 func (t *installedAppApplyTransaction) rollback(cause error) error {

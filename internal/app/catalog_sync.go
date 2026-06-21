@@ -245,7 +245,11 @@ func (m *AppManager) SyncManifest(ctx context.Context, instanceID string) error 
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
-	if _, err := m.ensureStateManager(); err != nil {
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceSyncTrigger); err != nil {
 		return err
 	}
 	return m.syncManifestIfDrifted(ctx, instanceID, true, nil)
@@ -256,6 +260,9 @@ func (m *AppManager) SyncManifest(ctx context.Context, instanceID string) error 
 // re-evaluates the catalog hash. Must run on the cluster leader so the
 // metadata write is the canonical truth across the cluster.
 func (m *AppManager) SetSyncDisabled(ctx context.Context, instanceID string, disabled bool) error {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
@@ -266,6 +273,9 @@ func (m *AppManager) SetSyncDisabled(ctx context.Context, instanceID string, dis
 	inst, exists := state.GetApp(instanceID)
 	if !exists {
 		return errAppNotFound(instanceID)
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, transitionFenceForSyncDisabled(disabled)); err != nil {
+		return err
 	}
 	inst.SyncDisabled = disabled
 	if !disabled {
@@ -325,12 +335,24 @@ func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
+	finishSync, err := m.beginSyncAttempt(instanceID)
+	if err != nil {
+		return err
+	}
+	defer finishSync()
+
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
 	}
 	if _, exists := state.GetApp(instanceID); !exists {
 		return errAppNotFound(instanceID)
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceSyncRefreshContext); err != nil {
+		return err
 	}
 	st, err := state.LoadInstallState(instanceID)
 	if err != nil && !errors.Is(err, ErrInstallStateNotFound) {
@@ -351,7 +373,7 @@ func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID
 		if err := state.StoreInstallState(instanceID, st); err != nil {
 			return err
 		}
-		if err := m.syncManifestIfDrifted(ctx, instanceID, true, nil); err != nil {
+		if err := m.syncManifestIfDriftedLocked(ctx, host, instanceID, true, nil); err != nil {
 			var restoreErr error
 			if hadInstallState && previous != nil {
 				restoreErr = state.StoreInstallState(instanceID, previous)
@@ -366,5 +388,5 @@ func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID
 		return nil
 	}
 
-	return m.syncManifestIfDrifted(ctx, instanceID, true, &fresh)
+	return m.syncManifestIfDriftedLocked(ctx, host, instanceID, true, &fresh)
 }

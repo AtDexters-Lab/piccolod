@@ -7,6 +7,7 @@ enum AppOperationType {
   updateConfig,
   updateManifest,
   updateListeners,
+  transitionFollowUp,
   start,
   stop,
   rollback,
@@ -306,6 +307,12 @@ const appOperationPolicies = <AppOperationType, AppOperationPolicy>{
     type: AppOperationType.updateListeners,
     taskType: 'update_listeners',
     label: 'Updating listeners',
+    httpSuccessCompletesOperation: true,
+  ),
+  AppOperationType.transitionFollowUp: AppOperationPolicy(
+    type: AppOperationType.transitionFollowUp,
+    taskType: 'transition_followup',
+    label: 'Finishing update',
     httpSuccessCompletesOperation: true,
   ),
   AppOperationType.start: AppOperationPolicy(

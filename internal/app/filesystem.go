@@ -41,6 +41,10 @@ type FilesystemStateManager struct {
 	// Test hook for fault-injecting image update transaction writes.
 	storeImageUpdateTransactionHook func(instanceID string, txn *ImageUpdateTransaction) error
 
+	// Test hook for fault-injecting v2 installed app transition writes.
+	storeTransitionRecordHook func(instanceID string, record *TransitionRecord) error
+	clearTransitionRecordHook func(instanceID string) error
+
 	// Test hook for fault-injecting tuple generation writes.
 	storeTupleStateHook func(instanceID string, state *TupleState) error
 

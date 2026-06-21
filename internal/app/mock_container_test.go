@@ -23,6 +23,7 @@ type MockContainerManager struct {
 	removeError            error
 	removeRunningError     bool
 	removedImages          []string
+	pulledImages           []string
 	removeImageErr         error
 	reloadedContainers     []string
 	reloadErr              error
@@ -112,13 +113,13 @@ func (m *MockContainerManager) ListContainersByLabel(ctx context.Context, runtim
 
 func (m *MockContainerManager) PullImage(ctx context.Context, runtime container.PodmanRuntime, image string) error {
 	_ = runtime
-	_ = image
+	m.pulledImages = append(m.pulledImages, image)
 	return nil
 }
 
 func (m *MockContainerManager) PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error {
 	_ = runtime
-	_ = image
+	m.pulledImages = append(m.pulledImages, image)
 	// Mock: if callback provided, emit a quick progress sequence
 	if callback != nil {
 		callback(container.ImagePullReport{
@@ -328,16 +329,19 @@ func generateMockContainerID(id int) string {
 // stubRootfsManager is a minimal RootfsVolumeManager for unit tests.
 // It creates real temp directories so mount paths resolve for container specs.
 type stubRootfsManager struct {
-	baseDir       string // temp dir for mock mount points
-	exists        map[string]bool
-	identities    map[string]persistence.RootfsImageIdentity
-	identityErrs  map[string]error
-	goldenConfigs map[string]persistence.GoldenImageConfig
-	goldenReads   []string
-	detached      []string
-	destroyed     []string
-	detachErr     error
-	destroyErr    error
+	baseDir            string // temp dir for mock mount points
+	exists             map[string]bool
+	identities         map[string]persistence.RootfsImageIdentity
+	identityErrs       map[string]error
+	goldenConfigs      map[string]persistence.GoldenImageConfig
+	goldenReads        []string
+	detached           []string
+	destroyed          []string
+	resizedWorkspace   []string
+	resizedApplication []string
+	createServiceErr   error
+	detachErr          error
+	destroyErr         error
 }
 
 func newStubRootfsManager(baseDir string) *stubRootfsManager {
@@ -372,6 +376,9 @@ func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persisten
 			BaseImageRef:    req.ImageRef,
 			BaseImageDigest: req.ImageDigest,
 		}
+	}
+	if s.createServiceErr != nil {
+		return persistence.RootfsHandle{}, s.createServiceErr
 	}
 	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: true}, nil
 }
@@ -455,10 +462,12 @@ func (s *stubRootfsManager) ReadRootfsImageIdentity(volumeID string) (persistenc
 func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }
-func (s *stubRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
+func (s *stubRootfsManager) ResizeWorkspace(_ context.Context, volumeID string, _ int64) error {
+	s.resizedWorkspace = append(s.resizedWorkspace, volumeID)
 	return nil
 }
-func (s *stubRootfsManager) ResizeApplication(_ context.Context, _ string, _ int64) error {
+func (s *stubRootfsManager) ResizeApplication(_ context.Context, volumeID string, _ int64) error {
+	s.resizedApplication = append(s.resizedApplication, volumeID)
 	return nil
 }
 

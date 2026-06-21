@@ -231,6 +231,30 @@ class AppService {
     );
   }
 
+  Future<void> retryAppAccessRepair(String name, {String? taskId}) async {
+    await _client.post(
+      '/api/v1/apps/$name/transition/access-repair',
+      body: {},
+      headers: _taskHeaders(taskId),
+    );
+  }
+
+  Future<void> finishAppTransitionCleanup(String name, {String? taskId}) async {
+    await _client.post(
+      '/api/v1/apps/$name/transition/finish-cleanup',
+      body: {},
+      headers: _taskHeaders(taskId),
+    );
+  }
+
+  Future<void> retryAppTransitionMetadata(String name, {String? taskId}) async {
+    await _client.post(
+      '/api/v1/apps/$name/transition/metadata-retry',
+      body: {},
+      headers: _taskHeaders(taskId),
+    );
+  }
+
   Future<void> uninstallApp(
     String name, {
     String? taskId,
@@ -319,6 +343,7 @@ class AppService {
       body: {
         'base_manifest_hash': dryRun.baseManifestHash,
         'runtime_fingerprint': dryRun.runtimeFingerprint,
+        'transition_plan_hash': dryRun.transitionPlanHash,
         'dry_run_token': dryRun.dryRunToken,
         'confirmations': confirmations,
         if (catalogPending) 'catalog_pending': true,
@@ -384,6 +409,7 @@ class AppService {
         'input_schema_hash': dryRun.inputSchemaHash,
         'base_manifest_hash': dryRun.baseManifestHash,
         'runtime_fingerprint': dryRun.runtimeFingerprint,
+        'transition_plan_hash': dryRun.transitionPlanHash,
       },
       headers: _taskHeaders(taskId),
     );

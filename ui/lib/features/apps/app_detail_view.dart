@@ -59,7 +59,15 @@ class AppDetailView extends StatefulWidget {
 
 enum _AppMenuAction { modifyApp, rollback, uninstall }
 
-enum _UpdateRoute { refreshImage, configReview, manifestReview, blocked }
+enum _UpdateRoute {
+  refreshImage,
+  configReview,
+  manifestReview,
+  accessRepair,
+  finishCleanup,
+  metadataRetry,
+  blocked,
+}
 
 class _UpdateAction {
   const _UpdateAction({
@@ -396,14 +404,17 @@ class _AppDetailViewState extends State<AppDetailView>
     String? displayLabel,
     String? displaySource,
     void Function(TrackedAppOperation operation)? onSubmitted,
+    bool allowActiveTransition = false,
   }) async {
     if (!mounted) return const _OperationSubmitResult(accepted: false);
-    if (_activeOperation != null) {
+    final pauseReason = _pauseReason;
+    final transitionOnlyPause =
+        _activeOperation == null && (_app?.transitionActive ?? false);
+    if (pauseReason != null &&
+        !(allowActiveTransition && transitionOnlyPause)) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(
-            '${_activeOperation!.label} is already in progress.',
-          ),
+          content: Text(pauseReason),
         ),
       );
       return const _OperationSubmitResult(
@@ -1053,14 +1064,31 @@ class _AppDetailViewState extends State<AppDetailView>
             'Workspace apps are updated by reinstalling with a new base image.',
       );
     }
-    if (_mutatingActionsPaused) {
+    if (_activeOperation != null) {
       return _UpdateAction(
         route: _UpdateRoute.blocked,
         label: 'Update',
         enabled: false,
         icon: PiccoloIcons.refresh,
         stateLabel: 'Update paused',
-        reason: '${_activeOperation!.label} is in progress',
+        reason:
+            _pauseReason ?? 'Another update for this app is still finishing',
+      );
+    }
+    final followUpAction = _transitionFollowUpAction(app);
+    if (followUpAction != null) {
+      return followUpAction;
+    }
+    if (app.accessRepairPending) {
+      return const _UpdateAction(
+        route: _UpdateRoute.accessRepair,
+        label: 'Repair access',
+        enabled: true,
+        icon: PiccoloIcons.warning,
+        stateLabel: 'Access repair needed',
+        reason:
+            'The update committed, but listener routes or auth still need repair.',
+        source: 'Source: committed update',
       );
     }
     if (app.catalogUpdatePending) {
@@ -1142,6 +1170,57 @@ class _AppDetailViewState extends State<AppDetailView>
     );
   }
 
+  _UpdateAction? _transitionFollowUpAction(App app) {
+    if (!app.transitionActive) return null;
+    switch (app.transitionPhase.toLowerCase()) {
+      case 'publishing_access':
+        return const _UpdateAction(
+          route: _UpdateRoute.accessRepair,
+          label: 'Repair access',
+          enabled: true,
+          icon: PiccoloIcons.warning,
+          stateLabel: 'Access repair needed',
+          reason:
+              'The update committed, but listener routes or auth still need repair.',
+          source: 'Source: committed update',
+        );
+      case 'committed_cleanup_pending':
+        return const _UpdateAction(
+          route: _UpdateRoute.finishCleanup,
+          label: 'Finish cleanup',
+          enabled: true,
+          icon: PiccoloIcons.check,
+          stateLabel: 'Cleanup pending',
+          reason: 'The update committed, but cleanup still needs to finish.',
+          source: 'Source: committed update',
+        );
+      case 'committed_metadata_pending':
+        return const _UpdateAction(
+          route: _UpdateRoute.metadataRetry,
+          label: 'Finish catalog update',
+          enabled: true,
+          icon: PiccoloIcons.sync,
+          stateLabel: 'Catalog status needs retry',
+          reason:
+              'The update committed, but catalog metadata still needs to be saved.',
+          source: 'Source: app catalog',
+        );
+      default:
+        final message = app.transitionMessage.trim();
+        return _UpdateAction(
+          route: _UpdateRoute.blocked,
+          label: 'Update paused',
+          enabled: false,
+          icon: PiccoloIcons.hourglass,
+          stateLabel: 'Update paused',
+          reason: message.isEmpty
+              ? 'Another update for this app is still finishing.'
+              : message,
+          source: 'Source: active update',
+        );
+    }
+  }
+
   Future<void> _handleUpdate() async {
     final app = _app;
     if (app == null) return;
@@ -1156,10 +1235,49 @@ class _AppDetailViewState extends State<AppDetailView>
           action: (taskId) =>
               widget.appService.updateApp(widget.appId, taskId: taskId),
         );
+        return;
       case _UpdateRoute.configReview:
         _showInstalledConfigWizard(pendingCatalogUpdate: true);
+        return;
       case _UpdateRoute.manifestReview:
         _showManifestUpdateWizard(catalogPending: true);
+        return;
+      case _UpdateRoute.accessRepair:
+        await _handleActionWithProgress(
+          type: AppOperationType.transitionFollowUp,
+          displayLabel: action.stateLabel,
+          displaySource: action.source,
+          allowActiveTransition: true,
+          action: (taskId) => widget.appService.retryAppAccessRepair(
+            widget.appId,
+            taskId: taskId,
+          ),
+        );
+        return;
+      case _UpdateRoute.finishCleanup:
+        await _handleActionWithProgress(
+          type: AppOperationType.transitionFollowUp,
+          displayLabel: action.stateLabel,
+          displaySource: action.source,
+          allowActiveTransition: true,
+          action: (taskId) => widget.appService.finishAppTransitionCleanup(
+            widget.appId,
+            taskId: taskId,
+          ),
+        );
+        return;
+      case _UpdateRoute.metadataRetry:
+        await _handleActionWithProgress(
+          type: AppOperationType.transitionFollowUp,
+          displayLabel: action.stateLabel,
+          displaySource: action.source,
+          allowActiveTransition: true,
+          action: (taskId) => widget.appService.retryAppTransitionMetadata(
+            widget.appId,
+            taskId: taskId,
+          ),
+        );
+        return;
       case _UpdateRoute.blocked:
         return;
     }
@@ -1458,12 +1576,17 @@ class _AppDetailViewState extends State<AppDetailView>
 
         if (_activeOperation != null) _buildOperationBanner(_activeOperation!),
 
+        if (_activeOperation == null && _app!.transitionActive)
+          _buildTransitionInProgressBanner(),
+
         if (_recentOperationFailure != null)
           _buildOperationFailureBanner(_recentOperationFailure!),
 
-        if (_app!.accessRepairPending) _buildAccessRepairPendingBanner(),
+        if (_app!.accessRepairPending && !_app!.transitionActive)
+          _buildAccessRepairPendingBanner(),
 
-        if (_app!.catalogUpdatePending) _buildCatalogUpdatePendingBanner(),
+        if (_app!.catalogUpdatePending && !_app!.transitionActive)
+          _buildCatalogUpdatePendingBanner(),
 
         if (_readiness != null) _buildReadinessBanner(_readiness!),
 
@@ -1634,14 +1757,12 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildActionToolbar() {
-    final paused = _mutatingActionsPaused;
-    final pauseReason = paused
-        ? '${_activeOperation!.label} is in progress'
-        : null;
+    final pauseReason = _pauseReason;
+    final paused = pauseReason != null;
     final updateAction = _currentUpdateAction(_app!);
 
     Widget pausedTooltip(Widget child) {
-      if (!paused || pauseReason == null) return child;
+      if (pauseReason == null) return child;
       return Tooltip(message: pauseReason, child: child);
     }
 
@@ -2006,10 +2127,78 @@ class _AppDetailViewState extends State<AppDetailView>
       message: message,
       action: Align(
         alignment: Alignment.centerLeft,
-        child: TextButton.icon(
-          onPressed: () => unawaited(_loadData(showLoading: false)),
-          icon: const Icon(PiccoloIcons.refresh),
-          label: const Text('Refresh'),
+        child: Wrap(
+          spacing: Spacing.sm,
+          children: [
+            TextButton.icon(
+              onPressed: () => unawaited(_handleUpdate()),
+              icon: const Icon(PiccoloIcons.warning, size: 16),
+              label: const Text('Repair access'),
+            ),
+            TextButton.icon(
+              onPressed: () => unawaited(_loadData(showLoading: false)),
+              icon: const Icon(PiccoloIcons.refresh, size: 16),
+              label: const Text('Check Again'),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTransitionInProgressBanner() {
+    final message = _app!.transitionMessage.trim().isEmpty
+        ? 'Another update for this app is still finishing.'
+        : _app!.transitionMessage.trim();
+    final needsRepair = _app!.transitionPhase.toLowerCase() == 'restore_failed';
+    final followUp = _currentUpdateAction(_app!);
+    final canRunFollowUp =
+        followUp.enabled && followUp.route != _UpdateRoute.blocked;
+    final title = canRunFollowUp
+        ? followUp.stateLabel
+        : needsRepair
+        ? 'Update needs repair'
+        : 'Update finishing';
+    final bannerMessage = canRunFollowUp
+        ? '${followUp.reason} Use ${followUp.label} to complete the committed update. This does not start a new update.'
+        : needsRepair
+        ? '$message Mutating actions are paused until repair completes.'
+        : '$message Mutating actions are paused until this settles.';
+    return StatusBanner(
+      severity: (needsRepair || canRunFollowUp)
+          ? BannerSeverity.warning
+          : BannerSeverity.info,
+      icon: canRunFollowUp
+          ? followUp.icon
+          : needsRepair
+          ? PiccoloIcons.warning
+          : PiccoloIcons.hourglass,
+      title: title,
+      message: bannerMessage,
+      action: Align(
+        alignment: Alignment.centerLeft,
+        child: Wrap(
+          spacing: Spacing.sm,
+          children: [
+            if (needsRepair)
+              TextButton.icon(
+                onPressed: () =>
+                    _tabController.animateTo(AppDetailView.tabLogs),
+                icon: const Icon(PiccoloIcons.article, size: 16),
+                label: const Text('View Logs'),
+              ),
+            if (canRunFollowUp)
+              TextButton.icon(
+                onPressed: () => unawaited(_handleUpdate()),
+                icon: Icon(followUp.icon, size: 16),
+                label: Text(followUp.label),
+              ),
+            TextButton.icon(
+              onPressed: () => unawaited(_loadData(showLoading: false)),
+              icon: const Icon(PiccoloIcons.refresh, size: 16),
+              label: const Text('Check status'),
+            ),
+          ],
         ),
       ),
     );
@@ -2265,7 +2454,23 @@ class _AppDetailViewState extends State<AppDetailView>
     return warnings;
   }
 
-  bool get _mutatingActionsPaused => _activeOperation != null;
+  bool get _mutatingActionsPaused =>
+      _activeOperation != null || (_app?.transitionActive ?? false);
+
+  String? get _pauseReason {
+    final active = _activeOperation;
+    if (active != null) {
+      return '${active.label} is in progress';
+    }
+    final app = _app;
+    if (app != null && app.transitionActive) {
+      final message = app.transitionMessage.trim();
+      return message.isEmpty
+          ? 'Another update for this app is still finishing'
+          : message;
+    }
+    return null;
+  }
 
   static String? _findPrimaryListenerName(List<ServiceEndpoint> listeners) {
     // Prefer the endpoint marked as primary

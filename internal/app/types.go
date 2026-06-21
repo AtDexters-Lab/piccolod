@@ -104,6 +104,11 @@ type AppInstance struct {
 	// AccessRepairPending is response-only state derived from manifest update transactions.
 	AccessRepairPending bool   `json:"access_repair_pending,omitempty"`
 	AccessRepairMessage string `json:"access_repair_message,omitempty"`
+	// Transition state is response-only state derived from app_transition_v2.json.
+	TransitionActive    bool   `json:"transition_active,omitempty"`
+	TransitionOperation string `json:"transition_operation,omitempty"`
+	TransitionPhase     string `json:"transition_phase,omitempty"`
+	TransitionMessage   string `json:"transition_message,omitempty"`
 
 	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
 	// nil = legacy install (use ServiceRootfsVolumeID without digest).

@@ -106,6 +106,11 @@ func (m *ServiceManager) UseInMemoryNetworkForTest() {
 	}
 }
 
+// SetTCPListenForTest overrides TCP listener creation for cross-package tests.
+func (m *ServiceManager) SetTCPListenForTest(fn func(network, address string) (net.Listener, error)) {
+	m.proxyManager.listenTCP = fn
+}
+
 type inMemoryTestListener struct{}
 
 func (inMemoryTestListener) Accept() (net.Conn, error) {

@@ -77,6 +77,7 @@ type ManifestUpdateRequest struct {
 	SystemContext      InstallSystemContext
 	BaseManifestHash   string
 	RuntimeFingerprint string
+	TransitionPlanHash string
 	DryRunToken        string
 }
 
@@ -139,6 +140,7 @@ type ManifestUpdateResult struct {
 	InstanceID            string                              `json:"instance_id"`
 	BaseManifestHash      string                              `json:"base_manifest_hash"`
 	RuntimeFingerprint    string                              `json:"runtime_fingerprint"`
+	TransitionPlanHash    string                              `json:"transition_plan_hash,omitempty"`
 	DryRunToken           string                              `json:"dry_run_token,omitempty"`
 	RenderedAppID         string                              `json:"rendered_app_id"`
 	DiffKind              string                              `json:"diff_kind"`
@@ -185,6 +187,8 @@ type manifestUpdateCandidate struct {
 	Summary              ManifestUpdateSummary
 	Classification       manifestUpdateClassification
 	ImagePlan            []ManifestUpdateImagePlanItem
+	TransitionPlan       TransitionPlan
+	TransitionPlanHash   string
 	CreatedAt            time.Time
 	ExpiresAt            time.Time
 }
@@ -587,6 +591,9 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	if err != nil {
 		return nil, err
 	}
+	if err := m.rejectIfTransitionInProgress(state, req.InstanceID, TransitionFenceModifyApp); err != nil {
+		return nil, err
+	}
 	appInst, exists := state.GetApp(req.InstanceID)
 	if !exists {
 		return nil, errAppNotFound(req.InstanceID)
@@ -607,6 +614,12 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	}
 	if req.RuntimeFingerprint != "" && req.RuntimeFingerprint != cand.RuntimeFingerprint {
 		return nil, fmt.Errorf("%w: runtime fingerprint does not match dry run", ErrManifestUpdateConflict)
+	}
+	if cand.TransitionPlanHash != "" && strings.TrimSpace(req.TransitionPlanHash) == "" {
+		return nil, fmt.Errorf("%w: transition plan hash is required", ErrManifestUpdateConflict)
+	}
+	if req.TransitionPlanHash != "" && req.TransitionPlanHash != cand.TransitionPlanHash {
+		return nil, fmt.Errorf("%w: transition plan hash does not match dry run", ErrManifestUpdateConflict)
 	}
 	if missing := missingManifestUpdateConfirmations(cand.Classification.RequiredConfirmations, req.Confirmations); len(missing) > 0 {
 		return nil, fmt.Errorf("%w: missing required confirmation(s): %s", ErrManifestUpdateRejected, strings.Join(missing, ", "))
@@ -688,6 +701,9 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 		CandidateLedgerSourceHash: nextState.RawTemplateHash,
 		DryRunToken:               cand.Token,
 		RuntimeFingerprint:        cand.RuntimeFingerprint,
+		TransitionPlan:            cand.TransitionPlan,
+		TransitionPlanHash:        cand.TransitionPlanHash,
+		CatalogSourceSnapshot:     transitionSnapshotFromPlan(cand.TransitionPlan),
 		ImagePlan:                 cand.ImagePlan,
 		MetadataOnly:              cand.MetadataOnly,
 		ApplyPhase:                taskPhaseApplyingManifest,
@@ -733,6 +749,7 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 		InstanceID:            req.InstanceID,
 		BaseManifestHash:      cand.BaseManifestHash,
 		RuntimeFingerprint:    cand.RuntimeFingerprint,
+		TransitionPlanHash:    cand.TransitionPlanHash,
 		RenderedAppID:         req.InstanceID,
 		DiffKind:              cand.DiffKind.String(),
 		UpdateClass:           cand.Classification.UpdateClass,
@@ -760,6 +777,7 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 	txn.LastError = cause.Error()
 	txn.UpdatedAt = time.Now().UTC()
 	_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+	_ = storeTransitionRecordForManifestTransaction(state, instanceID, txn, appInst, TransitionPhaseRestoringPrevious)
 	m.emitProgress(ctx, taskType, instanceID, taskPhaseRestoringManifest, 75, "Restoring previous manifest", false, nil)
 
 	var rollbackErrs []error
@@ -807,12 +825,15 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 		txn.LastError = fmt.Sprintf("apply failed: %v; rollback failed: %v", cause, restoreErr)
 		txn.UpdatedAt = time.Now().UTC()
 		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+		_ = storeTransitionRecordForManifestTransaction(state, instanceID, txn, appInst, TransitionPhaseRestoreFailed)
 		m.setObservedStatus(instanceID, StatusError)
 		m.emitProgress(ctx, taskType, instanceID, taskPhaseRestoreFailed, 95, "Restore failed", false, restoreErr)
 		return fmt.Errorf("%s failed: %w; rollback failed: %w", operationKind, cause, restoreErr)
 	}
 	m.ReconcileAllSlicePolicies()
-	if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
+	if err := state.ClearTransitionRecord(instanceID); err != nil {
+		log.Printf("WARN: manifest update %s: cleanup v2 transition after rollback: %v", instanceID, err)
+	} else if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
 		log.Printf("WARN: manifest update %s: cleanup after rollback: %v", instanceID, err)
 	}
 	return nil
@@ -849,6 +870,16 @@ func (m *AppManager) cleanupPrecommitDataSnapshot(ctx context.Context, txn *Mani
 	return nil
 }
 
+func storeManifestUpdateTransactionAndTransition(state *FilesystemStateManager, instanceID string, txn *ManifestUpdateTransaction, appInst *AppInstance) error {
+	if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+		return err
+	}
+	if err := storeTransitionRecordForManifestTransaction(state, instanceID, txn, appInst, transitionPhaseForManifestPhase(txn.Phase)); err != nil {
+		return fmt.Errorf("store v2 transition projection: %w", err)
+	}
+	return nil
+}
+
 func (m *AppManager) cleanupCommittedManifestUpdateTransaction(ctx context.Context, state *FilesystemStateManager, instanceID string, txn *ManifestUpdateTransaction) error {
 	if err := errors.Join(
 		m.cleanupPrecommitDataSnapshot(ctx, txn),
@@ -860,6 +891,9 @@ func (m *AppManager) cleanupCommittedManifestUpdateTransaction(ctx context.Conte
 		if storeErr := state.StoreManifestUpdateTransaction(instanceID, txn); storeErr != nil {
 			return errors.Join(err, fmt.Errorf("persist committed cleanup retry marker: %w", storeErr))
 		}
+		if storeErr := storeTransitionRecordForManifestTransaction(state, instanceID, txn, nil, TransitionPhaseCommittedCleanupPending); storeErr != nil {
+			return errors.Join(err, fmt.Errorf("persist v2 committed cleanup retry marker: %w", storeErr))
+		}
 		return err
 	}
 	txn.Phase = "committed"
@@ -867,6 +901,12 @@ func (m *AppManager) cleanupCommittedManifestUpdateTransaction(ctx context.Conte
 	txn.UpdatedAt = time.Now().UTC()
 	if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
 		return fmt.Errorf("persist committed cleanup state: %w", err)
+	}
+	if err := storeTransitionRecordForManifestTransaction(state, instanceID, txn, nil, TransitionPhaseCommitted); err != nil {
+		return fmt.Errorf("persist committed v2 transition state: %w", err)
+	}
+	if err := state.ClearTransitionRecord(instanceID); err != nil {
+		return fmt.Errorf("clear committed v2 transition: %w", err)
 	}
 	if err := state.ClearManifestUpdateTransaction(instanceID, txn.BackupPath); err != nil {
 		return fmt.Errorf("clear committed transaction: %w", err)
@@ -881,7 +921,7 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 	instanceID := appInst.InstanceID
 	txn.Phase = "publishing_access"
 	txn.UpdatedAt = time.Now().UTC()
-	if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+	if err := storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst); err != nil {
 		return fmt.Errorf("manifest update recovery %s: persist access repair marker: %w", instanceID, err)
 	}
 	if appInst.Enabled && (manifestTransactionRuntimeSwitchStarted(txn) || txn.AccessSuspended || len(txn.PreparedListenerEndpoints) > 0) {
@@ -889,7 +929,7 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 			if err := m.serviceManager.RestorePreparedPublication(instanceID, txn.PreparedListenerEndpoints); err != nil {
 				txn.LastError = err.Error()
 				txn.UpdatedAt = time.Now().UTC()
-				_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+				_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 				return fmt.Errorf("manifest update recovery %s: repair prepared listener publication: %w", instanceID, err)
 			}
 		} else if txn.AccessSuspended && m.serviceManager != nil {
@@ -897,19 +937,19 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 				if err := m.serviceManager.ResumeAppPublicationChecked(instanceID); err != nil {
 					txn.LastError = err.Error()
 					txn.UpdatedAt = time.Now().UTC()
-					_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+					_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 					return fmt.Errorf("manifest update recovery %s: resume listener publication: %w", instanceID, err)
 				}
 			} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, appInst, candidateDef); err != nil {
 				txn.LastError = err.Error()
 				txn.UpdatedAt = time.Now().UTC()
-				_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+				_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 				return fmt.Errorf("manifest update recovery %s: repair access: %w", instanceID, err)
 			}
 		} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, appInst, candidateDef); err != nil {
 			txn.LastError = err.Error()
 			txn.UpdatedAt = time.Now().UTC()
-			_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+			_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 			return fmt.Errorf("manifest update recovery %s: repair access: %w", instanceID, err)
 		}
 	} else if !appInst.Enabled && m.serviceManager != nil {
@@ -920,7 +960,7 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 		if err := m.applyProxyOIDCDelta(ctx, host, instanceID, prevDef, candidateDef); err != nil {
 			txn.LastError = err.Error()
 			txn.UpdatedAt = time.Now().UTC()
-			_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+			_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 			return fmt.Errorf("manifest update recovery %s: repair proxy oidc delta: %w", instanceID, err)
 		}
 		proxyDeltaApplied = true
@@ -933,7 +973,7 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 	}
 	txn.LastError = ""
 	txn.UpdatedAt = time.Now().UTC()
-	if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+	if err := storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst); err != nil {
 		return fmt.Errorf("manifest update recovery %s: persist access repaired marker: %w", instanceID, err)
 	}
 	return nil
@@ -1577,10 +1617,72 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
 	}
 	policy.UpdateClass = policy.Classification.UpdateClass
+	operationKind := TransitionOperationModifyApp
+	transitionSourceKind := TransitionSourceCustomRaw
+	pendingFlow := ""
+	expectedPendingFlow := ""
+	transitionSourceHash := Sha256Hex(rawTemplate)
+	if req.CatalogPending {
+		operationKind = TransitionOperationCatalogManifestReview
+		transitionSourceKind = TransitionSourceCatalogPending
+		pendingFlow = pendingCatalogReviewFlowManifest
+		expectedPendingFlow = pendingCatalogReviewFlowManifest
+		transitionSourceHash = pendingSourceHash
+	}
+	requiresSnapshot := false
+	if policy.Classification.DataSafety != nil && policy.Classification.DataSafety.SnapshotRequired {
+		requiresSnapshot = true
+	}
+	if !requiresSnapshot && !policy.MetadataOnly && len(imagePlan) > 0 && appHasPersistentStorage(curDef) {
+		requiresSnapshot = true
+	}
+	legacyTransitionActive, err := transitionLegacyJournalExists(state, req.InstanceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	transitionPlan, err := PlanInstalledAppTransition(TransitionPlanInput{
+		OperationKind:              operationKind,
+		SourceKind:                 transitionSourceKind,
+		PendingCatalogFlow:         pendingFlow,
+		ExpectedPendingCatalogFlow: expectedPendingFlow,
+		Mode:                       appInst.Mode(),
+		Enabled:                    appInst.Enabled,
+		RuntimeChanging:            !policy.MetadataOnly,
+		LegacyTransactionActive:    legacyTransitionActive,
+		BaseManifestHash:           baseHash,
+		CandidateManifestHash:      candidateDigest,
+		LedgerRevision:             ledgerRevision,
+		SourceHash:                 transitionSourceHash,
+		ImageRootfs:                transitionImageRootfsFromManifestPlan(imagePlan),
+		Data: TransitionDataPolicy{
+			SnapshotRequired:      requiresSnapshot,
+			CandidateMayTouchData: !policy.MetadataOnly,
+		},
+		Runtime: TransitionRuntimePolicy{
+			RuntimeFingerprint:   runtimeFingerprint,
+			PreviousActiveRootfs: cloneStringMap(appInst.ActiveRootfs),
+			PrimaryService:       primaryServiceFor(res.Definition, appInst),
+		},
+		Access: TransitionAccessPolicy{
+			PrepareRequired: !policy.MetadataOnly,
+		},
+		Cleanup: TransitionCleanupPolicy{
+			StagedRootfsKeys: transitionRootfsKeysFromManifestPlan(imagePlan),
+		},
+		RequiredConfirmations: policy.Classification.RequiredConfirmations,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	transitionPlanHash, err := transitionPlan.Hash()
+	if err != nil {
+		return nil, nil, err
+	}
 	result := &ManifestUpdateResult{
 		InstanceID:         req.InstanceID,
 		BaseManifestHash:   baseHash,
 		RuntimeFingerprint: runtimeFingerprint,
+		TransitionPlanHash: transitionPlanHash,
 		RenderedAppID:      req.InstanceID,
 		DiffKind:           diffKind.String(),
 		UpdateClass:        policy.UpdateClass,
@@ -1612,6 +1714,8 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		Summary:              summary,
 		Classification:       policy.Classification,
 		ImagePlan:            cloneManifestUpdateImagePlan(imagePlan),
+		TransitionPlan:       *transitionPlan,
+		TransitionPlanHash:   transitionPlanHash,
 	}
 	return cand, result, nil
 }
@@ -4168,10 +4272,13 @@ func (fsm *FilesystemStateManager) ClearManifestUpdateTransaction(instanceID, ba
 	return firstErr
 }
 
-func (m *AppManager) recoverPendingManifestUpdates(ctx context.Context, state *FilesystemStateManager) map[string]bool {
+func (m *AppManager) recoverPendingManifestUpdates(ctx context.Context, state *FilesystemStateManager, skipMaps ...map[string]bool) map[string]bool {
 	blocked := map[string]bool{}
 	for _, appInst := range state.ListApps() {
 		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
+			continue
+		}
+		if manifestRecoverySkipped(appInst.InstanceID, skipMaps...) {
 			continue
 		}
 		txn, err := state.LoadManifestUpdateTransaction(appInst.InstanceID)
@@ -4198,6 +4305,15 @@ func (m *AppManager) recoverPendingManifestUpdates(ctx context.Context, state *F
 	return blocked
 }
 
+func manifestRecoverySkipped(instanceID string, skipMaps ...map[string]bool) bool {
+	for _, skip := range skipMaps {
+		if skip != nil && skip[instanceID] {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, txn *ManifestUpdateTransaction) error {
 	instanceID := appInst.InstanceID
 	if txn.Phase == "committed" || txn.Phase == "committed_cleanup_pending" {
@@ -4217,7 +4333,7 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 				txn.Phase = "publishing_access"
 				txn.LastError = fmt.Sprintf("load backup for access repair: %v", err)
 				txn.UpdatedAt = time.Now().UTC()
-				_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+				_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 				m.setObservedStatus(instanceID, StatusError)
 				return fmt.Errorf("manifest update recovery %s: load backup for access repair: %w", instanceID, err)
 			}
@@ -4226,18 +4342,22 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 				return err
 			}
 		}
-		if err := storeCommittedCatalogMetadata(state, appInst, txn.CandidateLedgerSourceHash); err != nil {
-			txn.Phase = "committed_metadata_pending"
-			txn.LastError = err.Error()
-			txn.AccessPublished = true
-			txn.UpdatedAt = time.Now().UTC()
-			_ = state.StoreManifestUpdateTransaction(instanceID, txn)
-			return nil
+		if catalogHash, ok := recoveredLedgerCommitCatalogHash(state, appInst, txn); ok {
+			if err := storeCommittedCatalogMetadata(state, appInst, catalogHash); err != nil {
+				txn.Phase = "committed_metadata_pending"
+				txn.LastError = err.Error()
+				txn.AccessPublished = true
+				txn.UpdatedAt = time.Now().UTC()
+				if storeErr := storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst); storeErr != nil {
+					return fmt.Errorf("manifest update recovery %s: persist metadata retry marker: %w", instanceID, storeErr)
+				}
+				return nil
+			}
 		}
 		txn.Phase = "committed"
 		txn.LastError = ""
 		txn.UpdatedAt = time.Now().UTC()
-		if err := state.StoreManifestUpdateTransaction(instanceID, txn); err != nil {
+		if err := storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst); err != nil {
 			log.Printf("WARN: manifest update recovery %s: mark committed after ledger recovery: %v", instanceID, err)
 		}
 		if err := m.cleanupCommittedManifestUpdateTransaction(ctx, state, instanceID, txn); err != nil {
@@ -4255,7 +4375,7 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	if err != nil {
 		txn.Phase = "restore_failed"
 		txn.LastError = fmt.Sprintf("load backup: %v", err)
-		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+		_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("manifest update recovery %s: load backup: %w", instanceID, err)
 	}
@@ -4263,13 +4383,13 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	if err != nil {
 		txn.Phase = "restore_failed"
 		txn.LastError = fmt.Sprintf("parse backup: %v", err)
-		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+		_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("manifest update recovery %s: parse backup: %w", instanceID, err)
 	}
 	failedDef := appInst.Definition
 	txn.Phase = "restoring_previous"
-	_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+	_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 	appInst.Definition = prevDef
 	if txn.PreviousActiveRootfs != nil || txn.CandidateActiveRootfs != nil {
 		appInst.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
@@ -4313,12 +4433,14 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	if restoreErr := errors.Join(rollbackErrs...); restoreErr != nil {
 		txn.Phase = "restore_failed"
 		txn.LastError = restoreErr.Error()
-		_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+		_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("manifest update recovery %s: %w", instanceID, restoreErr)
 	}
 	m.ReconcileAllSlicePolicies()
-	if err := state.ClearManifestUpdateTransaction(instanceID, backupPath); err != nil {
+	if err := state.ClearTransitionRecord(instanceID); err != nil {
+		log.Printf("WARN: manifest update recovery %s: cleanup v2 transition: %v", instanceID, err)
+	} else if err := state.ClearManifestUpdateTransaction(instanceID, backupPath); err != nil {
 		log.Printf("WARN: manifest update recovery %s: cleanup transaction: %v", instanceID, err)
 	}
 	log.Printf("INFO: manifest update recovery %s: restored previous manifest/runtime from transaction phase %s", instanceID, txn.Phase)
@@ -4338,7 +4460,7 @@ func recoverLedgerCommitReached(state *FilesystemStateManager, appInst *AppInsta
 		return false
 	}
 	switch txn.Phase {
-	case "ledger_committing", "publishing_access", "access_published", "committed_metadata_pending":
+	case "ledger_committing", "ledger_committed", "publishing_access", "access_published", "committed_metadata_pending":
 	default:
 		return false
 	}
@@ -4359,4 +4481,21 @@ func recoverLedgerCommitReached(state *FilesystemStateManager, appInst *AppInsta
 		return false
 	}
 	return currentManifestHash == txn.CandidateManifestHash
+}
+
+func recoveredLedgerCommitCatalogHash(state *FilesystemStateManager, appInst *AppInstance, txn *ManifestUpdateTransaction) (string, bool) {
+	if state == nil || appInst == nil || txn == nil || strings.TrimSpace(appInst.CatalogSource) == "" {
+		return "", false
+	}
+	st, err := state.LoadInstallState(appInst.InstanceID)
+	if err != nil {
+		return "", false
+	}
+	if st.SourceKind != InstallSourceKindCatalog ||
+		st.Revision != txn.CandidateLedgerRevision ||
+		st.RawTemplateHash != txn.CandidateLedgerSourceHash {
+		return "", false
+	}
+	hash := strings.TrimSpace(st.RawTemplateHash)
+	return hash, hash != ""
 }

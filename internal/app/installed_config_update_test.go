@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -333,6 +334,73 @@ func TestRefreshInstallSystemContextRestoresLedgerOnSyncFailure(t *testing.T) {
 	}
 }
 
+func TestRefreshInstallSystemContextSerializesLegacyInstallStateWrite(t *testing.T) {
+	mgr, state, raw, _, systemCtx := installedConfigTestApp(t)
+	if err := state.StoreInstallState("piclu", &InstallState{
+		InstanceID:       "piclu",
+		IsLegacyBackfill: true,
+		InstallSystemCtx: &systemCtx,
+	}); err != nil {
+		t.Fatalf("store legacy install state: %v", err)
+	}
+
+	fresh := systemCtx
+	fresh.Timezone = "Asia/Kolkata"
+	mgr.SetSyncHost(installedConfigSyncHost{
+		templates: map[string][]byte{"piclu": raw},
+		systemCtx: &fresh,
+		fetchErr:  errors.New("catalog temporarily unavailable"),
+	})
+
+	enteredWrite := make(chan struct{})
+	releaseWrite := make(chan struct{})
+	var once sync.Once
+	state.storeInstallStateHook = func(instanceID string, st *InstallState) error {
+		if instanceID == "piclu" && st != nil && st.InstallSystemCtx != nil && st.InstallSystemCtx.Timezone == "Asia/Kolkata" {
+			once.Do(func() {
+				close(enteredWrite)
+				<-releaseWrite
+			})
+		}
+		return nil
+	}
+
+	done := make(chan error, 1)
+	go func() {
+		done <- mgr.RefreshInstallSystemContext(context.Background(), "piclu")
+	}()
+
+	select {
+	case <-enteredWrite:
+	case <-time.After(time.Second):
+		t.Fatalf("refresh-context did not reach legacy install_state write")
+	}
+
+	lockAcquired := make(chan struct{})
+	go func() {
+		mgr.reconcileMu.Lock()
+		defer mgr.reconcileMu.Unlock()
+		close(lockAcquired)
+	}()
+
+	select {
+	case <-lockAcquired:
+		close(releaseWrite)
+		t.Fatalf("legacy install_state write ran outside reconcileMu")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseWrite)
+	if err := <-done; err == nil {
+		t.Fatalf("expected refresh-context sync failure")
+	}
+	select {
+	case <-lockAcquired:
+	case <-time.After(time.Second):
+		t.Fatalf("reconcileMu remained locked after refresh-context returned")
+	}
+}
+
 func TestRefreshInstallSystemContextStagesLedgerThroughManifestApply(t *testing.T) {
 	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
 	tzRaw := []byte(strings.Replace(string(raw), `      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"`, `      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
@@ -462,6 +530,14 @@ func TestEditConfigSurfacesPendingCatalogRequiredInput(t *testing.T) {
 	if !dryRun.Applicable {
 		t.Fatalf("dry run not applicable: %s", dryRun.BlockingReason)
 	}
+	var firstTransition *TransitionRecord
+	state.storeTransitionRecordHook = func(instanceID string, record *TransitionRecord) error {
+		if instanceID == "piclu" && firstTransition == nil {
+			copy := *record
+			firstTransition = &copy
+		}
+		return nil
+	}
 	applied, err := mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
 		DryRunToken:        dryRun.DryRunToken,
 		CandidateDigest:    dryRun.CandidateDigest,
@@ -470,12 +546,22 @@ func TestEditConfigSurfacesPendingCatalogRequiredInput(t *testing.T) {
 		InputSchemaHash:    dryRun.InputSchemaHash,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	})
 	if err != nil {
 		t.Fatalf("apply pending config update: %v", err)
 	}
 	if !applied.Applicable {
 		t.Fatalf("apply result not applicable")
+	}
+	if firstTransition == nil || firstTransition.CatalogSourceSnapshot == nil {
+		t.Fatalf("missing catalog source snapshot in transition record: %+v", firstTransition)
+	}
+	if firstTransition.CatalogSourceSnapshot.Flow != pendingCatalogReviewFlowConfig || firstTransition.CatalogSourceSnapshot.Hash != newHash {
+		t.Fatalf("catalog source snapshot = %+v, want flow=%q hash=%q", firstTransition.CatalogSourceSnapshot, pendingCatalogReviewFlowConfig, newHash)
+	}
+	if firstTransition.Plan.SourceHash != newHash {
+		t.Fatalf("transition source hash = %q, want pending source hash %q", firstTransition.Plan.SourceHash, newHash)
 	}
 	st, err := state.LoadInstallState("piclu")
 	if err != nil {
@@ -594,12 +680,21 @@ func TestCatalogSyncStoresPendingServiceAppReviewForImageChange(t *testing.T) {
 	if !slices.Contains(dryRun.RequiredConfirmations, "image_update_review") {
 		t.Fatalf("expected image review confirmation, got %v", dryRun.RequiredConfirmations)
 	}
+	var firstTransition *TransitionRecord
+	state.storeTransitionRecordHook = func(instanceID string, record *TransitionRecord) error {
+		if instanceID == "piclu" && firstTransition == nil {
+			copy := *record
+			firstTransition = &copy
+		}
+		return nil
+	}
 	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
 		InstanceID:         "piclu",
 		CatalogPending:     true,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
 		DryRunToken:        dryRun.DryRunToken,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 		Confirmations:      dryRun.RequiredConfirmations,
 	})
 	if err != nil {
@@ -607,6 +702,15 @@ func TestCatalogSyncStoresPendingServiceAppReviewForImageChange(t *testing.T) {
 	}
 	if !applied.Applicable {
 		t.Fatalf("apply result not applicable")
+	}
+	if firstTransition == nil || firstTransition.CatalogSourceSnapshot == nil {
+		t.Fatalf("missing catalog source snapshot in transition record: %+v", firstTransition)
+	}
+	if firstTransition.CatalogSourceSnapshot.Flow != pendingCatalogReviewFlowManifest || firstTransition.CatalogSourceSnapshot.Hash != newHash {
+		t.Fatalf("catalog source snapshot = %+v, want flow=%q hash=%q", firstTransition.CatalogSourceSnapshot, pendingCatalogReviewFlowManifest, newHash)
+	}
+	if firstTransition.Plan.SourceHash != newHash {
+		t.Fatalf("transition source hash = %q, want pending source hash %q", firstTransition.Plan.SourceHash, newHash)
 	}
 	st, err = state.LoadInstallState("piclu")
 	if err != nil {
@@ -775,6 +879,7 @@ func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *test
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
 		DryRunToken:        dryRun.DryRunToken,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 		Confirmations:      dryRun.RequiredConfirmations,
 	})
 	if err != nil {
@@ -1302,6 +1407,17 @@ func TestEvaluateInstalledConfigPolicyRejectsUDPOnlyRuntimeUpdate(t *testing.T) 
 func TestApplyInstalledConfigNoopUsesTransactionAndBumpsLedgerRevision(t *testing.T) {
 	mgr, state, raw, _, _ := installedConfigTestApp(t)
 	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": raw}})
+	var phases []TransitionPhase
+	state.storeTransitionRecordHook = func(instanceID string, record *TransitionRecord) error {
+		if instanceID != "piclu" {
+			t.Fatalf("transition instance = %q, want piclu", instanceID)
+		}
+		if record.PlanHash == "" {
+			t.Fatalf("transition record missing plan hash: %+v", record)
+		}
+		phases = append(phases, record.Phase)
+		return nil
+	}
 	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
 	if err != nil {
 		t.Fatalf("read installed config: %v", err)
@@ -1317,6 +1433,9 @@ func TestApplyInstalledConfigNoopUsesTransactionAndBumpsLedgerRevision(t *testin
 	if !dryRun.Applicable || !dryRun.MetadataOnly {
 		t.Fatalf("expected applicable metadata-only dry run, got applicable=%v metadata=%v reason=%q", dryRun.Applicable, dryRun.MetadataOnly, dryRun.BlockingReason)
 	}
+	if dryRun.TransitionPlanHash == "" {
+		t.Fatalf("dry run missing transition plan hash")
+	}
 	applied, err := mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
 		DryRunToken:        dryRun.DryRunToken,
 		CandidateDigest:    dryRun.CandidateDigest,
@@ -1325,18 +1444,108 @@ func TestApplyInstalledConfigNoopUsesTransactionAndBumpsLedgerRevision(t *testin
 		InputSchemaHash:    dryRun.InputSchemaHash,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
+	}
+	if applied.TransitionPlanHash != dryRun.TransitionPlanHash {
+		t.Fatalf("applied transition plan hash = %q, want %q", applied.TransitionPlanHash, dryRun.TransitionPlanHash)
 	}
 	if applied.LedgerRevision != read.LedgerRevision+1 {
 		t.Fatalf("ledger revision = %d, want %d", applied.LedgerRevision, read.LedgerRevision+1)
 	}
 	appDir := filepath.Join(state.appsDir, "piclu")
-	for _, name := range []string{manifestUpdateTxnFilename, manifestUpdateBackupFilename, installStateBackupFilename} {
+	for _, name := range []string{manifestUpdateTxnFilename, manifestUpdateBackupFilename, installStateBackupFilename, transitionRecordFilename} {
 		if _, err := os.Stat(filepath.Join(appDir, name)); !os.IsNotExist(err) {
 			t.Fatalf("%s should be cleared after config apply, stat err=%v", name, err)
 		}
+	}
+	if !slices.Contains(phases, TransitionPhasePrepared) || !slices.Contains(phases, TransitionPhaseCommitted) {
+		t.Fatalf("transition phases = %v, want prepared and committed", phases)
+	}
+}
+
+func TestApplyInstalledConfigRequiresTransitionPlanHash(t *testing.T) {
+	mgr, _, raw, _, _ := installedConfigTestApp(t)
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": raw}})
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if dryRun.TransitionPlanHash == "" {
+		t.Fatalf("dry run missing transition plan hash")
+	}
+	_, err = mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		DryRunToken:        dryRun.DryRunToken,
+		CandidateDigest:    dryRun.CandidateDigest,
+		LedgerRevision:     dryRun.LedgerRevision,
+		SourceHash:         dryRun.SourceHash,
+		InputSchemaHash:    dryRun.InputSchemaHash,
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+	})
+	if !errors.Is(err, ErrInstalledConfigConflict) || !strings.Contains(err.Error(), "transition plan hash is required") {
+		t.Fatalf("apply err = %v, want required transition hash conflict", err)
+	}
+}
+
+func TestApplyInstalledConfigTransitionFencePreservesDryRunToken(t *testing.T) {
+	mgr, state, raw, _, _ := installedConfigTestApp(t)
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": raw}})
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if err := state.StoreTransitionRecord("piclu", transitionTestRecord("piclu", TransitionPhaseSwitchingRuntime)); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+	readDuringTransition, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read during active transition should remain available: %v", err)
+	}
+	if readDuringTransition.InstanceID != "piclu" {
+		t.Fatalf("read during transition instance = %q, want piclu", readDuringTransition.InstanceID)
+	}
+	req := InstalledConfigUpdateRequest{
+		DryRunToken:        dryRun.DryRunToken,
+		CandidateDigest:    dryRun.CandidateDigest,
+		LedgerRevision:     dryRun.LedgerRevision,
+		SourceHash:         dryRun.SourceHash,
+		InputSchemaHash:    dryRun.InputSchemaHash,
+		BaseManifestHash:   dryRun.BaseManifestHash,
+		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
+	}
+	_, err = mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", req)
+	if !errors.Is(err, ErrTransitionInProgress) {
+		t.Fatalf("apply error = %v, want ErrTransitionInProgress", err)
+	}
+	if err := state.ClearTransitionRecord("piclu"); err != nil {
+		t.Fatalf("clear transition: %v", err)
+	}
+	applied, err := mgr.ApplyInstalledConfigUpdate(context.Background(), "piclu", req)
+	if err != nil {
+		t.Fatalf("apply after cleared transition should reuse dry-run token: %v", err)
+	}
+	if applied.TransitionPlanHash != dryRun.TransitionPlanHash {
+		t.Fatalf("applied transition hash = %q, want %q", applied.TransitionPlanHash, dryRun.TransitionPlanHash)
 	}
 }
 
@@ -1377,6 +1586,7 @@ func TestApplyInstalledConfigRuntimeChangeSnapshotsPersistentData(t *testing.T) 
 		InputSchemaHash:    dryRun.InputSchemaHash,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	})
 	if err != nil {
 		t.Fatalf("apply: %v", err)
@@ -1389,6 +1599,72 @@ func TestApplyInstalledConfigRuntimeChangeSnapshotsPersistentData(t *testing.T) 
 	}
 	if len(volumes.destroyed) != 1 || volumes.destroyed[0] != volumes.snapshots[0] {
 		t.Fatalf("destroyed snapshots = %v, want cleanup of %s", volumes.destroyed, volumes.snapshots[0])
+	}
+}
+
+func TestDryRunInstalledConfigStoppedRuntimeChangeReturnsPolicyResult(t *testing.T) {
+	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
+	runtimeRaw := []byte(strings.Replace(string(raw), `  webhook_token:
+    type: string
+    label: Webhook token
+    default: default-token`, `  webhook_token:
+    type: string
+    label: Webhook token
+    default: default-token
+  runtime_flag:
+    type: string
+    label: Runtime flag
+    default: old`, 1))
+	runtimeRaw = []byte(strings.Replace(string(runtimeRaw), `      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"`, `      PICLU_DEVICE_DIAG_DIR: "{{ .Inputs.diag_dir }}"
+      RUNTIME_FLAG: "{{ .Inputs.runtime_flag }}"`, 1))
+	inputs["runtime_flag"] = "old"
+	res, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   runtimeRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render runtime flag template: %v", err)
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found")
+	}
+	appInst.Definition = res.Definition
+	appInst.CatalogManifestHash = Sha256Hex(runtimeRaw)
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store runtime flag app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState("piclu", InstallSourceKindCatalog, "piclu", runtimeRaw, inputs, systemCtx, nil, false)); err != nil {
+		t.Fatalf("store runtime flag install state: %v", err)
+	}
+	appInst.Enabled = false
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		t.Fatalf("store disabled app metadata: %v", err)
+	}
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": runtimeRaw}})
+	read, err := mgr.ReadInstalledConfig(context.Background(), "piclu")
+	if err != nil {
+		t.Fatalf("read installed config: %v", err)
+	}
+	dryRun, err := mgr.DryRunInstalledConfigUpdate(context.Background(), "piclu", InstalledConfigUpdateRequest{
+		Inputs:          map[string]interface{}{"runtime_flag": "new"},
+		LedgerRevision:  read.LedgerRevision,
+		SourceHash:      read.SourceHash,
+		InputSchemaHash: read.InputSchemaHash,
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if dryRun.Applicable {
+		t.Fatalf("dry run applicable, want policy rejection")
+	}
+	if !strings.Contains(dryRun.BlockingReason, "start app before applying runtime config") {
+		t.Fatalf("blocking reason = %q", dryRun.BlockingReason)
+	}
+	if dryRun.TransitionPlanHash != "" {
+		t.Fatalf("rejected dry run transition hash = %q, want empty", dryRun.TransitionPlanHash)
 	}
 }
 
@@ -1427,6 +1703,7 @@ func TestApplyInstalledConfigRestoresManifestWhenCandidateStoreFails(t *testing.
 		InputSchemaHash:    dryRun.InputSchemaHash,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	})
 	if err == nil {
 		t.Fatalf("expected apply to fail")
@@ -1484,6 +1761,7 @@ func TestApplyInstalledConfigRejectsLedgerRawTemplateHashMismatchAfterDryRun(t *
 		InputSchemaHash:    dryRun.InputSchemaHash,
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	})
 	if err == nil {
 		t.Fatalf("expected apply to reject tampered ledger")
@@ -2720,13 +2998,6 @@ func TestRecoverPendingManifestUpdateRepairsAccessAfterPostCommitPublishFailure(
 		requiresProxy:   requiresProxy,
 		registeredProxy: &registered,
 	})
-	failMetadata := true
-	state.storeAppMetadataHook = func(instanceID string, app *AppInstance) error {
-		if failMetadata && instanceID == "oidcapp" && app.CatalogManifestHash == nextState.RawTemplateHash && app.LastSyncError == "" {
-			return errors.New("metadata store unavailable during recovery")
-		}
-		return nil
-	}
 	now := time.Now().UTC()
 	if err := state.StoreManifestUpdateTransaction("oidcapp", &ManifestUpdateTransaction{
 		OperationID:               "op-access-repair",
@@ -2747,17 +3018,27 @@ func TestRecoverPendingManifestUpdateRepairsAccessAfterPostCommitPublishFailure(
 	}); err != nil {
 		t.Fatalf("store publishing transaction: %v", err)
 	}
+	transitionRecord := transitionTestRecord("oidcapp", TransitionPhasePublishingAccess)
+	transitionRecord.OperationID = "op-access-repair"
+	transitionRecord.Plan.OperationKind = TransitionOperationModifyApp
+	transitionRecord.Plan.SourceKind = TransitionSourceCustomRaw
+	if err := state.StoreTransitionRecord("oidcapp", transitionRecord); err != nil {
+		t.Fatalf("store v2 transition record: %v", err)
+	}
 
 	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
 	if blocked["oidcapp"] {
 		t.Fatalf("recovery should repair access without blocking")
 	}
-	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
-	if err != nil {
-		t.Fatalf("transaction should remain for metadata retry: %v", err)
+	if _, err := state.LoadManifestUpdateTransaction("oidcapp"); err == nil {
+		t.Fatalf("transaction should be cleared after access repair")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load transaction: %v", err)
 	}
-	if txn.Phase != "committed_metadata_pending" || !txn.AccessPublished || !strings.Contains(txn.LastError, "metadata store unavailable during recovery") {
-		t.Fatalf("metadata retry transaction = phase:%q access:%v err:%q", txn.Phase, txn.AccessPublished, txn.LastError)
+	if _, err := state.LoadTransitionRecord("oidcapp"); err == nil {
+		t.Fatalf("v2 transition should be cleared after access repair")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("load v2 transition: %v", err)
 	}
 	if len(registered) != 1 || registered[0] != "oidcapp" {
 		t.Fatalf("proxy registration calls = %v, want recovery retry", registered)
@@ -2769,18 +3050,67 @@ func TestRecoverPendingManifestUpdateRepairsAccessAfterPostCommitPublishFailure(
 	if got := committedDef.Services["main"].OIDCClient.AuthorizePaths; !slices.Equal(got, []string{"/authorize"}) {
 		t.Fatalf("committed authorize paths = %v", got)
 	}
-	failMetadata = false
-	blocked = mgr.recoverPendingManifestUpdates(context.Background(), state)
-	if blocked["oidcapp"] {
-		t.Fatalf("second recovery should clear metadata retry without blocking")
+	appInst, exists = state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("app missing after recovery")
 	}
-	if _, err := state.LoadManifestUpdateTransaction("oidcapp"); err == nil {
-		t.Fatalf("transaction should be cleared after metadata recovery")
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("load transaction: %v", err)
+	if appInst.CatalogManifestHash != Sha256Hex(oldRaw) {
+		t.Fatalf("catalog hash after custom access recovery = %q, want old catalog hash", appInst.CatalogManifestHash)
 	}
-	if len(registered) != 1 {
-		t.Fatalf("proxy registration calls after metadata retry = %v, want no duplicate access repair", registered)
+}
+
+func TestTransitionFollowUpReportsLegacyManifestMetadataStillPending(t *testing.T) {
+	mgr, state, _ := installedConfigOIDCTestApp(t)
+	appInst, ok := state.GetApp("oidcapp")
+	if !ok {
+		t.Fatalf("app missing")
+	}
+	st, err := state.LoadInstallState("oidcapp")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	candidateHash, err := canonicalManifestHash(appInst.Definition)
+	if err != nil {
+		t.Fatalf("candidate hash: %v", err)
+	}
+	state.storeAppMetadataHook = func(instanceID string, app *AppInstance) error {
+		if instanceID == "oidcapp" && app.CatalogManifestHash == st.RawTemplateHash {
+			return errors.New("metadata store still unavailable")
+		}
+		return nil
+	}
+	now := time.Now().UTC()
+	if err := state.StoreManifestUpdateTransaction("oidcapp", &ManifestUpdateTransaction{
+		OperationID:               "op-metadata",
+		OperationKind:             "service_app_update",
+		Phase:                     "committed_metadata_pending",
+		CandidateManifestHash:     candidateHash,
+		CandidateLedgerRevision:   st.Revision,
+		CandidateLedgerSourceHash: st.RawTemplateHash,
+		AccessPublished:           true,
+		CreatedAt:                 now,
+		UpdatedAt:                 now,
+	}); err != nil {
+		t.Fatalf("store metadata-pending transaction: %v", err)
+	}
+	record := transitionTestRecord("oidcapp", TransitionPhaseCommittedMetadataPending)
+	record.OperationID = "op-metadata"
+	record.Plan.OperationKind = TransitionOperationCatalogAutoApply
+	record.Plan.SourceKind = TransitionSourceCatalogRendered
+	if err := state.StoreTransitionRecord("oidcapp", record); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+
+	err = mgr.RetryTransitionFollowUp(context.Background(), "oidcapp", TransitionActionMetadataRetry)
+	if !errors.Is(err, ErrTransitionFollowUpUnavailable) || !strings.Contains(err.Error(), "metadata store still unavailable") {
+		t.Fatalf("follow-up err = %v, want pending metadata failure", err)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("oidcapp")
+	if err != nil {
+		t.Fatalf("load metadata-pending transaction: %v", err)
+	}
+	if txn.Phase != "committed_metadata_pending" || !strings.Contains(txn.LastError, "metadata store still unavailable") {
+		t.Fatalf("transaction = phase:%q err:%q, want metadata pending", txn.Phase, txn.LastError)
 	}
 }
 

@@ -1,16 +1,17 @@
 package app
 
 const (
-	taskTypeInstallApp       = "install_app"
-	taskTypeStartApp         = "start_app"
-	taskTypeStopApp          = "stop_app"
-	taskTypeUninstallApp     = "uninstall_app"
-	taskTypeUpdateListeners  = "update_listeners"
-	taskTypeUpdateImage      = "update_image"
-	taskTypeUpdateManifest   = "update_manifest"
-	taskTypeUpdateServiceApp = "update_service_app"
-	taskTypeUpdateConfig     = "update_config"
-	taskTypeRollbackApp      = "rollback_app"
+	taskTypeInstallApp         = "install_app"
+	taskTypeStartApp           = "start_app"
+	taskTypeStopApp            = "stop_app"
+	taskTypeUninstallApp       = "uninstall_app"
+	taskTypeUpdateListeners    = "update_listeners"
+	taskTypeUpdateImage        = "update_image"
+	taskTypeUpdateManifest     = "update_manifest"
+	taskTypeUpdateServiceApp   = "update_service_app"
+	taskTypeUpdateConfig       = "update_config"
+	taskTypeTransitionFollowUp = "transition_followup"
+	taskTypeRollbackApp        = "rollback_app"
 )
 
 const (

@@ -77,6 +77,7 @@ type InstalledConfigUpdateRequest struct {
 	InputSchemaHash    string                 `json:"input_schema_hash,omitempty"`
 	BaseManifestHash   string                 `json:"base_manifest_hash,omitempty"`
 	RuntimeFingerprint string                 `json:"runtime_fingerprint,omitempty"`
+	TransitionPlanHash string                 `json:"transition_plan_hash,omitempty"`
 }
 
 type InstalledConfigActionSummary struct {
@@ -95,6 +96,7 @@ type InstalledConfigUpdateResult struct {
 	InputSchemaHash     string                         `json:"input_schema_hash"`
 	BaseManifestHash    string                         `json:"base_manifest_hash"`
 	RuntimeFingerprint  string                         `json:"runtime_fingerprint"`
+	TransitionPlanHash  string                         `json:"transition_plan_hash,omitempty"`
 	DryRunToken         string                         `json:"dry_run_token,omitempty"`
 	CandidateDigest     string                         `json:"candidate_digest,omitempty"`
 	DiffKind            string                         `json:"diff_kind"`
@@ -123,6 +125,8 @@ type installedConfigCandidate struct {
 	InstallState       *InstallState
 	Actions            []InstalledConfigActionSummary
 	Summary            ManifestUpdateSummary
+	TransitionPlan     TransitionPlan
+	TransitionPlanHash string
 	CreatedAt          time.Time
 	ExpiresAt          time.Time
 }
@@ -1232,6 +1236,9 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	if err != nil {
 		return nil, err
 	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceEditConfig); err != nil {
+		return nil, err
+	}
 	appInst, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil, errAppNotFound(instanceID)
@@ -1260,6 +1267,12 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	}
 	if req.RuntimeFingerprint != "" && req.RuntimeFingerprint != cand.RuntimeFingerprint {
 		return nil, fmt.Errorf("%w: runtime fingerprint does not match dry run", ErrInstalledConfigConflict)
+	}
+	if cand.TransitionPlanHash != "" && strings.TrimSpace(req.TransitionPlanHash) == "" {
+		return nil, fmt.Errorf("%w: transition plan hash is required", ErrInstalledConfigConflict)
+	}
+	if req.TransitionPlanHash != "" && req.TransitionPlanHash != cand.TransitionPlanHash {
+		return nil, fmt.Errorf("%w: transition plan hash does not match dry run", ErrInstalledConfigConflict)
 	}
 
 	currentState, err := state.LoadInstallState(instanceID)
@@ -1316,6 +1329,9 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 		CandidateLedgerSourceHash: cand.InstallState.RawTemplateHash,
 		DryRunToken:               cand.Token,
 		RuntimeFingerprint:        cand.RuntimeFingerprint,
+		TransitionPlan:            cand.TransitionPlan,
+		TransitionPlanHash:        cand.TransitionPlanHash,
+		CatalogSourceSnapshot:     transitionSnapshotFromPlan(cand.TransitionPlan),
 		MetadataOnly:              cand.MetadataOnly,
 		RequiresPrecommitSnapshot: cand.RequiresSnapshot,
 		ApplyPhase:                taskPhaseApplyingConfig,
@@ -1362,6 +1378,7 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 		InputSchemaHash:     cand.InputSchemaHash,
 		BaseManifestHash:    cand.BaseManifestHash,
 		RuntimeFingerprint:  cand.RuntimeFingerprint,
+		TransitionPlanHash:  cand.TransitionPlanHash,
 		CandidateDigest:     cand.CandidateDigest,
 		DiffKind:            cand.DiffKind.String(),
 		Applicable:          true,
@@ -1511,6 +1528,16 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	policy.Reason = redactUnsafeDisplayText(policy.Reason, unsafeDisplayFragments)
 	diffKind := classifyDiff(cloneDefinitionForCompare(curDef), cloneDefinitionForCompare(res.Definition))
 	candidateDigest := Sha256Hex(res.CanonicalBytes)
+	operationKind := TransitionOperationEditConfig
+	transitionSourceKind := TransitionSourceCurrentCommitted
+	pendingFlow := ""
+	expectedPendingFlow := ""
+	if pendingSource {
+		operationKind = TransitionOperationCatalogConfigReview
+		transitionSourceKind = TransitionSourceCatalogPending
+		pendingFlow = pendingCatalogReviewFlowConfig
+		expectedPendingFlow = pendingCatalogReviewFlowConfig
+	}
 	result := &InstalledConfigUpdateResult{
 		InstanceID:         instanceID,
 		LedgerRevision:     st.Revision,
@@ -1529,6 +1556,45 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 	if !policy.Allowed {
 		return nil, result, nil
 	}
+	legacyTransitionActive, err := transitionLegacyJournalExists(state, instanceID)
+	if err != nil {
+		return nil, nil, err
+	}
+	transitionPlan, err := PlanInstalledAppTransition(TransitionPlanInput{
+		OperationKind:              operationKind,
+		SourceKind:                 transitionSourceKind,
+		PendingCatalogFlow:         pendingFlow,
+		ExpectedPendingCatalogFlow: expectedPendingFlow,
+		Mode:                       appInst.Mode(),
+		Enabled:                    appInst.Enabled,
+		RuntimeChanging:            !policy.MetadataOnly,
+		LegacyTransactionActive:    legacyTransitionActive,
+		BaseManifestHash:           baseHash,
+		CandidateManifestHash:      candidateDigest,
+		LedgerRevision:             st.Revision,
+		SourceHash:                 sourceHash,
+		InputSchemaHash:            schemaHash,
+		Data: TransitionDataPolicy{
+			SnapshotRequired:      policy.RequiresSnapshot,
+			CandidateMayTouchData: !policy.MetadataOnly,
+		},
+		Runtime: TransitionRuntimePolicy{
+			RuntimeFingerprint:   runtimeFingerprint,
+			PreviousActiveRootfs: cloneStringMap(appInst.ActiveRootfs),
+			PrimaryService:       primaryServiceFor(res.Definition, appInst),
+		},
+		Access: TransitionAccessPolicy{
+			PrepareRequired: !policy.MetadataOnly,
+		},
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	transitionPlanHash, err := transitionPlan.Hash()
+	if err != nil {
+		return nil, nil, err
+	}
+	result.TransitionPlanHash = transitionPlanHash
 	nextState := *st
 	if pendingSource {
 		nextState.RawTemplate = append([]byte(nil), rawTemplate...)
@@ -1553,6 +1619,8 @@ func (m *AppManager) renderInstalledConfigCandidate(ctx context.Context, instanc
 		InstallState:       &nextState,
 		Actions:            actions,
 		Summary:            summary,
+		TransitionPlan:     *transitionPlan,
+		TransitionPlanHash: transitionPlanHash,
 	}
 	return cand, result, nil
 }

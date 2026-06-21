@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -76,6 +75,51 @@ func TestEvaluateCustomManifestUpdatePolicy_EnvWithPersistentStorageRequiresData
 	}
 	if policy.Classification.DataSafety == nil || !policy.Classification.DataSafety.SnapshotRequired {
 		t.Fatalf("expected data safety snapshot requirement, got %+v", policy.Classification.DataSafety)
+	}
+}
+
+func TestCleanupCommittedManifestUpdateKeepsLegacyJournalWhenTransitionClearFails(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "manifest_committed_cleanup_v2_clear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	mgr, err := NewAppManagerForTest(NewMockContainerManager(), tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	txn := &ManifestUpdateTransaction{
+		OperationID: "op-1",
+		Phase:       "committed_cleanup_pending",
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", txn); err != nil {
+		t.Fatalf("store manifest txn: %v", err)
+	}
+	record := transitionTestRecord("piclu", TransitionPhaseCommittedCleanupPending)
+	if err := state.StoreTransitionRecord("piclu", record); err != nil {
+		t.Fatalf("store transition record: %v", err)
+	}
+	state.clearTransitionRecordHook = func(instanceID string) error {
+		if instanceID == "piclu" {
+			return errors.New("transition clear failed")
+		}
+		return nil
+	}
+
+	err = mgr.cleanupCommittedManifestUpdateTransaction(context.Background(), state, "piclu", txn)
+	if err == nil || !strings.Contains(err.Error(), "clear committed v2 transition") {
+		t.Fatalf("cleanup err = %v, want transition clear failure", err)
+	}
+	if _, err := state.LoadManifestUpdateTransaction("piclu"); err != nil {
+		t.Fatalf("manifest update transaction should remain after v2 clear failure: %v", err)
+	}
+	if _, err := state.LoadTransitionRecord("piclu"); err != nil {
+		t.Fatalf("transition record should remain after failed clear: %v", err)
 	}
 }
 
@@ -416,10 +460,47 @@ func TestDryRunCustomManifestUpdate_AllowsOIDCAuthorizePathDeltaWithExistingCred
 		InstanceID:         "oidcapp",
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
+		TransitionPlanHash: result.TransitionPlanHash,
 		DryRunToken:        result.DryRunToken,
 	})
 	if !errors.Is(err, ErrManifestUpdateRejected) || !strings.Contains(err.Error(), confirmation) {
 		t.Fatalf("apply err = %v, want missing %s confirmation rejection", err, confirmation)
+	}
+}
+
+func TestApplyCustomManifestUpdateRequiresTransitionPlanHash(t *testing.T) {
+	mgr, state, raw := installedConfigOIDCTestApp(t)
+	appInst, exists := state.GetApp("oidcapp")
+	if !exists {
+		t.Fatalf("oidc app missing")
+	}
+	appInst.CatalogSource = ""
+	appInst.CatalogManifestHash = ""
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store custom oidc app: %v", err)
+	}
+	nextRaw := []byte(strings.Replace(string(raw), "  display_name:\n    type: string", "  operator_note:\n    type: string\n    label: Operator note\n    default: preserved\n  display_name:\n    type: string", 1))
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "oidcapp",
+		RawTemplate:   nextRaw,
+		Inputs:        map[string]interface{}{"display_name": "OIDC app"},
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC", IssuerHint: "https://issuer.local"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if result.TransitionPlanHash == "" {
+		t.Fatalf("dry run missing transition plan hash")
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "oidcapp",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if !errors.Is(err, ErrManifestUpdateConflict) || !strings.Contains(err.Error(), "transition plan hash is required") {
+		t.Fatalf("apply err = %v, want required transition hash conflict", err)
 	}
 }
 
@@ -455,6 +536,7 @@ func TestApplyCustomManifestUpdate_PreservesExistingOIDCCredentialsInFallbackLed
 		InstanceID:         "oidcapp",
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
+		TransitionPlanHash: result.TransitionPlanHash,
 		DryRunToken:        result.DryRunToken,
 		Confirmations:      result.RequiredConfirmations,
 	})
@@ -1090,9 +1172,7 @@ func TestDryRunCustomManifestUpdate_MaterializesCandidateAndToken(t *testing.T) 
 		t.Fatalf("store app: %v", err)
 	}
 
-	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
-		InstanceID: "piclu",
-		RawTemplate: []byte(`type: user
+	rawTemplate := []byte(`type: user
 inputs:
   diag_dir:
     type: string
@@ -1124,7 +1204,10 @@ services:
           shared: true
 x-piccolo:
   mode: service
-`),
+`)
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:  "piclu",
+		RawTemplate: rawTemplate,
 		Inputs: map[string]interface{}{
 			"__app_address__": "other",
 			"diag_dir":        "/diagnostics",
@@ -1142,6 +1225,13 @@ x-piccolo:
 	}
 	if result.RenderedAppID != "piclu" {
 		t.Fatalf("rendered app id = %q, want piclu", result.RenderedAppID)
+	}
+	cand := mgr.manifestUpdateCandidates[result.DryRunToken]
+	if cand == nil {
+		t.Fatalf("stored candidate not found for token %q", result.DryRunToken)
+	}
+	if cand.TransitionPlan.SourceHash != Sha256Hex(rawTemplate) {
+		t.Fatalf("transition source hash = %q, want raw template hash %q", cand.TransitionPlan.SourceHash, Sha256Hex(rawTemplate))
 	}
 	if _, err := os.Stat(filepath.Join(tempDir, AppsDir, "piclu", "install_state.json")); !os.IsNotExist(err) {
 		t.Fatalf("dry run must not create install_state.json, stat err=%v", err)
@@ -1236,6 +1326,7 @@ x-piccolo:
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 	})
 	if !errors.Is(err, ErrManifestUpdateRejected) || !strings.Contains(err.Error(), "image_update_review") {
 		t.Fatalf("apply err = %v, want missing image_update_review confirmation rejection", err)
@@ -1330,6 +1421,7 @@ func TestApplyCustomManifestUpdateRefreshesSameRefDigestDrift(t *testing.T) {
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 		Confirmations:      result.RequiredConfirmations,
 	})
 	if err != nil {
@@ -1451,6 +1543,7 @@ func TestApplyCustomManifestUpdateImageOnlySameRefRefreshRequiresSnapshotViabili
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 		Confirmations:      result.RequiredConfirmations,
 	})
 	if err == nil || !strings.Contains(err.Error(), "precommit data snapshot viability") {
@@ -1554,6 +1647,7 @@ func TestApplyCustomManifestUpdateRejectsExistingTargetRootfsDigestMismatch(t *t
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 		Confirmations:      result.RequiredConfirmations,
 	})
 	if err == nil || !strings.Contains(err.Error(), "does not match planned image identity") {
@@ -1866,6 +1960,7 @@ func TestApplyCustomManifestUpdateRefreshesNetworkAnchorDigestDrift(t *testing.T
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 		Confirmations:      result.RequiredConfirmations,
 	})
 	if err != nil {
@@ -2032,6 +2127,7 @@ func TestApplyCustomManifestUpdateRejectsImageDigestDriftAfterDryRun(t *testing.
 		BaseManifestHash:   result.BaseManifestHash,
 		RuntimeFingerprint: result.RuntimeFingerprint,
 		DryRunToken:        result.DryRunToken,
+		TransitionPlanHash: result.TransitionPlanHash,
 		Confirmations:      result.RequiredConfirmations,
 	})
 	if !errors.Is(err, ErrManifestUpdateConflict) || !strings.Contains(err.Error(), "image digest for service main changed after dry run") {
@@ -2523,6 +2619,7 @@ func TestInstalledAppApplyTransactionKeepsPreparedListenerReservationAfterPublis
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
 	serviceManager := services.NewServiceManager()
+	serviceManager.UseInMemoryNetworkForTest()
 	mgr, err := NewAppManagerForTestWithServices(nil, tempDir, serviceManager, nil)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -2533,14 +2630,7 @@ func TestInstalledAppApplyTransactionKeepsPreparedListenerReservationAfterPublis
 		t.Fatalf("state manager: %v", err)
 	}
 
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("reserve test port: %v", err)
-	}
-	port := probe.Addr().(*net.TCPAddr).Port
-	if err := probe.Close(); err != nil {
-		t.Fatalf("close test port probe: %v", err)
-	}
+	port := 18080
 
 	now := time.Now().UTC()
 	prevDef := customManifestPolicyBaseDef()
@@ -2597,14 +2687,10 @@ func TestInstalledAppApplyTransactionKeepsPreparedListenerReservationAfterPublis
 		t.Fatalf("prepare listeners: %v", err)
 	}
 
-	blocker, err := net.Listen("tcp", ":"+strconv.Itoa(port))
-	if err != nil {
-		t.Fatalf("occupy prepared public port %d: %v", port, err)
-	}
+	serviceManager.SetTCPListenForTest(func(network, address string) (net.Listener, error) {
+		return nil, fmt.Errorf("test bind failure on %s", address)
+	})
 	publishErr := txn.publishAccess()
-	if closeErr := blocker.Close(); closeErr != nil {
-		t.Fatalf("close port blocker: %v", closeErr)
-	}
 	if publishErr == nil {
 		t.Fatalf("publish err = nil, want bind failure")
 	}
@@ -2624,6 +2710,7 @@ func TestInstalledAppApplyTransactionKeepsPreparedListenerReservationAfterPublis
 		otherPlan.Release()
 		t.Fatalf("port claim %d was reusable after repair-pending publish failure", port)
 	}
+	serviceManager.UseInMemoryNetworkForTest()
 	if err := serviceManager.RestorePreparedPublication("piclu", txn.txn.PreparedListenerEndpoints); err != nil {
 		t.Fatalf("same-process access repair rejected retained prepared endpoints: %v", err)
 	}
@@ -3393,6 +3480,64 @@ func TestBeginInstalledAppApplyTransactionRejectsPendingCleanup(t *testing.T) {
 	}
 }
 
+func TestTransitionFollowUpReportsLegacyManifestCleanupStillPending(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(NewMockContainerManager(), tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		destroyErr:        errors.New("thin snapshot busy"),
+	}
+	mgr.SetVolumeManager(volumes)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	def := customManifestPolicyBaseDef()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     def,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreManifestUpdateTransaction("piclu", &ManifestUpdateTransaction{
+		OperationID:             "op-cleanup",
+		OperationKind:           "service_app_update",
+		Phase:                   "committed_cleanup_pending",
+		PrecommitDataSnapshotID: "snap-app-piclu--manifest-op-cleanup",
+		CreatedAt:               now,
+		UpdatedAt:               now,
+	}); err != nil {
+		t.Fatalf("store cleanup-pending transaction: %v", err)
+	}
+	record := transitionTestRecord("piclu", TransitionPhaseCommittedCleanupPending)
+	if err := state.StoreTransitionRecord("piclu", record); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+
+	err = mgr.RetryTransitionFollowUp(context.Background(), "piclu", TransitionActionFinishCleanup)
+	if !errors.Is(err, ErrTransitionFollowUpUnavailable) || !strings.Contains(err.Error(), "thin snapshot busy") {
+		t.Fatalf("follow-up err = %v, want pending cleanup failure", err)
+	}
+	txn, err := state.LoadManifestUpdateTransaction("piclu")
+	if err != nil {
+		t.Fatalf("load cleanup-pending transaction: %v", err)
+	}
+	if txn.Phase != "committed_cleanup_pending" || !strings.Contains(txn.LastError, "thin snapshot busy") {
+		t.Fatalf("transaction = phase:%q err:%q, want cleanup pending", txn.Phase, txn.LastError)
+	}
+}
+
 func TestApplyCustomManifestUpdate_DataImpactRequiresPrivateSnapshotCapability(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
@@ -3622,6 +3767,7 @@ x-piccolo:
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
 		DryRunToken:        dryRun.DryRunToken,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 	}); err != nil {
 		t.Fatalf("apply: %v", err)
 	}
@@ -3798,6 +3944,7 @@ func TestApplyCustomManifestUpdateKeepsReclassifiedSecretWriteOnly(t *testing.T)
 		BaseManifestHash:   dryRun.BaseManifestHash,
 		RuntimeFingerprint: dryRun.RuntimeFingerprint,
 		DryRunToken:        dryRun.DryRunToken,
+		TransitionPlanHash: dryRun.TransitionPlanHash,
 		Confirmations:      dryRun.RequiredConfirmations,
 	}); err != nil {
 		t.Fatalf("apply manifest update: %v", err)
@@ -5244,12 +5391,15 @@ func TestRecoverPendingManifestUpdate_RemovesCreatedInstallState(t *testing.T) {
 	now := time.Now().UTC()
 	prevDef := customManifestPolicyBaseDef()
 	app := &AppInstance{
-		InstanceID:     "piclu",
-		Enabled:        false,
-		PrimaryService: "main",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Definition:     prevDef,
+		InstanceID:          "piclu",
+		Enabled:             false,
+		PrimaryService:      "main",
+		CatalogSource:       "piclu",
+		CatalogManifestHash: "old-catalog-template-hash",
+		LastSyncError:       "previous catalog drift",
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		Definition:          prevDef,
 	}
 	if err := state.StoreApp(app); err != nil {
 		t.Fatalf("store previous app: %v", err)
@@ -5374,10 +5524,16 @@ func TestRecoverPendingManifestUpdate_RestoresPrecommitDataSnapshot(t *testing.T
 	}); err != nil {
 		t.Fatalf("store transaction: %v", err)
 	}
+	if err := state.StoreTransitionRecord("piclu", transitionTestRecord("piclu", TransitionPhaseCandidateTouched)); err != nil {
+		t.Fatalf("store transition record: %v", err)
+	}
 
 	blocked := mgr.recoverPendingManifestUpdates(context.Background(), state)
 	if blocked["piclu"] {
 		t.Fatalf("piclu should recover successfully")
+	}
+	if _, err := state.LoadTransitionRecord("piclu"); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("transition record err = %v, want cleared", err)
 	}
 	if len(volumes.rollbacks) != 1 || volumes.rollbacks[0] != "snap-app-piclu--manifest-test->vol-app-piclu--failed-manifest-test" {
 		t.Fatalf("rollbacks = %v", volumes.rollbacks)
@@ -5674,12 +5830,15 @@ func TestRecoverPendingManifestUpdate_PreservesReachedLedgerCommit(t *testing.T)
 	now := time.Now().UTC()
 	prevDef := customManifestPolicyBaseDef()
 	app := &AppInstance{
-		InstanceID:     "piclu",
-		Enabled:        false,
-		PrimaryService: "main",
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		Definition:     prevDef,
+		InstanceID:          "piclu",
+		Enabled:             false,
+		PrimaryService:      "main",
+		CatalogSource:       "piclu",
+		CatalogManifestHash: "old-catalog-template-hash",
+		LastSyncError:       "previous catalog drift",
+		CreatedAt:           now,
+		UpdatedAt:           now,
+		Definition:          prevDef,
 	}
 	if err := state.StoreApp(app); err != nil {
 		t.Fatalf("store previous app: %v", err)
@@ -5750,6 +5909,16 @@ func TestRecoverPendingManifestUpdate_PreservesReachedLedgerCommit(t *testing.T)
 	}
 	if got := kept.Services["main"].Environment["PICLU_DEVICE_DIAG_DIR"]; got != "/diagnostics" {
 		t.Fatalf("candidate manifest was not preserved, env=%q", got)
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app missing after recovery")
+	}
+	if appInst.CatalogManifestHash != "old-catalog-template-hash" {
+		t.Fatalf("catalog hash after custom ledger recovery = %q, want old catalog hash", appInst.CatalogManifestHash)
+	}
+	if appInst.LastSyncError != "previous catalog drift" {
+		t.Fatalf("last sync error after custom ledger recovery = %q, want preserved catalog sync state", appInst.LastSyncError)
 	}
 	appDir := filepath.Join(tempDir, AppsDir, "piclu")
 	if _, err := os.Stat(filepath.Join(appDir, manifestUpdateTxnFilename)); !os.IsNotExist(err) {

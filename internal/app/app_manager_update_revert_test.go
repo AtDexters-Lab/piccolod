@@ -38,6 +38,7 @@ func TestAppManager_UpdateImage_And_Revert(t *testing.T) {
 		t.Fatalf("install: %v", err)
 	}
 	instanceID := inst.InstanceID
+	setMockRegistryDigest(mock, "sha256:update-revert-smoke")
 
 	err = mgr.UpdateImage(ctx, instanceID)
 	if err != nil {

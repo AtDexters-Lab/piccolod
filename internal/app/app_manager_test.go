@@ -109,7 +109,10 @@ func allowHostStorage(t *testing.T, m *AppManager) {
 		t.Setenv("PICCOLO_PODMAN_RUNROOT_BASE", shortRunroot)
 		paths.SetCoreRootForTest(t, m.stateBaseDir)
 		m.SetVolumeManager(&stubVolumeManager{root: m.stateBaseDir})
-		m.SetRootfsManager(newStubRootfsManager(m.stateBaseDir))
+		rootfs := newStubRootfsManager(m.stateBaseDir)
+		rootfs.exists = map[string]bool{}
+		rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+		m.SetRootfsManager(rootfs)
 		// Create dummy workspace assets so install succeeds (boot.sh is
 		// bind-mounted into workspace containers).
 		assetsDir := filepath.Join(m.stateBaseDir, "assets")
@@ -1189,6 +1192,64 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	}
 }
 
+func TestAppManager_FollowerTransitionQuiescesWithoutConsumingTransitionRecord(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	app := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+	if _, err := mgr.Install(context.Background(), app); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if err := mgr.Start(context.Background(), "demo"); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	record := transitionTestRecord("demo", TransitionPhaseSwitchingRuntime)
+	if err := state.StoreTransitionRecord("demo", record); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+	before, err := state.LoadTransitionRecord("demo")
+	if err != nil {
+		t.Fatalf("load before transition: %v", err)
+	}
+
+	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
+		t.Fatalf("follower stop: %v", err)
+	}
+
+	after, err := state.LoadTransitionRecord("demo")
+	if err != nil {
+		t.Fatalf("load after transition: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("transition record changed after follower quiesce:\n before=%+v\n after=%+v", before, after)
+	}
+	inst, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
+		t.Fatalf("expected container to be stopped after follower quiesce")
+	}
+}
+
 func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
@@ -1298,6 +1359,150 @@ func TestAppManager_StopAllApps_Basic(t *testing.T) {
 		if c.Status == "running" {
 			t.Errorf("container %s should be stopped but is %s", id, c.Status)
 		}
+	}
+}
+
+func TestAppManager_StopAllAppsQuiescesWithoutConsumingTransitionRecord(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	ctx := context.Background()
+	appDef := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+	if _, err := mgr.Install(ctx, appDef); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	record := transitionTestRecord("demo", TransitionPhaseCandidateTouched)
+	if err := state.StoreTransitionRecord("demo", record); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+	before, err := state.LoadTransitionRecord("demo")
+	if err != nil {
+		t.Fatalf("load before shutdown: %v", err)
+	}
+
+	if err := mgr.StopAllApps(ctx); err != nil {
+		t.Fatalf("StopAllApps: %v", err)
+	}
+
+	after, err := state.LoadTransitionRecord("demo")
+	if err != nil {
+		t.Fatalf("load after shutdown: %v", err)
+	}
+	if !reflect.DeepEqual(after, before) {
+		t.Fatalf("transition record changed after shutdown quiesce:\n before=%+v\n after=%+v", before, after)
+	}
+	for id, c := range mock.containers {
+		if c.Status == "running" {
+			t.Fatalf("container %s should be stopped but is %s", id, c.Status)
+		}
+	}
+}
+
+func TestResizeStorageRejectsTransitionInProgress(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{}
+	mgr.SetRootfsManager(rootfs)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	if err := state.StoreApp(transitionTestAppInstance("piclu")); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	if err := state.StoreTransitionRecord("piclu", transitionTestRecord("piclu", TransitionPhaseSwitchingRuntime)); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+
+	_, err = mgr.ResizeStorage(context.Background(), "piclu", 1024)
+	if !errors.Is(err, ErrTransitionInProgress) {
+		t.Fatalf("resize err = %v, want ErrTransitionInProgress", err)
+	}
+	if len(rootfs.resizedApplication) != 0 || len(rootfs.resizedWorkspace) != 0 {
+		t.Fatalf("resize should not reach rootfs while transition is active: app=%v workspace=%v", rootfs.resizedApplication, rootfs.resizedWorkspace)
+	}
+}
+
+func TestExecShellRejectsTransitionInProgress(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	appInst := transitionTestAppInstance("piclu")
+	appInst.Containers = map[string]string{"main": "cid-main"}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	mgr.setObservedStatus("piclu", StatusRunning)
+	if err := state.StoreTransitionRecord("piclu", transitionTestRecord("piclu", TransitionPhaseSwitchingRuntime)); err != nil {
+		t.Fatalf("store transition: %v", err)
+	}
+
+	_, err = mgr.ExecShellCmdForService(context.Background(), "piclu", "main")
+	if !errors.Is(err, ErrTransitionInProgress) {
+		t.Fatalf("exec shell err = %v, want ErrTransitionInProgress", err)
+	}
+}
+
+func TestResizeStorageResizesServiceApplicationVolume(t *testing.T) {
+	tempDir := t.TempDir()
+	mgr, err := NewAppManagerForTest(nil, tempDir)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{}
+	mgr.SetRootfsManager(rootfs)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	if err := state.StoreApp(transitionTestAppInstance("piclu")); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	res, err := mgr.ResizeStorage(context.Background(), "piclu", 4096)
+	if err != nil {
+		t.Fatalf("resize: %v", err)
+	}
+	if res.VolumeID != "app-piclu" || res.VolumeKind != "application" || res.SizeBytes != 4096 {
+		t.Fatalf("resize result = %+v", res)
+	}
+	if !reflect.DeepEqual(rootfs.resizedApplication, []string{"app-piclu"}) {
+		t.Fatalf("application resize calls = %v", rootfs.resizedApplication)
+	}
+	if len(rootfs.resizedWorkspace) != 0 {
+		t.Fatalf("workspace resize calls = %v", rootfs.resizedWorkspace)
 	}
 }
 

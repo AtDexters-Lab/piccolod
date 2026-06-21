@@ -734,6 +734,9 @@ func (m *AppManager) removeContainersForMultiApp(ctx context.Context, appInst *A
 		if stored != "" {
 			remove(svcName, stored)
 		}
+		// Image-update recovery can crash after candidate containers are created
+		// but before their IDs are recorded; deterministic names keep cleanup
+		// durable across that window.
 		name := containerNameForService(appInst.InstanceID, svcName, primary)
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" && id != stored {
 			remove(svcName+" (resolved)", id)

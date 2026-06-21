@@ -20,6 +20,12 @@ type appVolumeLayout struct {
 	WorkspaceDir string // Workspace disk directory ({MountDir}/disk/workspace)
 }
 
+type StorageResizeResult struct {
+	VolumeID   string
+	VolumeKind string
+	SizeBytes  int64
+}
+
 // appVolumeID returns the volume ID for an app instance.
 // The instanceID is the unique instance identifier.
 func appVolumeID(instanceID string) string {
@@ -82,6 +88,50 @@ func (m *AppManager) currentVolumeManager() persistence.VolumeManager {
 	m.stateMu.RLock()
 	defer m.stateMu.RUnlock()
 	return m.volumeManager
+}
+
+func (m *AppManager) ResizeStorage(ctx context.Context, instanceID string, sizeBytes int64) (StorageResizeResult, error) {
+	if sizeBytes <= 0 {
+		return StorageResizeResult{}, fmt.Errorf("storage size must be positive")
+	}
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return StorageResizeResult{}, err
+	}
+	if err := m.ensureUnlocked(); err != nil {
+		return StorageResizeResult{}, err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return StorageResizeResult{}, err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceResizeStorage); err != nil {
+		return StorageResizeResult{}, err
+	}
+	inst, exists := state.GetApp(instanceID)
+	if !exists {
+		return StorageResizeResult{}, errAppNotFound(instanceID)
+	}
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return StorageResizeResult{}, fmt.Errorf("%w: rootfs manager not available", ErrVolumeUnavailable)
+	}
+
+	workspaceVolumeID := rootfs.RootfsVolumeID("workspace", inst.InstanceID)
+	if rootfs.RootfsExists(workspaceVolumeID) {
+		if err := rootfs.ResizeWorkspace(ctx, workspaceVolumeID, sizeBytes); err != nil {
+			return StorageResizeResult{}, fmt.Errorf("resize workspace %s: %w", workspaceVolumeID, err)
+		}
+		return StorageResizeResult{VolumeID: workspaceVolumeID, VolumeKind: "workspace", SizeBytes: sizeBytes}, nil
+	}
+
+	applicationVolumeID := appVolumeID(inst.InstanceID)
+	if err := rootfs.ResizeApplication(ctx, applicationVolumeID, sizeBytes); err != nil {
+		return StorageResizeResult{}, fmt.Errorf("resize application volume %s: %w", applicationVolumeID, err)
+	}
+	return StorageResizeResult{VolumeID: applicationVolumeID, VolumeKind: "application", SizeBytes: sizeBytes}, nil
 }
 
 // ensureAppVolumeLayout ensures the per-app encrypted volume is mounted and returns its layout.

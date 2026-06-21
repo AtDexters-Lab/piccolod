@@ -29,6 +29,10 @@ class App {
     this.catalogUpdatePendingFlow = '',
     this.accessRepairPending = false,
     this.accessRepairMessage = '',
+    this.transitionActive = false,
+    this.transitionOperation = '',
+    this.transitionPhase = '',
+    this.transitionMessage = '',
   });
 
   factory App.fromJson(Map<String, dynamic> json) {
@@ -134,6 +138,10 @@ class App {
     final accessRepairPending = json['access_repair_pending'] == true;
     final accessRepairMessage = (json['access_repair_message'] ?? '')
         .toString();
+    final transitionActive = json['transition_active'] == true;
+    final transitionOperation = (json['transition_operation'] ?? '').toString();
+    final transitionPhase = (json['transition_phase'] ?? '').toString();
+    final transitionMessage = (json['transition_message'] ?? '').toString();
 
     return App(
       id: instanceId,
@@ -155,6 +163,10 @@ class App {
       catalogUpdatePendingFlow: catalogUpdatePendingFlow,
       accessRepairPending: accessRepairPending,
       accessRepairMessage: accessRepairMessage,
+      transitionActive: transitionActive,
+      transitionOperation: transitionOperation,
+      transitionPhase: transitionPhase,
+      transitionMessage: transitionMessage,
     );
   }
   final String id;
@@ -176,6 +188,10 @@ class App {
   final String catalogUpdatePendingFlow;
   final bool accessRepairPending;
   final String accessRepairMessage;
+  final bool transitionActive;
+  final String transitionOperation;
+  final String transitionPhase;
+  final String transitionMessage;
   final String
   statusMessage; // Transient status context (e.g., "Re-pulling base image")
 
@@ -192,6 +208,7 @@ class App {
   bool get hasConfigReviewCatalogUpdate =>
       catalogUpdatePending &&
       catalogUpdatePendingFlow.toLowerCase() == 'config';
+  bool get hasActiveTransition => transitionActive;
 
   Map<String, String> environmentForService(String? serviceName) {
     final svc = serviceName?.trim();
@@ -235,6 +252,10 @@ class App {
       catalogUpdatePendingFlow: catalogUpdatePendingFlow,
       accessRepairPending: accessRepairPending,
       accessRepairMessage: accessRepairMessage,
+      transitionActive: transitionActive,
+      transitionOperation: transitionOperation,
+      transitionPhase: transitionPhase,
+      transitionMessage: transitionMessage,
     );
   }
 }
@@ -480,6 +501,7 @@ class ManifestUpdateResult {
     required this.instanceId,
     required this.baseManifestHash,
     required this.runtimeFingerprint,
+    required this.transitionPlanHash,
     required this.diffKind,
     required this.applicable,
     required this.metadataOnly,
@@ -512,6 +534,7 @@ class ManifestUpdateResult {
       instanceId: (json['instance_id'] ?? '').toString(),
       baseManifestHash: (json['base_manifest_hash'] ?? '').toString(),
       runtimeFingerprint: (json['runtime_fingerprint'] ?? '').toString(),
+      transitionPlanHash: (json['transition_plan_hash'] ?? '').toString(),
       dryRunToken: (json['dry_run_token'] ?? '').toString(),
       renderedAppId: (json['rendered_app_id'] ?? '').toString(),
       diffKind: (json['diff_kind'] ?? '').toString(),
@@ -572,6 +595,7 @@ class ManifestUpdateResult {
   final String instanceId;
   final String baseManifestHash;
   final String runtimeFingerprint;
+  final String transitionPlanHash;
   final String dryRunToken;
   final String renderedAppId;
   final String diffKind;
@@ -734,6 +758,7 @@ class InstalledConfigUpdateResult {
     required this.inputSchemaHash,
     required this.baseManifestHash,
     required this.runtimeFingerprint,
+    required this.transitionPlanHash,
     required this.candidateDigest,
     required this.diffKind,
     required this.applicable,
@@ -756,6 +781,7 @@ class InstalledConfigUpdateResult {
       inputSchemaHash: (json['input_schema_hash'] ?? '').toString(),
       baseManifestHash: (json['base_manifest_hash'] ?? '').toString(),
       runtimeFingerprint: (json['runtime_fingerprint'] ?? '').toString(),
+      transitionPlanHash: (json['transition_plan_hash'] ?? '').toString(),
       dryRunToken: (json['dry_run_token'] ?? '').toString(),
       candidateDigest: (json['candidate_digest'] ?? '').toString(),
       diffKind: (json['diff_kind'] ?? '').toString(),
@@ -788,6 +814,7 @@ class InstalledConfigUpdateResult {
   final String inputSchemaHash;
   final String baseManifestHash;
   final String runtimeFingerprint;
+  final String transitionPlanHash;
   final String dryRunToken;
   final String candidateDigest;
   final String diffKind;

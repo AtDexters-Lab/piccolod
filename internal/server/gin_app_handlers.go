@@ -476,6 +476,7 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		CatalogPending     bool                   `json:"catalog_pending"`
 		BaseManifestHash   string                 `json:"base_manifest_hash"`
 		RuntimeFingerprint string                 `json:"runtime_fingerprint"`
+		TransitionPlanHash string                 `json:"transition_plan_hash"`
 		DryRunToken        string                 `json:"dry_run_token"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil || strings.TrimSpace(req.DryRunToken) == "" {
@@ -495,6 +496,7 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		SystemContext:      s.buildInstallSystemContext(),
 		BaseManifestHash:   req.BaseManifestHash,
 		RuntimeFingerprint: req.RuntimeFingerprint,
+		TransitionPlanHash: req.TransitionPlanHash,
 		DryRunToken:        req.DryRunToken,
 	})
 	if err != nil {
@@ -1223,6 +1225,33 @@ func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 	writeGinSuccess(c, nil, "App updated successfully")
 }
 
+func (s *GinServer) handleGinAppTransitionAccessRepair(c *gin.Context) {
+	s.handleGinAppTransitionFollowUp(c, app.TransitionActionAccessRepair, "retry access repair")
+}
+
+func (s *GinServer) handleGinAppTransitionFinishCleanup(c *gin.Context) {
+	s.handleGinAppTransitionFollowUp(c, app.TransitionActionFinishCleanup, "finish cleanup")
+}
+
+func (s *GinServer) handleGinAppTransitionMetadataRetry(c *gin.Context) {
+	s.handleGinAppTransitionFollowUp(c, app.TransitionActionMetadataRetry, "retry catalog metadata")
+}
+
+func (s *GinServer) handleGinAppTransitionFollowUp(c *gin.Context, action app.TransitionActionKind, label string) {
+	appName := c.Param("name")
+	followUpCtx, cancel := s.opContext(c, 5*time.Minute)
+	defer cancel()
+
+	if err := s.appManager.RetryTransitionFollowUp(followUpCtx, appName, action); err != nil {
+		if handleAppManagerError(c, err, label) {
+			return
+		}
+		writeGinError(c, http.StatusInternalServerError, "Failed to "+label+": "+err.Error())
+		return
+	}
+	writeGinSuccess(c, nil, "App transition follow-up completed")
+}
+
 // handleGinAppRollback handles POST /api/v1/apps/:name/rollback - Rollback to previous snapshot
 // Uses a background context because rollback involves non-interruptible LV rename
 // operations that must complete even if the HTTP connection drops.
@@ -1434,6 +1463,18 @@ func handleAppManagerError(c *gin.Context, err error, action string) bool {
 		writeGinError(c, http.StatusServiceUnavailable, err.Error())
 		return true
 	}
+	if errors.Is(err, app.ErrTransitionInProgress) {
+		writeGinErrorWithKey(c, http.StatusConflict, "Another update for this app is still finishing. Try again after it completes.", "transition_in_progress")
+		return true
+	}
+	if errors.Is(err, app.ErrTransitionFollowUpUnavailable) {
+		writeGinErrorWithKey(c, http.StatusConflict, err.Error(), "transition_followup_unavailable")
+		return true
+	}
+	if errors.Is(err, app.ErrVolumeUnavailable) {
+		writeGinError(c, http.StatusServiceUnavailable, err.Error())
+		return true
+	}
 	return false
 }
 
@@ -1442,7 +1483,7 @@ func handleManifestUpdateError(c *gin.Context, err error, action string) bool {
 		return true
 	}
 	if errors.Is(err, app.ErrManifestUpdateConflict) {
-		writeGinError(c, http.StatusConflict, err.Error())
+		writeGinErrorWithKey(c, http.StatusConflict, err.Error(), appUpdateConflictKey(err))
 		return true
 	}
 	if errors.Is(err, app.ErrManifestUpdateRejected) {
@@ -1457,7 +1498,7 @@ func handleInstalledConfigError(c *gin.Context, err error, action string) bool {
 		return true
 	}
 	if errors.Is(err, app.ErrInstalledConfigConflict) {
-		writeGinError(c, http.StatusConflict, err.Error())
+		writeGinErrorWithKey(c, http.StatusConflict, err.Error(), appUpdateConflictKey(err))
 		return true
 	}
 	if errors.Is(err, app.ErrInstalledConfigRejected) {
@@ -1469,6 +1510,24 @@ func handleInstalledConfigError(c *gin.Context, err error, action string) bool {
 		return true
 	}
 	return false
+}
+
+func appUpdateConflictKey(err error) string {
+	message := strings.ToLower(err.Error())
+	for _, marker := range []string{
+		"dry run",
+		"changed after",
+		"changed during",
+		"no longer matches",
+		"does not match",
+		"rerun",
+		"token is expired",
+	} {
+		if strings.Contains(message, marker) {
+			return "update_preview_stale"
+		}
+	}
+	return ""
 }
 
 // handleGinAppCheckInstance handles GET /api/v1/apps/check-instance?id=<candidate>
@@ -1660,52 +1719,19 @@ func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid request: "+err.Error())
 		return
 	}
-
-	inst, err := s.appManager.Get(ctx, appName)
+	res, err := s.appManager.ResizeStorage(ctx, appName, req.SizeBytes)
 	if err != nil {
-		if strings.Contains(err.Error(), "not found") {
-			writeGinError(c, http.StatusNotFound, "App not found: "+appName)
-		} else {
-			writeGinError(c, http.StatusInternalServerError, "Failed to get app: "+err.Error())
-		}
-		return
-	}
-
-	rootfs := s.persistence.Rootfs()
-	if rootfs == nil {
-		writeGinError(c, http.StatusServiceUnavailable, "Rootfs manager not available")
-		return
-	}
-
-	// Prefer workspace-volume resize when present (workspace-mode apps).
-	// Fall back to the per-app application volume (service-mode).
-	workspaceVolumeID := rootfs.RootfsVolumeID("workspace", inst.InstanceID)
-	if rootfs.RootfsExists(workspaceVolumeID) {
-		if err := rootfs.ResizeWorkspace(ctx, workspaceVolumeID, req.SizeBytes); err != nil {
-			log.Printf("WARN: resize workspace %s: %v", workspaceVolumeID, err)
-			writeGinError(c, http.StatusInternalServerError, "Resize failed")
+		if handleAppManagerError(c, err, "resize storage") {
 			return
 		}
-		c.JSON(http.StatusOK, gin.H{
-			"status":      "resized",
-			"volume_id":   workspaceVolumeID,
-			"volume_kind": "workspace",
-			"size_bytes":  req.SizeBytes,
-		})
-		return
-	}
-
-	// Service-mode app: resize the per-app application volume (app-<instanceID>).
-	appVolumeID := "app-" + inst.InstanceID
-	if err := rootfs.ResizeApplication(ctx, appVolumeID, req.SizeBytes); err != nil {
-		log.Printf("WARN: resize application volume %s: %v", appVolumeID, err)
+		log.Printf("WARN: resize storage %s: %v", appName, err)
 		writeGinError(c, http.StatusInternalServerError, "Resize failed")
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"status":      "resized",
-		"volume_id":   appVolumeID,
-		"volume_kind": "application",
-		"size_bytes":  req.SizeBytes,
+		"volume_id":   res.VolumeID,
+		"volume_kind": res.VolumeKind,
+		"size_bytes":  res.SizeBytes,
 	})
 }

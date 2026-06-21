@@ -119,7 +119,9 @@ class ApiClient {
   ) async {
     final response = await request();
 
-    final cleanPath = path.contains('?') ? path.substring(0, path.indexOf('?')) : path;
+    final cleanPath = path.contains('?')
+        ? path.substring(0, path.indexOf('?'))
+        : path;
     if (response.statusCode == 401 &&
         !_reauthExcludedPaths.contains(cleanPath) &&
         onAuthRequired != null) {
@@ -183,7 +185,11 @@ class ApiClient {
     throw ApiException(response.statusCode, response.body);
   }
 
-  Future<dynamic> post(String path, {Object? body, Map<String, String>? headers}) async {
+  Future<dynamic> post(
+    String path, {
+    Object? body,
+    Map<String, String>? headers,
+  }) async {
     // Automatically ensure we have a CSRF token before mutating state.
     // Skip for pre-auth setup endpoints (no session exists yet, CSRF fetch would fail).
     if (_csrfToken == null && !_isPreAuthPath(path)) {
@@ -224,7 +230,11 @@ class ApiClient {
     });
   }
 
-  Future<dynamic> put(String path, {Object? body, Map<String, String>? headers}) async {
+  Future<dynamic> put(
+    String path, {
+    Object? body,
+    Map<String, String>? headers,
+  }) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
@@ -241,7 +251,11 @@ class ApiClient {
     });
   }
 
-  Future<dynamic> patch(String path, {Object? body, Map<String, String>? headers}) async {
+  Future<dynamic> patch(
+    String path, {
+    Object? body,
+    Map<String, String>? headers,
+  }) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
@@ -258,7 +272,11 @@ class ApiClient {
     });
   }
 
-  Future<dynamic> delete(String path, {Object? body, Map<String, String>? headers}) async {
+  Future<dynamic> delete(
+    String path, {
+    Object? body,
+    Map<String, String>? headers,
+  }) async {
     if (_csrfToken == null) {
       await fetchCsrfToken();
     }
@@ -316,23 +334,35 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> beginPasskeyRegistration() async {
-    return await post('/api/v1/auth/passkey/register/begin') as Map<String, dynamic>;
+    return await post('/api/v1/auth/passkey/register/begin')
+        as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> finishPasskeyRegistration(
-      String sessionId, Map<String, dynamic> credential) async {
-    return await post('/api/v1/auth/passkey/register/finish?session_id=$sessionId',
-        body: credential) as Map<String, dynamic>;
+    String sessionId,
+    Map<String, dynamic> credential,
+  ) async {
+    return await post(
+          '/api/v1/auth/passkey/register/finish?session_id=$sessionId',
+          body: credential,
+        )
+        as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> beginPasskeyLogin() async {
-    return await post('/api/v1/auth/passkey/login/begin') as Map<String, dynamic>;
+    return await post('/api/v1/auth/passkey/login/begin')
+        as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> finishPasskeyLogin(
-      String sessionId, Map<String, dynamic> credential) async {
-    return await post('/api/v1/auth/passkey/login/finish?session_id=$sessionId',
-        body: credential) as Map<String, dynamic>;
+    String sessionId,
+    Map<String, dynamic> credential,
+  ) async {
+    return await post(
+          '/api/v1/auth/passkey/login/finish?session_id=$sessionId',
+          body: credential,
+        )
+        as Map<String, dynamic>;
   }
 
   Future<List<dynamic>> listPasskeys() async {
@@ -352,8 +382,10 @@ class ApiClient {
   /// account-level user identity, not per-credential labels — firing it here
   /// would clobber the OS/browser's account display with a credential nickname.
   Future<Map<String, dynamic>> renamePasskey(String id, String name) async {
-    final res =
-        await patch('/api/v1/auth/passkeys/$id', body: {'friendly_name': name});
+    final res = await patch(
+      '/api/v1/auth/passkeys/$id',
+      body: {'friendly_name': name},
+    );
     return (res is Map<String, dynamic>) ? res : <String, dynamic>{};
   }
 
@@ -364,11 +396,15 @@ class ApiClient {
     required String email,
     List<String>? allowedApps,
   }) async {
-    return await post('/api/v1/users/invite', body: {
-      'username': username,
-      'email': email,
-      'allowed_apps': ?allowedApps,
-    }) as Map<String, dynamic>;
+    return await post(
+          '/api/v1/users/invite',
+          body: {
+            'username': username,
+            'email': email,
+            'allowed_apps': ?allowedApps,
+          },
+        )
+        as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> validateInvite(String token) async {
@@ -381,24 +417,74 @@ class ApiClient {
   }
 
   Future<Map<String, dynamic>> finishInvitePasskey(
-      String token, String sessionId, Map<String, dynamic> credential) async {
+    String token,
+    String sessionId,
+    Map<String, dynamic> credential,
+  ) async {
     return await post(
-        '/api/v1/auth/invite/$token/passkey/finish?session_id=$sessionId',
-        body: credential) as Map<String, dynamic>;
+          '/api/v1/auth/invite/$token/passkey/finish?session_id=$sessionId',
+          body: credential,
+        )
+        as Map<String, dynamic>;
   }
 
   Future<Map<String, dynamic>> reinviteUser(String userId) async {
-    return await post('/api/v1/users/$userId/reinvite')
-        as Map<String, dynamic>;
+    return await post('/api/v1/users/$userId/reinvite') as Map<String, dynamic>;
   }
 }
 
 class ApiException implements Exception {
-
-  ApiException(this.statusCode, this.message);
+  ApiException(this.statusCode, String body)
+    : rawBody = body,
+      message = _extractApiErrorMessage(statusCode, body),
+      key = _extractApiErrorKey(body);
   final int statusCode;
   final String message;
+  final String? key;
+  final String rawBody;
 
   @override
-  String toString() => 'ApiException($statusCode): $message';
+  String toString() => message;
+}
+
+Map<String, dynamic>? _decodeApiErrorBody(String body) {
+  if (body.trim().isEmpty) return null;
+  try {
+    final decoded = jsonDecode(body);
+    if (decoded is! Map) return null;
+    final map = Map<String, dynamic>.from(decoded);
+    final error = map['error'];
+    if (error is Map) {
+      return Map<String, dynamic>.from(error);
+    }
+    if (error is String && error.trim().isNotEmpty) {
+      final normalized = Map<String, dynamic>.from(map);
+      normalized['message'] ??= error.trim();
+      return normalized;
+    }
+    return map;
+  } on FormatException {
+    return null;
+  }
+}
+
+String _extractApiErrorMessage(int statusCode, String body) {
+  final decoded = _decodeApiErrorBody(body);
+  final message = decoded?['message'];
+  if (message is String && message.trim().isNotEmpty) {
+    return message.trim();
+  }
+  if (body.trim().isNotEmpty && decoded == null) {
+    return body.trim();
+  }
+  return 'Request failed ($statusCode)';
+}
+
+String? _extractApiErrorKey(String body) {
+  final decoded = _decodeApiErrorBody(body);
+  final key = decoded?['key'];
+  if (key is String && key.trim().isNotEmpty) {
+    return key.trim();
+  }
+  return null;
 }

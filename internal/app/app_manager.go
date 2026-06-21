@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -111,11 +112,13 @@ type AppManager struct {
 }
 
 var (
-	ErrLocked              = errors.New("app manager: persistence locked")
-	ErrNotLeader           = errors.New("app manager: not leader")
-	ErrVolumeUnavailable   = errors.New("app manager: persistence volume not mounted")
-	ErrAppUninstalling     = errors.New("app manager: app is being uninstalled")
-	ErrImageUpdateRejected = errors.New("image update rejected")
+	ErrLocked                        = errors.New("app manager: persistence locked")
+	ErrNotLeader                     = errors.New("app manager: not leader")
+	ErrVolumeUnavailable             = errors.New("app manager: persistence volume not mounted")
+	ErrAppUninstalling               = errors.New("app manager: app is being uninstalled")
+	ErrImageUpdateRejected           = errors.New("image update rejected")
+	ErrTransitionInProgress          = errors.New("app manager: app transition in progress")
+	ErrTransitionFollowUpUnavailable = errors.New("app manager: transition follow-up unavailable")
 )
 
 // LockStateReader exposes the control lock state.
@@ -904,6 +907,9 @@ func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) 
 		return err
 	}
 
+	// Daemon shutdown is a transition-boundary quiesce exception: it may stop
+	// processes, but must not mutate app source/rootfs metadata or transition
+	// records. Startup recovery remains responsible for any active transition.
 	return m.stopContainerGroupWithOpts(ctx, stateMgr, app, def, layout, runtime, stopContainerGroupOpts{
 		ShutdownMode: true,
 	})
@@ -1393,6 +1399,317 @@ func (m *AppManager) manifestUpdateServiceRestoreBlocked(state *FilesystemStateM
 	}
 }
 
+func (m *AppManager) recoverPendingTransitionRecords(ctx context.Context, state *FilesystemStateManager) map[string]bool {
+	_ = ctx
+	blocked := map[string]bool{}
+	for _, appInst := range state.ListApps() {
+		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
+			continue
+		}
+		instanceID := appInst.InstanceID
+		record, err := state.LoadTransitionRecord(instanceID)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			log.Printf("ERROR: transition recovery %s: read authoritative transition record: %v", instanceID, err)
+			m.setObservedStatus(instanceID, StatusError)
+			blocked[instanceID] = true
+			continue
+		}
+		if record.Phase == TransitionPhaseCommitted {
+			if err := state.ClearTransitionRecord(instanceID); err != nil {
+				log.Printf("ERROR: transition recovery %s: clear committed transition record: %v", instanceID, err)
+				m.setObservedStatus(instanceID, StatusError)
+				blocked[instanceID] = true
+			}
+			continue
+		}
+		legacy, legacyErr := loadTransitionLegacyJournals(state, instanceID)
+		if legacyErr != nil {
+			log.Printf("ERROR: transition recovery %s: inspect legacy journals: %v", instanceID, legacyErr)
+			m.setObservedStatus(instanceID, StatusError)
+			blocked[instanceID] = true
+			continue
+		}
+		if legacy.hasAny() {
+			if err := m.recoverTransitionWithLegacyJournal(ctx, state, appInst, record, legacy); err != nil {
+				log.Printf("ERROR: transition recovery %s: recover legacy-backed v2 transition: %v", instanceID, err)
+				m.setObservedStatus(instanceID, StatusError)
+				blocked[instanceID] = true
+			}
+			continue
+		}
+		if record.Plan.OperationKind == TransitionOperationUpdateImage && record.Plan.SourceKind == TransitionSourceCurrentCommitted {
+			if err := m.recoverV2OnlyImageUpdateTransition(ctx, state, appInst, record); err != nil {
+				log.Printf("ERROR: transition recovery %s: recover v2-only image update: %v", instanceID, err)
+				m.setObservedStatus(instanceID, StatusError)
+				blocked[instanceID] = true
+			}
+			continue
+		}
+		if record.Phase == TransitionPhasePrepared {
+			log.Printf("INFO: transition recovery %s: clearing prepared transition with no legacy journal", instanceID)
+			if err := state.ClearTransitionRecord(instanceID); err != nil {
+				log.Printf("ERROR: transition recovery %s: clear prepared transition: %v", instanceID, err)
+				m.setObservedStatus(instanceID, StatusError)
+				blocked[instanceID] = true
+			}
+			continue
+		}
+		log.Printf("ERROR: transition recovery %s: v2 transition %s has no legacy journal; manual repair required", instanceID, record.Phase)
+		m.setObservedStatus(instanceID, StatusError)
+		blocked[instanceID] = true
+	}
+	return blocked
+}
+
+type transitionLegacyJournals struct {
+	manifest *ManifestUpdateTransaction
+	image    *ImageUpdateTransaction
+}
+
+func (j transitionLegacyJournals) hasAny() bool {
+	return j.manifest != nil || j.image != nil
+}
+
+func (j transitionLegacyJournals) count() int {
+	count := 0
+	if j.manifest != nil {
+		count++
+	}
+	if j.image != nil {
+		count++
+	}
+	return count
+}
+
+func loadTransitionLegacyJournals(state *FilesystemStateManager, instanceID string) (transitionLegacyJournals, error) {
+	var out transitionLegacyJournals
+	if txn, err := state.LoadManifestUpdateTransaction(instanceID); err == nil && txn != nil {
+		out.manifest = txn
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return out, fmt.Errorf("manifest update transaction: %w", err)
+	}
+	if txn, err := state.LoadImageUpdateTransaction(instanceID); err == nil && txn != nil {
+		out.image = txn
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return out, fmt.Errorf("image update transaction: %w", err)
+	}
+	return out, nil
+}
+
+func (m *AppManager) recoverTransitionWithLegacyJournal(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, record *TransitionRecord, legacy transitionLegacyJournals) error {
+	if appInst == nil || record == nil {
+		return nil
+	}
+	if legacy.manifest != nil && legacy.image != nil {
+		return fmt.Errorf("both manifest and image legacy journals exist; manual repair required")
+	}
+	switch record.Plan.OperationKind {
+	case TransitionOperationUpdateImage:
+		if legacy.image == nil {
+			return fmt.Errorf("v2 update_image transition has non-image legacy journal")
+		}
+		return m.recoverOneImageUpdate(ctx, state, appInst, legacy.image)
+	case TransitionOperationModifyApp, TransitionOperationEditConfig, TransitionOperationCatalogManifestReview, TransitionOperationCatalogConfigReview, TransitionOperationCatalogAutoApply:
+		if legacy.manifest == nil {
+			return fmt.Errorf("v2 %s transition has non-manifest legacy journal", record.Plan.OperationKind)
+		}
+		return m.recoverOneManifestUpdate(ctx, state, appInst, legacy.manifest)
+	default:
+		return fmt.Errorf("unsupported legacy-backed v2 transition operation %s", record.Plan.OperationKind)
+	}
+}
+
+func (m *AppManager) RetryTransitionFollowUp(ctx context.Context, instanceID string, action TransitionActionKind) (err error) {
+	m.reconcileMu.Lock()
+	defer m.reconcileMu.Unlock()
+	if err := m.ensureUnlocked(); err != nil {
+		return err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return err
+	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists || appInst == nil {
+		return ErrAppNotFound
+	}
+	label := transitionFollowUpProgressLabel(action)
+	m.emitProgress(ctx, taskTypeTransitionFollowUp, instanceID, taskPhaseValidating, 0, label, false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeTransitionFollowUp, instanceID, taskPhaseComplete, 100, label+" failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeTransitionFollowUp, instanceID, taskPhaseComplete, 100, label+" complete", true, nil)
+	}()
+	return m.retryTransitionFollowUpLocked(ctx, state, appInst, action)
+}
+
+func (m *AppManager) retryTransitionFollowUpLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, action TransitionActionKind) error {
+	instanceID := appInst.InstanceID
+	record, err := state.LoadTransitionRecord(instanceID)
+	if errors.Is(err, os.ErrNotExist) {
+		return m.retryLegacyTransitionFollowUp(ctx, state, appInst, action)
+	}
+	if err != nil {
+		return fmt.Errorf("read app transition record: %w", err)
+	}
+	if record == nil || record.Phase == TransitionPhaseCommitted {
+		return fmt.Errorf("%w: no active transition for %s", ErrTransitionFollowUpUnavailable, action)
+	}
+	if !transitionFollowUpActionMatchesPhase(action, record.Phase) {
+		return fmt.Errorf("%w: %s cannot consume phase %s", ErrTransitionFollowUpUnavailable, action, record.Phase)
+	}
+	legacy, err := loadTransitionLegacyJournals(state, instanceID)
+	if err != nil {
+		return err
+	}
+	if legacy.hasAny() {
+		if err := m.recoverTransitionWithLegacyJournal(ctx, state, appInst, record, legacy); err != nil {
+			return err
+		}
+		return ensureTransitionFollowUpCompleted(state, instanceID, action)
+	}
+	if action == TransitionActionFinishCleanup && record.Plan.OperationKind == TransitionOperationUpdateImage && record.Plan.SourceKind == TransitionSourceCurrentCommitted {
+		if err := m.recoverV2OnlyImageUpdateTransition(ctx, state, appInst, record); err != nil {
+			return err
+		}
+		return ensureTransitionFollowUpCompleted(state, instanceID, action)
+	}
+	return fmt.Errorf("%w: no recovery journal for %s phase %s", ErrTransitionFollowUpUnavailable, action, record.Phase)
+}
+
+func (m *AppManager) retryLegacyTransitionFollowUp(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, action TransitionActionKind) error {
+	instanceID := appInst.InstanceID
+	legacy, err := loadTransitionLegacyJournals(state, instanceID)
+	if err != nil {
+		return err
+	}
+	if legacy.manifest != nil && manifestFollowUpActionMatchesPhase(action, legacy.manifest) {
+		if err := m.recoverOneManifestUpdate(ctx, state, appInst, legacy.manifest); err != nil {
+			return err
+		}
+		return ensureTransitionFollowUpCompleted(state, instanceID, action)
+	}
+	if action == TransitionActionFinishCleanup && legacy.image != nil && imageFollowUpActionMatchesCleanup(legacy.image) {
+		if err := m.recoverOneImageUpdate(ctx, state, appInst, legacy.image); err != nil {
+			return err
+		}
+		return ensureTransitionFollowUpCompleted(state, instanceID, action)
+	}
+	return fmt.Errorf("%w: no active %s follow-up", ErrTransitionFollowUpUnavailable, action)
+}
+
+func ensureTransitionFollowUpCompleted(state *FilesystemStateManager, instanceID string, action TransitionActionKind) error {
+	pending, detail, err := transitionFollowUpStillPending(state, instanceID, action)
+	if err != nil {
+		return err
+	}
+	if pending {
+		if detail != "" {
+			return fmt.Errorf("%w: %s still pending: %s", ErrTransitionFollowUpUnavailable, action, detail)
+		}
+		return fmt.Errorf("%w: %s still pending", ErrTransitionFollowUpUnavailable, action)
+	}
+	return nil
+}
+
+func transitionFollowUpStillPending(state *FilesystemStateManager, instanceID string, action TransitionActionKind) (bool, string, error) {
+	record, err := state.LoadTransitionRecord(instanceID)
+	if err == nil && record != nil && transitionFollowUpActionMatchesPhase(action, record.Phase) {
+		return true, transitionPendingDetail(string(record.Phase), record.LastError), nil
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return false, "", fmt.Errorf("read app transition record after follow-up: %w", err)
+	}
+	legacy, err := loadTransitionLegacyJournals(state, instanceID)
+	if err != nil {
+		return false, "", fmt.Errorf("read legacy transaction after follow-up: %w", err)
+	}
+	if legacy.manifest != nil && manifestFollowUpActionMatchesPhase(action, legacy.manifest) {
+		return true, transitionPendingDetail(legacy.manifest.Phase, legacy.manifest.LastError), nil
+	}
+	if action == TransitionActionFinishCleanup && legacy.image != nil && imageFollowUpActionMatchesCleanup(legacy.image) {
+		return true, transitionPendingDetail(legacy.image.Phase, legacy.image.LastError), nil
+	}
+	return false, "", nil
+}
+
+func transitionPendingDetail(phase, lastError string) string {
+	phase = strings.TrimSpace(phase)
+	lastError = strings.TrimSpace(lastError)
+	if phase == "" {
+		return lastError
+	}
+	if lastError == "" {
+		return "phase " + phase
+	}
+	return fmt.Sprintf("phase %s: %s", phase, lastError)
+}
+
+func transitionFollowUpActionMatchesPhase(action TransitionActionKind, phase TransitionPhase) bool {
+	switch action {
+	case TransitionActionAccessRepair:
+		return phase == TransitionPhasePublishingAccess
+	case TransitionActionFinishCleanup:
+		return phase == TransitionPhaseCommittedCleanupPending
+	case TransitionActionMetadataRetry:
+		return phase == TransitionPhaseCommittedMetadataPending
+	default:
+		return false
+	}
+}
+
+func manifestFollowUpActionMatchesPhase(action TransitionActionKind, txn *ManifestUpdateTransaction) bool {
+	if txn == nil {
+		return false
+	}
+	switch action {
+	case TransitionActionAccessRepair:
+		return txn.Phase == "publishing_access" && !txn.AccessPublished
+	case TransitionActionFinishCleanup:
+		return txn.Phase == "committed" || txn.Phase == "committed_cleanup_pending"
+	case TransitionActionMetadataRetry:
+		return txn.Phase == "committed_metadata_pending"
+	default:
+		return false
+	}
+}
+
+func imageFollowUpActionMatchesCleanup(txn *ImageUpdateTransaction) bool {
+	if txn == nil {
+		return false
+	}
+	return txn.Phase == imageUpdatePhaseCommitted || txn.Phase == imageUpdatePhaseCleanupPending
+}
+
+func transitionFollowUpProgressLabel(action TransitionActionKind) string {
+	switch action {
+	case TransitionActionAccessRepair:
+		return "Access repair"
+	case TransitionActionFinishCleanup:
+		return "Cleanup"
+	case TransitionActionMetadataRetry:
+		return "Catalog metadata retry"
+	default:
+		return "Update follow-up"
+	}
+}
+
+func transitionLegacyJournalExists(state *FilesystemStateManager, instanceID string) (bool, error) {
+	legacy, err := loadTransitionLegacyJournals(state, instanceID)
+	if err != nil {
+		return false, err
+	}
+	return legacy.hasAny(), nil
+}
+
 // ReconcileOnce ensures Podman observed state converges to Piccolo desired state.
 //
 // Desired state is derived from the persisted Enabled flag:
@@ -1416,8 +1733,9 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	imageUpdateBlocked := m.recoverPendingImageUpdates(ctx, state)
-	manifestUpdateBlocked := m.recoverPendingManifestUpdates(ctx, state)
+	transitionBlocked := m.recoverPendingTransitionRecords(ctx, state)
+	imageUpdateBlocked := m.recoverPendingImageUpdates(ctx, state, transitionBlocked)
+	manifestUpdateBlocked := m.recoverPendingManifestUpdates(ctx, state, transitionBlocked)
 
 	// Clean up orphaned per-app users on first reconciliation.
 	m.orphanCleanupOnce.Do(func() {
@@ -1441,6 +1759,15 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 			continue
 		}
 		if manifestUpdateBlocked[appInst.InstanceID] {
+			continue
+		}
+		if transitionBlocked[appInst.InstanceID] {
+			continue
+		}
+		if err := m.rejectIfTransitionInProgress(state, appInst.InstanceID, TransitionFenceNormalReconcile); err != nil {
+			if !errors.Is(err, ErrTransitionInProgress) {
+				log.Printf("ERROR: reconcile app %s: %v", appInst.InstanceID, err)
+			}
 			continue
 		}
 		if err := m.reconcileApp(ctx, state, appInst); err != nil {
@@ -2124,6 +2451,16 @@ func (m *AppManager) decorateAppResponseState(state *FilesystemStateManager, app
 	if state == nil || app == nil || strings.TrimSpace(app.InstanceID) == "" {
 		return
 	}
+	record, err := state.LoadTransitionRecord(app.InstanceID)
+	if err == nil && record != nil && record.Phase != TransitionPhaseCommitted {
+		app.TransitionActive = true
+		app.TransitionOperation = string(record.Plan.OperationKind)
+		app.TransitionPhase = string(record.Phase)
+		app.TransitionMessage = transitionDisplayMessage(record)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		log.Printf("WARN: app response %s: load transition record: %v", app.InstanceID, err)
+	}
+
 	txn, err := state.LoadManifestUpdateTransaction(app.InstanceID)
 	if errors.Is(err, os.ErrNotExist) {
 		return
@@ -2145,6 +2482,64 @@ func (m *AppManager) decorateAppResponseState(state *FilesystemStateManager, app
 	app.AccessRepairMessage = message
 }
 
+func transitionDisplayMessage(record *TransitionRecord) string {
+	if record == nil {
+		return "An app update is still finishing."
+	}
+	operation := transitionOperationDisplayLabel(record.Plan.OperationKind)
+	phase := transitionPhaseDisplayLabel(record.Phase)
+	if strings.TrimSpace(record.LastError) != "" && record.Phase == TransitionPhaseRestoreFailed {
+		return operation + " needs repair: " + strings.TrimSpace(record.LastError)
+	}
+	return operation + " is " + phase + "."
+}
+
+func transitionOperationDisplayLabel(operation TransitionOperationKind) string {
+	switch operation {
+	case TransitionOperationUpdateImage:
+		return "Image refresh"
+	case TransitionOperationModifyApp, TransitionOperationCatalogManifestReview:
+		return "App update"
+	case TransitionOperationEditConfig, TransitionOperationCatalogConfigReview:
+		return "Config update"
+	case TransitionOperationCatalogAutoApply:
+		return "Catalog update"
+	case TransitionOperationAccessRepair:
+		return "Access repair"
+	case TransitionOperationCleanupRetry:
+		return "Cleanup"
+	case TransitionOperationMetadataRetry:
+		return "Metadata update"
+	default:
+		return "App update"
+	}
+}
+
+func transitionPhaseDisplayLabel(phase TransitionPhase) string {
+	switch phase {
+	case TransitionPhasePrepared, TransitionPhaseResourcesPrepared:
+		return "preparing"
+	case TransitionPhaseCommitIntent, TransitionPhaseSourceCommitting, TransitionPhaseSourceCommitted:
+		return "committing"
+	case TransitionPhaseSwitchingRuntime, TransitionPhaseCandidateTouched:
+		return "switching runtime"
+	case TransitionPhasePublishingAccess:
+		return "publishing access"
+	case TransitionPhaseCommittedMetadataPending:
+		return "saving metadata"
+	case TransitionPhaseCommittedCleanupPending:
+		return "finishing cleanup"
+	case TransitionPhaseRestoringPrevious:
+		return "restoring the previous app"
+	case TransitionPhaseRestoreFailed:
+		return "waiting for repair"
+	case TransitionPhaseCommitted:
+		return "complete"
+	default:
+		return "finishing"
+	}
+}
+
 // GetAppDefinition returns the full definition (app.yaml content) for an installed app instance.
 func (m *AppManager) GetAppDefinition(ctx context.Context, instanceID string) (*api.AppDefinition, error) {
 	state, err := m.ensureStateManager()
@@ -2158,7 +2553,44 @@ func (m *AppManager) GetAppDefinition(ctx context.Context, instanceID string) (*
 func (m *AppManager) Start(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	if err := m.ensureUnlocked(); err != nil {
+		return err
+	}
+	if err := m.ensureKernelLeader(); err != nil {
+		return err
+	}
+	if err := m.recoverPendingImageUpdateBeforeTransitionFence(ctx, state, instanceID, "start"); err != nil {
+		return err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceStart); err != nil {
+		return err
+	}
 	return m.startLocked(ctx, instanceID)
+}
+
+func (m *AppManager) recoverPendingImageUpdateBeforeTransitionFence(ctx context.Context, state *FilesystemStateManager, instanceID, operation string) error {
+	record, err := state.LoadTransitionRecord(instanceID)
+	if err == nil && record != nil && record.Phase != TransitionPhaseCommitted {
+		if record.Plan.OperationKind != TransitionOperationUpdateImage || record.Plan.SourceKind != TransitionSourceCurrentCommitted {
+			return nil
+		}
+	}
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("read app transition record before %s: %w", operation, err)
+	}
+	appInst, exists := state.GetApp(instanceID)
+	if !exists {
+		return nil
+	}
+	if _, recoverErr := m.recoverPendingImageUpdateForApp(ctx, state, appInst); recoverErr != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("recover pending image update before %s: %w", operation, recoverErr)
+	}
+	return nil
 }
 
 func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err error) {
@@ -2247,6 +2679,13 @@ func (m *AppManager) Stop(ctx context.Context, instanceID string) error {
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceStop); err != nil {
+		return err
+	}
 	return m.stopInternal(ctx, instanceID)
 }
 
@@ -2276,6 +2715,9 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		return err
 	}
 
+	// Follower demotion is a transition-boundary quiesce exception: it may stop
+	// local containers, but must not change app source/rootfs metadata or consume
+	// transition records. The leader/recovery path owns the active transition.
 	if defErr == nil && mode == ModeService {
 		primary := primaryServiceFor(def, app)
 		order, _ := serviceStartOrder(def.Services)
@@ -2374,11 +2816,21 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 // Uninstall removes an application instance completely by instanceID,
 // including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
+	m.reconcileMu.Lock()
+	state, stateErr := m.ensureStateManager()
+	if stateErr != nil {
+		m.reconcileMu.Unlock()
+		return stateErr
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceUninstall); err != nil {
+		m.reconcileMu.Unlock()
+		return err
+	}
+
 	// Remove the slice drop-in before the user is destroyed. Live-reset is
 	// unnecessary because the slice itself is about to be torn down.
 	m.RemoveSlicePolicyForApp(instanceID)
 
-	m.reconcileMu.Lock()
 	err := m.uninstallLocked(ctx, instanceID)
 	m.reconcileMu.Unlock()
 
@@ -2512,6 +2964,13 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 func (m *AppManager) UpdateImage(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceUpdateImage); err != nil {
+		return err
+	}
 	return m.updateImageLocked(ctx, instanceID)
 }
 
@@ -2577,8 +3036,52 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		log.Printf("INFO: update image %s: all service images are digest-pinned; nothing to re-pull", instanceID)
 		return nil
 	}
+	if err := rejectImageUpdateIfLegacyJournalPending(state, instanceID); err != nil {
+		return err
+	}
 	if err := m.preflightImageRefreshRollbackSnapshot(ctx, instanceID, curDef); err != nil {
 		return err
+	}
+	imagePlan, err := m.resolveUpdateImageRootfsPlan(ctx, instanceID, appInst, updatedImages)
+	if err != nil {
+		return fmt.Errorf("resolve image update plan: %w", err)
+	}
+	if len(imagePlan) == 0 {
+		log.Printf("INFO: update image %s: registry digests match active rootfs; nothing to refresh", instanceID)
+		return nil
+	}
+	transitionRecord, err := m.beginUpdateImageTransitionRecord(ctx, state, appInst, curDef, imagePlan)
+	if err != nil {
+		return err
+	}
+	if transitionRecord != nil {
+		defer func() {
+			if err == nil {
+				return
+			}
+			if _, loadErr := state.LoadImageUpdateTransaction(instanceID); errors.Is(loadErr, os.ErrNotExist) {
+				record, recordErr := state.LoadTransitionRecord(instanceID)
+				if errors.Is(recordErr, os.ErrNotExist) {
+					return
+				}
+				if recordErr != nil {
+					log.Printf("WARN: update image %s: inspect transition record after failure: %v", instanceID, recordErr)
+					return
+				}
+				if record.Phase == TransitionPhasePrepared {
+					if clearErr := state.ClearTransitionRecord(instanceID); clearErr != nil {
+						log.Printf("WARN: update image %s: clear pre-resource transition record: %v", instanceID, clearErr)
+					}
+					return
+				}
+				record.LastError = err.Error()
+				if storeErr := state.StoreTransitionRecord(instanceID, record); storeErr != nil {
+					log.Printf("WARN: update image %s: persist transition failure details: %v", instanceID, storeErr)
+				}
+			} else if loadErr != nil {
+				log.Printf("WARN: update image %s: inspect rollback journal after failure: %v", instanceID, loadErr)
+			}
+		}()
 	}
 
 	// RollbackToSnapshot reads app.prev.yaml to restore pre-update state — keep
@@ -2588,8 +3091,21 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 	}
 
 	// Service-mode: transactional rootfs update (RFC 20260302).
-	if err := m.updateServiceModeImage(ctx, state, appInst, curDef, layout, runtime, updatedImages); err != nil {
+	if err := m.updateServiceModeImage(ctx, state, appInst, curDef, layout, runtime, imagePlan); err != nil {
 		return err
+	}
+	if transitionRecord != nil {
+		if imageTxn, loadErr := state.LoadImageUpdateTransaction(instanceID); loadErr == nil && imageTxn != nil {
+			if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+				log.Printf("WARN: update image %s: retain transition for uncleared image journal: %v", instanceID, storeErr)
+			}
+		} else if !errors.Is(loadErr, os.ErrNotExist) {
+			log.Printf("WARN: update image %s: inspect committed image journal: %v", instanceID, loadErr)
+		} else if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, &ImageUpdateTransaction{Phase: imageUpdatePhaseCommitted}, appInst); storeErr != nil {
+			log.Printf("WARN: update image %s: mark transition committed: %v", instanceID, storeErr)
+		} else if clearErr := state.ClearTransitionRecord(instanceID); clearErr != nil {
+			log.Printf("WARN: update image %s: clear committed transition record: %v", instanceID, clearErr)
+		}
 	}
 	// Image update succeeded — clear catalog manifest sync throttle so
 	// the next sync tick re-classifies the catalog version (which may
@@ -2602,6 +3118,187 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		}
 	}
 	return nil
+}
+
+func (m *AppManager) beginUpdateImageTransitionRecord(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, curDef *api.AppDefinition, imagePlan []ManifestUpdateImagePlanItem) (*TransitionRecord, error) {
+	_ = ctx
+	instanceID := appInst.InstanceID
+	if err := rejectImageUpdateIfLegacyJournalPending(state, instanceID); err != nil {
+		return nil, err
+	}
+	baseHash, err := canonicalManifestHash(curDef)
+	if err != nil {
+		return nil, fmt.Errorf("hash current manifest: %w", err)
+	}
+	runtimeFingerprint, err := manifestRuntimeFingerprint(appInst)
+	if err != nil {
+		return nil, fmt.Errorf("fingerprint runtime: %w", err)
+	}
+	_, ledgerRevision, ledgerSourceHash, err := loadInstallLedgerFingerprint(state, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	imageRootfs := transitionImageRootfsFromManifestPlan(imagePlan)
+	primary := primaryServiceFor(curDef, appInst)
+	order, err := serviceStartOrder(curDef.Services)
+	if err != nil {
+		return nil, fmt.Errorf("service start order: %w", err)
+	}
+	candidateActiveRootfs := cloneStringMap(appInst.ActiveRootfs)
+	if candidateActiveRootfs == nil {
+		candidateActiveRootfs = map[string]string{}
+	}
+	resourceKeys := make(map[string]string, len(imagePlan)+len(order)+2)
+	const candidateRuntimeNamePolicy = "deterministic_app_service_container_names_v1"
+	resourceKeys["runtime:name_policy"] = candidateRuntimeNamePolicy
+	resourceKeys["runtime:anchor"] = networkAnchorContainerName(instanceID)
+	for _, svcName := range order {
+		resourceKeys["runtime:service:"+svcName] = containerNameForService(instanceID, svcName, primary)
+	}
+	for _, item := range imagePlan {
+		if strings.TrimSpace(item.ServiceName) != "" {
+			resourceKeys["image:"+item.ServiceName] = item.RootfsVolumeID
+			if strings.TrimSpace(item.RootfsVolumeID) != "" {
+				candidateActiveRootfs[item.ServiceName] = item.RootfsVolumeID
+			}
+		}
+	}
+	snapshotRequired := appHasPersistentStorage(curDef)
+	plan, err := PlanInstalledAppTransition(TransitionPlanInput{
+		OperationKind:         TransitionOperationUpdateImage,
+		SourceKind:            TransitionSourceCurrentCommitted,
+		Mode:                  piccoloModeFromExtensions(curDef.Extensions),
+		Enabled:               appInst.Enabled,
+		RuntimeChanging:       true,
+		BaseManifestHash:      baseHash,
+		CandidateManifestHash: baseHash,
+		LedgerRevision:        ledgerRevision,
+		SourceHash:            ledgerSourceHash,
+		ImageRootfs:           imageRootfs,
+		Data: TransitionDataPolicy{
+			SnapshotRequired:      snapshotRequired,
+			CandidateMayTouchData: snapshotRequired,
+			RollbackBehavior:      "restore_previous_data_before_commit_or_forward_complete_after_commit_intent",
+		},
+		Runtime: TransitionRuntimePolicy{
+			RecreatePolicy:             "recreate_current_manifest_with_refreshed_rootfs",
+			RuntimeFingerprint:         runtimeFingerprint,
+			PreviousActiveRootfs:       cloneStringMap(appInst.ActiveRootfs),
+			CandidateActiveRootfs:      candidateActiveRootfs,
+			PrimaryService:             primary,
+			CandidateRuntimeNamePolicy: candidateRuntimeNamePolicy,
+			ReadinessPolicy:            "existing_image_update_runtime_checks",
+		},
+		Access: TransitionAccessPolicy{
+			PrepareRequired:     false,
+			PublicationStrategy: "preserve_existing_listener_topology",
+		},
+		Cleanup: TransitionCleanupPolicy{
+			StagedRootfsKeys: transitionRootfsKeysFromManifestPlan(imagePlan),
+		},
+		ResourceKeys: resourceKeys,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrImageUpdateRejected, err)
+	}
+	planHash, err := plan.Hash()
+	if err != nil {
+		return nil, err
+	}
+	operationID, err := randomManifestUpdateToken()
+	if err != nil {
+		return nil, err
+	}
+	record := &TransitionRecord{
+		SchemaVersion: TransitionPlanSchemaVersion,
+		OperationID:   operationID,
+		InstanceID:    instanceID,
+		Phase:         TransitionPhasePrepared,
+		PlanHash:      planHash,
+		Plan:          *plan,
+	}
+	if err := state.StoreTransitionRecord(instanceID, record); err != nil {
+		return nil, fmt.Errorf("store image update transition record: %w", err)
+	}
+	return record, nil
+}
+
+func rejectImageUpdateIfLegacyJournalPending(state *FilesystemStateManager, instanceID string) error {
+	if existing, err := state.LoadImageUpdateTransaction(instanceID); err == nil && existing != nil {
+		return fmt.Errorf("%w: image update already has pending rollback state in phase %s", ErrImageUpdateRejected, existing.Phase)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: image update rollback state unreadable: %v", ErrImageUpdateRejected, err)
+	}
+	if existing, err := state.LoadManifestUpdateTransaction(instanceID); err == nil && existing != nil {
+		return fmt.Errorf("%w: manifest update transaction already in progress (phase %s)", ErrImageUpdateRejected, existing.Phase)
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("%w: manifest update rollback state unreadable: %v", ErrImageUpdateRejected, err)
+	}
+	return nil
+}
+
+func (m *AppManager) resolveUpdateImageRootfsPlan(ctx context.Context, instanceID string, appInst *AppInstance, updatedImages map[string]string) ([]ManifestUpdateImagePlanItem, error) {
+	if len(updatedImages) == 0 {
+		return nil, nil
+	}
+	if m.containerManager == nil {
+		return nil, fmt.Errorf("container manager not configured")
+	}
+	ephRT, ephCleanup, err := m.newFlattenRuntime(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("create ephemeral runtime: %w", err)
+	}
+	defer ephCleanup()
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return nil, fmt.Errorf("rootfs volume manager not configured")
+	}
+	serviceNames := make([]string, 0, len(updatedImages))
+	for svcName := range updatedImages {
+		serviceNames = append(serviceNames, svcName)
+	}
+	slices.Sort(serviceNames)
+	plan := make([]ManifestUpdateImagePlanItem, 0, len(serviceNames))
+	for _, svcName := range serviceNames {
+		imageRef := strings.TrimSpace(updatedImages[svcName])
+		if imageRef == "" {
+			continue
+		}
+		if err := m.containerManager.PullImage(ctx, ephRT, imageRef); err != nil {
+			return nil, fmt.Errorf("pull image %s (service %s): %w", imageRef, svcName, err)
+		}
+		imgConfig, err := m.containerManager.InspectImage(ctx, ephRT, imageRef)
+		if err != nil {
+			return nil, fmt.Errorf("inspect image %s (service %s): %w", imageRef, svcName, err)
+		}
+		digest := imageConfigDigest(imgConfig)
+		if digest == "" {
+			return nil, fmt.Errorf("inspect image %s (service %s): digest unavailable", imageRef, svcName)
+		}
+		canonicalDigest := canonicalImageDigestKey(digest)
+		if canonicalDigest == "" {
+			return nil, fmt.Errorf("inspect image %s (service %s): canonical digest unavailable", imageRef, svcName)
+		}
+		previousRootfs := ""
+		if appInst.ActiveRootfs != nil {
+			previousRootfs = appInst.ActiveRootfs[svcName]
+		}
+		if matches, _, err := manifestUpdateRootfsProvesDigest(rootfs, previousRootfs, canonicalDigest); err == nil && matches {
+			continue
+		}
+		plan = append(plan, ManifestUpdateImagePlanItem{
+			ServiceName:            svcName,
+			EntryKind:              manifestUpdateImageEntryAppService,
+			Action:                 manifestUpdateImageActionRefresh,
+			Reason:                 "current image digest differs from active rootfs",
+			ImageRef:               imageRef,
+			ResolvedDigest:         digest,
+			CanonicalDigest:        canonicalDigest,
+			RootfsVolumeID:         persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, persistence.ShortDigest(canonicalDigest)),
+			PreviousRootfsVolumeID: previousRootfs,
+		})
+	}
+	return plan, nil
 }
 
 func (m *AppManager) ImageUpdateBlockedReason(ctx context.Context, instanceID string) string {
@@ -2699,7 +3396,7 @@ func (m *AppManager) updateServiceModeImage(
 	newDef *api.AppDefinition,
 	layout appVolumeLayout,
 	runtime container.PodmanRuntime,
-	updatedImages map[string]string, // svcName → newImage (only changed services)
+	imagePlan []ManifestUpdateImagePlanItem,
 ) (err error) {
 	instanceID := appInst.InstanceID
 	curDef := appInst.Definition
@@ -2713,8 +3410,14 @@ func (m *AppManager) updateServiceModeImage(
 	if rootfs == nil {
 		return fmt.Errorf("rootfs volume manager not configured")
 	}
+	transitionOperationID := ""
+	if record, loadErr := state.LoadTransitionRecord(instanceID); loadErr == nil && record != nil {
+		transitionOperationID = record.OperationID
+	} else if loadErr != nil && !errors.Is(loadErr, os.ErrNotExist) {
+		return fmt.Errorf("load image update transition record: %w", loadErr)
+	}
 	if rollbackSnapshotRequired {
-		imageTxn, plannedTupleState, err = m.planImageUpdateRollbackTransaction(ctx, state, appInst, primary)
+		imageTxn, plannedTupleState, err = m.planImageUpdateRollbackTransaction(ctx, state, appInst, primary, transitionOperationID)
 		if err != nil {
 			return err
 		}
@@ -2722,8 +3425,9 @@ func (m *AppManager) updateServiceModeImage(
 			if err == nil || imageTxn == nil || imageTxn.RuntimeSwitchStarted {
 				return
 			}
-			if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
+			if clearErr := m.clearImageUpdatePreCandidateAbort(ctx, state, instanceID, imageTxn); clearErr != nil {
 				log.Printf("WARN: update %s: clear pre-switch image update transaction: %v", instanceID, clearErr)
+				err = errors.Join(err, fmt.Errorf("clear pre-switch image update transaction: %w", clearErr))
 			}
 		}()
 	}
@@ -2747,8 +3451,13 @@ func (m *AppManager) updateServiceModeImage(
 		handle        persistence.RootfsHandle
 		imgConfig     persistence.GoldenImageConfig
 	}
-	changed := make([]changedService, 0, len(updatedImages))
-	for svcName, newImage := range updatedImages {
+	changed := make([]changedService, 0, len(imagePlan))
+	for _, planned := range imagePlan {
+		svcName := strings.TrimSpace(planned.ServiceName)
+		newImage := strings.TrimSpace(planned.ImageRef)
+		if svcName == "" || newImage == "" {
+			return fmt.Errorf("image update plan contains empty service or image reference")
+		}
 		if pullErr := m.containerManager.PullImage(ctx, ephRT, newImage); pullErr != nil {
 			return fmt.Errorf("pull image %s (service %s): %w", newImage, svcName, pullErr)
 		}
@@ -2766,8 +3475,17 @@ func (m *AppManager) updateServiceModeImage(
 		if canonicalDigest == "" {
 			return fmt.Errorf("inspect image %s (service %s): canonical digest unavailable", newImage, svcName)
 		}
-		shortDigest := persistence.ShortDigest(canonicalDigest)
-		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, shortDigest)
+		if expected := manifestUpdateImagePlanCanonicalDigest(planned); expected != "" && expected != canonicalDigest {
+			return fmt.Errorf("%w: image digest changed during image update for service %s", ErrImageUpdateRejected, svcName)
+		}
+		volID := strings.TrimSpace(planned.RootfsVolumeID)
+		expectedVolID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, persistence.ShortDigest(canonicalDigest))
+		if volID == "" {
+			volID = expectedVolID
+		}
+		if volID != expectedVolID {
+			return fmt.Errorf("%w: rootfs identity changed during image update for service %s", ErrImageUpdateRejected, svcName)
+		}
 		changed = append(changed, changedService{
 			svcName:       svcName,
 			newImage:      newImage,
@@ -2775,6 +3493,28 @@ func (m *AppManager) updateServiceModeImage(
 			volumeID:      volID,
 			imageSizeHint: imgConfig.Size,
 		})
+	}
+
+	plannedStagedRootfsIDs := transitionRootfsKeysFromManifestPlan(imagePlan)
+	candidateActiveRootfs := cloneStringMap(appInst.ActiveRootfs)
+	if candidateActiveRootfs == nil {
+		candidateActiveRootfs = map[string]string{}
+	}
+	for _, cs := range changed {
+		candidateActiveRootfs[cs.svcName] = cs.volumeID
+	}
+	if imageTxn != nil {
+		imageTxn.StagedRootfs = imageUpdateStagedRootfsMap(plannedStagedRootfsIDs)
+		imageTxn.CandidateActiveRootfs = cloneStringMap(candidateActiveRootfs)
+		imageTxn.LastError = ""
+		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
+			return fmt.Errorf("store image update staged rootfs marker: %w", storeErr)
+		}
+		if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+			return fmt.Errorf("store image update transition staged rootfs marker: %w", storeErr)
+		}
+	} else if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseResourcesPrepared, plannedStagedRootfsIDs, nil, nil, nil); storeErr != nil {
+		return fmt.Errorf("store image update transition staged rootfs marker: %w", storeErr)
 	}
 
 	// 2. Build IDMap config (once, shared across all services).
@@ -2797,6 +3537,31 @@ func (m *AppManager) updateServiceModeImage(
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseCreatingRootfs, 30, "Creating root filesystem", false, nil)
 
+	markCreatedRootfsForCleanup := func(volID string) error {
+		volID = strings.TrimSpace(volID)
+		if volID == "" {
+			return nil
+		}
+		if imageTxn != nil {
+			if imageTxn.CreatedRootfs == nil {
+				imageTxn.CreatedRootfs = map[string]string{}
+			}
+			imageTxn.CreatedRootfs[volID] = volID
+			imageTxn.LastError = ""
+			if err := state.StoreImageUpdateTransaction(instanceID, imageTxn); err != nil {
+				return fmt.Errorf("store image update created rootfs marker: %w", err)
+			}
+			if err := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); err != nil {
+				return fmt.Errorf("store image update transition created rootfs marker: %w", err)
+			}
+			return nil
+		}
+		if err := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseResourcesPrepared, plannedStagedRootfsIDs, []string{volID}, nil, nil); err != nil {
+			return fmt.Errorf("store image update transition created rootfs marker: %w", err)
+		}
+		return nil
+	}
+
 	// 3. For each changed service: create new rootfs (idempotent, while still running).
 	for i := range changed {
 		cs := &changed[i]
@@ -2810,6 +3575,9 @@ func (m *AppManager) updateServiceModeImage(
 				return fmt.Errorf("attach existing rootfs %s: %w", cs.volumeID, err)
 			}
 		} else {
+			if err := markCreatedRootfsForCleanup(cs.volumeID); err != nil {
+				return err
+			}
 			cs.handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
 				InstanceID:    instanceID,
 				ServiceName:   cs.svcName,
@@ -2824,6 +3592,16 @@ func (m *AppManager) updateServiceModeImage(
 				return fmt.Errorf("create rootfs for service %s: %w", cs.svcName, err)
 			}
 		}
+	}
+	stagedRootfsIDs := func() []string {
+		out := make([]string, 0, len(changed))
+		for _, cs := range changed {
+			if appInst.ActiveRootfs != nil && appInst.ActiveRootfs[cs.svcName] == cs.volumeID {
+				continue
+			}
+			out = append(out, cs.volumeID)
+		}
+		return out
 	}
 	detachStagedChangedRootfs := func() {
 		for _, cs := range changed {
@@ -2880,6 +3658,11 @@ func (m *AppManager) updateServiceModeImage(
 		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
 			return restartPreviousRuntime(fmt.Errorf("store image update runtime switch marker: %w", storeErr))
 		}
+		if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+			return restartPreviousRuntime(fmt.Errorf("store image update transition runtime switch marker: %w", storeErr))
+		}
+	} else if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseSwitchingRuntime, stagedRootfsIDs(), nil, nil, nil); storeErr != nil {
+		return restartPreviousRuntime(fmt.Errorf("store image update transition runtime switch marker: %w", storeErr))
 	}
 
 	var tupleState *TupleState
@@ -2921,13 +3704,6 @@ func (m *AppManager) updateServiceModeImage(
 	for svcName, info := range changedMap {
 		prebuiltRootfs[svcName] = info
 	}
-	candidateActiveRootfs := cloneStringMap(appInst.ActiveRootfs)
-	if candidateActiveRootfs == nil {
-		candidateActiveRootfs = map[string]string{}
-	}
-	for _, cs := range changed {
-		candidateActiveRootfs[cs.svcName] = cs.volumeID
-	}
 	if imageTxn != nil {
 		imageTxn.Phase = imageUpdatePhaseCandidateDataRisk
 		imageTxn.CandidateDataRisk = true
@@ -2936,12 +3712,20 @@ func (m *AppManager) updateServiceModeImage(
 		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
 			return restartPreviousRuntime(fmt.Errorf("store image update candidate data risk marker: %w", storeErr))
 		}
+		if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+			return restartPreviousRuntime(fmt.Errorf("store image update transition candidate data risk marker: %w", storeErr))
+		}
 		imageTxn.Phase = imageUpdatePhaseCommitIntent
 		imageTxn.CommitIntent = true
 		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
 			detachStagedChangedRootfs()
 			m.setObservedStatus(instanceID, StatusError)
 			return fmt.Errorf("store image update commit intent after candidate data risk marker: %w", storeErr)
+		}
+		if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+			detachStagedChangedRootfs()
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("store image update transition commit intent marker: %w", storeErr)
 		}
 	}
 
@@ -2979,6 +3763,14 @@ func (m *AppManager) updateServiceModeImage(
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("recreate containers after update: %w", err)
 	}
+	if imageTxn == nil {
+		if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseCommitIntent, stagedRootfsIDs(), nil, result, nil); storeErr != nil {
+			if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
+				log.Printf("WARN: update %s: cleanup candidate containers after transition marker failure: %v", instanceID, rmErr)
+			}
+			return restartPreviousRuntime(fmt.Errorf("store image update transition commit intent marker: %w", storeErr))
+		}
+	}
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseFinalizing, 90, "Saving state", false, nil)
 
@@ -2999,15 +3791,26 @@ func (m *AppManager) updateServiceModeImage(
 		imageTxn.CandidateNetworkAnchorID = result.NetworkAnchorID
 		imageTxn.CandidateContainers = cloneStringMap(result.Containers)
 		_ = state.StoreImageUpdateTransaction(instanceID, imageTxn)
+		_ = storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst)
 	}
 	if err := state.StoreApp(appInst); err != nil {
+		if imageTxn == nil {
+			if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseRestoringPrevious, stagedRootfsIDs(), nil, nil, err); storeErr != nil {
+				m.setObservedStatus(instanceID, StatusError)
+				return errors.Join(fmt.Errorf("store app: %w", err), fmt.Errorf("store image update transition restore marker: %w", storeErr))
+			}
+		}
 		// Best-effort cleanup: remove containers created by installContainerGroup
 		// to prevent unmanaged containers running with stale on-disk metadata.
 		if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
 			log.Printf("WARN: update %s: cleanup after persist failure: %v", instanceID, rmErr)
 		}
-		for _, cs := range changed {
-			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
+		if imageTxn == nil {
+			rollbackErr := restartPreviousRuntime(fmt.Errorf("store app: %w", err))
+			if clearErr := state.ClearTransitionRecord(instanceID); clearErr != nil {
+				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("clear aborted image transition: %w", clearErr))
+			}
+			return rollbackErr
 		}
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("store app: %w", err)
@@ -3021,6 +3824,7 @@ func (m *AppManager) updateServiceModeImage(
 				imageTxn.CommitIntent = true
 				imageTxn.LastError = fmt.Sprintf("record post-update generation: %v", err)
 				_ = state.StoreImageUpdateTransaction(instanceID, imageTxn)
+				_ = storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst)
 			}
 			m.setObservedStatus(instanceID, StatusError)
 			return fmt.Errorf("record post-update generation: %w", err)
@@ -3031,6 +3835,8 @@ func (m *AppManager) updateServiceModeImage(
 		imageTxn.LastError = ""
 		if storeErr := state.StoreImageUpdateTransaction(instanceID, imageTxn); storeErr != nil {
 			log.Printf("WARN: update %s: mark image update committed: %v", instanceID, storeErr)
+		} else if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+			log.Printf("WARN: update %s: mark image transition committed: %v", instanceID, storeErr)
 		} else if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
 			log.Printf("WARN: update %s: clear committed image update transaction: %v", instanceID, clearErr)
 		}
@@ -3110,6 +3916,9 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 				log.Printf("WARN: update %s: mark image update snapshot created: %v", instanceID, storeErr)
 				return ts, false, fmt.Errorf("mark image update snapshot created: %w", storeErr)
 			}
+			if storeErr := storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst); storeErr != nil {
+				return ts, false, fmt.Errorf("mark image transition snapshot created: %w", storeErr)
+			}
 		}
 	} else {
 		log.Printf("WARN: update %s: volume manager does not support snapshots", instanceID)
@@ -3161,6 +3970,9 @@ func (m *AppManager) snapshotTupleBeforeUpdate(
 			return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), cleanupErr)
 		}
 		if imageTxn != nil {
+			if clearErr := state.ClearTransitionRecord(instanceID); clearErr != nil {
+				return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), fmt.Errorf("clear image transition after snapshot cleanup: %w", clearErr))
+			}
 			if clearErr := state.ClearImageUpdateTransaction(instanceID); clearErr != nil {
 				return ts, false, errors.Join(fmt.Errorf("persist tuple state: %w", storeErr), fmt.Errorf("clear image update transaction after snapshot cleanup: %w", clearErr))
 			}
@@ -3214,15 +4026,20 @@ func mapsEqual(a, b map[string]string) bool {
 func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) error {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
-
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return err
+	}
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
 	}
-	state, err := m.ensureStateManager()
-	if err != nil {
+	if err := m.recoverPendingImageUpdateBeforeTransitionFence(ctx, state, instanceID, "rollback"); err != nil {
+		return err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceRollback); err != nil {
 		return err
 	}
 	appInst, exists := state.GetApp(instanceID)
@@ -3485,6 +4302,13 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceListenerUpdate); err != nil {
+		return nil, err
+	}
 	return m.updateListenersLocked(ctx, instanceID, listeners)
 }
 
@@ -3914,6 +4738,9 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	appInst, exists := state.GetApp(instanceID)
 	if !exists {
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceShellExec); err != nil {
+		return nil, err
 	}
 	if observed := m.getObservedStatus(instanceID); observed != StatusRunning {
 		return nil, fmt.Errorf("app %s is not running (status: %s)", instanceID, observed)

@@ -5,6 +5,7 @@ import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/app_service.dart';
 import 'package:piccolo_os/core/utils/task_id.dart';
 import 'package:piccolo_os/features/apps/apply_settlement.dart';
+import 'package:piccolo_os/features/apps/update_error_messages.dart';
 import 'package:piccolo_os/shared/widgets/task_progress_panel.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
@@ -125,7 +126,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
       setState(() => _configure = result);
     } on Object catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString());
+      setState(() => _error = updateErrorMessage(e));
       _revealError();
     } finally {
       if (mounted) setState(() => _busy = false);
@@ -192,7 +193,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
       _revealDryRunSummary();
     } on Object catch (e) {
       if (!mounted) return;
-      setState(() => _error = e.toString());
+      setState(() => _error = updateErrorMessage(e));
       _revealError();
     } finally {
       if (mounted) {
@@ -394,10 +395,22 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         await _finishApply();
         return;
       }
+      if (isStaleUpdatePreviewError(e)) {
+        setState(() {
+          _busy = false;
+          _taskId = null;
+          _dryRun = null;
+          _accessRepairMessage = null;
+          _confirmedReviewItems.clear();
+          _error = staleUpdatePreviewMessage;
+        });
+        _revealError();
+        return;
+      }
       setState(() {
         _busy = false;
         _taskId = null;
-        _error = e.toString();
+        _error = updateErrorMessage(e);
       });
       _revealError();
     }
@@ -1044,6 +1057,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
             items: _serviceReviewItems(result),
             children: _confirmationTiles(serviceConfirmations, result),
           ),
+        _SummarySection(title: 'What will change', items: summary.willChange),
         _SummarySection(title: 'Will preserve', items: summary.willPreserve),
         _SummarySection(
           title: 'Expected interruption',
