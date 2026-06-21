@@ -139,6 +139,11 @@ class SettingsController extends ChangeNotifier {
   bool _isBackendBusy = false;
   bool get isBackendBusy => _isBackendBusy;
 
+  bool _isBackendBusyError(Object error) {
+    if (error is ApiException) return error.statusCode == 429;
+    return error.toString().contains('429');
+  }
+
   Future<void> fetchOSUpdate({bool silent = false}) async {
     if (_disposed) return;
     if (!silent) _setLoading(true);
@@ -154,7 +159,7 @@ class SettingsController extends ChangeNotifier {
       }
     } on Object catch (e) {
       if (_disposed) return;
-      if (e.toString().contains('429')) {
+      if (_isBackendBusyError(e)) {
         // Backend is busy (Preparing update)
         _isBackendBusy = true;
         _error = null;
@@ -333,7 +338,7 @@ class SettingsController extends ChangeNotifier {
         await ApiClient().post('/api/v1/updates/os/apply');
       } on Object catch (e) {
         if (_disposed) return;
-        if (!e.toString().contains('429')) {
+        if (!_isBackendBusyError(e)) {
           _error = e.toString();
           return;
         }
@@ -363,7 +368,7 @@ class SettingsController extends ChangeNotifier {
         await ApiClient().post('/api/v1/updates/os/rollback');
       } on Object catch (e) {
         if (_disposed) return;
-        if (!e.toString().contains('429')) {
+        if (!_isBackendBusyError(e)) {
           _error = e.toString();
           return;
         }

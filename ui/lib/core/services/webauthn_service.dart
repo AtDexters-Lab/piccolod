@@ -18,7 +18,9 @@ external JSBoolean _jsSignalApiSupported();
 
 @JS('piccoloWebAuthn.signalUnknownCredential')
 external JSPromise<JSBoolean> _jsSignalUnknownCredential(
-    JSString rpId, JSString credentialId);
+  JSString rpId,
+  JSString credentialId,
+);
 
 class WebAuthnService {
   static bool isAvailable() {
@@ -30,16 +32,16 @@ class WebAuthnService {
   }
 
   static Future<Map<String, dynamic>> createCredential(
-      Map<String, dynamic> options) async {
-    final result =
-        await _jsCreateCredential(jsonEncode(options).toJS).toDart;
+    Map<String, dynamic> options,
+  ) async {
+    final result = await _jsCreateCredential(jsonEncode(options).toJS).toDart;
     return jsonDecode(result.toDart) as Map<String, dynamic>;
   }
 
   static Future<Map<String, dynamic>> getCredential(
-      Map<String, dynamic> options) async {
-    final result =
-        await _jsGetCredential(jsonEncode(options).toJS).toDart;
+    Map<String, dynamic> options,
+  ) async {
+    final result = await _jsGetCredential(jsonEncode(options).toJS).toDart;
     return jsonDecode(result.toDart) as Map<String, dynamic>;
   }
 
@@ -58,11 +60,14 @@ class WebAuthnService {
   // through unchanged.
   // Returns true on success, false on unsupported / thrown error.
   static Future<bool> signalUnknownCredential(
-      String rpId, String credentialIdB64Url) async {
+    String rpId,
+    String credentialIdB64Url,
+  ) async {
     try {
       final result = await _jsSignalUnknownCredential(
-              rpId.toJS, credentialIdB64Url.toJS)
-          .toDart;
+        rpId.toJS,
+        credentialIdB64Url.toJS,
+      ).toDart;
       return result.toDart;
     } on Object catch (_) {
       return false;
@@ -76,7 +81,7 @@ class WebAuthnService {
   static void maybeSignalFromApiError(ApiException e) {
     if (e.statusCode != 401) return;
     try {
-      final body = jsonDecode(e.message);
+      final body = jsonDecode(e.rawBody);
       if (body is! Map) return;
       final hint = body['signal_unknown_credential'];
       if (hint is! Map) return;

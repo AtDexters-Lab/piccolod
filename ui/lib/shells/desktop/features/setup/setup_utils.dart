@@ -77,7 +77,7 @@ enum RecoveryKeyEntryContext {
 /// pattern that previously duplicated across call sites — a typo on either
 /// clause used to fail-open silently (rethrow path), now compile-checked.
 bool isApiError(ApiException e, int status, String code) {
-  return e.statusCode == status && extractServerError(e.message) == code;
+  return e.statusCode == status && extractServerError(e.rawBody) == code;
 }
 
 /// Records that the operator has seen and saved the current recovery-key words.
@@ -141,15 +141,19 @@ Future<void> ackRecoveryKey(String keyId) async {
         return;
       }
       if (i == attempts - 1) {
-        debugPrint('Recovery-key ack failed after $attempts attempts '
-            '(will re-prompt on reload): $e');
+        debugPrint(
+          'Recovery-key ack failed after $attempts attempts '
+          '(will re-prompt on reload): $e',
+        );
         return;
       }
       await Future<void>.delayed(backoff[i]);
     } on Object catch (e) {
       if (i == attempts - 1) {
-        debugPrint('Recovery-key ack failed after $attempts attempts '
-            '(will re-prompt on reload): $e');
+        debugPrint(
+          'Recovery-key ack failed after $attempts attempts '
+          '(will re-prompt on reload): $e',
+        );
         return;
       }
       await Future<void>.delayed(backoff[i]);
@@ -188,7 +192,7 @@ String extractServerError(String body) {
 /// Checks if an API exception represents a storage system error.
 /// Covers LUKS data volume failures (500) and emergency middleware blocks (503).
 bool isStorageSystemError(ApiException e) {
-  final code = extractErrorCode(e.message);
+  final code = extractErrorCode(e.rawBody);
   if (code == 'storage_init_failed' ||
       code == 'storage_unlock_failed' ||
       code == 'storage_emergency') {
@@ -218,7 +222,8 @@ String friendlyApiError(ApiException e) {
   // Benign duplicate on /register/finish — the authenticator already has a
   // credential for this account and we correctly refused to insert a second
   // row. Surface a non-destructive message.
-  if (e.statusCode == 409 && serverMsg == ServerErrorCode.passkeyAlreadyRegistered) {
+  if (e.statusCode == 409 &&
+      serverMsg == ServerErrorCode.passkeyAlreadyRegistered) {
     return 'This device already has a passkey for this account. Try signing '
         'in with your existing passkey, or use a different device.';
   }
@@ -274,7 +279,9 @@ String friendlyPasskeyError(Object e) {
   if (msg.contains('NotSupportedError')) {
     return 'Passkeys are not supported in this browser. Try Chrome, Safari, or Edge.';
   }
-  if (msg.contains('TimeoutError') || msg.contains('not found') || msg.contains('expired')) {
+  if (msg.contains('TimeoutError') ||
+      msg.contains('not found') ||
+      msg.contains('expired')) {
     return 'Session expired. Please try again.';
   }
   debugPrint('Unexpected passkey error: $msg');

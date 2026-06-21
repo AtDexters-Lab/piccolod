@@ -123,7 +123,8 @@ class FirstRunController extends ChangeNotifier {
   /// Re-check boot response to detect if auto-enrollment completed.
   Future<void> refreshEnrollmentStatus() async {
     try {
-      final boot = await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
+      final boot =
+          await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
       if (boot['screen'] == 'setup') {
         namekEnrolled = boot['namek_enrolled'] == true;
         namekBaseDomain = boot['namek_base_domain'] as String?;
@@ -161,17 +162,20 @@ class FirstRunController extends ChangeNotifier {
       _hostnameError = null;
       notifyListeners();
 
-      final result = await _api.post(
-        '/api/v1/identity/setup-hostname',
-        body: {'hostname': hostname},
-      ) as Map<String, dynamic>;
+      final result =
+          await _api.post(
+                '/api/v1/identity/setup-hostname',
+                body: {'hostname': hostname},
+              )
+              as Map<String, dynamic>;
 
       final fqdn = result['fqdn'] as String?;
       final baseDomain = result['base_domain'] as String?;
       final nonce = result['setup_nonce'] as String?;
 
       _settingHostname = false;
-      namekSuggestedHostname = null; // prevent stale suggestion on back-navigation
+      namekSuggestedHostname =
+          null; // prevent stale suggestion on back-navigation
       _pendingFqdn = fqdn ?? '$hostname.$baseDomain';
       _pendingNonce = nonce;
       _relayReady = false;
@@ -216,9 +220,11 @@ class FirstRunController extends ChangeNotifier {
   Future<void> _pollReadiness() async {
     if (_pollCancelled || _disposed) return;
     try {
-      final resp = await _api
-          .get('/api/v1/identity/remote-readiness')
-          .timeout(const Duration(seconds: 10)) as Map<String, dynamic>;
+      final resp =
+          await _api
+                  .get('/api/v1/identity/remote-readiness')
+                  .timeout(const Duration(seconds: 10))
+              as Map<String, dynamic>;
       if (_pollCancelled || _disposed) return;
       final newRelay = resp['relay'] == true;
       final newCert = resp['cert'] == true;
@@ -251,8 +257,9 @@ class FirstRunController extends ChangeNotifier {
       scheme: 'https',
       host: _pendingFqdn,
       path: '/',
-      queryParameters:
-          _pendingNonce != null ? {'setup_nonce': _pendingNonce} : null,
+      queryParameters: _pendingNonce != null
+          ? {'setup_nonce': _pendingNonce}
+          : null,
     );
     web.window.location.href = uri.toString();
   }
@@ -278,22 +285,30 @@ class FirstRunController extends ChangeNotifier {
 
   Future<bool> submitCredentials(String password) async {
     try {
-      _step = FirstRunStep.credentials; // ensure we're on this step for error routing
+      _step = FirstRunStep
+          .credentials; // ensure we're on this step for error routing
       _error = null;
       _setupPhase = SetupPhase.encrypting;
       notifyListeners();
 
       const timeout = Duration(seconds: 120);
 
-      await _api.post('/api/v1/crypto/setup', body: {
-        'password': password,
-        if (_setupNonce != null) 'setup_nonce': _setupNonce,
-      }).timeout(timeout);
+      await _api
+          .post(
+            '/api/v1/crypto/setup',
+            body: {
+              'password': password,
+              if (_setupNonce != null) 'setup_nonce': _setupNonce,
+            },
+          )
+          .timeout(timeout);
 
       // Nonce consumed server-side.
       if (_setupNonce != null) {
         _setupNonce = null;
-        try { web.window.sessionStorage.removeItem('setup_nonce'); } on Object catch (_) {}
+        try {
+          web.window.sessionStorage.removeItem('setup_nonce');
+        } on Object catch (_) {}
       }
 
       _setupPhase = SetupPhase.creatingAdmin;
@@ -320,7 +335,8 @@ class FirstRunController extends ChangeNotifier {
       try {
         await _waitForSetupCompletion();
       } on Object catch (_) {
-        _error = 'Setup is taking longer than expected. '
+        _error =
+            'Setup is taking longer than expected. '
             'Your device may still be working \u2014 try refreshing in a minute.';
         _step = FirstRunStep.credentials;
         if (!_disposed) notifyListeners();
@@ -328,7 +344,7 @@ class FirstRunController extends ChangeNotifier {
       return false;
     } on ApiException catch (e) {
       _setupPhase = null;
-      final code = extractErrorCode(e.message);
+      final code = extractErrorCode(e.rawBody);
       if (isStorageSystemError(e)) {
         onSystemError(extractServerError(e.message));
       } else if (e.statusCode == 409 && code == 'setup_in_progress') {
@@ -373,8 +389,8 @@ class FirstRunController extends ChangeNotifier {
   Future<void> _recoverAfterSetupComplete() async {
     _setupPhase = null;
     try {
-      final boot = await _api.get('/api/v1/system/boot')
-          as Map<String, dynamic>;
+      final boot =
+          await _api.get('/api/v1/system/boot') as Map<String, dynamic>;
       final screen = boot['screen'] as String?;
       final rkPending = boot['recovery_key_pending'] == true;
       if (screen == 'desktop' || screen == 'passkey_required') {
@@ -457,7 +473,10 @@ class FirstRunController extends ChangeNotifier {
 
       final credential = await WebAuthnService.createCredential(options);
 
-      final finishResp = await _api.finishPasskeyRegistration(sessionId, credential);
+      final finishResp = await _api.finishPasskeyRegistration(
+        sessionId,
+        credential,
+      );
 
       // First-run passkey registration historically skipped the recovery-key
       // gate. Honor it now so an operator who reaches this step on a device
@@ -497,7 +516,9 @@ class FirstRunController extends ChangeNotifier {
   }
 
   void _persistSetupStep(String step) {
-    try { web.window.sessionStorage.setItem('setup_started', step); } on Object catch (_) {}
+    try {
+      web.window.sessionStorage.setItem('setup_started', step);
+    } on Object catch (_) {}
   }
 
   void _persistPreparingState() {

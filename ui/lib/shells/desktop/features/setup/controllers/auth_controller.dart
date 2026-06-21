@@ -7,6 +7,7 @@ import 'package:piccolo_os/shells/desktop/features/setup/setup_utils.dart';
 import 'package:web/web.dart' as web;
 
 enum AuthMode { unlock, login, passkeyRequired }
+
 enum AuthStep { main, forgotPassword, finishing, recoveryKey }
 
 class AuthController extends ChangeNotifier {
@@ -32,6 +33,7 @@ class AuthController extends ChangeNotifier {
   bool recoveryKeyPending;
   final String? authRequestId;
   final String? nextUrl;
+
   /// Router-owned guard: returns words+keyId on success, null on skip/timeout.
   final Future<RecoveryKeyMaterial?> Function() generateRecoveryKey;
 
@@ -76,9 +78,9 @@ class AuthController extends ChangeNotifier {
   Future<void> fetchLoginOptions() async {
     for (var attempt = 0; attempt < 3; attempt++) {
       try {
-        final result = await _api
-            .getLoginOptions()
-            .timeout(const Duration(seconds: 5));
+        final result = await _api.getLoginOptions().timeout(
+          const Duration(seconds: 5),
+        );
         if (_disposed) return;
         _loginMethods = List<String>.from(result['methods'] as List);
         notifyListeners();
@@ -99,10 +101,12 @@ class AuthController extends ChangeNotifier {
   Future<bool> unlock(String password) async {
     try {
       debugPrint('Unlock attempt');
-      final unlockResp = await _api.post(
-        '/api/v1/crypto/unlock',
-        body: {'password': password},
-      ) as Map<String, dynamic>?;
+      final unlockResp =
+          await _api.post(
+                '/api/v1/crypto/unlock',
+                body: {'password': password},
+              )
+              as Map<String, dynamic>?;
 
       if (unlockResp?['warning'] != null) {
         onSystemError(unlockResp!['warning'] as String);
@@ -130,14 +134,16 @@ class AuthController extends ChangeNotifier {
 
   /// Partial-setup-after-unlock: handled internally (no controller switch).
   Future<void> _completeSetupAfterUnlock(String password) async {
-    debugPrint('Partial setup detected after unlock, completing via /crypto/setup');
+    debugPrint(
+      'Partial setup detected after unlock, completing via /crypto/setup',
+    );
     _step = AuthStep.finishing;
     _setupPhase = SetupPhase.encrypting;
     notifyListeners();
     try {
       await _api.post('/api/v1/crypto/setup', body: {'password': password});
     } on ApiException catch (e) {
-      final code = extractErrorCode(e.message);
+      final code = extractErrorCode(e.rawBody);
       if (e.statusCode == 409 && code == 'setup_in_progress') {
         await _waitForSetupCompletion();
         return;
@@ -178,12 +184,16 @@ class AuthController extends ChangeNotifier {
         _error = 'Unlock partially failed, please try again';
         return;
       }
-      debugPrint('Chained login after unlock failed (${e.statusCode}), '
-          'falling back via reRoute');
+      debugPrint(
+        'Chained login after unlock failed (${e.statusCode}), '
+        'falling back via reRoute',
+      );
       reRoute();
     } on Object catch (e) {
-      debugPrint('Chained login after unlock failed: $e, '
-          'falling back via reRoute');
+      debugPrint(
+        'Chained login after unlock failed: $e, '
+        'falling back via reRoute',
+      );
       reRoute();
     }
   }
@@ -240,8 +250,9 @@ class AuthController extends ChangeNotifier {
     // First-run: generate recovery key before any routing. Server is
     // authoritative when present; constructor fallback only for older builds.
     if (await _showRecoveryKeyIfPending(
-        _resolvePending(resp is Map ? resp.cast<String, dynamic>() : null),
-        RecoveryKeyEntryContext.postLogin)) {
+      _resolvePending(resp is Map ? resp.cast<String, dynamic>() : null),
+      RecoveryKeyEntryContext.postLogin,
+    )) {
       return;
     }
 
@@ -276,11 +287,14 @@ class AuthController extends ChangeNotifier {
       // _resolvePending centralizes the server-authoritative-with-fallback
       // rule.
       if (await _showRecoveryKeyIfPending(
-          _resolvePending(finishResp), RecoveryKeyEntryContext.postLogin)) {
+        _resolvePending(finishResp),
+        RecoveryKeyEntryContext.postLogin,
+      )) {
         return true;
       }
 
-      final session = await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
+      final session =
+          await _api.get('/api/v1/auth/session') as Map<String, dynamic>;
       if (session['must_register_passkey'] == true) {
         reRoute();
         return true;
@@ -315,7 +329,10 @@ class AuthController extends ChangeNotifier {
 
       final credential = await WebAuthnService.createCredential(options);
 
-      final finishResp = await _api.finishPasskeyRegistration(sessionId, credential);
+      final finishResp = await _api.finishPasskeyRegistration(
+        sessionId,
+        credential,
+      );
 
       // The MustRegisterPasskey forcing path lands here and used to skip
       // the recovery-key gate entirely. If the server says the key is
@@ -324,8 +341,9 @@ class AuthController extends ChangeNotifier {
       // at router level) so a server-side false-positive on the gate or a
       // staleness-read failure won't misattribute as a passkey error.
       if (await _showRecoveryKeyIfPending(
-          finishResp['recovery_key_pending'] == true,
-          RecoveryKeyEntryContext.postPasskeyRegister)) {
+        finishResp['recovery_key_pending'] == true,
+        RecoveryKeyEntryContext.postPasskeyRegister,
+      )) {
         return true;
       }
 
@@ -403,7 +421,9 @@ class AuthController extends ChangeNotifier {
   /// per router policy). notifyListeners is called on success so the UI
   /// reflects the step change without relying on the caller's later notify.
   Future<bool> _showRecoveryKeyIfPending(
-      bool pending, RecoveryKeyEntryContext ctx) async {
+    bool pending,
+    RecoveryKeyEntryContext ctx,
+  ) async {
     if (!pending) return false;
     final material = await generateRecoveryKey();
     if (material == null) return false;
@@ -461,10 +481,12 @@ class AuthController extends ChangeNotifier {
   Future<void> _completeOidcAuthRequest() async {
     try {
       debugPrint('Completing OIDC auth request: $authRequestId');
-      final response = await _api.post(
-        '/api/v1/oauth/resume',
-        body: {'auth_request_id': authRequestId},
-      ) as Map<String, dynamic>;
+      final response =
+          await _api.post(
+                '/api/v1/oauth/resume',
+                body: {'auth_request_id': authRequestId},
+              )
+              as Map<String, dynamic>;
 
       final data = response['data'] as Map<String, dynamic>?;
       final redirectUrl = data?['redirect_url'] as String?;
