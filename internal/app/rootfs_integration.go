@@ -176,10 +176,32 @@ func (m *AppManager) prepareRootfsStorage(
 
 // readImageConfigForRootfs reads the golden image config by deriving the golden LV ID.
 func (m *AppManager) readImageConfigForRootfs(ctx context.Context, rootfs persistence.RootfsVolumeManager, imageDigest string) (persistence.GoldenImageConfig, error) {
-	goldenID := "golden-" + persistence.ShortDigest(imageDigest)
-	return rootfs.ReadGoldenImageConfig(ctx, goldenID)
+	canonical := canonicalImageDigestKey(imageDigest)
+	candidates := make([]string, 0, 2)
+	if canonical != "" {
+		candidates = append(candidates, "golden-"+persistence.ShortDigest(canonical))
+	}
+	trimmed := strings.TrimSpace(imageDigest)
+	if trimmed != "" && trimmed != canonical {
+		candidates = append(candidates, "golden-"+persistence.ShortDigest(trimmed))
+	}
+	if len(candidates) == 0 {
+		return persistence.GoldenImageConfig{}, fmt.Errorf("image digest unavailable")
+	}
+	var lastErr error
+	for _, goldenID := range candidates {
+		cfg, err := rootfs.ReadGoldenImageConfig(ctx, goldenID)
+		if err == nil {
+			return cfg, nil
+		}
+		lastErr = err
+	}
+	return persistence.GoldenImageConfig{}, lastErr
 }
 
+func canonicalImageDigestKey(digest string) string {
+	return strings.TrimSpace(extractDigestHash(strings.TrimSpace(digest)))
+}
 
 // ensureRootfsAttached ensures a rootfs volume is attached.
 // Returns (nil, nil) if the volume doesn't exist — the app was installed

@@ -32,6 +32,12 @@ const (
 	installStateBackupFilename   = "install_state.manifest-update.prev.json"
 	exposureReviewConfirmation   = "exposure_review"
 	inputUsageScanSentinelPrefix = "__PICCOLO_INPUT_USAGE_SCAN_SENTINEL_"
+
+	manifestUpdateImageEntryAppService    = "app_service"
+	manifestUpdateImageEntryRuntimeAnchor = "runtime_anchor"
+
+	manifestUpdateImageActionStage   = "stage"
+	manifestUpdateImageActionRefresh = "refresh"
 )
 
 var (
@@ -111,10 +117,15 @@ type ManifestUpdateKeptValueReviewItem struct {
 }
 
 type ManifestUpdateImagePlanItem struct {
-	ServiceName    string `json:"service_name"`
-	ImageRef       string `json:"image_ref"`
-	ResolvedDigest string `json:"resolved_digest"`
-	RootfsVolumeID string `json:"rootfs_volume_id"`
+	ServiceName            string `json:"service_name"`
+	EntryKind              string `json:"entry_kind,omitempty"`
+	Action                 string `json:"action,omitempty"`
+	Reason                 string `json:"reason,omitempty"`
+	ImageRef               string `json:"image_ref"`
+	ResolvedDigest         string `json:"resolved_digest"`
+	CanonicalDigest        string `json:"canonical_digest,omitempty"`
+	RootfsVolumeID         string `json:"rootfs_volume_id"`
+	PreviousRootfsVolumeID string `json:"previous_rootfs_volume_id,omitempty"`
 }
 
 type ManifestUpdateDataSafetySummary struct {
@@ -1076,10 +1087,7 @@ func manifestUpdateSupersededActiveRootfs(previous, candidate map[string]string)
 	}
 	removed := []string{}
 	seen := map[string]struct{}{}
-	for svcName, raw := range previous {
-		if svcName == networkAnchorServiceName {
-			continue
-		}
+	for _, raw := range previous {
 		volID := strings.TrimSpace(raw)
 		if volID == "" {
 			continue
@@ -1544,10 +1552,31 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 	sanitizeManifestUpdateSummaryForDisplay(&summary, unsafeDisplayFragments)
 	sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
 	policy.Reason = redactUnsafeDisplayText(policy.Reason, unsafeDisplayFragments)
-	blockingReason := ""
 	if !policy.Stageable {
-		blockingReason = policy.Reason
+		result := &ManifestUpdateResult{
+			InstanceID:         req.InstanceID,
+			BaseManifestHash:   baseHash,
+			RuntimeFingerprint: runtimeFingerprint,
+			RenderedAppID:      req.InstanceID,
+			DiffKind:           diffKind.String(),
+			UpdateClass:        policy.UpdateClass,
+			Applicable:         false,
+			BlockingReason:     policy.Reason,
+			MetadataOnly:       policy.MetadataOnly,
+			Summary:            summary,
+		}
+		applyManifestUpdateClassification(result, policy.Classification)
+		return nil, result, nil
 	}
+	imagePlan, err := m.resolveManifestUpdateImagePlan(ctx, req.InstanceID, appInst, curDef, res.Definition, !policy.MetadataOnly)
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve manifest update image plan: %w", err)
+	}
+	if len(imagePlan) > 0 {
+		applyManifestUpdateImagePlanClassification(&policy.Classification, &summary, curDef, imagePlan)
+		sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
+	}
+	policy.UpdateClass = policy.Classification.UpdateClass
 	result := &ManifestUpdateResult{
 		InstanceID:         req.InstanceID,
 		BaseManifestHash:   baseHash,
@@ -1555,24 +1584,11 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 		RenderedAppID:      req.InstanceID,
 		DiffKind:           diffKind.String(),
 		UpdateClass:        policy.UpdateClass,
-		Applicable:         policy.Stageable,
-		BlockingReason:     blockingReason,
+		Applicable:         true,
 		MetadataOnly:       policy.MetadataOnly,
 		Summary:            summary,
 	}
 	applyManifestUpdateClassification(result, policy.Classification)
-	if !policy.Stageable {
-		return nil, result, nil
-	}
-	imagePlan, err := m.resolveManifestUpdateImagePlan(ctx, req.InstanceID, curDef, res.Definition)
-	if err != nil {
-		return nil, nil, fmt.Errorf("resolve manifest update image plan: %w", err)
-	}
-	if len(imagePlan) > 0 {
-		policy.Classification.StagedImageRootfs = manifestUpdateImagePlanSummary(imagePlan)
-		sanitizeManifestUpdateClassificationForDisplay(&policy.Classification, unsafeDisplayFragments)
-		result.StagedImageRootfs = append([]string(nil), policy.Classification.StagedImageRootfs...)
-	}
 	cand := &manifestUpdateCandidate{
 		InstanceID:           req.InstanceID,
 		RawTemplate:          append([]byte(nil), rawTemplate...),
@@ -1659,6 +1675,28 @@ func addManifestUpdateRiskFlag(classification *manifestUpdateClassification, val
 		return
 	}
 	classification.OperationRiskFlags = append(classification.OperationRiskFlags, value)
+}
+
+func applyManifestUpdateImagePlanClassification(classification *manifestUpdateClassification, summary *ManifestUpdateSummary, previousDef *api.AppDefinition, imagePlan []ManifestUpdateImagePlanItem) {
+	if classification == nil || len(imagePlan) == 0 {
+		return
+	}
+	classification.UpdateClass = "service_app_update_v2"
+	classification.HasOperatorReview = true
+	addManifestUpdateRequiredConfirmation(classification, "image_update_review")
+	addManifestUpdateRiskFlag(classification, "image_refs_changed")
+	classification.StagedImageRootfs = manifestUpdateImagePlanSummary(imagePlan)
+	if summary != nil && !slices.Contains(summary.WillRestart, "existing containers will be recreated using planned image/rootfs updates") {
+		summary.WillRestart = append(summary.WillRestart, "existing containers will be recreated using planned image/rootfs updates")
+	}
+	if appHasPersistentStorage(previousDef) && (classification.DataSafety == nil || !classification.DataSafety.SnapshotRequired) {
+		classification.DataSafety = &ManifestUpdateDataSafetySummary{
+			SnapshotRequired: true,
+			Reason:           "planned image/rootfs refresh can mount existing persistent storage",
+			FailureBehavior:  "reject before runtime switch if rollback snapshot capacity, headroom, health, or creation preflight fails",
+			RollbackLimit:    "snapshot is for pre-commit failure recovery only and is hidden after successful commit",
+		}
+	}
 }
 
 func markManifestUpdateRejected(classification *manifestUpdateClassification, summary *ManifestUpdateSummary, flag, path, reason string) {
@@ -2810,9 +2848,25 @@ type manifestUpdateRuntimeStage struct {
 	requiresPrecommitDataSnapshot bool
 }
 
-func (m *AppManager) resolveManifestUpdateImagePlan(ctx context.Context, instanceID string, curDef, candidateDef *api.AppDefinition) ([]ManifestUpdateImagePlanItem, error) {
-	imagesToStage := manifestUpdateImageRefsToStage(curDef, candidateDef)
-	if len(imagesToStage) == 0 {
+type manifestUpdateImagePlanRequest struct {
+	serviceName             string
+	entryKind               string
+	action                  string
+	reason                  string
+	imageRef                string
+	expectedCanonicalDigest string
+	previousRootfsVolumeID  string
+}
+
+func (m *AppManager) resolveManifestUpdateImagePlan(ctx context.Context, instanceID string, appInst *AppInstance, curDef, candidateDef *api.AppDefinition, planRuntimeRootfs bool) ([]ManifestUpdateImagePlanItem, error) {
+	if candidateDef == nil || !planRuntimeRootfs {
+		return nil, nil
+	}
+	requests, err := m.manifestUpdateImagePlanRequests(ctx, appInst, curDef, candidateDef)
+	if err != nil {
+		return nil, err
+	}
+	if len(requests) == 0 {
 		return nil, nil
 	}
 	if m.containerManager == nil {
@@ -2824,39 +2878,192 @@ func (m *AppManager) resolveManifestUpdateImagePlan(ctx context.Context, instanc
 	}
 	defer ephCleanup()
 
-	serviceNames := make([]string, 0, len(imagesToStage))
-	for svcName := range imagesToStage {
-		serviceNames = append(serviceNames, svcName)
-	}
-	slices.Sort(serviceNames)
+	slices.SortFunc(requests, func(a, b manifestUpdateImagePlanRequest) int {
+		if a.serviceName != b.serviceName {
+			return strings.Compare(a.serviceName, b.serviceName)
+		}
+		return strings.Compare(a.entryKind, b.entryKind)
+	})
 
-	plan := make([]ManifestUpdateImagePlanItem, 0, len(serviceNames))
-	for _, svcName := range serviceNames {
-		imageRef := imagesToStage[svcName]
-		if err := m.containerManager.PullImage(ctx, ephRT, imageRef); err != nil {
-			return nil, fmt.Errorf("pull image %s (service %s): %w", imageRef, svcName, err)
-		}
-		imgConfig, err := m.containerManager.InspectImage(ctx, ephRT, imageRef)
+	plan := make([]ManifestUpdateImagePlanItem, 0, len(requests))
+	for _, req := range requests {
+		item, err := m.resolveManifestUpdateImagePlanItem(ctx, ephRT, instanceID, req)
 		if err != nil {
-			return nil, fmt.Errorf("inspect image %s (service %s): %w", imageRef, svcName, err)
+			return nil, err
 		}
-		digest := imageConfigDigest(imgConfig)
-		if digest == "" {
-			return nil, fmt.Errorf("inspect image %s (service %s): digest unavailable", imageRef, svcName)
-		}
-		plan = append(plan, ManifestUpdateImagePlanItem{
-			ServiceName:    svcName,
-			ImageRef:       imageRef,
-			ResolvedDigest: digest,
-			RootfsVolumeID: persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, persistence.ShortDigest(digest)),
-		})
+		plan = append(plan, item)
 	}
 	return plan, nil
 }
 
+func (m *AppManager) manifestUpdateImagePlanRequests(ctx context.Context, appInst *AppInstance, curDef, candidateDef *api.AppDefinition) ([]manifestUpdateImagePlanRequest, error) {
+	if candidateDef == nil {
+		return nil, nil
+	}
+	activeRootfs := map[string]string{}
+	if appInst != nil {
+		activeRootfs = appInst.ActiveRootfs
+	}
+	rootfs := m.currentRootfsManager()
+
+	serviceNames := make([]string, 0, len(candidateDef.Services))
+	for svcName := range candidateDef.Services {
+		serviceNames = append(serviceNames, svcName)
+	}
+	slices.Sort(serviceNames)
+
+	requests := make([]manifestUpdateImagePlanRequest, 0)
+	for _, svcName := range serviceNames {
+		newSvc := candidateDef.Services[svcName]
+		imageRef := strings.TrimSpace(newSvc.Image)
+		if imageRef == "" {
+			continue
+		}
+		oldSvc, existed := api.AppService{}, false
+		if curDef != nil {
+			oldSvc, existed = curDef.Services[svcName]
+		}
+		previousRootfs := strings.TrimSpace(activeRootfs[svcName])
+		switch {
+		case !existed:
+			requests = append(requests, manifestUpdateImagePlanRequest{
+				serviceName:            svcName,
+				entryKind:              manifestUpdateImageEntryAppService,
+				action:                 manifestUpdateImageActionStage,
+				reason:                 "service added",
+				imageRef:               imageRef,
+				previousRootfsVolumeID: previousRootfs,
+			})
+			continue
+		case strings.TrimSpace(oldSvc.Image) != imageRef:
+			requests = append(requests, manifestUpdateImagePlanRequest{
+				serviceName:            svcName,
+				entryKind:              manifestUpdateImageEntryAppService,
+				action:                 manifestUpdateImageActionStage,
+				reason:                 "image reference changed",
+				imageRef:               imageRef,
+				previousRootfsVolumeID: previousRootfs,
+			})
+			continue
+		}
+		req, refresh, err := m.manifestUpdateRootfsRefreshRequest(ctx, rootfs, svcName, manifestUpdateImageEntryAppService, imageRef, previousRootfs)
+		if err != nil {
+			return nil, err
+		}
+		if refresh {
+			requests = append(requests, req)
+		}
+	}
+
+	anchorImageRef := strings.TrimSpace(networkAnchorImage())
+	if anchorImageRef != "" {
+		req, refresh, err := m.manifestUpdateRootfsRefreshRequest(ctx, rootfs, networkAnchorServiceName, manifestUpdateImageEntryRuntimeAnchor, anchorImageRef, strings.TrimSpace(activeRootfs[networkAnchorServiceName]))
+		if err != nil {
+			return nil, err
+		}
+		if refresh {
+			requests = append(requests, req)
+		}
+	}
+	return requests, nil
+}
+
+func (m *AppManager) manifestUpdateRootfsRefreshRequest(ctx context.Context, rootfs persistence.RootfsVolumeManager, serviceName, entryKind, imageRef, previousRootfs string) (manifestUpdateImagePlanRequest, bool, error) {
+	targetCanonical := ""
+	if isDigestPinned(imageRef) {
+		targetCanonical = canonicalImageDigestKey(imageRef)
+		if targetCanonical == "" {
+			return manifestUpdateImagePlanRequest{}, false, fmt.Errorf("image %s (%s) has no canonical digest", imageRef, serviceName)
+		}
+	} else {
+		remoteDigest, err := m.resolveRemoteImageDigest(ctx, imageRef)
+		if err != nil {
+			return manifestUpdateImagePlanRequest{}, false, fmt.Errorf("resolve image digest %s (%s): %w", imageRef, serviceName, err)
+		}
+		targetCanonical = canonicalImageDigestKey(remoteDigest)
+		if targetCanonical == "" {
+			return manifestUpdateImagePlanRequest{}, false, fmt.Errorf("resolve image digest %s (%s): digest unavailable", imageRef, serviceName)
+		}
+	}
+	matches, _, err := manifestUpdateRootfsProvesDigest(rootfs, previousRootfs, targetCanonical)
+	if err == nil && matches {
+		return manifestUpdateImagePlanRequest{}, false, nil
+	}
+	reason := "current rootfs identity unavailable"
+	if err == nil && !matches {
+		reason = "current image digest differs from active rootfs"
+	}
+	if entryKind == manifestUpdateImageEntryRuntimeAnchor {
+		reason = "runtime network anchor " + reason
+	}
+	return manifestUpdateImagePlanRequest{
+		serviceName:             serviceName,
+		entryKind:               entryKind,
+		action:                  manifestUpdateImageActionRefresh,
+		reason:                  reason,
+		imageRef:                imageRef,
+		expectedCanonicalDigest: targetCanonical,
+		previousRootfsVolumeID:  previousRootfs,
+	}, true, nil
+}
+
+func (m *AppManager) resolveManifestUpdateImagePlanItem(ctx context.Context, ephRT container.PodmanRuntime, instanceID string, req manifestUpdateImagePlanRequest) (ManifestUpdateImagePlanItem, error) {
+	imageRef := strings.TrimSpace(req.imageRef)
+	serviceName := strings.TrimSpace(req.serviceName)
+	if serviceName == "" {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("image plan service name is empty")
+	}
+	if imageRef == "" {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("image plan image ref is empty for %s", serviceName)
+	}
+	if err := m.containerManager.PullImage(ctx, ephRT, imageRef); err != nil {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("pull image %s (%s): %w", imageRef, serviceName, err)
+	}
+	imgConfig, err := m.containerManager.InspectImage(ctx, ephRT, imageRef)
+	if err != nil {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("inspect image %s (%s): %w", imageRef, serviceName, err)
+	}
+	digest := imageConfigDigest(imgConfig)
+	if digest == "" {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("inspect image %s (%s): digest unavailable", imageRef, serviceName)
+	}
+	canonicalDigest := canonicalImageDigestKey(digest)
+	if canonicalDigest == "" {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("inspect image %s (%s): canonical digest unavailable", imageRef, serviceName)
+	}
+	if req.expectedCanonicalDigest != "" && canonicalDigest != req.expectedCanonicalDigest {
+		return ManifestUpdateImagePlanItem{}, fmt.Errorf("%w: image digest for %s changed during planning", ErrManifestUpdateConflict, serviceName)
+	}
+	entryKind := req.entryKind
+	if entryKind == "" {
+		entryKind = manifestUpdateImageEntryAppService
+	}
+	action := req.action
+	if action == "" {
+		action = manifestUpdateImageActionStage
+	}
+	return ManifestUpdateImagePlanItem{
+		ServiceName:            serviceName,
+		EntryKind:              entryKind,
+		Action:                 action,
+		Reason:                 req.reason,
+		ImageRef:               imageRef,
+		ResolvedDigest:         digest,
+		CanonicalDigest:        canonicalDigest,
+		RootfsVolumeID:         persistence.VersionedServiceRootfsVolumeID(instanceID, serviceName, persistence.ShortDigest(canonicalDigest)),
+		PreviousRootfsVolumeID: strings.TrimSpace(req.previousRootfsVolumeID),
+	}, nil
+}
+
 func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, instanceID string, appInst *AppInstance, curDef, candidateDef *api.AppDefinition, expectedPlan []ManifestUpdateImagePlanItem, requiresPrecommitDataSnapshot bool, markCreatedRootfs func(string) error) (*manifestUpdateRuntimeStage, error) {
-	imagesToStage := manifestUpdateImageRefsToStage(curDef, candidateDef)
-	if len(imagesToStage) == 0 {
+	planned, err := m.resolveManifestUpdateImagePlan(ctx, instanceID, appInst, curDef, candidateDef, true)
+	if err != nil {
+		return nil, err
+	}
+	if err := manifestUpdateImagePlanMatchesExpected(expectedPlan, planned); err != nil {
+		return nil, err
+	}
+	if len(planned) == 0 {
 		if !requiresPrecommitDataSnapshot {
 			return nil, nil
 		}
@@ -2928,44 +3135,40 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 	}
 	defer ephCleanup()
 
-	serviceNames := make([]string, 0, len(imagesToStage))
-	for svcName := range imagesToStage {
-		serviceNames = append(serviceNames, svcName)
-	}
-	slices.Sort(serviceNames)
-
-	stagedRootfs := make([]string, 0, len(serviceNames))
-	createdRootfs := make([]string, 0, len(serviceNames))
-	for i, svcName := range serviceNames {
-		imageRef := imagesToStage[svcName]
-		expected, ok := expectedByService[svcName]
-		if !ok {
-			return nil, fmt.Errorf("%w: reviewed image plan missing service %s", ErrManifestUpdateConflict, svcName)
-		}
-		if expected.ImageRef != imageRef {
-			return nil, fmt.Errorf("%w: image ref for service %s changed after dry run", ErrManifestUpdateConflict, svcName)
-		}
-		m.emitProgress(ctx, taskType, instanceID, taskPhasePullingImage, 10+(20*i)/len(serviceNames), fmt.Sprintf("Pulling image for %s", svcName), false, nil)
+	stagedRootfs := make([]string, 0, len(planned))
+	createdRootfs := make([]string, 0, len(planned))
+	for i, plannedItem := range planned {
+		svcName := plannedItem.ServiceName
+		expected := expectedByService[svcName]
+		imageRef := plannedItem.ImageRef
+		m.emitProgress(ctx, taskType, instanceID, taskPhasePullingImage, 10+(20*i)/len(planned), fmt.Sprintf("Pulling image for %s", manifestUpdateImagePlanDisplayName(plannedItem)), false, nil)
 		if err := m.containerManager.PullImage(ctx, ephRT, imageRef); err != nil {
-			return nil, fmt.Errorf("pull image %s (service %s): %w", imageRef, svcName, err)
+			return nil, fmt.Errorf("pull image %s (%s): %w", imageRef, svcName, err)
 		}
 		imgConfig, err := m.containerManager.InspectImage(ctx, ephRT, imageRef)
 		if err != nil {
-			return nil, fmt.Errorf("inspect image %s (service %s): %w", imageRef, svcName, err)
+			return nil, fmt.Errorf("inspect image %s (%s): %w", imageRef, svcName, err)
 		}
 		digest := imageConfigDigest(imgConfig)
 		if digest == "" {
-			return nil, fmt.Errorf("inspect image %s (service %s): digest unavailable", imageRef, svcName)
+			return nil, fmt.Errorf("inspect image %s (%s): digest unavailable", imageRef, svcName)
 		}
-		if digest != expected.ResolvedDigest {
-			return nil, fmt.Errorf("%w: image digest for service %s changed after dry run", ErrManifestUpdateConflict, svcName)
+		canonicalDigest := canonicalImageDigestKey(digest)
+		if canonicalDigest == "" {
+			return nil, fmt.Errorf("inspect image %s (%s): canonical digest unavailable", imageRef, svcName)
 		}
-		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, persistence.ShortDigest(digest))
+		if canonicalDigest != manifestUpdateImagePlanCanonicalDigest(expected) {
+			return nil, fmt.Errorf("%w: image digest for %s changed after dry run", ErrManifestUpdateConflict, manifestUpdateImagePlanErrorSubject(plannedItem))
+		}
+		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, persistence.ShortDigest(canonicalDigest))
 		if volID != expected.RootfsVolumeID {
-			return nil, fmt.Errorf("%w: rootfs identity for service %s changed after dry run", ErrManifestUpdateConflict, svcName)
+			return nil, fmt.Errorf("%w: rootfs identity for %s changed after dry run", ErrManifestUpdateConflict, svcName)
 		}
 		var handle persistence.RootfsHandle
 		if rootfs.RootfsExists(volID) {
+			if err := verifyRootfsIdentityForDigest(rootfs, volID, canonicalDigest); err != nil {
+				return nil, fmt.Errorf("existing planned rootfs for %s does not match planned image identity: %w", manifestUpdateImagePlanDisplayName(plannedItem), err)
+			}
 			handle, err = rootfs.AttachRootfs(ctx, volID)
 			if err != nil {
 				return nil, fmt.Errorf("attach staged rootfs %s: %w", volID, err)
@@ -2976,11 +3179,11 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 					return nil, err
 				}
 			}
-			m.emitProgress(ctx, taskType, instanceID, taskPhaseCreatingRootfs, 30+(15*i)/len(serviceNames), fmt.Sprintf("Creating rootfs for %s", svcName), false, nil)
+			m.emitProgress(ctx, taskType, instanceID, taskPhaseCreatingRootfs, 30+(15*i)/len(planned), fmt.Sprintf("Creating rootfs for %s", manifestUpdateImagePlanDisplayName(plannedItem)), false, nil)
 			handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
 				InstanceID:    instanceID,
 				ServiceName:   svcName,
-				ImageDigest:   digest,
+				ImageDigest:   canonicalDigest,
 				ImageRef:      imageRef,
 				IDMap:         idmap,
 				VolumeID:      volID,
@@ -2988,11 +3191,11 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 				PrePulledDir:  filepath.Dir(ephRT.Root),
 			})
 			if err != nil {
-				return nil, fmt.Errorf("create rootfs for service %s: %w", svcName, err)
+				return nil, fmt.Errorf("create rootfs for %s: %w", manifestUpdateImagePlanDisplayName(plannedItem), err)
 			}
 			createdRootfs = append(createdRootfs, volID)
 		}
-		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, digest)
+		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, canonicalDigest)
 		if cfgErr != nil {
 			log.Printf("WARN: manifest update %s: read image config for %s: %v", instanceID, svcName, cfgErr)
 		}
@@ -3008,6 +3211,159 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 		createdRootfs:                 createdRootfs,
 		requiresPrecommitDataSnapshot: requiresPrecommitDataSnapshot,
 	}, nil
+}
+
+func manifestUpdateRootfsProvesDigest(rootfs persistence.RootfsVolumeManager, volumeID, targetCanonicalDigest string) (bool, string, error) {
+	if rootfs == nil {
+		return false, "", fmt.Errorf("rootfs volume manager not configured")
+	}
+	volumeID = strings.TrimSpace(volumeID)
+	if volumeID == "" {
+		return false, "", fmt.Errorf("active rootfs volume id is empty")
+	}
+	identity, err := rootfs.ReadRootfsImageIdentity(volumeID)
+	if err != nil {
+		return false, "", err
+	}
+	actual := canonicalImageDigestKey(identity.BaseImageDigest)
+	if actual == "" {
+		return false, "", fmt.Errorf("active rootfs %s missing canonical image digest", volumeID)
+	}
+	return actual == targetCanonicalDigest, actual, nil
+}
+
+func verifyRootfsIdentityForDigest(rootfs persistence.RootfsVolumeManager, volumeID, targetCanonicalDigest string) error {
+	matches, actual, err := manifestUpdateRootfsProvesDigest(rootfs, volumeID, targetCanonicalDigest)
+	if err != nil {
+		return fmt.Errorf("verify existing rootfs %s identity: %w", strings.TrimSpace(volumeID), err)
+	}
+	if !matches {
+		return fmt.Errorf("verify existing rootfs %s identity: base image digest %s does not match planned digest %s", strings.TrimSpace(volumeID), actual, targetCanonicalDigest)
+	}
+	return nil
+}
+
+func manifestUpdateImagePlanMatchesExpected(expected, planned []ManifestUpdateImagePlanItem) error {
+	expectedByService, err := manifestUpdateImagePlanByService(expected)
+	if err != nil {
+		return err
+	}
+	if len(expectedByService) != len(planned) {
+		return fmt.Errorf("%w: reviewed image plan no longer matches candidate image plan", ErrManifestUpdateConflict)
+	}
+	for _, plannedItem := range planned {
+		expectedItem, ok := expectedByService[plannedItem.ServiceName]
+		if !ok {
+			return fmt.Errorf("%w: reviewed image plan missing %s", ErrManifestUpdateConflict, plannedItem.ServiceName)
+		}
+		if err := manifestUpdateCompareImagePlanItem(expectedItem, plannedItem); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func manifestUpdateCompareImagePlanItem(expected, planned ManifestUpdateImagePlanItem) error {
+	serviceName := planned.ServiceName
+	if strings.TrimSpace(expected.ImageRef) != strings.TrimSpace(planned.ImageRef) {
+		return fmt.Errorf("%w: image ref for %s changed after dry run", ErrManifestUpdateConflict, serviceName)
+	}
+	if manifestUpdateImagePlanCanonicalDigest(expected) != manifestUpdateImagePlanCanonicalDigest(planned) {
+		return fmt.Errorf("%w: image digest for %s changed after dry run", ErrManifestUpdateConflict, manifestUpdateImagePlanErrorSubject(planned))
+	}
+	if strings.TrimSpace(expected.RootfsVolumeID) != strings.TrimSpace(planned.RootfsVolumeID) {
+		return fmt.Errorf("%w: rootfs identity for %s changed after dry run", ErrManifestUpdateConflict, serviceName)
+	}
+	if manifestUpdateImagePlanAction(expected) != manifestUpdateImagePlanAction(planned) {
+		return fmt.Errorf("%w: image action for %s changed after dry run", ErrManifestUpdateConflict, serviceName)
+	}
+	if manifestUpdateImagePlanEntryKind(expected) != manifestUpdateImagePlanEntryKind(planned) {
+		return fmt.Errorf("%w: image entry kind for %s changed after dry run", ErrManifestUpdateConflict, serviceName)
+	}
+	return nil
+}
+
+func manifestUpdateImagePlanCanonicalDigest(item ManifestUpdateImagePlanItem) string {
+	if canonical := strings.TrimSpace(item.CanonicalDigest); canonical != "" {
+		return canonical
+	}
+	return canonicalImageDigestKey(item.ResolvedDigest)
+}
+
+func manifestUpdateImagePlanAction(item ManifestUpdateImagePlanItem) string {
+	if action := strings.TrimSpace(item.Action); action != "" {
+		return action
+	}
+	return manifestUpdateImageActionStage
+}
+
+func manifestUpdateImagePlanEntryKind(item ManifestUpdateImagePlanItem) string {
+	if kind := strings.TrimSpace(item.EntryKind); kind != "" {
+		return kind
+	}
+	return manifestUpdateImageEntryAppService
+}
+
+func manifestUpdateImagePlanDisplayName(item ManifestUpdateImagePlanItem) string {
+	if manifestUpdateImagePlanEntryKind(item) == manifestUpdateImageEntryRuntimeAnchor {
+		return "Piccolo runtime support"
+	}
+	return item.ServiceName
+}
+
+func manifestUpdateImagePlanErrorSubject(item ManifestUpdateImagePlanItem) string {
+	if manifestUpdateImagePlanEntryKind(item) == manifestUpdateImageEntryRuntimeAnchor {
+		return "Piccolo runtime support"
+	}
+	return "service " + item.ServiceName
+}
+
+func manifestUpdateImagePlanByService(plan []ManifestUpdateImagePlanItem) (map[string]ManifestUpdateImagePlanItem, error) {
+	out := make(map[string]ManifestUpdateImagePlanItem, len(plan))
+	for _, item := range plan {
+		serviceName := strings.TrimSpace(item.ServiceName)
+		if serviceName == "" {
+			return nil, fmt.Errorf("%w: reviewed image plan has empty service name", ErrManifestUpdateConflict)
+		}
+		if _, exists := out[serviceName]; exists {
+			return nil, fmt.Errorf("%w: reviewed image plan has duplicate service %s", ErrManifestUpdateConflict, serviceName)
+		}
+		out[serviceName] = item
+	}
+	return out, nil
+}
+
+func manifestUpdateImagePlanSummary(plan []ManifestUpdateImagePlanItem) []string {
+	if len(plan) == 0 {
+		return nil
+	}
+	items := make([]string, 0, len(plan))
+	for _, item := range plan {
+		display := "service " + item.ServiceName
+		if manifestUpdateImagePlanEntryKind(item) == manifestUpdateImageEntryRuntimeAnchor {
+			display = "Piccolo runtime support"
+		}
+		action := "will stage"
+		if manifestUpdateImagePlanAction(item) == manifestUpdateImageActionRefresh {
+			action = "will refresh"
+		}
+		reason := strings.TrimSpace(item.Reason)
+		if reason != "" {
+			reason = "; " + reason
+		}
+		items = append(items, fmt.Sprintf("%s %s image %s at digest %s; expected rootfs %s%s", display, action, item.ImageRef, manifestUpdateImagePlanCanonicalDigest(item), item.RootfsVolumeID, reason))
+	}
+	slices.Sort(items)
+	return items
+}
+
+func cloneManifestUpdateImagePlan(in []ManifestUpdateImagePlanItem) []ManifestUpdateImagePlanItem {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]ManifestUpdateImagePlanItem, len(in))
+	copy(out, in)
+	return out
 }
 
 func (m *AppManager) manifestUpdateRuntimeEndpoints(instanceID string, candidateDef, removeDef *api.AppDefinition, listenerPlan *services.PreparedReconcile) ([]services.ServiceEndpoint, error) {
@@ -3138,26 +3494,6 @@ func (m *AppManager) recreateContainersFromStagedRootfsWithHook(ctx context.Cont
 	return nil
 }
 
-func manifestUpdateImageRefsToStage(oldDef, newDef *api.AppDefinition) map[string]string {
-	images := map[string]string{}
-	if newDef == nil {
-		return images
-	}
-	for svcName, newSvc := range newDef.Services {
-		if strings.TrimSpace(newSvc.Image) == "" {
-			continue
-		}
-		oldSvc, existed := api.AppService{}, false
-		if oldDef != nil {
-			oldSvc, existed = oldDef.Services[svcName]
-		}
-		if !existed || oldSvc.Image != newSvc.Image {
-			images[svcName] = newSvc.Image
-		}
-	}
-	return images
-}
-
 func imageConfigDigest(cfg *container.ImageConfig) string {
 	if cfg == nil {
 		return ""
@@ -3166,42 +3502,6 @@ func imageConfigDigest(cfg *container.ImageConfig) string {
 		return cfg.RepoDigests[0]
 	}
 	return cfg.Digest
-}
-
-func manifestUpdateImagePlanByService(plan []ManifestUpdateImagePlanItem) (map[string]ManifestUpdateImagePlanItem, error) {
-	out := make(map[string]ManifestUpdateImagePlanItem, len(plan))
-	for _, item := range plan {
-		serviceName := strings.TrimSpace(item.ServiceName)
-		if serviceName == "" {
-			return nil, fmt.Errorf("%w: reviewed image plan has empty service name", ErrManifestUpdateConflict)
-		}
-		if _, exists := out[serviceName]; exists {
-			return nil, fmt.Errorf("%w: reviewed image plan has duplicate service %s", ErrManifestUpdateConflict, serviceName)
-		}
-		out[serviceName] = item
-	}
-	return out, nil
-}
-
-func manifestUpdateImagePlanSummary(plan []ManifestUpdateImagePlanItem) []string {
-	if len(plan) == 0 {
-		return nil
-	}
-	items := make([]string, 0, len(plan))
-	for _, item := range plan {
-		items = append(items, fmt.Sprintf("service %s image %s resolved to %s; expected rootfs %s", item.ServiceName, item.ImageRef, item.ResolvedDigest, item.RootfsVolumeID))
-	}
-	slices.Sort(items)
-	return items
-}
-
-func cloneManifestUpdateImagePlan(in []ManifestUpdateImagePlanItem) []ManifestUpdateImagePlanItem {
-	if len(in) == 0 {
-		return nil
-	}
-	out := make([]ManifestUpdateImagePlanItem, len(in))
-	copy(out, in)
-	return out
 }
 
 func allowMissingListenerEndpointsForTest() bool {

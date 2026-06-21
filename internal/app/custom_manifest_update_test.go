@@ -356,12 +356,28 @@ func TestEvaluateCustomManifestUpdatePolicy_OIDCAuthorizePathsRequireV2Apply(t *
 
 func TestDryRunCustomManifestUpdate_AllowsOIDCAuthorizePathDeltaWithExistingCredentials(t *testing.T) {
 	mgr, state, raw := installedConfigOIDCTestApp(t)
+	mgr.containerManager = NewMockContainerManager()
+	rootfs := newStubRootfsManager(t.TempDir())
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/oidc:stable",
+			BaseImageDigest: "sha256:mockdigest",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:mockdigest",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
 	appInst, exists := state.GetApp("oidcapp")
 	if !exists {
 		t.Fatalf("oidc app missing")
 	}
 	appInst.CatalogSource = ""
 	appInst.CatalogManifestHash = ""
+	appInst.ActiveRootfs[networkAnchorServiceName] = "rootfs-anchor"
 	if err := state.StoreApp(appInst); err != nil {
 		t.Fatalf("store custom oidc app: %v", err)
 	}
@@ -1212,7 +1228,7 @@ x-piccolo:
 	if result.DataSafety == nil || !result.DataSafety.SnapshotRequired {
 		t.Fatalf("expected data safety snapshot requirement, got %+v", result.DataSafety)
 	}
-	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "expected rootfs") || !strings.Contains(got, "docker.io/library/mock-image@sha256:mockdigest") {
+	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "service main will stage") || !strings.Contains(got, "sha256:mockdigest") || !strings.Contains(got, "expected rootfs") {
 		t.Fatalf("expected dry-run image plan with digest/rootfs, got %q", got)
 	}
 	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
@@ -1223,6 +1239,737 @@ x-piccolo:
 	})
 	if !errors.Is(err, ErrManifestUpdateRejected) || !strings.Contains(err.Error(), "image_update_review") {
 		t.Fatalf("apply err = %v, want missing image_update_review confirmation rejection", err)
+	}
+}
+
+func TestApplyCustomManifestUpdateRefreshesSameRefDigestDrift(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		digest := "sha256:new"
+		repoDigest := "docker.io/example/piclu@sha256:new"
+		if imageName == networkAnchorImage() {
+			digest = "sha256:pause"
+			repoDigest = networkAnchorImage() + "@sha256:pause"
+		}
+		return &container.ImageConfig{
+			Cmd:         []string{"/bin/sh"},
+			Digest:      digest,
+			RepoDigests: []string{repoDigest},
+			Size:        500 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:pause", nil
+		}
+		return "docker.io/example/piclu@sha256:new", nil
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		"rootfs-main":   true,
+		"rootfs-anchor": true,
+	}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:old",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("expected image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "service main will refresh") || !strings.Contains(got, "sha256:new") {
+		t.Fatalf("expected same-ref refresh image plan, got %q", got)
+	}
+
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied.Applicable {
+		t.Fatalf("apply result not applicable: %+v", applied)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("sha256:new"))
+	if got := stored.ActiveRootfs["main"]; got != wantRootfs {
+		t.Fatalf("active rootfs main = %q, want refreshed %q", got, wantRootfs)
+	}
+	if got := stored.ActiveRootfs[networkAnchorServiceName]; got != "rootfs-anchor" {
+		t.Fatalf("anchor rootfs = %q, want preserved rootfs-anchor", got)
+	}
+	if len(volumes.snapshots) == 0 {
+		t.Fatalf("same-ref rootfs refresh for persistent app did not create a precommit data snapshot")
+	}
+}
+
+func TestApplyCustomManifestUpdateImageOnlySameRefRefreshRequiresSnapshotViability(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		digest := "sha256:new"
+		repoDigest := "docker.io/example/piclu@sha256:new"
+		if imageName == networkAnchorImage() {
+			digest = "sha256:pause"
+			repoDigest = networkAnchorImage() + "@sha256:pause"
+		}
+		return &container.ImageConfig{
+			Cmd:         []string{"/bin/sh"},
+			Digest:      digest,
+			RepoDigests: []string{repoDigest},
+			Size:        500 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:pause", nil
+		}
+		return "docker.io/example/piclu@sha256:new", nil
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		viabilityErr:      errors.New("thin pool metadata usage 91.0% exceeds threshold"),
+	}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		"rootfs-main":   true,
+		"rootfs-anchor": true,
+	}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:old",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	oldContainerID := "cid-old-main"
+	mock.containers[oldContainerID] = &mockContainer{ID: oldContainerID, Status: "running", Spec: container.ContainerCreateSpec{Name: "piclu-main"}}
+	baseDef := customManifestPolicyBaseDef()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		Containers:     map[string]string{"main": oldContainerID},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     baseDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestBaseRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("expected image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if result.DataSafety == nil || !result.DataSafety.SnapshotRequired {
+		t.Fatalf("expected image-only rootfs refresh to require data snapshot, got %+v", result.DataSafety)
+	}
+	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "service main will refresh") || !strings.Contains(got, "sha256:new") {
+		t.Fatalf("expected same-ref refresh image plan, got %q", got)
+	}
+
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "precommit data snapshot viability") {
+		t.Fatalf("apply err = %v, want snapshot viability rejection", err)
+	}
+	if len(volumes.snapshots) != 0 {
+		t.Fatalf("snapshot should not be created after failed viability gate, got %v", volumes.snapshots)
+	}
+	if oldContainer, exists := mock.containers[oldContainerID]; !exists {
+		t.Fatalf("old container %q missing from mock runtime", oldContainerID)
+	} else if oldContainer.Status != "running" {
+		t.Fatalf("viability preflight should leave old container running, status=%q", oldContainer.Status)
+	}
+}
+
+func TestApplyCustomManifestUpdateRejectsExistingTargetRootfsDigestMismatch(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		digest := "sha256:new"
+		repoDigest := "docker.io/example/piclu@sha256:new"
+		if imageName == networkAnchorImage() {
+			digest = "sha256:pause"
+			repoDigest = networkAnchorImage() + "@sha256:pause"
+		}
+		return &container.ImageConfig{
+			Cmd:         []string{"/bin/sh"},
+			Digest:      digest,
+			RepoDigests: []string{repoDigest},
+			Size:        500 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:pause", nil
+		}
+		return "docker.io/example/piclu@sha256:new", nil
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	targetRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("sha256:new"))
+	rootfs.exists = map[string]bool{
+		"rootfs-main":   true,
+		"rootfs-anchor": true,
+		targetRootfs:    true,
+	}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:old",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+		targetRootfs: {
+			VolumeID:        targetRootfs,
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:stale-target",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err == nil || !strings.Contains(err.Error(), "does not match planned image identity") {
+		t.Fatalf("apply err = %v, want existing target rootfs identity rejection", err)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if got := stored.ActiveRootfs["main"]; got != "rootfs-main" {
+		t.Fatalf("active rootfs main = %q, want previous rootfs-main", got)
+	}
+	if slices.Contains(rootfs.detached, "rootfs-main") || slices.Contains(rootfs.destroyed, "rootfs-main") {
+		t.Fatalf("previous active rootfs should not be detached/destroyed, detached=%v destroyed=%v", rootfs.detached, rootfs.destroyed)
+	}
+}
+
+func TestDryRunCustomManifestUpdateFailsFastWhenSameRefDigestUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		return "", fmt.Errorf("registry unavailable for %s", imageRef)
+	}
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:old",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	_, err = mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err == nil || !strings.Contains(err.Error(), "resolve manifest update image plan") || !strings.Contains(err.Error(), "registry unavailable") {
+		t.Fatalf("dry run err = %v, want registry digest failure", err)
+	}
+	if _, ok := mgr.manifestUpdateCandidates["piclu"]; ok {
+		t.Fatalf("dry run failure must not store a candidate")
+	}
+}
+
+func TestDryRunCustomManifestUpdatePreservesSameRefWhenRootfsIdentityFresh(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		t.Fatalf("unexpected image inspect for preserved rootfs: %s", imageName)
+		return nil, fmt.Errorf("unexpected image inspect")
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:pause", nil
+		}
+		return "docker.io/example/piclu@sha256:stable", nil
+	}
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "docker.io/example/piclu@sha256:stable",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("did not expect image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if len(result.StagedImageRootfs) != 0 {
+		t.Fatalf("expected no staged image rootfs decisions, got %v", result.StagedImageRootfs)
+	}
+}
+
+func TestDryRunCustomManifestUpdateFallsBackWhenSkopeoUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	t.Setenv("PATH", tempDir)
+	mock := NewMockContainerManager()
+	inspectCalls := 0
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		inspectCalls++
+		switch imageName {
+		case "docker.io/example/piclu:stable":
+			return &container.ImageConfig{
+				Digest:      "sha256:stable",
+				RepoDigests: []string{"docker.io/example/piclu@sha256:stable"},
+				Size:        500 << 20,
+			}, nil
+		case networkAnchorImage():
+			return &container.ImageConfig{
+				Digest:      "sha256:pause",
+				RepoDigests: []string{networkAnchorImage() + "@sha256:pause"},
+				Size:        8 << 20,
+			}, nil
+		default:
+			t.Fatalf("unexpected image inspect for %s", imageName)
+			return nil, fmt.Errorf("unexpected image inspect")
+		}
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = nil
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "docker.io/example/piclu@sha256:stable",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("did not expect image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if len(result.StagedImageRootfs) != 0 {
+		t.Fatalf("expected no staged image rootfs decisions, got %v", result.StagedImageRootfs)
+	}
+	if inspectCalls == 0 {
+		t.Fatalf("expected pull/inspect digest fallback when skopeo is unavailable")
+	}
+}
+
+func TestApplyCustomManifestUpdateRefreshesNetworkAnchorDigestDrift(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		if imageName != networkAnchorImage() {
+			t.Fatalf("unexpected image inspect for %s", imageName)
+		}
+		return &container.ImageConfig{
+			Cmd:         []string{"/pause"},
+			Digest:      "sha256:anchor-new",
+			RepoDigests: []string{networkAnchorImage() + "@sha256:anchor-new"},
+			Size:        8 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:anchor-new", nil
+		}
+		return "docker.io/example/piclu@sha256:stable", nil
+	}
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tempDir}}
+	mgr.SetVolumeManager(volumes)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		"rootfs-main":   true,
+		"rootfs-anchor": true,
+	}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:stable",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:anchor-old",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:     "piclu",
+		Enabled:        true,
+		PrimaryService: "main",
+		ActiveRootfs:   map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+		CreatedAt:      now,
+		UpdatedAt:      now,
+		Definition:     customManifestPolicyBaseDef(),
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    "piclu",
+		RawTemplate:   customManifestEnvUpdateRaw(),
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !slices.Contains(result.RequiredConfirmations, "image_update_review") {
+		t.Fatalf("expected image_update_review confirmation, got %v", result.RequiredConfirmations)
+	}
+	if got := strings.Join(result.StagedImageRootfs, "\n"); !strings.Contains(got, "Piccolo runtime support will refresh") || strings.Contains(got, "service main will refresh") {
+		t.Fatalf("expected only runtime anchor refresh plan, got %q", got)
+	}
+
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         "piclu",
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	if !applied.Applicable {
+		t.Fatalf("apply result not applicable: %+v", applied)
+	}
+	stored, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("stored app missing")
+	}
+	if got := stored.ActiveRootfs["main"]; got != "rootfs-main" {
+		t.Fatalf("main rootfs = %q, want preserved rootfs-main", got)
+	}
+	wantAnchor := persistence.VersionedServiceRootfsVolumeID("piclu", networkAnchorServiceName, persistence.ShortDigest("sha256:anchor-new"))
+	if got := stored.ActiveRootfs[networkAnchorServiceName]; got != wantAnchor {
+		t.Fatalf("anchor rootfs = %q, want refreshed %q", got, wantAnchor)
+	}
+	if !slices.Contains(rootfs.destroyed, "rootfs-anchor") {
+		t.Fatalf("destroyed rootfs = %v, want old runtime anchor rootfs cleaned up", rootfs.destroyed)
+	}
+}
+
+func TestResolveManifestUpdateImagePlanDigestPinnedRootfsIdentity(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	inspectCalls := 0
+	mock.inspectImageHook = func(imageName string) (*container.ImageConfig, error) {
+		inspectCalls++
+		if imageName != "docker.io/example/piclu@sha256:pinned" {
+			t.Fatalf("unexpected image inspect for %s", imageName)
+		}
+		return &container.ImageConfig{
+			Digest:      "sha256:pinned",
+			RepoDigests: []string{"docker.io/example/piclu@sha256:pinned"},
+			Size:        500 << 20,
+		}, nil
+	}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.imageDigestResolver = func(_ context.Context, imageRef string) (string, error) {
+		if imageRef == networkAnchorImage() {
+			return networkAnchorImage() + "@sha256:pause", nil
+		}
+		t.Fatalf("digest-pinned refs must not resolve remote digest: %s", imageRef)
+		return "", fmt.Errorf("unexpected registry lookup")
+	}
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main-fresh": {
+			VolumeID:        "rootfs-main-fresh",
+			BaseImageRef:    "docker.io/example/piclu@sha256:pinned",
+			BaseImageDigest: "sha256:pinned",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:pause",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	curDef := customManifestPolicyBaseDef()
+	svc := curDef.Services["main"]
+	svc.Image = "docker.io/example/piclu@sha256:pinned"
+	curDef.Services["main"] = svc
+	candidateDef := customManifestPolicyClone(t, curDef)
+	appInst := &AppInstance{
+		InstanceID:   "piclu",
+		ActiveRootfs: map[string]string{"main": "rootfs-main-fresh", networkAnchorServiceName: "rootfs-anchor"},
+	}
+
+	plan, err := mgr.resolveManifestUpdateImagePlan(context.Background(), appInst.InstanceID, appInst, curDef, candidateDef, true)
+	if err != nil {
+		t.Fatalf("fresh pinned image plan: %v", err)
+	}
+	if len(plan) != 0 {
+		t.Fatalf("expected fresh pinned rootfs to be preserved, got %+v", plan)
+	}
+	if inspectCalls != 0 {
+		t.Fatalf("fresh pinned rootfs should not be inspected, got %d calls", inspectCalls)
+	}
+
+	rootfs.identities["rootfs-main-stale"] = persistence.RootfsImageIdentity{
+		VolumeID:        "rootfs-main-stale",
+		BaseImageRef:    "docker.io/example/piclu@sha256:pinned",
+		BaseImageDigest: "sha256:old",
+	}
+	appInst.ActiveRootfs["main"] = "rootfs-main-stale"
+	plan, err = mgr.resolveManifestUpdateImagePlan(context.Background(), appInst.InstanceID, appInst, curDef, candidateDef, true)
+	if err != nil {
+		t.Fatalf("stale pinned image plan: %v", err)
+	}
+	if len(plan) != 1 {
+		t.Fatalf("expected one stale pinned refresh item, got %+v", plan)
+	}
+	if got := plan[0]; got.ServiceName != "main" || got.Action != manifestUpdateImageActionRefresh || got.CanonicalDigest != "sha256:pinned" {
+		t.Fatalf("unexpected pinned refresh item: %+v", got)
+	}
+	if inspectCalls != 1 {
+		t.Fatalf("stale pinned rootfs should be inspected once, got %d calls", inspectCalls)
 	}
 }
 
@@ -1357,7 +2104,7 @@ func TestApplyCustomManifestUpdate_ImageReviewStagesRootfsAndPrivateSnapshot(t *
 	if !exists {
 		t.Fatalf("updated app missing")
 	}
-	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("sha256:mockdigest"))
 	if got := stored.ActiveRootfs["main"]; got != wantRootfs {
 		t.Fatalf("active rootfs main = %q, want %q", got, wantRootfs)
 	}
@@ -2407,7 +3154,7 @@ func TestApplyCustomManifestUpdate_CleansCreatedRootfsOnStagingRollback(t *testi
 	svc.Image = "docker.io/example/piclu:new"
 	candidateDef.Services["main"] = svc
 	cand := storeManifestUpdateCandidateForTest(t, mgr, state, appInst, candidateDef, []byte("image update"))
-	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("sha256:mockdigest"))
 	sawRootfsStagingMarker := false
 	state.storeManifestUpdateTransactionHook = func(instanceID string, txn *ManifestUpdateTransaction) error {
 		if instanceID == "piclu" && txn.Phase == "rootfs_staging" && slices.Contains(txn.CreatedRootfs, wantRootfs) {
@@ -2454,7 +3201,7 @@ func TestApplyCustomManifestUpdate_DoesNotDetachPreviousActiveRootfsOnSameDigest
 		t.Fatalf("new manager: %v", err)
 	}
 	allowHostStorage(t, mgr)
-	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("docker.io/library/mock-image@sha256:mockdigest"))
+	wantRootfs := persistence.VersionedServiceRootfsVolumeID("piclu", "main", persistence.ShortDigest("sha256:mockdigest"))
 	rootfs := newStubRootfsManager(tempDir)
 	rootfs.exists = map[string]bool{
 		wantRootfs:      true,
@@ -2910,12 +3657,13 @@ x-piccolo:
 func TestDryRunCustomManifestUpdateSurfacesKeptSecretSemanticReview(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
-	mgr, err := NewAppManagerForTest(nil, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
-	mgr.SetMountVerifier(func(string) error { return nil })
 	state, err := mgr.ensureStateManager()
 	if err != nil {
 		t.Fatalf("state manager: %v", err)
@@ -4052,10 +4800,12 @@ x-piccolo:
 func TestDryRunCustomManifestUpdateSkipsKeptReviewForClearedStoredSecret(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
-	mgr, err := NewAppManagerForTest(nil, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
 	}
+	allowHostStorage(t, mgr)
 	mgr.ForceLockState(false)
 	state, err := mgr.ensureStateManager()
 	if err != nil {
@@ -5258,6 +6008,34 @@ func customManifestPolicyBaseDef() *api.AppDefinition {
 	}
 }
 
+func customManifestBaseRaw() []byte {
+	return []byte(`type: user
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: "/"
+          type: prefix
+          strategy: public
+primary_service: main
+services:
+  main:
+    image: docker.io/example/piclu:stable
+    bind_ports: [8080]
+    environment:
+      PICLU_MODE: device
+    storage:
+      persistent:
+        data:
+          container: /data
+x-piccolo:
+  mode: service
+`)
+}
+
 func customManifestPolicyClone(t *testing.T, def *api.AppDefinition) *api.AppDefinition {
 	t.Helper()
 	data, err := SerializeAppDefinition(def)
@@ -5362,12 +6140,12 @@ func storeManifestUpdateCandidateForTest(t *testing.T, mgr *AppManager, state *F
 		t.Fatalf("candidate hash: %v", err)
 	}
 	policy, summary := evaluateCustomManifestUpdatePolicy(appInst.Definition, candidateDef)
-	imagePlan, err := mgr.resolveManifestUpdateImagePlan(context.Background(), appInst.InstanceID, appInst.Definition, candidateDef)
+	imagePlan, err := mgr.resolveManifestUpdateImagePlan(context.Background(), appInst.InstanceID, appInst, appInst.Definition, candidateDef, !policy.MetadataOnly)
 	if err != nil {
 		t.Fatalf("image plan: %v", err)
 	}
 	if len(imagePlan) > 0 {
-		policy.Classification.StagedImageRootfs = manifestUpdateImagePlanSummary(imagePlan)
+		applyManifestUpdateImagePlanClassification(&policy.Classification, &summary, appInst.Definition, imagePlan)
 	}
 	token := "token-" + candidateHash[:12]
 	cand := &manifestUpdateCandidate{

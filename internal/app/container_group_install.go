@@ -230,11 +230,16 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			} else {
 				imageDigest = imgConfig.Digest
 			}
+			rootfsImageDigest := canonicalImageDigestKey(imageDigest)
+			if rootfsImageDigest == "" {
+				ephCleanup()
+				return nil, fmt.Errorf("inspect image %s: canonical digest unavailable", svc.Image)
+			}
 
 			// Pass the pre-pulled runtime's root dir so flattenFn skips pulling again.
 			// ephRT.Root is "<base>/root" — pass the parent (base) dir.
 			prePulledDir := filepath.Dir(ephRT.Root)
-			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, imageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir)
+			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, rootfsImageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir)
 			ephCleanup()
 			if err != nil {
 				return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
@@ -272,8 +277,13 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		} else {
 			anchorDigest = imgConfig.Digest
 		}
+		anchorRootfsDigest := canonicalImageDigestKey(anchorDigest)
+		if anchorRootfsDigest == "" {
+			ephCleanup()
+			return nil, fmt.Errorf("inspect anchor image: canonical digest unavailable")
+		}
 		anchorPrePulledDir := filepath.Dir(ephRT.Root)
-		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir)
+		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorRootfsDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir)
 		ephCleanup()
 		if err != nil {
 			return nil, fmt.Errorf("prepare rootfs for network anchor: %w", err)
@@ -445,6 +455,20 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	// Record container ID used for service proxy reconciliation (publishes live on the anchor).
 	m.serviceManager.SetAppContainerID(instanceID, anchorID)
 
+	var activeRootfs map[string]string
+	if mode == ModeService {
+		activeRootfs = make(map[string]string, len(blockNativeRootfsMap))
+		for svcName, rInfo := range blockNativeRootfsMap {
+			if rInfo == nil || strings.TrimSpace(rInfo.handle.VolumeID) == "" {
+				continue
+			}
+			activeRootfs[svcName] = rInfo.handle.VolumeID
+		}
+		if len(activeRootfs) == 0 {
+			activeRootfs = nil
+		}
+	}
+
 	now := time.Now()
 	return &AppInstance{
 		InstanceID:      instanceID,
@@ -456,6 +480,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		UpdatedAt:       now,
 		Definition:      appDef,
 		CatalogSource:   CatalogSourceFromContext(ctx),
+		ActiveRootfs:    activeRootfs,
 		Init:            initState,
 	}, nil
 }
@@ -472,6 +497,44 @@ func resolveRemoteDigest(ctx context.Context, imageRef string) (string, error) {
 	digest := strings.TrimSpace(string(out))
 	if digest == "" {
 		return "", fmt.Errorf("skopeo returned empty digest for %s", imageRef)
+	}
+	return digest, nil
+}
+
+func (m *AppManager) resolveRemoteImageDigest(ctx context.Context, imageRef string) (string, error) {
+	if m != nil && m.imageDigestResolver != nil {
+		return m.imageDigestResolver(ctx, imageRef)
+	}
+	digest, err := resolveRemoteDigest(ctx, imageRef)
+	if err == nil {
+		return digest, nil
+	}
+	pulledDigest, pullErr := m.resolveImageDigestByPull(ctx, imageRef)
+	if pullErr != nil {
+		return "", fmt.Errorf("%w; fallback pull/inspect: %v", err, pullErr)
+	}
+	return pulledDigest, nil
+}
+
+func (m *AppManager) resolveImageDigestByPull(ctx context.Context, imageRef string) (string, error) {
+	if m == nil || m.containerManager == nil {
+		return "", fmt.Errorf("container manager not configured")
+	}
+	ephRT, ephCleanup, err := m.newFlattenRuntime(ctx)
+	if err != nil {
+		return "", fmt.Errorf("create ephemeral runtime: %w", err)
+	}
+	defer ephCleanup()
+	if err := m.containerManager.PullImage(ctx, ephRT, imageRef); err != nil {
+		return "", fmt.Errorf("pull image %s: %w", imageRef, err)
+	}
+	imgConfig, err := m.containerManager.InspectImage(ctx, ephRT, imageRef)
+	if err != nil {
+		return "", fmt.Errorf("inspect image %s: %w", imageRef, err)
+	}
+	digest := imageConfigDigest(imgConfig)
+	if digest == "" {
+		return "", fmt.Errorf("inspect image %s: digest unavailable", imageRef)
 	}
 	return digest, nil
 }

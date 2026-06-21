@@ -956,6 +956,12 @@ func (s *stubTestRootfsManager) RootfsVolumeID(mode, instanceID string) string {
 	return "rootfs-" + instanceID
 }
 func (s *stubTestRootfsManager) RootfsExists(_ string) bool { return true }
+func (s *stubTestRootfsManager) ReadRootfsImageIdentity(volumeID string) (persistence.RootfsImageIdentity, error) {
+	return persistence.RootfsImageIdentity{
+		VolumeID:        volumeID,
+		BaseImageDigest: "sha256:mockdigest",
+	}, nil
+}
 func (s *stubTestRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }

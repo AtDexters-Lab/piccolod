@@ -92,6 +92,14 @@ type WorkspaceResizeMonitor interface {
 	StopWorkspaceResizeMonitor()
 }
 
+// RootfsImageIdentity is the image provenance recorded in rootfs volume
+// metadata. Callers use this as proof for preserving an active rootfs.
+type RootfsImageIdentity struct {
+	VolumeID        string
+	BaseImageRef    string
+	BaseImageDigest string
+}
+
 // RootfsVolumeManager manages block-native rootfs volumes — golden LVs,
 // workspace snapshots, and service rootfs instances with idmapped mounts.
 type RootfsVolumeManager interface {
@@ -124,6 +132,9 @@ type RootfsVolumeManager interface {
 	// RootfsExists checks if rootfs volume metadata exists on disk for a given volume ID.
 	// Used to distinguish apps installed with block-native rootfs from legacy apps.
 	RootfsExists(volumeID string) bool
+	// ReadRootfsImageIdentity returns the image provenance recorded for an
+	// existing rootfs volume.
+	ReadRootfsImageIdentity(volumeID string) (RootfsImageIdentity, error)
 	// FindGoldenByImageRef checks the in-memory golden LV cache for a completed
 	// golden LV matching the given image reference (e.g., "vaultwarden/server:latest").
 	// When multiple golden LVs match (mutable tag pulled at different times),

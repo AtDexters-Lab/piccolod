@@ -1305,6 +1305,32 @@ func (m *luksVolumeManager) RootfsExists(volumeID string) bool {
 	return err == nil
 }
 
+// ReadRootfsImageIdentity returns the image provenance recorded for a rootfs
+// volume. Missing or incomplete provenance means the active rootfs cannot be
+// used as identity proof for mutable-image update planning.
+func (m *luksVolumeManager) ReadRootfsImageIdentity(volumeID string) (RootfsImageIdentity, error) {
+	volumeID = strings.TrimSpace(volumeID)
+	if volumeID == "" {
+		return RootfsImageIdentity{}, fmt.Errorf("rootfs volume id is empty")
+	}
+	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return RootfsImageIdentity{}, fmt.Errorf("read rootfs metadata %s: %w", volumeID, err)
+	}
+	if meta.Type != volumeTypeServiceRootfs {
+		return RootfsImageIdentity{}, fmt.Errorf("volume %s is type %s, not service rootfs", volumeID, meta.Type)
+	}
+	if strings.TrimSpace(meta.BaseImageDigest) == "" {
+		return RootfsImageIdentity{}, fmt.Errorf("volume %s missing base image digest", volumeID)
+	}
+	return RootfsImageIdentity{
+		VolumeID:        volumeID,
+		BaseImageRef:    meta.BaseImageRef,
+		BaseImageDigest: meta.BaseImageDigest,
+	}, nil
+}
+
 // newUUID generates a random UUID v4 using crypto/rand.
 func newUUID() string {
 	b := make([]byte, 16)

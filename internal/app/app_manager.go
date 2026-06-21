@@ -55,6 +55,7 @@ type AppManager struct {
 	lockOverride          *bool
 	mountVerifier         func(string) error
 	runtimeReadinessProbe func(context.Context, []services.ServiceEndpoint, time.Duration) error
+	imageDigestResolver   func(context.Context, string) (string, error)
 
 	// In-memory observed status: derived from container state during reconciliation.
 	// Published via event bus and returned in API responses. Never persisted.
@@ -1220,6 +1221,9 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		leadershipState:       make(map[string]cluster.Role),
 		mountVerifier:         testMountVerifier,
 		runtimeReadinessProbe: testRuntimeReadinessProbe,
+		imageDigestResolver: func(_ context.Context, imageRef string) (string, error) {
+			return imageRef + "@sha256:mockdigest", nil
+		},
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
@@ -1252,6 +1256,9 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		lockReader:            lockReader,
 		mountVerifier:         testMountVerifier,
 		runtimeReadinessProbe: testRuntimeReadinessProbe,
+		imageDigestResolver: func(_ context.Context, imageRef string) (string, error) {
+			return imageRef + "@sha256:mockdigest", nil
+		},
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		oidcHostname:          "piccolo.local",
@@ -2734,7 +2741,7 @@ func (m *AppManager) updateServiceModeImage(
 	type changedService struct {
 		svcName       string
 		newImage      string
-		digest        string
+		canonical     string
 		volumeID      string
 		imageSizeHint int64
 		handle        persistence.RootfsHandle
@@ -2755,12 +2762,16 @@ func (m *AppManager) updateServiceModeImage(
 		} else {
 			digest = imgConfig.Digest
 		}
-		shortDigest := persistence.ShortDigest(digest)
+		canonicalDigest := canonicalImageDigestKey(digest)
+		if canonicalDigest == "" {
+			return fmt.Errorf("inspect image %s (service %s): canonical digest unavailable", newImage, svcName)
+		}
+		shortDigest := persistence.ShortDigest(canonicalDigest)
 		volID := persistence.VersionedServiceRootfsVolumeID(instanceID, svcName, shortDigest)
 		changed = append(changed, changedService{
 			svcName:       svcName,
 			newImage:      newImage,
-			digest:        digest,
+			canonical:     canonicalDigest,
 			volumeID:      volID,
 			imageSizeHint: imgConfig.Size,
 		})
@@ -2790,6 +2801,9 @@ func (m *AppManager) updateServiceModeImage(
 	for i := range changed {
 		cs := &changed[i]
 		if rootfs.RootfsExists(cs.volumeID) {
+			if err := verifyRootfsIdentityForDigest(rootfs, cs.volumeID, cs.canonical); err != nil {
+				return fmt.Errorf("existing rootfs for service %s does not match planned image identity: %w", cs.svcName, err)
+			}
 			log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, cs.volumeID)
 			cs.handle, err = rootfs.AttachRootfs(ctx, cs.volumeID)
 			if err != nil {
@@ -2799,7 +2813,7 @@ func (m *AppManager) updateServiceModeImage(
 			cs.handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
 				InstanceID:    instanceID,
 				ServiceName:   cs.svcName,
-				ImageDigest:   cs.digest,
+				ImageDigest:   cs.canonical,
 				ImageRef:      cs.newImage,
 				IDMap:         idmap,
 				VolumeID:      cs.volumeID,
@@ -2837,7 +2851,7 @@ func (m *AppManager) updateServiceModeImage(
 	// 4. Read image config from golden LV for each changed service.
 	for i := range changed {
 		cs := &changed[i]
-		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, cs.digest)
+		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, cs.canonical)
 		if cfgErr != nil {
 			log.Printf("WARN: update %s: failed to read image config for %s: %v", instanceID, cs.svcName, cfgErr)
 		} else {

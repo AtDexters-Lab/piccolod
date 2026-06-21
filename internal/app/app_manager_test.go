@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -293,6 +294,13 @@ func TestAppManager_Install(t *testing.T) {
 
 	if app.Status != StatusRunning {
 		t.Errorf("Expected app status %q, got %s", StatusRunning, app.Status)
+	}
+	wantActiveRootfs := map[string]string{
+		"main":                   persistence.ServiceRootfsVolumeID(app.InstanceID, "main"),
+		networkAnchorServiceName: persistence.ServiceRootfsVolumeID(app.InstanceID, networkAnchorServiceName),
+	}
+	if !reflect.DeepEqual(app.ActiveRootfs, wantActiveRootfs) {
+		t.Errorf("Expected active rootfs %v, got %v", wantActiveRootfs, app.ActiveRootfs)
 	}
 
 	// Verify containers were created (network anchor + main service)

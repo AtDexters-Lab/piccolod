@@ -149,6 +149,9 @@ func (t *installedAppApplyTransaction) stageRuntimeRootfsIfNeeded(classification
 		return nil
 	}
 	requiresSnapshot := classification.DataSafety != nil && classification.DataSafety.SnapshotRequired
+	if !requiresSnapshot && len(t.spec.ImagePlan) > 0 && appHasPersistentStorage(t.spec.PreviousDefinition) {
+		requiresSnapshot = true
+	}
 	stage, err := t.manager.stageManifestUpdateRootfs(
 		t.ctx,
 		t.spec.TaskType,

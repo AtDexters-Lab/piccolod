@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
+	"piccolod/internal/persistence"
 )
 
 func TestIsDigestPinned(t *testing.T) {
@@ -1162,6 +1163,47 @@ func TestRollbackToSnapshot_RoutesAroundStaleFailedDataLV(t *testing.T) {
 	}
 }
 
+func TestUpdateImageRejectsExistingTargetRootfsDigestMismatch(t *testing.T) {
+	tmp, err := os.MkdirTemp("", "update_target_rootfs_mismatch")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmp)
+
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	rootfs := newStubRootfsManager(tmp)
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	def := updateImageMutableServiceAppDef()
+	inst, err := mgr.Install(ctx, def)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	activeRootfs := inst.ActiveRootfs["main"]
+	if activeRootfs == "" {
+		t.Fatalf("installed app did not record active rootfs: %+v", inst.ActiveRootfs)
+	}
+	rootfs.identities[activeRootfs] = persistence.RootfsImageIdentity{
+		VolumeID:        activeRootfs,
+		BaseImageRef:    "alpine:3.18",
+		BaseImageDigest: "sha256:stale-target",
+	}
+
+	err = mgr.UpdateImage(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "does not match planned image identity") {
+		t.Fatalf("update image err = %v, want existing target rootfs identity rejection", err)
+	}
+	assertAppContainersRunning(t, mock, inst)
+}
+
 func updateImagePersistentAppDef() *api.AppDefinition {
 	return &api.AppDefinition{
 		Type:           "user",
@@ -1180,6 +1222,27 @@ func updateImagePersistentAppDef() *api.AppDefinition {
 				Storage: &api.AppStorage{Persistent: map[string]api.AppVolume{
 					"data": {Container: "/data"},
 				}},
+			},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+}
+
+func updateImageMutableServiceAppDef() *api.AppDefinition {
+	return &api.AppDefinition{
+		Type:           "user",
+		PrimaryService: "main",
+		Listeners: []api.AppListener{{
+			Name:      "mutableapp",
+			GuestPort: 80,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+			Primary:   true,
+		}},
+		Services: map[string]api.AppService{
+			"main": {
+				Image:     "alpine:3.18",
+				BindPorts: []int{80},
 			},
 		},
 		Extensions: map[string]interface{}{"mode": "service"},

@@ -328,12 +328,16 @@ func generateMockContainerID(id int) string {
 // stubRootfsManager is a minimal RootfsVolumeManager for unit tests.
 // It creates real temp directories so mount paths resolve for container specs.
 type stubRootfsManager struct {
-	baseDir    string // temp dir for mock mount points
-	exists     map[string]bool
-	detached   []string
-	destroyed  []string
-	detachErr  error
-	destroyErr error
+	baseDir       string // temp dir for mock mount points
+	exists        map[string]bool
+	identities    map[string]persistence.RootfsImageIdentity
+	identityErrs  map[string]error
+	goldenConfigs map[string]persistence.GoldenImageConfig
+	goldenReads   []string
+	detached      []string
+	destroyed     []string
+	detachErr     error
+	destroyErr    error
 }
 
 func newStubRootfsManager(baseDir string) *stubRootfsManager {
@@ -361,6 +365,13 @@ func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persisten
 	os.MkdirAll(mp, 0o755)
 	if s.exists != nil {
 		s.exists[volID] = true
+	}
+	if s.identities != nil {
+		s.identities[volID] = persistence.RootfsImageIdentity{
+			VolumeID:        volID,
+			BaseImageRef:    req.ImageRef,
+			BaseImageDigest: req.ImageDigest,
+		}
 	}
 	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: true}, nil
 }
@@ -400,7 +411,15 @@ func (s *stubRootfsManager) DestroyRootfs(_ context.Context, volumeID string) er
 func (s *stubRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
 func (s *stubRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
 
-func (s *stubRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
+func (s *stubRootfsManager) ReadGoldenImageConfig(_ context.Context, goldenID string) (persistence.GoldenImageConfig, error) {
+	s.goldenReads = append(s.goldenReads, goldenID)
+	if s.goldenConfigs != nil {
+		cfg, ok := s.goldenConfigs[goldenID]
+		if !ok {
+			return persistence.GoldenImageConfig{}, fmt.Errorf("golden config %s unavailable", goldenID)
+		}
+		return cfg, nil
+	}
 	return persistence.GoldenImageConfig{
 		Cmd: []string{"/bin/sh"},
 	}, nil
@@ -415,6 +434,23 @@ func (s *stubRootfsManager) RootfsExists(volumeID string) bool {
 		return s.exists[volumeID]
 	}
 	return true
+}
+func (s *stubRootfsManager) ReadRootfsImageIdentity(volumeID string) (persistence.RootfsImageIdentity, error) {
+	if s.identityErrs != nil {
+		if err := s.identityErrs[volumeID]; err != nil {
+			return persistence.RootfsImageIdentity{}, err
+		}
+	}
+	if s.identities != nil {
+		if identity, ok := s.identities[volumeID]; ok {
+			return identity, nil
+		}
+		return persistence.RootfsImageIdentity{}, fmt.Errorf("identity for %s unavailable", volumeID)
+	}
+	return persistence.RootfsImageIdentity{
+		VolumeID:        volumeID,
+		BaseImageDigest: "sha256:mockdigest",
+	}, nil
 }
 func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
