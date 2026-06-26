@@ -1,8 +1,5 @@
-import 'dart:async';
 import 'dart:convert';
 import 'dart:js_interop';
-
-import 'package:piccolo_os/core/services/api_client.dart';
 
 @JS('piccoloWebAuthn.isAvailable')
 external JSBoolean _jsIsAvailable();
@@ -72,23 +69,5 @@ class WebAuthnService {
     } on Object catch (_) {
       return false;
     }
-  }
-
-  // maybeSignalFromApiError fires signalUnknownCredential if the 401 response
-  // body carries a `signal_unknown_credential: {rp_id, credential_id}` hint.
-  // Fire-and-forget: server-side cleanup is authoritative; this only prunes
-  // the OS picker entry to avoid re-autofilling the same stale credential.
-  static void maybeSignalFromApiError(ApiException e) {
-    if (e.statusCode != 401) return;
-    try {
-      final body = jsonDecode(e.rawBody);
-      if (body is! Map) return;
-      final hint = body['signal_unknown_credential'];
-      if (hint is! Map) return;
-      final rpId = (hint['rp_id'] as String?) ?? '';
-      final credId = (hint['credential_id'] as String?) ?? '';
-      if (rpId.isEmpty || credId.isEmpty) return;
-      unawaited(signalUnknownCredential(rpId, credId));
-    } on Object catch (_) {}
   }
 }

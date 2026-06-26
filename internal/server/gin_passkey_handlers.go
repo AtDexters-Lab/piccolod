@@ -454,20 +454,6 @@ func (s *GinServer) handlePasskeyLoginFinish(c *gin.Context) {
 			"rp_id":  rpID,
 			"reason": err.Error(),
 		})
-		// Genuine DB miss: include a Signal API hint so the frontend can prune
-		// the stale picker entry. Other failures (signature/origin/etc.) get
-		// the generic 401 with no leak.
-		var notFound *authpkg.CredentialNotFoundError
-		if errors.As(err, &notFound) {
-			c.JSON(http.StatusUnauthorized, gin.H{
-				"error": "authentication failed",
-				"signal_unknown_credential": gin.H{
-					"rp_id":         notFound.RPID,
-					"credential_id": notFound.CredentialID,
-				},
-			})
-			return
-		}
 		log.Printf("WARN: passkey login finish: %v", err)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "authentication failed"})
 		return

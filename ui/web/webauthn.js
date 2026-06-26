@@ -12,11 +12,11 @@ window.piccoloWebAuthn = {
       typeof window.PublicKeyCredential.signalUnknownCredential === 'function';
   },
 
-  // signalUnknownCredential tells the OS picker to forget a credential we no
-  // longer recognize. Used after deletes (D-9) and after server-side login
-  // failures with a known DB miss (D-14). Idempotent — safe to fire multiple
-  // times for the same id (D-13). Returns true on success, false on
-  // unsupported / thrown error. Fire-and-forget at call sites.
+  // signalUnknownCredential tells the OS picker to forget a credential after
+  // the user explicitly deletes it server-side. Login failures must never call
+  // this: with shared RP IDs, another server can legitimately own the selected
+  // passkey. Idempotent — safe to fire multiple times for the same id (D-13).
+  // Returns true on success, false on unsupported / thrown error.
   signalUnknownCredential: async function(rpId, credentialIdB64Url) {
     if (!this.signalApiSupported()) return false;
     try {

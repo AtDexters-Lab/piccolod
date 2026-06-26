@@ -25,12 +25,6 @@ var (
 	// credential ID that already exists — a benign duplicate. The frontend
 	// shows a non-destructive "already registered" message.
 	ErrPasskeyAlreadyRegistered = errors.New("passkey already registered")
-
-	// ErrCredentialNotFoundInDB indicates a discoverable login asserted a
-	// credential ID that is not registered server-side. Distinct from generic
-	// auth failures so handlers can include a Signal API hint to prune the
-	// stale picker entry without leaking other validation failure modes.
-	ErrCredentialNotFoundInDB = errors.New("credential not found in db")
 )
 
 // AlreadyRegisteredError carries the existing credential ID alongside
@@ -45,19 +39,6 @@ func (e *AlreadyRegisteredError) Error() string {
 }
 
 func (e *AlreadyRegisteredError) Unwrap() error { return ErrPasskeyAlreadyRegistered }
-
-// CredentialNotFoundError carries the missing credential ID and RP ID alongside
-// ErrCredentialNotFoundInDB. Wrap-checked via errors.As.
-type CredentialNotFoundError struct {
-	CredentialID string
-	RPID         string
-}
-
-func (e *CredentialNotFoundError) Error() string {
-	return ErrCredentialNotFoundInDB.Error()
-}
-
-func (e *CredentialNotFoundError) Unwrap() error { return ErrCredentialNotFoundInDB }
 
 type ceremonyType string
 
@@ -334,10 +315,6 @@ type AuthenticationResult struct {
 }
 
 // FinishAuthentication completes authentication and returns the authenticated user.
-//
-// If the parsed response carries a credential ID that does not exist in the DB,
-// returns *CredentialNotFoundError so the handler can include a Signal API
-// pruning hint without conflating with other validation failures.
 func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, rpDisplayName string, parsedResponse *protocol.ParsedCredentialAssertionData) (*AuthenticationResult, error) {
 	if m.disabled {
 		return nil, ErrWebAuthnDisabled
@@ -356,20 +333,13 @@ func (m *WebAuthnManager) FinishAuthentication(ctx context.Context, sessionID, r
 		return nil, fmt.Errorf("create webauthn: %w", err)
 	}
 
-	// Pre-check: if the asserted credential ID is not in our DB, surface a
-	// typed sentinel so the handler can emit a signalUnknownCredential hint.
-	// This is checked before ValidateDiscoverableLogin so the "genuine DB
-	// miss" condition is mechanically distinct from signature/origin/etc.
-	// failures, which the library surfaces via generic *protocol.Error and
-	// would otherwise be brittle to pattern-match.
+	// Pre-check unknown credential IDs before ValidateDiscoverableLogin so DB
+	// misses stay mechanically distinct from signature/origin validation
+	// failures. This remains a normal, non-destructive authentication failure:
+	// with shared RP IDs such as piccolospace.com, another Piccolo instance can
+	// legitimately own the selected passkey.
 	assertedCredID := base64.RawURLEncoding.EncodeToString(parsedResponse.RawID)
 	if _, getErr := m.credRepo.Get(ctx, assertedCredID); getErr != nil {
-		if errors.Is(getErr, persistence.ErrNotFound) {
-			return nil, &CredentialNotFoundError{
-				CredentialID: assertedCredID,
-				RPID:         cs.RPID,
-			}
-		}
 		return nil, fmt.Errorf("lookup credential: %w", getErr)
 	}
 

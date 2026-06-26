@@ -1,6 +1,8 @@
 package server
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -10,6 +12,10 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-webauthn/webauthn/protocol"
+
+	authpkg "piccolod/internal/auth"
+	"piccolod/internal/persistence"
 )
 
 // TestSessionGate_ContractAllThreeStates pins the three-state contract of
@@ -215,6 +221,72 @@ func TestLoginOptions_NoPasskeyAnywhere_WhenEmpty(t *testing.T) {
 	}
 }
 
+// TestPasskeyLoginFinish_DBMissIsNonDestructive pins the shared-RP invariant:
+// selecting a passkey that belongs to another Piccolo under the same RP ID must
+// fail authentication without telling the browser/passkey provider to delete it.
+func TestPasskeyLoginFinish_DBMissIsNonDestructive(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	srv := &GinServer{
+		webauthnMgr:        authpkg.NewWebAuthnManager(emptyWebAuthnCredentialRepo{}, false),
+		passkeyRateLimiter: newIPRateLimiter(10, time.Minute),
+	}
+
+	_, sessionID, err := srv.webauthnMgr.BeginAuthentication(
+		context.Background(),
+		"piccolospace.com",
+		rpDisplayName,
+		"https://abc.piccolospace.com",
+		protocol.VerificationPreferred,
+	)
+	if err != nil {
+		t.Fatalf("BeginAuthentication: %v", err)
+	}
+
+	credentialID := base64.RawURLEncoding.EncodeToString([]byte("foreign"))
+	authenticatorData := make([]byte, 37)
+	authenticatorData[32] = 0x01 // User Present flag.
+	body, err := json.Marshal(map[string]any{
+		"id":    credentialID,
+		"rawId": credentialID,
+		"type":  "public-key",
+		"response": map[string]any{
+			"clientDataJSON": base64.RawURLEncoding.EncodeToString([]byte(
+				`{"type":"webauthn.get","challenge":"test","origin":"https://abc.piccolospace.com"}`,
+			)),
+			"authenticatorData": base64.RawURLEncoding.EncodeToString(authenticatorData),
+			"signature":         base64.RawURLEncoding.EncodeToString([]byte("sig")),
+			"userHandle":        base64.RawURLEncoding.EncodeToString([]byte("user-1")),
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal assertion: %v", err)
+	}
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Request = httptest.NewRequest(
+		http.MethodPost,
+		"https://abc.piccolospace.com/api/v1/auth/passkey/login/finish?session_id="+sessionID,
+		strings.NewReader(string(body)),
+	)
+	c.Request.Host = "abc.piccolospace.com"
+
+	srv.handlePasskeyLoginFinish(c)
+
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401, got %d body=%s", w.Code, w.Body.String())
+	}
+	var response map[string]any
+	if err := json.Unmarshal(w.Body.Bytes(), &response); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if response["error"] != "authentication failed" {
+		t.Fatalf("expected generic auth failure, got %v", response)
+	}
+	if _, ok := response["signal_unknown_credential"]; ok {
+		t.Fatalf("login failure must not include destructive Signal API hint: %v", response)
+	}
+}
+
 // TestLoginRateLimit_PerUsername_LockoutAfter10Failures is plan test #9.
 func TestLoginRateLimit_PerUsername_LockoutAfter10Failures(t *testing.T) {
 	rl := newLoginRateLimiter(10, 15*time.Minute, 100)
@@ -348,4 +420,54 @@ func TestLoginRateLimit_HardCap_EvictsExpiredBeforeDropping(t *testing.T) {
 	if allowed, _ := rl.Allow("new_user"); allowed {
 		t.Fatalf("new_user lockout did not engage — failures were silently dropped")
 	}
+}
+
+type emptyWebAuthnCredentialRepo struct{}
+
+func (emptyWebAuthnCredentialRepo) Create(context.Context, persistence.WebAuthnCredential) error {
+	return nil
+}
+
+func (emptyWebAuthnCredentialRepo) Get(context.Context, string) (persistence.WebAuthnCredential, error) {
+	return persistence.WebAuthnCredential{}, persistence.ErrNotFound
+}
+
+func (emptyWebAuthnCredentialRepo) ListByUser(context.Context, string) ([]persistence.WebAuthnCredential, error) {
+	return nil, nil
+}
+
+func (emptyWebAuthnCredentialRepo) ListByUserAndRP(context.Context, string, string) ([]persistence.WebAuthnCredential, error) {
+	return nil, nil
+}
+
+func (emptyWebAuthnCredentialRepo) ListByRP(context.Context, string) ([]persistence.WebAuthnCredential, error) {
+	return nil, nil
+}
+
+func (emptyWebAuthnCredentialRepo) UpdateAfterAuth(context.Context, string, uint32, time.Time) error {
+	return nil
+}
+
+func (emptyWebAuthnCredentialRepo) UpdateFriendlyName(context.Context, string, string) error {
+	return nil
+}
+
+func (emptyWebAuthnCredentialRepo) Delete(context.Context, string) error {
+	return nil
+}
+
+func (emptyWebAuthnCredentialRepo) DeleteByUser(context.Context, string) error {
+	return nil
+}
+
+func (emptyWebAuthnCredentialRepo) CountByUser(context.Context, string) (int, error) {
+	return 0, nil
+}
+
+func (emptyWebAuthnCredentialRepo) CountByUserAndRP(context.Context, string, string) (int, error) {
+	return 0, nil
+}
+
+func (emptyWebAuthnCredentialRepo) ListUserIDsByRP(context.Context, string) ([]string, error) {
+	return nil, nil
 }

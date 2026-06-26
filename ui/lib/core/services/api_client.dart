@@ -371,7 +371,7 @@ class ApiClient {
   }
 
   /// Returns the response body which carries `rp_id` and `credential_id` for
-  /// the post-delete WebAuthn Signal API call (D-9 / D-14).
+  /// the post-delete WebAuthn Signal API call.
   Future<Map<String, dynamic>> deletePasskey(String id) async {
     final res = await delete('/api/v1/auth/passkeys/$id');
     return (res is Map<String, dynamic>) ? res : <String, dynamic>{};

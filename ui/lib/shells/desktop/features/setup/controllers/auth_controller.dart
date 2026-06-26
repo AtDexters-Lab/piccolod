@@ -305,7 +305,6 @@ class AuthController extends ChangeNotifier {
       onComplete();
       return true;
     } on ApiException catch (e) {
-      WebAuthnService.maybeSignalFromApiError(e);
       _passkeyError = friendlyApiError(e);
       if (!_disposed) notifyListeners();
       return false;
