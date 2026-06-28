@@ -127,11 +127,11 @@ func (inMemoryTestListener) Addr() net.Addr {
 
 type inMemoryTestUDPConn struct{}
 
-func (inMemoryTestUDPConn) ReadFromUDP([]byte) (int, *net.UDPAddr, error) {
-	return 0, nil, net.ErrClosed
+func (inMemoryTestUDPConn) ReadFromUDP([]byte) (int, *net.UDPAddr, udpPacketInfo, error) {
+	return 0, nil, udpPacketInfo{}, net.ErrClosed
 }
 
-func (inMemoryTestUDPConn) WriteToUDP(payload []byte, addr *net.UDPAddr) (int, error) {
+func (inMemoryTestUDPConn) WriteToUDP(payload []byte, addr *net.UDPAddr, _ udpPacketInfo) (int, error) {
 	return len(payload), nil
 }
 

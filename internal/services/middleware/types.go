@@ -92,10 +92,17 @@ type L4Middleware func(next ConnHandler) ConnHandler
 
 // UDPContext is the per-datagram context passed to L4-UDP middlewares.
 type UDPContext struct {
-	Endpoint   EndpointInfo
-	Source     *net.UDPAddr
-	Local      *net.UDPAddr
-	AcceptedAt time.Time
+	Endpoint EndpointInfo
+	Source   *net.UDPAddr
+	Local    *net.UDPAddr
+	// LocalIfIndex is the receiving interface index from packet metadata when available.
+	LocalIfIndex int
+	// ReplySourceIP is the precomputed local unicast address that is safe to
+	// force as the reply source. ReplySourceIPKnown distinguishes "computed as
+	// nil" (for broadcast/multicast) from "not computed".
+	ReplySourceIP      net.IP
+	ReplySourceIPKnown bool
+	AcceptedAt         time.Time
 }
 
 // UDPSink writes a response datagram back to a source address. Provided to UDP
