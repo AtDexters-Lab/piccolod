@@ -27,9 +27,9 @@ type Supervisor struct {
 	led    *LedgerStore
 	sys    SystemState
 
-	devAct  DeviceActuator
-	apAct   APModeActuator
-	sysAct  SystemActuator
+	devAct DeviceActuator
+	apAct  APModeActuator
+	sysAct SystemActuator
 
 	bus *events.Bus
 
@@ -47,6 +47,8 @@ type Supervisor struct {
 	// Atomic-swap snapshot pointer. Snapshot() readers see whole-snapshot
 	// consistency.
 	snap atomic.Pointer[Snapshot]
+
+	transition *networkTransitionStore
 
 	// Early-tick request channel; size 1, drop-if-pending.
 	requestCh chan struct{}
@@ -76,11 +78,12 @@ type legacyEventKey struct {
 // wire actuators and EnableActuation to start them firing.
 func NewSupervisor(prober *Prober, led *LedgerStore, sys SystemState) *Supervisor {
 	return &Supervisor{
-		prober:    prober,
-		led:       led,
-		sys:       sys,
-		doneCh:    make(chan struct{}),
-		requestCh: make(chan struct{}, 1),
+		prober:     prober,
+		led:        led,
+		sys:        sys,
+		transition: newNetworkTransitionStore(),
+		doneCh:     make(chan struct{}),
+		requestCh:  make(chan struct{}, 1),
 	}
 }
 
@@ -285,6 +288,7 @@ func (s *Supervisor) runTick(ctx context.Context) {
 
 	// Step 6: emit legacy wire-contract event for existing subscribers.
 	s.publishLegacyEvent(tick, snap)
+	s.recordNetworkTransition(tick, snap)
 
 	logTick(tick, hwWiFi, hwEth, apA)
 }
@@ -500,6 +504,79 @@ func (s *Supervisor) publishLegacyEvent(tick Tick, snap Snapshot) {
 			APSSID:       cur.apSSID,
 		},
 	})
+}
+
+func (s *Supervisor) recordNetworkTransition(tick Tick, snap Snapshot) {
+	if s.transition == nil {
+		return
+	}
+	state := buildNetworkTransitionState(tick, snap)
+	evt, changed, wakes := s.transition.record(state)
+	if !changed {
+		return
+	}
+	if s.bus != nil {
+		s.bus.Publish(events.Event{
+			Topic:   events.TopicNetworkTransition,
+			Payload: evt,
+		})
+	}
+	log.Printf("INFO: net-supervisor.transition: gen=%d reasons=%s uplink=%s iface=%s route_observed=%t route=%t/%s dns_observed=%t dns=%t/%s connectivity=%s lan=%s",
+		evt.Generation,
+		networkTransitionReasonLog(evt.Reasons),
+		evt.Current.ActiveUplink,
+		evt.Current.ActiveUplinkIface,
+		evt.Current.DefaultRouteObserved,
+		evt.Current.DefaultRouteKnown,
+		evt.Current.DefaultRouteIface,
+		evt.Current.DNSDefaultObserved,
+		evt.Current.DNSDefaultKnown,
+		evt.Current.DNSDefaultIface,
+		evt.Current.Connectivity,
+		networkTransitionLANLog(evt.Current.Interfaces),
+	)
+	for _, wake := range wakes {
+		go wake()
+	}
+}
+
+func networkTransitionReasonLog(reasons []NetworkTransitionReason) string {
+	if len(reasons) == 0 {
+		return "-"
+	}
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, string(reason))
+	}
+	return strings.Join(parts, ",")
+}
+
+func networkTransitionLANLog(ifaces []NetworkInterfaceState) string {
+	var parts []string
+	for _, iface := range ifaces {
+		switch iface.Role {
+		case InterfaceRoleLAN, InterfaceRoleWANLAN, InterfaceRoleUnknown:
+			parts = append(parts, iface.Iface+"="+string(iface.Role))
+		}
+	}
+	if len(parts) == 0 {
+		return "-"
+	}
+	return strings.Join(parts, ",")
+}
+
+func (s *Supervisor) TransitionDeltaSince(lastIngested uint64) (NetworkTransitionDelta, bool) {
+	if s.transition == nil {
+		return NetworkTransitionDelta{}, false
+	}
+	return s.transition.deltaSince(lastIngested)
+}
+
+func (s *Supervisor) SubscribeNetworkTransitionWake(cb func()) func() {
+	if s.transition == nil {
+		return func() {}
+	}
+	return s.transition.subscribeWake(cb)
 }
 
 func logTick(t Tick, hwW, hwE HWAction, apA APAction) {

@@ -65,7 +65,8 @@ type ServiceManager struct {
 	appTransientMu  sync.RWMutex
 	appStatusCancel func() // unsubscribe from app status events
 
-	// portClaimCache must be rebuilt via rebuildPortClaimCache() after every m.registry mutation.
+	// portClaimCache must be rebuilt via rebuildPortClaimCache() after every
+	// registry or publication-state mutation.
 	portClaimCache []api.PortClaimInfo
 }
 
@@ -192,6 +193,75 @@ func (m *ServiceManager) openFirewallClaim(ep ServiceEndpoint) {
 			log.Printf("ERROR: firewall open port %d: %v", *ep.PortClaim, err)
 		}
 	}
+}
+
+type publicationEndpointRef struct {
+	app      string
+	listener string
+}
+
+// ReconcileNetworkPublications reapplies LAN-facing firewall publication for
+// currently registered port claims after a network transition. Proxy state and
+// the endpoint registry remain authoritative; this only repairs network-local
+// exposure that may have drifted when interface/zone state changed.
+func (m *ServiceManager) ReconcileNetworkPublications() int {
+	return m.applyNetworkPublicationFirewall(true)
+}
+
+// CloseNetworkPublications removes LAN-facing firewall publication for
+// currently registered port claims when network role/zone applicability is not
+// proven safe. Proxy state and the endpoint registry remain authoritative.
+func (m *ServiceManager) CloseNetworkPublications() int {
+	return m.applyNetworkPublicationFirewall(false)
+}
+
+func (m *ServiceManager) applyNetworkPublicationFirewall(open bool) int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	var refs []publicationEndpointRef
+	for app, byListener := range m.registry {
+		if len(m.deactivated[app]) > 0 {
+			continue
+		}
+		for listener, ep := range byListener {
+			if ep.PortClaim != nil {
+				refs = append(refs, publicationEndpointRef{app: app, listener: listener})
+			}
+		}
+	}
+	m.mu.RUnlock()
+
+	applied := 0
+	for _, ref := range refs {
+		if m.applyCurrentFirewallClaim(ref, open) {
+			applied++
+		}
+	}
+	return applied
+}
+
+func (m *ServiceManager) applyCurrentFirewallClaim(ref publicationEndpointRef, open bool) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if len(m.deactivated[ref.app]) > 0 {
+		return false
+	}
+	byListener, ok := m.registry[ref.app]
+	if !ok {
+		return false
+	}
+	ep, ok := byListener[ref.listener]
+	if !ok || ep.PortClaim == nil {
+		return false
+	}
+	if open {
+		m.openFirewallClaim(ep)
+	} else {
+		m.closeFirewallClaim(ep)
+	}
+	return true
 }
 
 // releaseEndpointPorts releases allocated ports for an endpoint.
@@ -403,7 +473,10 @@ func (m *ServiceManager) ActivePortClaims() []api.PortClaimInfo {
 // Caller must hold m.mu write lock.
 func (m *ServiceManager) rebuildPortClaimCache() {
 	var claims []api.PortClaimInfo
-	for _, mapp := range m.registry {
+	for app, mapp := range m.registry {
+		if len(m.deactivated[app]) > 0 {
+			continue
+		}
 		for _, ep := range mapp {
 			if ep.PortClaim != nil {
 				claims = append(claims, api.PortClaimInfo{
@@ -782,9 +855,9 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 	if len(registry) > 0 {
 		m.registry[appName] = registry
 	}
-	m.rebuildPortClaimCache()
 	// App is back — clear any stashed deactivated state.
 	delete(m.deactivated, appName)
+	m.rebuildPortClaimCache()
 
 	// Publish endpoint changes (non-blocking)
 	if len(endpoints) > 0 {
@@ -1832,8 +1905,8 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 	}
 
 	m.registry[prepared.appName] = prepared.newMap
-	m.rebuildPortClaimCache()
 	delete(m.deactivated, prepared.appName)
+	m.rebuildPortClaimCache()
 
 	// Publish endpoint changes (non-blocking). Listener config changes are
 	// permanent — removed endpoints will not come back.
@@ -1997,6 +2070,7 @@ func (m *ServiceManager) SuspendAppPublication(appName string) {
 	if len(endpoints) > 0 {
 		info := endpointInfoSlice(endpoints)
 		m.deactivated[appName] = info
+		m.rebuildPortClaimCache()
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:         appName,
 			Deactivated: info,
@@ -2034,6 +2108,7 @@ func (m *ServiceManager) ResumeAppPublicationChecked(appName string) error {
 		started = append(started, ep)
 	}
 	delete(m.deactivated, appName)
+	m.rebuildPortClaimCache()
 	if len(endpoints) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:   appName,
@@ -2123,8 +2198,8 @@ func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []
 	} else {
 		delete(m.registry, appName)
 	}
-	m.rebuildPortClaimCache()
 	delete(m.deactivated, appName)
+	m.rebuildPortClaimCache()
 	delete(m.preparedReservations, appName)
 	if len(added) > 0 || len(removed) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{

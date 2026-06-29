@@ -49,6 +49,9 @@ func (c *DBusClient) EthernetDevices() ([]EthernetDevice, error) {
 
 		devices = append(devices, dev)
 	}
+	sort.Slice(devices, func(i, j int) bool {
+		return devices[i].Interface < devices[j].Interface
+	})
 	return devices, nil
 }
 

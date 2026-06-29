@@ -362,6 +362,49 @@ const (
 	failedSetupMaxCooldown     = 5 * time.Minute
 )
 
+type interfacePublishPolicy struct {
+	setup map[string]bool
+}
+
+type interfaceRemoval struct {
+	name  string
+	state *InterfaceState
+}
+
+func newInterfacePublishPolicy(setupIfaces []string) *interfacePublishPolicy {
+	p := &interfacePublishPolicy{setup: make(map[string]bool, len(setupIfaces))}
+	for _, iface := range setupIfaces {
+		if iface != "" {
+			p.setup[iface] = true
+		}
+	}
+	return p
+}
+
+func cloneInterfacePublishPolicy(p *interfacePublishPolicy) *interfacePublishPolicy {
+	if p == nil {
+		return nil
+	}
+	cloned := &interfacePublishPolicy{setup: make(map[string]bool, len(p.setup))}
+	for iface, allowed := range p.setup {
+		if allowed {
+			cloned.setup[iface] = true
+		}
+	}
+	return cloned
+}
+
+func (p *interfacePublishPolicy) allows(name string) bool {
+	return p == nil || p.setup[name]
+}
+
+func (p *interfacePublishPolicy) ifaceSet() map[string]bool {
+	if p == nil {
+		return nil
+	}
+	return p.setup
+}
+
 // failedSetupBackoff computes the cooldown duration for a given attempt count.
 func failedSetupBackoff(attempts int) time.Duration {
 	if attempts >= 4 {
@@ -391,8 +434,73 @@ func (m *Manager) networkMonitor() {
 	}
 }
 
+// ReconcileNetworkTransition refreshes interface state immediately after the
+// network supervisor observes a LAN-relevant transition. The periodic network
+// monitor remains the fallback; this hook reduces recovery latency after
+// multi-interface route/address changes.
+func (m *Manager) ReconcileNetworkTransition(publishIfaces, preserveIfaces []string) {
+	if m == nil || !m.started.Load() || m.stopped.Load() {
+		return
+	}
+	announcementPolicy := newInterfacePublishPolicy(publishIfaces)
+	policy := m.updateInterfacePublishPolicy(publishIfaces, preserveIfaces)
+	m.checkInterfaceChangesWithPolicyOptions(policy, false)
+	if len(announcementPolicy.setup) == 0 {
+		return
+	}
+	m.sendServiceAnnouncementForInterfaces(announcementPolicy.setup)
+	m.sendMultiInterfaceAnnouncementsForInterfaces(announcementPolicy.setup)
+}
+
 // checkInterfaceChanges detects and handles interface changes
 func (m *Manager) checkInterfaceChanges() {
+	m.checkInterfaceChangesWithPolicy(m.currentInterfacePublishPolicy())
+}
+
+func (m *Manager) checkInterfaceChangesWithPolicy(policy *interfacePublishPolicy) {
+	m.checkInterfaceChangesWithPolicyOptions(policy, true)
+}
+
+func (m *Manager) currentInterfacePublishPolicy() *interfacePublishPolicy {
+	m.mutex.RLock()
+	policy := cloneInterfacePublishPolicy(m.interfacePublishPolicy)
+	m.mutex.RUnlock()
+	return policy
+}
+
+func (m *Manager) currentInterfaceAnnouncementPolicy() *interfacePublishPolicy {
+	m.mutex.RLock()
+	policy := cloneInterfacePublishPolicy(m.interfaceAnnouncementPolicy)
+	m.mutex.RUnlock()
+	return policy
+}
+
+func (m *Manager) updateInterfacePublishPolicy(publishIfaces, preserveIfaces []string) *interfacePublishPolicy {
+	next := newInterfacePublishPolicy(publishIfaces)
+	announcements := newInterfacePublishPolicy(publishIfaces)
+	m.mutex.Lock()
+	for _, iface := range preserveIfaces {
+		if iface == "" {
+			continue
+		}
+		preserveAllowed := false
+		if m.interfacePublishPolicy != nil {
+			preserveAllowed = m.interfacePublishPolicy.setup[iface]
+		} else {
+			_, preserveAllowed = m.interfaces[iface]
+		}
+		if preserveAllowed {
+			next.setup[iface] = true
+		}
+	}
+	m.interfacePublishPolicy = cloneInterfacePublishPolicy(next)
+	m.interfaceAnnouncementPolicy = cloneInterfacePublishPolicy(announcements)
+	policy := cloneInterfacePublishPolicy(m.interfacePublishPolicy)
+	m.mutex.Unlock()
+	return policy
+}
+
+func (m *Manager) checkInterfaceChangesWithPolicyOptions(policy *interfacePublishPolicy, announceNewInterfaces bool) {
 	interfaceFuncsMu.RLock()
 	listFn := listNetworkInterfaces
 	interfaceFuncsMu.RUnlock()
@@ -404,16 +512,22 @@ func (m *Manager) checkInterfaceChanges() {
 	}
 
 	m.mutex.Lock()
-	defer m.mutex.Unlock()
 
 	seenInterfaces := make(map[string]bool)
 	needsAnnounce := false
+	var removals []interfaceRemoval
 
 	// Check each interface
 	for _, iface := range interfaces {
 		ifaceCopy := iface
 		seenInterfaces[ifaceCopy.Name] = true
 		if existing, exists := m.interfaces[ifaceCopy.Name]; exists {
+			if !policy.allows(ifaceCopy.Name) {
+				log.Printf("INFO: Interface %s no longer LAN-capable for mDNS, withdrawing", ifaceCopy.Name)
+				delete(m.interfaces, ifaceCopy.Name)
+				removals = append(removals, interfaceRemoval{name: ifaceCopy.Name, state: existing})
+				continue
+			}
 			// Interface still exists. Two cases:
 			//   1. Interface flag is Down (link-down or admin-down): legitimate
 			//      change — reconfigure on next FlagUp tick.
@@ -433,8 +547,8 @@ func (m *Manager) checkInterfaceChanges() {
 				// interface detected" branch will pick this back up once
 				// the link returns.
 				log.Printf("INFO: Interface %s down, closing connections", ifaceCopy.Name)
-				closeConns(existing)
 				delete(m.interfaces, ifaceCopy.Name)
+				removals = append(removals, interfaceRemoval{name: ifaceCopy.Name, state: existing})
 			case ipLost:
 				// IP lost while interface still Up — likely transient (DHCP
 				// renewal, brief carrier drop). Require 3-of-3 ticks before
@@ -442,12 +556,12 @@ func (m *Manager) checkInterfaceChanges() {
 				existing.IPLossTicks++
 				if existing.IPLossTicks >= 3 {
 					log.Printf("INFO: Sustained IP loss on %s (%d ticks), dropping stale state", ifaceCopy.Name, existing.IPLossTicks)
-					closeConns(existing)
 					// Drop the stale entry — setupInterface cannot succeed
 					// without an IP, and a stale active entry with closed
 					// conns blocks recovery (next-tick default branch
 					// would mark it active without reopening sockets).
 					delete(m.interfaces, ifaceCopy.Name)
+					removals = append(removals, interfaceRemoval{name: ifaceCopy.Name, state: existing})
 				} else {
 					existing.Active = true
 					existing.LastSeen = time.Now()
@@ -475,6 +589,9 @@ func (m *Manager) checkInterfaceChanges() {
 				continue
 			}
 			if ifaceCopy.Flags&net.FlagMulticast == 0 || isVirtualInterface(ifaceCopy.Name) {
+				continue
+			}
+			if !policy.allows(ifaceCopy.Name) {
 				continue
 			}
 
@@ -508,15 +625,10 @@ func (m *Manager) checkInterfaceChanges() {
 
 	// Remove interfaces that no longer exist
 	for name, state := range m.interfaces {
-		if !seenInterfaces[name] {
+		if !seenInterfaces[name] || !policy.allows(name) {
 			log.Printf("INFO: Interface %s no longer available, removing", name)
-			if state.IPv4Conn != nil {
-				state.IPv4Conn.Close()
-			}
-			if state.IPv6Conn != nil {
-				state.IPv6Conn.Close()
-			}
 			delete(m.interfaces, name)
+			removals = append(removals, interfaceRemoval{name: name, state: state})
 		}
 	}
 
@@ -532,8 +644,15 @@ func (m *Manager) checkInterfaceChanges() {
 		}
 	}
 
+	m.mutex.Unlock()
+
+	for _, removal := range removals {
+		m.sendInterfaceGoodbye(removal.name, removal.state)
+		closeConns(removal.state)
+	}
+
 	// Announce on new interface join so device is immediately visible
-	if needsAnnounce {
+	if needsAnnounce && announceNewInterfaces {
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()
@@ -541,6 +660,29 @@ func (m *Manager) checkInterfaceChanges() {
 			m.sendMultiInterfaceAnnouncements()
 			m.sendPeerDiscoveryQuery()
 		}()
+	}
+}
+
+func (m *Manager) sendInterfaceGoodbye(name string, state *InterfaceState) {
+	if m == nil || state == nil || !state.Active {
+		return
+	}
+	msg := m.buildServiceAnnouncement(state, 0)
+	if data, err := msg.Pack(); err == nil {
+		if state.IPv4Conn != nil {
+			_, _ = state.IPv4Conn.WriteToUDP(data, &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353})
+		}
+		if state.IPv6Conn != nil {
+			_, _ = state.IPv6Conn.WriteToUDP(data, &net.UDPAddr{IP: net.ParseIP("ff02::fb"), Port: 5353})
+		}
+	}
+	for _, fqdn := range m.AdvertisedNames() {
+		if state.HasIPv4 && state.IPv4Conn != nil && state.IPv4 != nil {
+			m.sendIPv4Announcement(name, state, state.IPv4Conn, state.IPv4, fqdn, 0)
+		}
+		if state.HasIPv6 && state.IPv6Conn != nil && state.IPv6 != nil {
+			m.sendIPv6Announcement(name, state, state.IPv6Conn, state.IPv6, fqdn, 0)
+		}
 	}
 }
 

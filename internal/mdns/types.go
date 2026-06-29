@@ -137,8 +137,8 @@ type Manager struct {
 	bootTime        time.Time
 
 	// Gateway leadership
-	gatewayLeader    *GatewayLeader
-	specificHostname string            // Always "piccolo-<machineId>.local"
+	gatewayLeader     *GatewayLeader
+	specificHostname  string             // Always "piccolo-<machineId>.local"
 	serviceIntervalCh chan time.Duration // Signals service announcer to change interval
 
 	// Socket factories (overrideable for tests)
@@ -148,7 +148,7 @@ type Manager struct {
 	// Service endpoint observation
 	endpointsMu          sync.Mutex
 	endpointsCancel      func()
-	endpointsUnsubscribe func() // Unsubscribe from event bus
+	endpointsUnsubscribe func()              // Unsubscribe from event bus
 	appHostLabels        map[string][]string // app -> host labels for that app
 	appHostLabelsMu      sync.RWMutex
 
@@ -156,6 +156,13 @@ type Manager struct {
 	announceDebounceMu    sync.Mutex
 	announceDebounceTimer *time.Timer
 	announcePending       bool
+
+	// Transition-derived interface policies. Nil means unconstrained legacy
+	// behavior until the network supervisor provides a classified view. The
+	// publish policy is the retention/setup surface; the announcement policy is
+	// the stricter positive-advertisement surface.
+	interfacePublishPolicy      *interfacePublishPolicy
+	interfaceAnnouncementPolicy *interfacePublishPolicy
 
 	// Event bus for publishing peer changes
 	eventBus *events.Bus

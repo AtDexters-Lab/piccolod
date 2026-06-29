@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"piccolod/internal/network"
 	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
 )
@@ -215,6 +216,84 @@ func TestManager_NexusAdapterLifecycle(t *testing.T) {
 
 	if err := adapter.awaitStop(500 * time.Millisecond); err != nil {
 		t.Fatalf("adapter stop: %v", err)
+	}
+}
+
+func TestManager_RestartAdapterForNetworkTransition(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(3, 0)))
+	adapter := newFakeAdapter()
+	m.SetNexusAdapter(adapter)
+
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
+	select {
+	case <-adapter.startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected initial adapter start")
+	}
+
+	m.RestartAdapterForNetworkTransition([]network.NetworkTransitionReason{network.ReasonDefaultRouteChanged})
+
+	if err := adapter.awaitStop(500 * time.Millisecond); err != nil {
+		t.Fatalf("adapter stop: %v", err)
+	}
+	select {
+	case <-adapter.startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected adapter restart")
+	}
+}
+
+func TestManager_RestartAdapterForNetworkTransitionRespectsDisabledConfig(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(time.Unix(3, 0)))
+	adapter := newFakeAdapter()
+	m.SetNexusAdapter(adapter)
+
+	if err := m.Configure(ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure: %v", err)
+	}
+	waitForCertNotPending(t, m, "portal", 200*time.Millisecond)
+	select {
+	case <-adapter.startCh:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatalf("expected initial adapter start")
+	}
+	if err := m.Disable(); err != nil {
+		t.Fatalf("disable: %v", err)
+	}
+	if err := adapter.awaitStop(500 * time.Millisecond); err != nil {
+		t.Fatalf("adapter stop: %v", err)
+	}
+
+	if restarted := m.RestartAdapterForNetworkTransition([]network.NetworkTransitionReason{network.ReasonDefaultRouteChanged}); restarted {
+		t.Fatal("restart should not be accepted while remote config is disabled")
+	}
+	select {
+	case <-adapter.startCh:
+		t.Fatal("adapter restarted while disabled")
+	case <-time.After(100 * time.Millisecond):
 	}
 }
 
@@ -781,7 +860,7 @@ func TestNeedsRelay(t *testing.T) {
 	}{
 		{acme.SolverHTTP01, true},
 		{"HTTP-01", true},
-		{"", true},          // conservative default
+		{"", true}, // conservative default
 		{acme.SolverDNS01, false},
 		{"DNS-01", false},
 	}

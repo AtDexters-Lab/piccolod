@@ -7,7 +7,7 @@ import "time"
 //   - TriHealthy:  proved working
 //   - TriFaulted:  preconditions agree it should work, but it isn't
 //   - TriInactive: preconditions correctly say "nothing to do here" (no cable,
-//                  rfkill-by-intent, no profile)
+//     rfkill-by-intent, no profile)
 type Tri int
 
 const (
@@ -54,7 +54,7 @@ type DeviceObservation struct {
 	Kind         DeviceKind
 	Present      bool
 	HWHealth     Tri
-	ConfigHealth Tri  // Healthy | Faulted | Inactive — DHCP-in-flight maps to Healthy
+	ConfigHealth Tri // Healthy | Faulted | Inactive — DHCP-in-flight maps to Healthy
 	LinkUp       bool
 	HasIP        bool
 	GwReachable  Tri
@@ -116,6 +116,13 @@ func (r L3ProbeResult) String() string {
 // field is set by the probe layer before deciders run.
 type Tick struct {
 	Devices map[DeviceKind]DeviceObservation
+	// Interfaces is the reconciliation-grade projection of all NM-managed
+	// physical interfaces. It is separate from Devices because legacy
+	// watchdog deciders intentionally keep the first-device-per-kind model.
+	Interfaces []NetworkInterfaceState
+	// InterfacesObserved says the all-interface projection completed. This
+	// distinguishes a proven empty interface set from legacy fallback data.
+	InterfacesObserved bool
 
 	// NMConn is advisory only — read from NM's Connectivity property as it
 	// stands. Deciders consume L3Probe (the TCP-connect truth) instead.
@@ -129,6 +136,21 @@ type Tick struct {
 	// ethernet-if-eligible-else-wifi-if-eligible-else-none. AP mode maps to
 	// UplinkNone per existing wire convention.
 	ActiveUplink UplinkType
+	// ActiveUplinkIface is the concrete interface that owns ActiveUplink
+	// when known. Same-kind multi-NIC owners must consume this rather than
+	// inferring from ActiveUplink alone.
+	ActiveUplinkIface string
+
+	// DefaultRouteObserved says the NetworkManager route projection completed.
+	// DefaultRouteKnown says that completed projection found a default route.
+	// This distinguishes a proven no-default-route state from projection
+	// unavailability.
+	DefaultRouteIface    string
+	DefaultRouteObserved bool
+	DefaultRouteKnown    bool
+	DNSDefaultIface      string
+	DNSDefaultObserved   bool
+	DNSDefaultKnown      bool
 
 	// SystemBusy is read once per tick from SystemState, then passed as data
 	// to deciders. Closes mid-tick TOCTOU between deciders.

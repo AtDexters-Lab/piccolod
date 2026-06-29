@@ -1,7 +1,11 @@
 package mdns
 
 import (
+	"bytes"
+	"fmt"
+	"log"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -533,6 +537,143 @@ func TestCheckInterfaceChanges_AnnouncesOnNewInterface(t *testing.T) {
 
 	// The announcement goroutine is wg-tracked and completes during manager.Stop().
 	// The wlan0 addition to m.interfaces (the key assertion) is synchronous.
+}
+
+func TestReconcileNetworkTransitionWithdrawsNonPublishInterface(t *testing.T) {
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 1, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast},
+			{Index: 2, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			"eth0":  {&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}},
+			"wlan0": {&net.IPNet{IP: net.ParseIP("192.168.2.10"), Mask: net.CIDRMask(24, 32)}},
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { _ = manager.Stop() })
+
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	_, eth0Exists := manager.interfaces["eth0"]
+	wlan0State := manager.interfaces["wlan0"]
+	manager.mutex.RUnlock()
+	if !eth0Exists || wlan0State == nil || wlan0State.IPv4Conn == nil {
+		t.Fatalf("expected eth0 and wlan0 to be initially discovered")
+	}
+
+	manager.started.Store(true)
+	manager.ReconcileNetworkTransition([]string{"eth0"}, nil)
+
+	manager.mutex.RLock()
+	_, eth0Exists = manager.interfaces["eth0"]
+	_, wlan0Exists := manager.interfaces["wlan0"]
+	manager.mutex.RUnlock()
+	if !eth0Exists {
+		t.Fatal("eth0 should remain published")
+	}
+	if wlan0Exists {
+		t.Fatal("wlan0 should be withdrawn when transition role set excludes it")
+	}
+	if _, err := wlan0State.IPv4Conn.WriteToUDP([]byte("x"), &net.UDPAddr{IP: net.IPv4(224, 0, 0, 251), Port: 5353}); err == nil {
+		t.Fatal("withdrawn wlan0 socket should be closed")
+	}
+
+	manager.checkInterfaceChanges()
+	manager.mutex.RLock()
+	_, wlan0Exists = manager.interfaces["wlan0"]
+	manager.mutex.RUnlock()
+	if wlan0Exists {
+		t.Fatal("periodic interface check should not re-add a transition-withdrawn interface")
+	}
+}
+
+func TestReconcileNetworkTransitionDoesNotAnnouncePreservedInterface(t *testing.T) {
+	wlan0 := net.Interface{Index: 1, MTU: 1500, Name: "wlan0", Flags: net.FlagUp | net.FlagMulticast}
+	eth0 := net.Interface{Index: 2, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast}
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			wlan0,
+		},
+		addrMap: map[string][]net.Addr{
+			"eth0":  {&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}},
+			"wlan0": {&net.IPNet{IP: net.ParseIP("192.168.2.10"), Mask: net.CIDRMask(24, 32)}},
+		},
+	}
+	interfaceFuncsMu.Lock()
+	origList := listNetworkInterfaces
+	origAddrs := interfaceAddrs
+	listNetworkInterfaces = func() ([]net.Interface, error) {
+		clones := make([]net.Interface, len(env.interfaces))
+		copy(clones, env.interfaces)
+		return clones, nil
+	}
+	interfaceAddrs = func(iface *net.Interface) ([]net.Addr, error) {
+		addrs, ok := env.addrMap[iface.Name]
+		if !ok {
+			return nil, fmt.Errorf("no addresses configured for interface %s", iface.Name)
+		}
+		out := make([]net.Addr, len(addrs))
+		copy(out, addrs)
+		return out, nil
+	}
+	interfaceFuncsMu.Unlock()
+	t.Cleanup(func() {
+		interfaceFuncsMu.Lock()
+		listNetworkInterfaces = origList
+		interfaceAddrs = origAddrs
+		interfaceFuncsMu.Unlock()
+	})
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { _ = manager.Stop() })
+
+	manager.checkInterfaceChanges()
+	time.Sleep(100 * time.Millisecond)
+	manager.started.Store(true)
+	env.interfaces = []net.Interface{wlan0, eth0}
+
+	var logs bytes.Buffer
+	oldLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	t.Cleanup(func() { log.SetOutput(oldLogOutput) })
+
+	manager.ReconcileNetworkTransition([]string{"eth0"}, []string{"wlan0"})
+	time.Sleep(100 * time.Millisecond)
+
+	manager.mutex.RLock()
+	_, eth0Exists := manager.interfaces["eth0"]
+	_, wlan0Exists := manager.interfaces["wlan0"]
+	preserved := manager.interfacePublishPolicy != nil && manager.interfacePublishPolicy.setup["wlan0"]
+	manager.mutex.RUnlock()
+	if !eth0Exists || !wlan0Exists || !preserved {
+		t.Fatalf("expected eth0 published and wlan0 preserved, got eth0=%v wlan0=%v preserved=%v", eth0Exists, wlan0Exists, preserved)
+	}
+	if strings.Contains(logs.String(), "[wlan0-IPv4] Announced") {
+		t.Fatalf("preserved wlan0 received transition positive announcement:\n%s", logs.String())
+	}
+
+	logs.Reset()
+	manager.sendServiceAnnouncement()
+	manager.sendMultiInterfaceAnnouncements()
+	if strings.Contains(logs.String(), "[wlan0-IPv4] Announced") {
+		t.Fatalf("preserved wlan0 received periodic positive announcement:\n%s", logs.String())
+	}
 }
 
 func TestFailedSetupBackoff(t *testing.T) {

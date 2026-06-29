@@ -93,6 +93,76 @@ func TestNMDeviceState_IsConnected(t *testing.T) {
 	}
 }
 
+func TestMergeDefaultRouteMetricIgnoresFamiliesWithoutDefaultRoutes(t *testing.T) {
+	metric, known := mergeDefaultRouteMetric(0, false, ipConfigSnapshot{
+		HasDefaultRoute:  true,
+		RouteMetric:      100,
+		RouteMetricKnown: true,
+	})
+	metric, known = mergeDefaultRouteMetric(metric, known, ipConfigSnapshot{
+		HasDefaultRoute:  false,
+		RouteMetric:      0,
+		RouteMetricKnown: true,
+	})
+
+	if !known || metric != 100 {
+		t.Fatalf("metric = (%d, %v), want (100, true)", metric, known)
+	}
+}
+
+func TestMergeDefaultRouteMetricKeepsLowestDefaultRouteMetric(t *testing.T) {
+	metric, known := mergeDefaultRouteMetric(0, false, ipConfigSnapshot{
+		HasDefaultRoute:  true,
+		RouteMetric:      100,
+		RouteMetricKnown: true,
+	})
+	metric, known = mergeDefaultRouteMetric(metric, known, ipConfigSnapshot{
+		HasDefaultRoute:  true,
+		RouteMetric:      50,
+		RouteMetricKnown: true,
+	})
+
+	if !known || metric != 50 {
+		t.Fatalf("metric = (%d, %v), want (50, true)", metric, known)
+	}
+}
+
+func TestMergeDefaultRouteMetricTreatsMissingMetricAsZero(t *testing.T) {
+	metric, known := mergeDefaultRouteMetric(0, false, ipConfigSnapshot{
+		HasDefaultRoute: true,
+	})
+
+	if !known || metric != 0 {
+		t.Fatalf("metric = (%d, %v), want (0, true)", metric, known)
+	}
+}
+
+func TestObserveDefaultRoutesDoesNotTreatGatewayAsDefaultRoute(t *testing.T) {
+	cfg := ipConfigSnapshot{Gateway: "192.168.1.1"}
+	observeDefaultRoutes(&cfg, []map[string]dbus.Variant{{
+		"dest":   dbus.MakeVariant("192.168.1.0"),
+		"prefix": dbus.MakeVariant(uint32(24)),
+		"metric": dbus.MakeVariant(uint32(5)),
+	}})
+
+	if cfg.HasDefaultRoute || cfg.RouteMetricKnown {
+		t.Fatalf("gateway/non-default route marked as default: %+v", cfg)
+	}
+}
+
+func TestObserveDefaultRoutesMarksDefaultRouteMetric(t *testing.T) {
+	cfg := ipConfigSnapshot{Gateway: "192.168.1.1"}
+	observeDefaultRoutes(&cfg, []map[string]dbus.Variant{{
+		"dest":   dbus.MakeVariant("0.0.0.0"),
+		"prefix": dbus.MakeVariant(uint32(0)),
+		"metric": dbus.MakeVariant(uint32(50)),
+	}})
+
+	if !cfg.HasDefaultRoute || !cfg.RouteMetricKnown || cfg.RouteMetric != 50 {
+		t.Fatalf("default route snapshot = %+v, want default metric 50", cfg)
+	}
+}
+
 func TestStubClient_CallRecording(t *testing.T) {
 	stub := NewStubClient()
 

@@ -141,13 +141,22 @@ func (m *Manager) buildServiceAnnouncement(state *InterfaceState, ttl uint32) *d
 	return msg
 }
 
-// sendServiceAnnouncement sends DNS-SD announcements on all interfaces.
+// sendServiceAnnouncement sends DNS-SD announcements on the current positive
+// publication surface.
 func (m *Manager) sendServiceAnnouncement() {
-	m.sendServiceAnnouncementWithTTL(serviceTTL)
+	m.sendServiceAnnouncementWithTTLForInterfaces(serviceTTL, m.currentInterfaceAnnouncementPolicy().ifaceSet())
 }
 
 // sendServiceAnnouncementWithTTL sends DNS-SD announcements with a specific TTL.
 func (m *Manager) sendServiceAnnouncementWithTTL(ttl uint32) {
+	m.sendServiceAnnouncementWithTTLForInterfaces(ttl, nil)
+}
+
+func (m *Manager) sendServiceAnnouncementForInterfaces(ifaces map[string]bool) {
+	m.sendServiceAnnouncementWithTTLForInterfaces(serviceTTL, ifaces)
+}
+
+func (m *Manager) sendServiceAnnouncementWithTTLForInterfaces(ttl uint32, ifaces map[string]bool) {
 	type ifaceSnapshot struct {
 		name     string
 		state    *InterfaceState
@@ -160,6 +169,9 @@ func (m *Manager) sendServiceAnnouncementWithTTL(ttl uint32) {
 	snapshots := make([]ifaceSnapshot, 0, len(m.interfaces))
 	for name, state := range m.interfaces {
 		if state == nil {
+			continue
+		}
+		if ifaces != nil && !ifaces[name] {
 			continue
 		}
 		snapshots = append(snapshots, ifaceSnapshot{

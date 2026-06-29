@@ -13,6 +13,7 @@
 #   ./scripts/alpha/dev-vm-alpha.sh deploy [name]    # Build on host, restart service on VM
 #   ./scripts/alpha/dev-vm-alpha.sh destroy [name]   # Power off + delete VM
 #   ./scripts/alpha/dev-vm-alpha.sh fresh [name]     # destroy + clone + start + deploy
+#   ./scripts/alpha/dev-vm-alpha.sh netlab [name]    # Attach extra NICs for multi-interface tests
 #   ./scripts/alpha/dev-vm-alpha.sh ip [name]        # Print VM IP
 #   ./scripts/alpha/dev-vm-alpha.sh logs [name]      # Tail piccolod journal on VM
 set -euo pipefail
@@ -179,8 +180,34 @@ cmd_destroy() {
 
 cmd_fresh() {
   cmd_clone
+  if [[ "${PICCOLO_ALPHA_NETLAB:-0}" == "1" ]]; then
+    cmd_netlab
+  fi
   cmd_start
   cmd_deploy
+}
+
+cmd_netlab() {
+  local vm
+  vm=$(resolve_vm)
+  [[ -n "$vm" ]] || die "No VM. Run 'clone' first."
+
+  local running
+  running=$(VBoxManage showvminfo "$vm" --machinereadable 2>/dev/null | grep -oP '^VMState="\K[^"]+' || true)
+  if [[ "$running" == "running" ]]; then
+    echo "==> Attaching runtime network lab NICs to $vm"
+    VBoxManage controlvm "$vm" nic2 nat
+    VBoxManage controlvm "$vm" cableconnected2 on
+    VBoxManage controlvm "$vm" nic3 intnet "piccolo-alpha-lanonly"
+    VBoxManage controlvm "$vm" cableconnected3 on
+  else
+    echo "==> Configuring network lab NICs on $vm"
+    VBoxManage modifyvm "$vm" --nic2 nat --cableconnected2 on
+    VBoxManage modifyvm "$vm" --nic3 intnet --intnet3 "piccolo-alpha-lanonly" --cableconnected3 on
+  fi
+
+  echo "  nic2: NAT (WAN-capable test uplink)"
+  echo "  nic3: internal network piccolo-alpha-lanonly (LAN-only static profile in test stage)"
 }
 
 cmd_ip() {
@@ -212,6 +239,7 @@ case "$CMD" in
   deploy)  cmd_deploy ;;
   destroy) cmd_destroy ;;
   fresh)   cmd_fresh ;;
+  netlab)  cmd_netlab ;;
   ip)      cmd_ip ;;
   logs)    cmd_logs ;;
   help|*)
@@ -224,6 +252,7 @@ case "$CMD" in
     echo "  deploy [name]  Build on host, restart service on VM"
     echo "  destroy [name] Power off and delete the VM"
     echo "  fresh [name]   destroy + clone + start + deploy"
+    echo "  netlab [name]  Attach extra NICs for multi-interface tests"
     echo "  ip [name]      Print VM IP"
     echo "  logs [name]    Tail piccolod journal (filtered)"
     ;;

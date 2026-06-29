@@ -23,6 +23,7 @@ const (
 	nmSettingsInterface   = "org.freedesktop.NetworkManager.Settings"
 	nmSettingsConnIface   = "org.freedesktop.NetworkManager.Settings.Connection"
 	nmIP4ConfigInterface  = "org.freedesktop.NetworkManager.IP4Config"
+	nmIP6ConfigInterface  = "org.freedesktop.NetworkManager.IP6Config"
 
 	dbusPropertiesInterface = "org.freedesktop.DBus.Properties"
 )
@@ -31,13 +32,13 @@ const (
 type NMState uint32
 
 const (
-	NMStateUnknown      NMState = 0
-	NMStateAsleep       NMState = 10
-	NMStateDisconnected NMState = 20
-	NMStateDisconnecting NMState = 30
-	NMStateConnecting   NMState = 40
-	NMStateConnectedLocal NMState = 50
-	NMStateConnectedSite  NMState = 60
+	NMStateUnknown         NMState = 0
+	NMStateAsleep          NMState = 10
+	NMStateDisconnected    NMState = 20
+	NMStateDisconnecting   NMState = 30
+	NMStateConnecting      NMState = 40
+	NMStateConnectedLocal  NMState = 50
+	NMStateConnectedSite   NMState = 60
 	NMStateConnectedGlobal NMState = 70
 )
 
@@ -134,54 +135,54 @@ func (r NMDeviceStateReason) String() string {
 type NMDeviceStateReason uint32
 
 const (
-	NMDeviceStateReasonNone            NMDeviceStateReason = 0
-	NMDeviceStateReasonUnknown         NMDeviceStateReason = 1
-	NMDeviceStateReasonNowManaged      NMDeviceStateReason = 2
-	NMDeviceStateReasonNowUnmanaged    NMDeviceStateReason = 3
-	NMDeviceStateReasonConfigFailed    NMDeviceStateReason = 4
-	NMDeviceStateReasonIPConfigUnavail NMDeviceStateReason = 5
-	NMDeviceStateReasonIPConfigExpired NMDeviceStateReason = 6
-	NMDeviceStateReasonNoSecrets       NMDeviceStateReason = 7
-	NMDeviceStateReasonSupplicantDisconnect NMDeviceStateReason = 8
-	NMDeviceStateReasonSupplicantConfigFailed NMDeviceStateReason = 9
-	NMDeviceStateReasonSupplicantFailed NMDeviceStateReason = 10
-	NMDeviceStateReasonSupplicantTimeout NMDeviceStateReason = 11
-	NMDeviceStateReasonPPPStartFailed  NMDeviceStateReason = 12
-	NMDeviceStateReasonPPPDisconnect   NMDeviceStateReason = 13
-	NMDeviceStateReasonPPPFailed       NMDeviceStateReason = 14
-	NMDeviceStateReasonDHCPStartFailed NMDeviceStateReason = 15
-	NMDeviceStateReasonDHCPError       NMDeviceStateReason = 16
-	NMDeviceStateReasonDHCPFailed      NMDeviceStateReason = 17
-	NMDeviceStateReasonSharedStartFailed NMDeviceStateReason = 18
-	NMDeviceStateReasonSharedFailed    NMDeviceStateReason = 19
-	NMDeviceStateReasonAutoIPStartFailed NMDeviceStateReason = 20
-	NMDeviceStateReasonAutoIPError     NMDeviceStateReason = 21
-	NMDeviceStateReasonAutoIPFailed    NMDeviceStateReason = 22
-	NMDeviceStateReasonModemBusy       NMDeviceStateReason = 23
-	NMDeviceStateReasonModemNoDialTone NMDeviceStateReason = 24
-	NMDeviceStateReasonModemNoCarrier  NMDeviceStateReason = 25
-	NMDeviceStateReasonModemDialTimeout NMDeviceStateReason = 26
-	NMDeviceStateReasonModemDialFailed NMDeviceStateReason = 27
-	NMDeviceStateReasonModemInitFailed NMDeviceStateReason = 28
-	NMDeviceStateReasonGSMAPNFailed    NMDeviceStateReason = 29
+	NMDeviceStateReasonNone                        NMDeviceStateReason = 0
+	NMDeviceStateReasonUnknown                     NMDeviceStateReason = 1
+	NMDeviceStateReasonNowManaged                  NMDeviceStateReason = 2
+	NMDeviceStateReasonNowUnmanaged                NMDeviceStateReason = 3
+	NMDeviceStateReasonConfigFailed                NMDeviceStateReason = 4
+	NMDeviceStateReasonIPConfigUnavail             NMDeviceStateReason = 5
+	NMDeviceStateReasonIPConfigExpired             NMDeviceStateReason = 6
+	NMDeviceStateReasonNoSecrets                   NMDeviceStateReason = 7
+	NMDeviceStateReasonSupplicantDisconnect        NMDeviceStateReason = 8
+	NMDeviceStateReasonSupplicantConfigFailed      NMDeviceStateReason = 9
+	NMDeviceStateReasonSupplicantFailed            NMDeviceStateReason = 10
+	NMDeviceStateReasonSupplicantTimeout           NMDeviceStateReason = 11
+	NMDeviceStateReasonPPPStartFailed              NMDeviceStateReason = 12
+	NMDeviceStateReasonPPPDisconnect               NMDeviceStateReason = 13
+	NMDeviceStateReasonPPPFailed                   NMDeviceStateReason = 14
+	NMDeviceStateReasonDHCPStartFailed             NMDeviceStateReason = 15
+	NMDeviceStateReasonDHCPError                   NMDeviceStateReason = 16
+	NMDeviceStateReasonDHCPFailed                  NMDeviceStateReason = 17
+	NMDeviceStateReasonSharedStartFailed           NMDeviceStateReason = 18
+	NMDeviceStateReasonSharedFailed                NMDeviceStateReason = 19
+	NMDeviceStateReasonAutoIPStartFailed           NMDeviceStateReason = 20
+	NMDeviceStateReasonAutoIPError                 NMDeviceStateReason = 21
+	NMDeviceStateReasonAutoIPFailed                NMDeviceStateReason = 22
+	NMDeviceStateReasonModemBusy                   NMDeviceStateReason = 23
+	NMDeviceStateReasonModemNoDialTone             NMDeviceStateReason = 24
+	NMDeviceStateReasonModemNoCarrier              NMDeviceStateReason = 25
+	NMDeviceStateReasonModemDialTimeout            NMDeviceStateReason = 26
+	NMDeviceStateReasonModemDialFailed             NMDeviceStateReason = 27
+	NMDeviceStateReasonModemInitFailed             NMDeviceStateReason = 28
+	NMDeviceStateReasonGSMAPNFailed                NMDeviceStateReason = 29
 	NMDeviceStateReasonGSMRegistrationNotSearching NMDeviceStateReason = 30
 	NMDeviceStateReasonGSMRegistrationDenied       NMDeviceStateReason = 31
 	NMDeviceStateReasonGSMRegistrationTimeout      NMDeviceStateReason = 32
 	NMDeviceStateReasonGSMRegistrationFailed       NMDeviceStateReason = 33
 	NMDeviceStateReasonGSMPINCheckFailed           NMDeviceStateReason = 34
-	NMDeviceStateReasonFirmwareMissing NMDeviceStateReason = 35
-	NMDeviceStateReasonRemoved         NMDeviceStateReason = 36
-	NMDeviceStateReasonSleeping        NMDeviceStateReason = 37
-	NMDeviceStateReasonConnectionRemoved NMDeviceStateReason = 38
-	NMDeviceStateReasonUserRequested   NMDeviceStateReason = 39
-	NMDeviceStateReasonCarrier         NMDeviceStateReason = 40
-	NMDeviceStateReasonConnectionAssumed NMDeviceStateReason = 41
-	NMDeviceStateReasonSupplicantAvail NMDeviceStateReason = 42
-	NMDeviceStateReasonModemNotFound   NMDeviceStateReason = 43
-	NMDeviceStateReasonBTFailed        NMDeviceStateReason = 44
-	NMDeviceStateReasonNewActivation   NMDeviceStateReason = 50
-	NMDeviceStateReasonParentChanged   NMDeviceStateReason = 51
-	NMDeviceStateReasonParentManagedChanged NMDeviceStateReason = 52
+	NMDeviceStateReasonFirmwareMissing             NMDeviceStateReason = 35
+	NMDeviceStateReasonRemoved                     NMDeviceStateReason = 36
+	NMDeviceStateReasonSleeping                    NMDeviceStateReason = 37
+	NMDeviceStateReasonConnectionRemoved           NMDeviceStateReason = 38
+	NMDeviceStateReasonUserRequested               NMDeviceStateReason = 39
+	NMDeviceStateReasonCarrier                     NMDeviceStateReason = 40
+	NMDeviceStateReasonConnectionAssumed           NMDeviceStateReason = 41
+	NMDeviceStateReasonSupplicantAvail             NMDeviceStateReason = 42
+	NMDeviceStateReasonModemNotFound               NMDeviceStateReason = 43
+	NMDeviceStateReasonBTFailed                    NMDeviceStateReason = 44
+	NMDeviceStateReasonNewActivation               NMDeviceStateReason = 50
+	NMDeviceStateReasonParentChanged               NMDeviceStateReason = 51
+	NMDeviceStateReasonParentManagedChanged        NMDeviceStateReason = 52
 )
 
 // NMDeviceType identifies the type of a network device.
@@ -227,29 +228,29 @@ const (
 
 // WiFiDevice represents a discovered WiFi network interface.
 type WiFiDevice struct {
-	Path       dbus.ObjectPath
-	Interface  string          // e.g., "wlan0"
-	HWAddress  net.HardwareAddr
-	State      NMDeviceState
-	Driver     string
+	Path      dbus.ObjectPath
+	Interface string // e.g., "wlan0"
+	HWAddress net.HardwareAddr
+	State     NMDeviceState
+	Driver    string
 }
 
 // EthernetDevice represents a discovered Ethernet network interface.
 type EthernetDevice struct {
 	Path      dbus.ObjectPath
-	Interface string          // e.g., "eth0", "enp0s3"
+	Interface string // e.g., "eth0", "enp0s3"
 	HWAddress net.HardwareAddr
 	State     NMDeviceState
-	Carrier   bool           // physical link detected
+	Carrier   bool // physical link detected
 }
 
 // AccessPoint represents a WiFi network seen during a scan.
 type AccessPoint struct {
 	Path      dbus.ObjectPath
 	SSID      string
-	HWAddress string         // BSSID
-	Frequency uint32         // MHz
-	Strength  uint8          // 0–100 (NM's normalized signal percentage)
+	HWAddress string // BSSID
+	Frequency uint32 // MHz
+	Strength  uint8  // 0–100 (NM's normalized signal percentage)
 	RSNFlags  NM80211ApSecurityFlags
 	WPAFlags  NM80211ApSecurityFlags
 	Flags     uint32
@@ -291,11 +292,11 @@ func (ap AccessPoint) SignalDBm() int {
 
 // ConnectionProfile represents a saved NM connection profile.
 type ConnectionProfile struct {
-	Path     dbus.ObjectPath
-	ID       string   // connection name
-	UUID     string
-	Type     string   // "802-11-wireless", "802-3-ethernet", etc.
-	SSID     string   // for WiFi connections
+	Path dbus.ObjectPath
+	ID   string // connection name
+	UUID string
+	Type string // "802-11-wireless", "802-3-ethernet", etc.
+	SSID string // for WiFi connections
 }
 
 // ConnectionSnapshot holds the full settings of a connection profile for rollback.
@@ -356,14 +357,23 @@ func (s *ConnectionSnapshot) PSK() string {
 
 // ActiveConnectionInfo holds details about a currently active connection.
 type ActiveConnectionInfo struct {
-	Path        dbus.ObjectPath
-	UUID        string
-	ID          string
-	State       uint32 // NM_ACTIVE_CONNECTION_STATE_*
-	Type        string
-	IP4Address  string
-	IP4Gateway  string
-	Devices     []dbus.ObjectPath
+	Path               dbus.ObjectPath
+	UUID               string
+	ID                 string
+	State              uint32 // NM_ACTIVE_CONNECTION_STATE_*
+	Type               string
+	IP4Address         string
+	IP4Gateway         string
+	IP4Addresses       []string
+	IP6Addresses       []string
+	IP4Nameservers     []string
+	IP6Nameservers     []string
+	IP4HasDefaultRoute bool
+	IP6HasDefaultRoute bool
+	IP4RoutesKnown     bool
+	IP6RoutesKnown     bool
+	RouteMetric        uint32
+	Devices            []dbus.ObjectPath
 }
 
 // IsHotspot returns true if this connection is a piccolo AP hotspot.
@@ -373,9 +383,9 @@ func (i *ActiveConnectionInfo) IsHotspot() bool {
 
 // HotspotOpts configures AP mode hotspot activation.
 type HotspotOpts struct {
-	Channel   int    // 0 = auto-select
-	Band      string // "a" (5GHz) or "bg" (2.4GHz), "" = auto
-	Zone      string // firewalld zone to assign (e.g., "piccolo-ap")
+	Channel int    // 0 = auto-select
+	Band    string // "a" (5GHz) or "bg" (2.4GHz), "" = auto
+	Zone    string // firewalld zone to assign (e.g., "piccolo-ap")
 }
 
 // StateChange is emitted when NM's overall daemon state changes.
@@ -445,21 +455,21 @@ func (s NMActiveConnectionState) String() string {
 type NMActiveConnectionStateReason uint32
 
 const (
-	NMActiveConnectionStateReasonUnknown          NMActiveConnectionStateReason = 0
-	NMActiveConnectionStateReasonNone             NMActiveConnectionStateReason = 1
-	NMActiveConnectionStateReasonUserDisconnected NMActiveConnectionStateReason = 2
-	NMActiveConnectionStateReasonDeviceDisconnect NMActiveConnectionStateReason = 3
-	NMActiveConnectionStateReasonServiceStopped   NMActiveConnectionStateReason = 4
-	NMActiveConnectionStateReasonIPConfigInvalid  NMActiveConnectionStateReason = 5
-	NMActiveConnectionStateReasonConnectTimeout   NMActiveConnectionStateReason = 6
+	NMActiveConnectionStateReasonUnknown             NMActiveConnectionStateReason = 0
+	NMActiveConnectionStateReasonNone                NMActiveConnectionStateReason = 1
+	NMActiveConnectionStateReasonUserDisconnected    NMActiveConnectionStateReason = 2
+	NMActiveConnectionStateReasonDeviceDisconnect    NMActiveConnectionStateReason = 3
+	NMActiveConnectionStateReasonServiceStopped      NMActiveConnectionStateReason = 4
+	NMActiveConnectionStateReasonIPConfigInvalid     NMActiveConnectionStateReason = 5
+	NMActiveConnectionStateReasonConnectTimeout      NMActiveConnectionStateReason = 6
 	NMActiveConnectionStateReasonServiceStartTimeout NMActiveConnectionStateReason = 7
 	NMActiveConnectionStateReasonServiceStartFailed  NMActiveConnectionStateReason = 8
-	NMActiveConnectionStateReasonNoSecrets        NMActiveConnectionStateReason = 9
-	NMActiveConnectionStateReasonLoginFailed      NMActiveConnectionStateReason = 10
-	NMActiveConnectionStateReasonConnectionRemoved NMActiveConnectionStateReason = 11
-	NMActiveConnectionStateReasonDependencyFailed NMActiveConnectionStateReason = 12
+	NMActiveConnectionStateReasonNoSecrets           NMActiveConnectionStateReason = 9
+	NMActiveConnectionStateReasonLoginFailed         NMActiveConnectionStateReason = 10
+	NMActiveConnectionStateReasonConnectionRemoved   NMActiveConnectionStateReason = 11
+	NMActiveConnectionStateReasonDependencyFailed    NMActiveConnectionStateReason = 12
 	NMActiveConnectionStateReasonDeviceRealizeFailed NMActiveConnectionStateReason = 13
-	NMActiveConnectionStateReasonDeviceRemoved    NMActiveConnectionStateReason = 14
+	NMActiveConnectionStateReasonDeviceRemoved       NMActiveConnectionStateReason = 14
 )
 
 // ActiveConnectionStateChange is emitted when an active-connection D-Bus

@@ -17,10 +17,10 @@ import (
 
 // Probe constants — see RFC §"Probe constants".
 const (
-	TickInterval     = 30 * time.Second
-	ColdBootGrace    = 60 * time.Second
-	NofM             = 3 // 3-of-3 dampening
-	QuietPeriod      = 90 * time.Second // 3 ticks post-action
+	TickInterval  = 30 * time.Second
+	ColdBootGrace = 60 * time.Second
+	NofM          = 3                // 3-of-3 dampening
+	QuietPeriod   = 90 * time.Second // 3 ticks post-action
 )
 
 // Prober coordinates the per-tick observation pass: WiFi + Eth device probes,
@@ -196,17 +196,30 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 	l3Final := p.dampenL3(l3)
 
 	nmConn := nmConnAdvisory(p.nm)
+	connectivity := classifyConnectivity(l3Final, devices, nmConn)
+	legacyActiveUplink := activeUplinkFor(devices)
+	projection := p.probeTransitionProjection(connectivity)
+
 	busy, reason := p.sys.SystemBusy()
 
 	return Tick{
-		Devices:          devices,
-		NMConn:           nmConn,
-		L3Probe:          l3Final,
-		ActiveUplink:     activeUplinkFor(devices),
-		SystemBusy:       busy,
-		SystemBusyReason: reason,
-		SystemUptime:     uptime,
-		At:               now,
+		Devices:              devices,
+		Interfaces:           projection.interfaces,
+		InterfacesObserved:   projection.interfacesObserved,
+		NMConn:               nmConn,
+		L3Probe:              l3Final,
+		ActiveUplink:         legacyActiveUplink,
+		ActiveUplinkIface:    activeUplinkIfaceFromDevices(devices, legacyActiveUplink),
+		DefaultRouteIface:    projection.defaultRouteIface,
+		DefaultRouteObserved: projection.defaultRouteObserved,
+		DefaultRouteKnown:    projection.defaultRouteKnown,
+		DNSDefaultIface:      projection.dnsDefaultIface,
+		DNSDefaultObserved:   projection.dnsDefaultObserved,
+		DNSDefaultKnown:      projection.dnsDefaultKnown,
+		SystemBusy:           busy,
+		SystemBusyReason:     reason,
+		SystemUptime:         uptime,
+		At:                   now,
 	}
 }
 

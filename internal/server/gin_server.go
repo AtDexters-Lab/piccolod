@@ -1479,6 +1479,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		})
 	}
 
+	var netTransitions network.NetworkTransitionSource
+
 	// Network manager + supervisor. D-Bus may be unavailable on dev machines —
 	// degrade gracefully, WiFi API returns available=false.
 	//
@@ -1508,6 +1510,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			s.supervisor.Register(networkMgr)
 		} else {
 			networkMgr.AttachSupervisor(netSup)
+			netTransitions = netSup
 			s.supervisor.Register(networkMgr) // must come before netSup
 			s.supervisor.Register(netSup)
 		}
@@ -1546,6 +1549,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	rm.SetNexusAdapter(nexusAdapter)
 	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
 	rm.SetPortClaimProvider(svcMgr)
+	s.subscribeSelfHostedNetworkTransitions(netTransitions, rm)
+	s.subscribeLANNetworkTransitions(netTransitions)
 
 	// Namek adapter (new, with TPM token provider) — owned by GinServer
 	if os.Getenv("PICCOLO_NEXUS_USE_STUB") != "1" {
@@ -1571,24 +1576,77 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	identityReadyCh, cancelReady := eventsBus.SubscribeWithCancel(events.TopicIdentityReady, 8)
 	identityChangedCh, cancelChanged := eventsBus.SubscribeWithCancel(events.TopicIdentityChanged, 8)
 	s.busUnsubs = append(s.busUnsubs, cancelReady, cancelChanged)
+	var namekNetworkWakeCh <-chan struct{}
+	var namekNetworkDoneCh <-chan struct{}
+	if netTransitions != nil {
+		var cancelNamekNetwork func()
+		namekNetworkWakeCh, namekNetworkDoneCh, cancelNamekNetwork = s.networkTransitionWakeChannel(netTransitions)
+		s.busUnsubs = append(s.busUnsubs, cancelNamekNetwork)
+	}
+	namekNetworkRetryTimer := time.NewTimer(time.Hour)
+	if !namekNetworkRetryTimer.Stop() {
+		<-namekNetworkRetryTimer.C
+	}
+	var namekNetworkRetryC <-chan time.Time
+	scheduleNamekNetworkRetry := func() {
+		if namekNetworkRetryC != nil && !namekNetworkRetryTimer.Stop() {
+			select {
+			case <-namekNetworkRetryTimer.C:
+			default:
+			}
+		}
+		namekNetworkRetryTimer.Reset(networkTransitionRecoveryInterval)
+		namekNetworkRetryC = namekNetworkRetryTimer.C
+	}
+	stopNamekNetworkRetry := func() {
+		if namekNetworkRetryC != nil && !namekNetworkRetryTimer.Stop() {
+			select {
+			case <-namekNetworkRetryTimer.C:
+			default:
+			}
+		}
+		namekNetworkRetryC = nil
+	}
 	go func() {
+		defer namekNetworkRetryTimer.Stop()
 		// Seed with current state to avoid spurious "activated" log on boot.
 		var lastLoggedState string
 		if s.identityService != nil {
 			lastLoggedState = s.identityService.Status().State
 		}
+		var namekNetworkGeneration uint64
+		var namekNetworkState network.NetworkTransitionState
+		var namekNetworkRetry networkTransitionRetry
 		for {
+			identityWake := false
+			networkWake := false
+			networkRetryWake := false
 			select {
 			case _, ok := <-identityReadyCh:
 				if !ok {
 					identityReadyCh = nil
+				} else {
+					identityWake = true
 				}
 			case _, ok := <-identityChangedCh:
 				if !ok {
 					identityChangedCh = nil
+				} else {
+					identityWake = true
 				}
+			case _, ok := <-namekNetworkWakeCh:
+				if !ok {
+					namekNetworkWakeCh = nil
+				} else {
+					networkWake = true
+				}
+			case <-namekNetworkDoneCh:
+				namekNetworkWakeCh = nil
+				namekNetworkDoneCh = nil
+			case <-namekNetworkRetryC:
+				networkRetryWake = true
 			}
-			if identityReadyCh == nil && identityChangedCh == nil {
+			if identityReadyCh == nil && identityChangedCh == nil && namekNetworkWakeCh == nil {
 				return
 			}
 
@@ -1607,6 +1665,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 						identityReadyCh = nil
 						continue // shutdown signal, don't extend debounce
 					}
+					identityWake = true
 					if !debounce.Stop() {
 						<-debounce.C
 					}
@@ -1616,10 +1675,28 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 						identityChangedCh = nil
 						continue // shutdown signal, don't extend debounce
 					}
+					identityWake = true
 					if !debounce.Stop() {
 						<-debounce.C
 					}
 					debounce.Reset(identityEventDebounce)
+				case _, ok := <-namekNetworkWakeCh:
+					if !ok {
+						namekNetworkWakeCh = nil
+						continue // shutdown signal, don't extend debounce
+					}
+					networkWake = true
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(identityEventDebounce)
+				case <-namekNetworkDoneCh:
+					namekNetworkWakeCh = nil
+					namekNetworkDoneCh = nil
+					continue // shutdown signal, don't extend debounce
+				case <-namekNetworkRetryC:
+					networkRetryWake = true
+					continue // timer wake, don't extend debounce
 				case <-debounce.C:
 					break drainLoop
 				}
@@ -1627,11 +1704,52 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			debounce.Stop()
 
 			// Both channels may have closed during drain.
-			if identityReadyCh == nil && identityChangedCh == nil {
+			if identityReadyCh == nil && identityChangedCh == nil && namekNetworkWakeCh == nil {
 				return
 			}
 
-			s.applyNamekState()
+			var restartReasons []network.NetworkTransitionReason
+			forceNetworkRestart := false
+			if networkWake && netTransitions != nil {
+				if delta, ok := netTransitions.TransitionDeltaSince(namekNetworkGeneration); ok {
+					namekNetworkGeneration = delta.ToGeneration
+					namekNetworkState = delta.Current
+					if reasons := remoteRelevantNetworkTransitionReasons(delta); len(reasons) > 0 {
+						namekNetworkRetry.add(reasons, time.Now())
+						forceNetworkRestart = true
+					}
+				}
+			}
+			if namekNetworkRetry.hasPending() && s.remoteManager != nil {
+				switch {
+				case networkTransitionRetrySatisfiedByConnectedRelay(forceNetworkRestart, &namekNetworkRetry, s.remoteManager.RelayConnectedByName(namekRelayName)):
+					namekNetworkRetry.clear()
+					stopNamekNetworkRetry()
+				case namekNetworkRetry.expired(time.Now()):
+					log.Printf("WARN: server: namek network transition recovery expired (reasons=%s)", networkTransitionReasonString(namekNetworkRetry.reasons()))
+					namekNetworkRetry.clear()
+					stopNamekNetworkRetry()
+				case !networkTransitionRemoteUsable(namekNetworkState):
+					if !namekNetworkRetry.hasAttempted() {
+						log.Printf("INFO: server: namek network transition recovery pending; uplink not usable yet (reasons=%s)", networkTransitionReasonString(namekNetworkRetry.reasons()))
+						stopNamekNetworkRetry()
+						break
+					}
+					log.Printf("INFO: server: dropping namek network transition recovery; uplink no longer usable (reasons=%s)", networkTransitionReasonString(namekNetworkRetry.reasons()))
+					namekNetworkRetry.clear()
+					stopNamekNetworkRetry()
+				case !s.namekNetworkTransitionExpectedActive():
+					namekNetworkRetry.clear()
+					stopNamekNetworkRetry()
+				case forceNetworkRestart || networkRetryWake || networkWake:
+					restartReasons = namekNetworkRetry.reasons()
+					namekNetworkRetry.markAttempted()
+					scheduleNamekNetworkRetry()
+				}
+			}
+			if identityWake || len(restartReasons) > 0 {
+				s.applyNamekState(restartReasons...)
+			}
 			// Log identity state change to remote activity log (only on actual transitions)
 			if s.remoteManager != nil && s.identityService != nil {
 				ids := s.identityService.Status()
@@ -3047,7 +3165,7 @@ func (s *GinServer) clearNamekState(rm *remote.Manager) {
 // issuance into a single method. Called when identity state changes.
 // applyNamekState must only be called from the identity event subscriber goroutine.
 // Concurrent calls would race on adapter lifecycle (namekLastKey, namekAdapterCancel).
-func (s *GinServer) applyNamekState() {
+func (s *GinServer) applyNamekState(networkRestartReasons ...network.NetworkTransitionReason) {
 	if s == nil || s.identityService == nil || s.namekStopped.Load() {
 		return
 	}
@@ -3100,9 +3218,10 @@ func (s *GinServer) applyNamekState() {
 	cancel := s.namekAdapterCancel
 	adapter := s.namekAdapter
 	s.namekMu.Unlock()
+	forceNetworkRestart := len(networkRestartReasons) > 0
 
 	if adapter != nil {
-		if !changed && cancel != nil {
+		if !changed && cancel != nil && !forceNetworkRestart {
 			// Adapter running with identical config — skip restart, but still update routing/certs below
 		} else {
 			adapterCfg := nexusclient.Config{
@@ -3150,7 +3269,11 @@ func (s *GinServer) applyNamekState() {
 					s.namekMu.Unlock()
 				}
 			}(key)
-			log.Printf("INFO: server: namek adapter started (endpoints=%d, slug=%s, custom=%s)", len(endpoints), slugHostname, customFQDN)
+			if forceNetworkRestart {
+				log.Printf("INFO: server: namek adapter restarted (network transition: %s)", networkTransitionReasonString(networkRestartReasons))
+			} else {
+				log.Printf("INFO: server: namek adapter started (endpoints=%d, slug=%s, custom=%s)", len(endpoints), slugHostname, customFQDN)
+			}
 		}
 	}
 
@@ -3269,6 +3392,14 @@ func (s *GinServer) applyNamekState() {
 	go s.rebuildNamekDomains(reconcileCtx)
 }
 
+func (s *GinServer) namekNetworkTransitionExpectedActive() bool {
+	if s == nil || s.identityService == nil || s.namekStopped.Load() {
+		return false
+	}
+	svc := s.identityService
+	return svc.IsEnrolled() && svc.IsEnabled() && !svc.IsSuspended() && len(svc.DeviceConfig().NexusEndpoints) > 0
+}
+
 // stopNamekAdapter cancels the namek adapter context and stops the adapter.
 func (s *GinServer) stopNamekAdapter() {
 	s.namekMu.Lock()
@@ -3285,6 +3416,9 @@ func (s *GinServer) stopNamekAdapter() {
 		if err := adapter.Stop(context.Background()); err != nil {
 			log.Printf("WARN: server: stopping namek adapter: %v", err)
 		}
+	}
+	if s.remoteManager != nil {
+		s.remoteManager.ClearRelayState(namekRelayName)
 	}
 }
 

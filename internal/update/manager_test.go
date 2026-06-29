@@ -1688,11 +1688,9 @@ func (r *hangingInProgressRunner) Run(ctx context.Context, name string, args ...
 			if !r.enabled.Load() {
 				return "", "", 3, nil
 			}
-			if r.hangs.Add(1) == 1 {
-				<-ctx.Done()
-				return "", "", -1, ctx.Err()
-			}
-			return "", "", 3, nil
+			r.hangs.Add(1)
+			<-ctx.Done()
+			return "", "", -1, ctx.Err()
 		}
 	}
 	select {

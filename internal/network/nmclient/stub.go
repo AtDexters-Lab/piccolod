@@ -14,44 +14,46 @@ type StubClient struct {
 	mu sync.Mutex
 
 	// Configurable return values
-	WaitForActivationState  NMDeviceState
-	WaitForActivationReason NMDeviceStateReason
-	WaitForActivationErr    error
+	WaitForActivationState      NMDeviceState
+	WaitForActivationReason     NMDeviceStateReason
+	WaitForActivationErr        error
 	ActivateHotspotActivePath   dbus.ObjectPath
 	ActivateHotspotSettingsPath dbus.ObjectPath
-	ActiveConnStateCh       chan ActiveConnectionStateChange
-	WiFiDevicesResult       []WiFiDevice
-	WiFiDevicesErr          error
-	EthernetDevicesResult []EthernetDevice
-	EthernetDevicesErr    error
-	ScanResult            []AccessPoint
-	ScanErr               error
-	ConnectErr            error
-	DisconnectErr         error
-	ConnectPath           dbus.ObjectPath
-	ConnectActivePath     dbus.ObjectPath
-	SavedConnections      []ConnectionProfile
-	SavedConnectionsErr   error
-	DeleteConnectionErr   error
-	SnapshotResult        *ConnectionSnapshot
-	SnapshotErr           error
-	RestoreErr            error
-	ActivateHotspotErr    error
-	DeactivateHotspotErr  error
-	ConnectivityResult    NMConnectivityState
-	ConnectivityErr       error
-	DeviceStateResult       NMDeviceState
-	DeviceStateErr          error
-	DeviceStateReasonResult NMDeviceStateReason
-	DeviceStateReasonErr    error
-	ActiveConnResult      *ActiveConnectionInfo
-	ActiveConnErr         error
-	SignalStrengthResult  uint8
-	SignalStrengthErr     error
-	WirelessEnabledResult bool
-	WirelessEnabledErr    error
-	SetWirelessErr        error
-	Connected             bool
+	ActiveConnStateCh           chan ActiveConnectionStateChange
+	WiFiDevicesResult           []WiFiDevice
+	WiFiDevicesErr              error
+	EthernetDevicesResult       []EthernetDevice
+	EthernetDevicesErr          error
+	ScanResult                  []AccessPoint
+	ScanErr                     error
+	ConnectErr                  error
+	DisconnectErr               error
+	ConnectPath                 dbus.ObjectPath
+	ConnectActivePath           dbus.ObjectPath
+	SavedConnections            []ConnectionProfile
+	SavedConnectionsErr         error
+	DeleteConnectionErr         error
+	SnapshotResult              *ConnectionSnapshot
+	SnapshotErr                 error
+	RestoreErr                  error
+	ActivateHotspotErr          error
+	DeactivateHotspotErr        error
+	ConnectivityResult          NMConnectivityState
+	ConnectivityErr             error
+	DeviceStateResult           NMDeviceState
+	DeviceStateErr              error
+	DeviceStateReasonResult     NMDeviceStateReason
+	DeviceStateReasonErr        error
+	ActiveConnResult            *ActiveConnectionInfo
+	ActiveConnByDevice          map[dbus.ObjectPath]*ActiveConnectionInfo
+	ActiveConnErr               error
+	ActiveConnErrByDevice       map[dbus.ObjectPath]error
+	SignalStrengthResult        uint8
+	SignalStrengthErr           error
+	WirelessEnabledResult       bool
+	WirelessEnabledErr          error
+	SetWirelessErr              error
+	Connected                   bool
 
 	// Call recording
 	Calls []StubCall
@@ -215,6 +217,16 @@ func (s *StubClient) DeviceStateReason(device dbus.ObjectPath) (NMDeviceState, N
 
 func (s *StubClient) ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnectionInfo, error) {
 	s.record("ActiveConnectionInfo", device)
+	if s.ActiveConnErrByDevice != nil {
+		if err, ok := s.ActiveConnErrByDevice[device]; ok {
+			return nil, err
+		}
+	}
+	if s.ActiveConnByDevice != nil {
+		if info, ok := s.ActiveConnByDevice[device]; ok {
+			return info, nil
+		}
+	}
 	return s.ActiveConnResult, s.ActiveConnErr
 }
 

@@ -60,6 +60,7 @@ const (
 
 	// Network state events (WiFi uplink + watchdog)
 	TopicNetworkStateChanged Topic = "network_state_changed" // Emitted on connectivity state transitions, signal tier changes
+	TopicNetworkTransition   Topic = "network_transition"    // Diagnostic-only payload; owners read retained deltas from network supervisor
 )
 
 // Event represents a message broadcast on the event bus.

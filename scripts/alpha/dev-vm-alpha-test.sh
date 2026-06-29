@@ -27,6 +27,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> listener-pipeline # stages 12+13+14 (the listener-pipeline RFC validation suite)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> net-supervisor   # stage 15: probe-decide-act validation (RFC 20260505) — destructive (restarts piccolod, plants legacy ledger, blocks rfkill)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> wifi-secret-agent # stage 16: NM SecretAgent registration + lifecycle (RFC 20260507) — destructive (restarts NetworkManager)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> network-transition # stage 18: multi-interface WAN/LAN transition validation (requires dev-vm-alpha.sh netlab)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> logs             # download piccolod journal
 set -euo pipefail
 
@@ -2326,19 +2327,23 @@ stage_net_supervisor() {
   ensure_session
   local wifi_status state
   wifi_status=$(curl -s -b "$COOKIE_JAR" --connect-timeout 5 "http://$IP/api/v1/wifi/status" 2>/dev/null || true)
+  if echo "$wifi_status" | grep -qi 'Unauthorized'; then
+    skip "15.3" "Legacy wire contract" "auth session unavailable; run setup/pre-setup stages first for API contract validation"
+  else
   state=$(echo "$wifi_status" | python3 -c "import sys,json
 try: print(json.load(sys.stdin).get('state',''))
 except: print('')" 2>/dev/null || true)
-  case "$state" in
-    ethernet|wifi_connected|ap_mode|reconnecting|disconnected)
-      echo -e "  ${GREEN}PASS${NC} [15.3] Legacy wire contract: state=\"$state\""
-      ((PASS_COUNT++)) || true
-      ;;
-    *)
-      echo -e "  ${RED}FAIL${NC} [15.3] Unexpected state: \"$state\" (response: $(echo "$wifi_status" | head -c 200))"
-      ((FAIL_COUNT++)) || true
-      ;;
-  esac
+    case "$state" in
+      ethernet|wifi_connected|ap_mode|reconnecting|disconnected)
+        echo -e "  ${GREEN}PASS${NC} [15.3] Legacy wire contract: state=\"$state\""
+        ((PASS_COUNT++)) || true
+        ;;
+      *)
+        echo -e "  ${RED}FAIL${NC} [15.3] Unexpected state: \"$state\" (response: $(echo "$wifi_status" | head -c 200))"
+        ((FAIL_COUNT++)) || true
+        ;;
+    esac
+  fi
 
   # 15.4 private dbus connection (F3-B1) — piccolod has 2 dbus connections
   local dbus_count
@@ -2656,6 +2661,65 @@ stage_wifi_secret_agent() {
     echo -e "  ${RED}FAIL${NC} [16.7] Binary missing SubscribeActiveConnectionState — RFC 20260508 not deployed"
     ((FAIL_COUNT++)) || true
   fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 18: Multi-interface network transition validation.
+# Requires an extra non-management Ethernet adapter. Use:
+#   scripts/alpha/dev-vm-alpha.sh netlab <vm>
+# ─────────────────────────────────────────────────────────
+stage_network_transition() {
+  echo -e "\n${CYAN}═══ Stage 18: Network Transition Multi-Interface Validation ═══${NC}"
+
+  check_ssh_ok "18.1" "NetworkManager available" "systemctl is-active NetworkManager"
+
+  local mgmt_if ethernet_devs test_if
+  mgmt_if=$(vssh "ip -4 -o addr show | awk '\$4 ~ /^$IP\\// {print \$2; exit}'" 2>/dev/null | tr -d '[:space:]' || true)
+  ethernet_devs=$(vssh "nmcli -t -f DEVICE,TYPE device status 2>/dev/null | awk -F: '\$2==\"ethernet\" {print \$1}'" 2>/dev/null || true)
+  test_if=$(printf '%s\n' "$ethernet_devs" | grep -v '^$' | grep -vx "$mgmt_if" | head -1 || true)
+
+  if [[ -z "$test_if" ]]; then
+    skip "18.2" "extra Ethernet interface" "no non-management Ethernet device found; run scripts/alpha/dev-vm-alpha.sh netlab <vm>"
+    return 0
+  fi
+
+  echo "  management iface: ${mgmt_if:-unknown}"
+  echo "  LAN-only test iface: $test_if"
+
+  vssh "nmcli connection delete piccolo-alpha-lanonly >/dev/null 2>&1 || true; nmcli connection add type ethernet ifname '$test_if' con-name piccolo-alpha-lanonly ipv4.method manual ipv4.addresses 172.31.255.2/24 ipv4.never-default yes ipv6.method disabled autoconnect no >/dev/null" >/dev/null 2>&1 || true
+  check_ssh "18.2" "LAN-only profile never-default" "nmcli -g ipv4.never-default connection show piccolo-alpha-lanonly 2>/dev/null" "yes"
+
+  vssh "nmcli connection down piccolo-alpha-lanonly >/dev/null 2>&1 || true; systemctl restart piccolod" >/dev/null 2>&1 || true
+  sleep 35
+
+  local cursor
+  cursor=$(vssh "journalctl -u piccolod --show-cursor -n 0 2>/dev/null | tail -1 | grep -oP 'cursor: \\K.*' || true" 2>/dev/null || true)
+
+  vssh "nmcli connection up piccolo-alpha-lanonly >/dev/null 2>&1" >/dev/null 2>&1 || true
+  sleep 40
+
+  local route_on_lan transition_logs
+  route_on_lan=$(vssh "ip route show default 2>/dev/null | grep -w '$test_if' || true" 2>/dev/null || true)
+  check_not "18.3" "LAN-only interface is not default route" "$route_on_lan" "$test_if"
+
+  if [[ -n "$cursor" ]]; then
+    transition_logs=$(vssh "journalctl -u piccolod --no-pager --after-cursor='$cursor' 2>/dev/null | grep 'net-supervisor.transition' || true" 2>/dev/null || true)
+  else
+    transition_logs=$(vssh "journalctl -u piccolod --no-pager --since '2 minutes ago' 2>/dev/null | grep 'net-supervisor.transition' || true" 2>/dev/null || true)
+  fi
+  check "18.4" "transition log emitted for LAN-only interface up" "$transition_logs" "interface_"
+  check "18.5" "transition preserves LAN-capable role" "$transition_logs" "$test_if=lan"
+
+  cursor=$(vssh "journalctl -u piccolod --show-cursor -n 0 2>/dev/null | tail -1 | grep -oP 'cursor: \\K.*' || true" 2>/dev/null || true)
+  vssh "nmcli device disconnect '$test_if' >/dev/null 2>&1 || nmcli connection down piccolo-alpha-lanonly >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  sleep 40
+  if [[ -n "$cursor" ]]; then
+    transition_logs=$(vssh "journalctl -u piccolod --no-pager --after-cursor='$cursor' 2>/dev/null | grep 'net-supervisor.transition' || true" 2>/dev/null || true)
+  else
+    transition_logs=$(vssh "journalctl -u piccolod --no-pager --since '2 minutes ago' 2>/dev/null | grep 'net-supervisor.transition' || true" 2>/dev/null || true)
+  fi
+  check "18.6" "transition log emitted for LAN-only interface down" "$transition_logs" "interface_"
+  check_not "18.7" "LAN-only interface removed from LAN-capable log after disconnect" "$transition_logs" "$test_if=lan"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -3067,6 +3131,7 @@ case "$STAGE" in
   listener-pipeline) stage_connection_auth; stage_tcp_raw; stage_cookie_isolation ;;
   net-supervisor)    stage_net_supervisor ;;
   wifi-secret-agent) stage_wifi_secret_agent ;;
+  network-transition) stage_network_transition ;;
   async-recovery-key) stage_async_recovery_key ;;
   async-rk-prod-ready) stage_async_rk_prod_ready ;;
   logs)              dump_logs "manual" ;;
@@ -3088,6 +3153,7 @@ case "$STAGE" in
     stage_tcp_raw
     stage_cookie_isolation
     stage_net_supervisor
+    stage_network_transition
     stage_wifi_secret_agent
     stage_async_recovery_key
     stage_auto_unlock
@@ -3096,7 +3162,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac

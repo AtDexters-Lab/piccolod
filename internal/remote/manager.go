@@ -30,6 +30,7 @@ import (
 	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
 	"piccolod/internal/hostname"
+	"piccolod/internal/network"
 	"piccolod/internal/remote/acme"
 	"piccolod/internal/remote/nexusclient"
 	"piccolod/internal/remote/orchestrator"
@@ -42,8 +43,8 @@ type NexusConfig struct {
 	Endpoint             string     `json:"endpoint"`
 	DeviceSecret         string     `json:"device_secret"`
 	Solver               string     `json:"solver"`
-	PortalHostname       string     `json:"portal_hostname"`        // Fully-qualified hostname (e.g., portal.home.example.com)
-	Managed              bool       `json:"managed,omitempty"`       // True for piccolospace managed nexus (DNS-01 via orchestrator)
+	PortalHostname       string     `json:"portal_hostname"`   // Fully-qualified hostname (e.g., portal.home.example.com)
+	Managed              bool       `json:"managed,omitempty"` // True for piccolospace managed nexus (DNS-01 via orchestrator)
 	Enabled              bool       `json:"enabled"`
 	OrchestratorEndpoint string     `json:"orchestrator_endpoint,omitempty"` // Orchestrator API endpoint
 	Issuer               string     `json:"issuer,omitempty"`
@@ -77,7 +78,6 @@ type Config struct {
 	EventLog
 }
 
-
 // Alias represents a remote alias domain attached to a listener.
 type Alias struct {
 	ID       string `json:"id"`
@@ -92,9 +92,9 @@ type Alias struct {
 type Certificate struct {
 	ID            string     `json:"id"`
 	Domains       []string   `json:"domains"`
-	Source        string     `json:"source,omitempty"`    // e.g., "self-hosted", "namek" — for orchClient lookup
+	Source        string     `json:"source,omitempty"` // e.g., "self-hosted", "namek" — for orchClient lookup
 	Solver        string     `json:"solver,omitempty"`
-	CertDir       string     `json:"cert_dir,omitempty"`  // override cert file location
+	CertDir       string     `json:"cert_dir,omitempty"` // override cert file location
 	Attempts      int        `json:"attempts,omitempty"`
 	LastAttempt   *time.Time `json:"last_attempt,omitempty"`
 	RetryAt       *time.Time `json:"retry_at,omitempty"`
@@ -196,35 +196,36 @@ type Storage interface {
 }
 
 type Manager struct {
-	storage       Storage
-	cfg           *Config
-	cfgMu         sync.RWMutex // Protects cfg access during concurrent reads/writes
-	dialer        dialer
-	resolver      resolver
-	now           func() time.Time
-	challenges    *ChallengeManager
-	acmeMgr       *acme.Manager
-	renewCancel   context.CancelFunc
-	renewDone     chan struct{}
-	issueCancel   context.CancelFunc
-	issueDone     chan struct{}
-	issueCh       chan issuanceJob
-	issueMu       sync.Mutex
-	issueQueued   map[string]struct{}
-	needsReload   atomic.Bool
-	closed        atomic.Bool
-	closeOnce     sync.Once
-	closeErr      error
-	eventsBus     *events.Bus
-	baseDir       string
+	storage     Storage
+	cfg         *Config
+	cfgMu       sync.RWMutex // Protects cfg access during concurrent reads/writes
+	dialer      dialer
+	resolver    resolver
+	now         func() time.Time
+	challenges  *ChallengeManager
+	acmeMgr     *acme.Manager
+	renewCancel context.CancelFunc
+	renewDone   chan struct{}
+	issueCancel context.CancelFunc
+	issueDone   chan struct{}
+	issueCh     chan issuanceJob
+	issueMu     sync.Mutex
+	issueQueued map[string]struct{}
+	needsReload atomic.Bool
+	closed      atomic.Bool
+	closeOnce   sync.Once
+	closeErr    error
+	eventsBus   *events.Bus
+	baseDir     string
 
 	// Wake signal for RetryAt-driven scheduler (RFC 20260125)
 	scheduleWakeCh chan struct{}
 
 	// Self-hosted adapter (existing behavior)
-	adapterMu     sync.Mutex // protects both self-hosted and namek adapter fields
-	adapter       nexusclient.Adapter
-	adapterCancel context.CancelFunc
+	adapterMu      sync.Mutex // protects both self-hosted and namek adapter fields
+	adapterApplyMu sync.Mutex
+	adapter        nexusclient.Adapter
+	adapterCancel  context.CancelFunc
 	lastAdapterKey string
 
 	// Source-agnostic orchestrator client registry (RFC 20260312)
@@ -328,9 +329,52 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	snap := extractAdapterSnapshot(m.cfg)
 	m.cfgMu.RUnlock()
 	snap = m.snapshotWithClaims(snap)
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 }
 
+// RestartAdapterForNetworkTransition forces the self-hosted Nexus adapter
+// through the normal stop/start path after an egress-affecting network
+// transition. The caller is responsible for filtering LAN-only transitions
+// and waiting until the current network state is usable.
+func (m *Manager) RestartAdapterForNetworkTransition(reasons []network.NetworkTransitionReason) bool {
+	if m == nil || m.closed.Load() {
+		return false
+	}
+	m.ensureConfigHydrated()
+	m.adapterApplyMu.Lock()
+	defer m.adapterApplyMu.Unlock()
+
+	m.cfgMu.RLock()
+	snap := extractAdapterSnapshot(m.cfg)
+	m.cfgMu.RUnlock()
+	snap = m.snapshotWithClaims(snap)
+	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
+		return false
+	}
+
+	m.adapterMu.Lock()
+	if m.adapter == nil {
+		m.adapterMu.Unlock()
+		return false
+	}
+	m.lastAdapterKey = ""
+	m.adapterMu.Unlock()
+
+	log.Printf("INFO: remote: restarting nexus adapter (network transition: %s)", networkTransitionReasonString(reasons))
+	m.applyAdapterState(snap)
+	return true
+}
+
+func networkTransitionReasonString(reasons []network.NetworkTransitionReason) string {
+	if len(reasons) == 0 {
+		return "unknown"
+	}
+	parts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		parts = append(parts, string(reason))
+	}
+	return strings.Join(parts, ",")
+}
 
 // SetEventsBus wires the shared event bus so the manager can publish config changes.
 func (m *Manager) SetEventsBus(bus *events.Bus) {
@@ -361,7 +405,7 @@ func (m *Manager) RefreshPortClaims() {
 	snap := extractAdapterSnapshot(m.cfg)
 	m.cfgMu.RUnlock()
 	snap = m.snapshotWithClaims(snap)
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 }
 
 // RegisterOrchClient registers an orchestrator client for a source tag.
@@ -566,7 +610,7 @@ func (m *Manager) saveNexus(cfg *Config) error {
 
 	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -645,7 +689,7 @@ func (m *Manager) saveNexusAndEvents(cfg *Config) error {
 
 	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -720,7 +764,7 @@ func (m *Manager) saveAll(cfg *Config) error {
 
 	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -760,7 +804,7 @@ func (m *Manager) reloadFromStorage() error {
 		log.Printf("remote: reloaded config (solver=%s, managed=%v, portal=%s, certs=%d)",
 			cfg.Solver, cfg.Managed, cfg.PortalHostname, len(cfg.Certificates))
 	}
-	m.applyAdapterState(snap)
+	m.applyAdapterStateSerialized(snap)
 	m.updateACMEConfig(&cfg)
 	m.publishConfigChanged()
 	m.requeueOutstandingIssuances()
@@ -1482,6 +1526,12 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	}()
 	// Ensure renew scheduler is running when remote is active
 	m.startRenewScheduler()
+}
+
+func (m *Manager) applyAdapterStateSerialized(snap adapterStateSnapshot) {
+	m.adapterApplyMu.Lock()
+	defer m.adapterApplyMu.Unlock()
+	m.applyAdapterState(snap)
 }
 
 func (m *Manager) publishConfigChanged() {

@@ -335,12 +335,21 @@ func (m *Manager) announcer() {
 	}
 }
 
-// sendMultiInterfaceAnnouncements sends dual-stack mDNS announcements on all active interfaces
+// sendMultiInterfaceAnnouncements sends dual-stack mDNS announcements on the
+// current positive publication surface.
 func (m *Manager) sendMultiInterfaceAnnouncements() {
-	m.sendMultiInterfaceAnnouncementsWithTTL(120)
+	m.sendMultiInterfaceAnnouncementsWithTTLForInterfaces(120, m.currentInterfaceAnnouncementPolicy().ifaceSet())
 }
 
 func (m *Manager) sendMultiInterfaceAnnouncementsWithTTL(ttl uint32) {
+	m.sendMultiInterfaceAnnouncementsWithTTLForInterfaces(ttl, nil)
+}
+
+func (m *Manager) sendMultiInterfaceAnnouncementsForInterfaces(ifaces map[string]bool) {
+	m.sendMultiInterfaceAnnouncementsWithTTLForInterfaces(120, ifaces)
+}
+
+func (m *Manager) sendMultiInterfaceAnnouncementsWithTTLForInterfaces(ttl uint32, ifaces map[string]bool) {
 	names := m.AdvertisedNames()
 	if len(names) == 0 {
 		return
@@ -362,6 +371,9 @@ func (m *Manager) sendMultiInterfaceAnnouncementsWithTTL(ttl uint32) {
 	snapshots := make([]ifaceSnapshot, 0, len(m.interfaces))
 	for name, state := range m.interfaces {
 		if state == nil {
+			continue
+		}
+		if ifaces != nil && !ifaces[name] {
 			continue
 		}
 		snap := ifaceSnapshot{

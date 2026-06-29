@@ -197,6 +197,46 @@ func TestProbe_B1_EthCableUnplugged(t *testing.T) {
 	}
 }
 
+func TestProbeKeepsLegacyActiveUplinkWhenDefaultRouteIsSecondEthernet(t *testing.T) {
+	f := newFixture(t)
+	eth0Path := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/1")
+	usb0Path := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/2")
+	f.nm.EthernetDevicesResult = []nmclient.EthernetDevice{
+		{
+			Path:      eth0Path,
+			Interface: "eth0",
+			Carrier:   false,
+			State:     nmclient.NMDeviceStateUnavailable,
+		},
+		{
+			Path:      usb0Path,
+			Interface: "usb0",
+			Carrier:   true,
+			State:     nmclient.NMDeviceStateActivated,
+		},
+	}
+	f.nm.ActiveConnByDevice = map[dbus.ObjectPath]*nmclient.ActiveConnectionInfo{
+		usb0Path: {
+			IP4Address:         "203.0.113.20",
+			IP4Addresses:       []string{"203.0.113.20"},
+			IP4Gateway:         "203.0.113.1",
+			IP4HasDefaultRoute: true,
+			RouteMetric:        10,
+		},
+	}
+
+	tick := f.probeN(1)
+	if got := tick.ActiveUplink; got != UplinkNone {
+		t.Fatalf("ActiveUplink = %s, want legacy none from first ethernet device", got)
+	}
+	if got := tick.ActiveUplinkIface; got != "" {
+		t.Fatalf("ActiveUplinkIface = %q, want empty legacy iface", got)
+	}
+	if !tick.DefaultRouteKnown || tick.DefaultRouteIface != "usb0" {
+		t.Fatalf("default route = (%v,%q), want known usb0", tick.DefaultRouteKnown, tick.DefaultRouteIface)
+	}
+}
+
 // C3: ISP down, gateway up — L3 down, GwReachable=Healthy.
 //
 // HW + Config Healthy, but L3 probe reports Down after 3-of-3 dampening.

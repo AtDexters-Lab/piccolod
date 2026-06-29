@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
+	"piccolod/internal/firewall"
 )
 
 func TestSuspendAppPublicationPreservesRegistryAndAllocations(t *testing.T) {
@@ -51,6 +52,66 @@ func TestSuspendAppPublicationPreservesRegistryAndAllocations(t *testing.T) {
 	}
 	if len(recorder.published) != 1 || recorder.published[0] != ep.PublicPort {
 		t.Fatalf("published ports = %v, want [%d]", recorder.published, ep.PublicPort)
+	}
+}
+
+func TestReconcileNetworkPublicationsSkipsSuspendedApp(t *testing.T) {
+	mgr := NewServiceManager()
+	useFakeProxyListeners(mgr)
+	fw := &recordingFirewall{}
+	mgr.SetFirewallManager(fw)
+	claim := 35080
+	ep := ServiceEndpoint{
+		App:        "piclu",
+		Name:       "web",
+		GuestPort:  8080,
+		HostBind:   15080,
+		PublicPort: claim,
+		Flow:       api.FlowTCP,
+		Protocol:   api.ListenerProtocolHTTP,
+		PortClaim:  &claim,
+	}
+	mgr.registry["piclu"] = map[string]ServiceEndpoint{"web": ep}
+
+	mgr.SuspendAppPublication("piclu")
+	if len(fw.closed) != 1 {
+		t.Fatalf("closed firewall rules = %v, want one close during suspend", fw.closed)
+	}
+	fw.opened = nil
+
+	if got := mgr.ReconcileNetworkPublications(); got != 0 {
+		t.Fatalf("reconciled publications = %d, want 0", got)
+	}
+	if len(fw.opened) != 0 {
+		t.Fatalf("opened firewall rules = %v, want none for suspended app", fw.opened)
+	}
+}
+
+func TestActivePortClaimsExcludeSuspendedApps(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	claim := 35080
+	if _, err := mgr.AllocateForApp("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}}); err != nil {
+		t.Fatalf("allocate: %v", err)
+	}
+	if claims := mgr.ActivePortClaims(); len(claims) != 1 || claims[0].Port != claim {
+		t.Fatalf("active claims before suspend = %+v, want one claim %d", claims, claim)
+	}
+
+	mgr.SuspendAppPublication("piclu")
+	if claims := mgr.ActivePortClaims(); len(claims) != 0 {
+		t.Fatalf("active claims while suspended = %+v, want none", claims)
+	}
+
+	mgr.ResumeAppPublication("piclu")
+	if claims := mgr.ActivePortClaims(); len(claims) != 1 || claims[0].Port != claim {
+		t.Fatalf("active claims after resume = %+v, want one claim %d", claims, claim)
 	}
 }
 
@@ -1024,6 +1085,58 @@ func TestPrepareReconcileRestartsProxyOnMiddlewareParamChange(t *testing.T) {
 	}
 }
 
+func TestReconcileNetworkPublicationsReopensRegisteredPortClaims(t *testing.T) {
+	mgr := NewServiceManager()
+	useFakeProxyListeners(mgr)
+	fw := &recordingFirewall{}
+	mgr.SetFirewallManager(fw)
+
+	claim := 8080
+	if _, _, err := mgr.Reconcile("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 80,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	fw.opened = nil
+
+	if got := mgr.ReconcileNetworkPublications(); got != 1 {
+		t.Fatalf("reconciled endpoints = %d, want 1", got)
+	}
+	if len(fw.opened) != 1 || fw.opened[0].Port != 8080 || fw.opened[0].Protocol != "tcp" {
+		t.Fatalf("opened = %+v, want 8080/tcp", fw.opened)
+	}
+}
+
+func TestCloseNetworkPublicationsClosesRegisteredPortClaims(t *testing.T) {
+	mgr := NewServiceManager()
+	useFakeProxyListeners(mgr)
+	fw := &recordingFirewall{}
+	mgr.SetFirewallManager(fw)
+
+	claim := 8080
+	if _, _, err := mgr.Reconcile("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 80,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	fw.closed = nil
+
+	if got := mgr.CloseNetworkPublications(); got != 1 {
+		t.Fatalf("closed endpoints = %d, want 1", got)
+	}
+	if len(fw.closed) != 1 || fw.closed[0].Port != 8080 || fw.closed[0].Protocol != "tcp" {
+		t.Fatalf("closed = %+v, want 8080/tcp", fw.closed)
+	}
+}
+
 func useFakeProxyListeners(mgr *ServiceManager) {
 	mgr.UseInMemoryNetworkForTest()
 }
@@ -1039,4 +1152,19 @@ func (r *recordingPublication) Publish(port int) {
 
 func (r *recordingPublication) Unpublish(port int) {
 	r.unpublished = append(r.unpublished, port)
+}
+
+type recordingFirewall struct {
+	opened []firewall.Rule
+	closed []firewall.Rule
+}
+
+func (r *recordingFirewall) OpenPort(rule firewall.Rule) error {
+	r.opened = append(r.opened, rule)
+	return nil
+}
+
+func (r *recordingFirewall) ClosePort(rule firewall.Rule) error {
+	r.closed = append(r.closed, rule)
+	return nil
 }

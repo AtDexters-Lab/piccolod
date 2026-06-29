@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
+	"net"
 	"sync"
 	"sync/atomic"
 
@@ -256,6 +258,7 @@ func (c *DBusClient) ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnec
 	}
 
 	info := &ActiveConnectionInfo{Path: acPath}
+	var routeMetricKnown bool
 
 	if uuidV, err := c.prop(acPath, nmActiveConnInterface, "Uuid"); err == nil {
 		info.UUID, _ = uuidV.Value().(string)
@@ -269,34 +272,204 @@ func (c *DBusClient) ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnec
 	if typeV, err := c.prop(acPath, nmActiveConnInterface, "Type"); err == nil {
 		info.Type, _ = typeV.Value().(string)
 	}
+	if devicesV, err := c.prop(acPath, nmActiveConnInterface, "Devices"); err == nil {
+		info.Devices, _ = devicesV.Value().([]dbus.ObjectPath)
+	}
 
 	// Get IP4 config
 	if ip4V, err := c.prop(acPath, nmActiveConnInterface, "Ip4Config"); err == nil {
 		ip4Path, _ := ip4V.Value().(dbus.ObjectPath)
 		if ip4Path.IsValid() && ip4Path != "/" {
-			info.IP4Address, info.IP4Gateway = c.readIP4Config(ip4Path)
+			ip4 := c.readIPConfig(ip4Path, nmIP4ConfigInterface)
+			info.IP4Addresses = ip4.Addresses
+			info.IP4Nameservers = ip4.Nameservers
+			info.IP4Gateway = ip4.Gateway
+			info.IP4HasDefaultRoute = ip4.HasDefaultRoute
+			info.IP4RoutesKnown = ip4.RoutesKnown
+			info.RouteMetric, routeMetricKnown = mergeDefaultRouteMetric(info.RouteMetric, routeMetricKnown, ip4)
+			if len(ip4.Addresses) > 0 {
+				info.IP4Address = ip4.Addresses[0]
+			}
+		}
+	}
+
+	if ip6V, err := c.prop(acPath, nmActiveConnInterface, "Ip6Config"); err == nil {
+		ip6Path, _ := ip6V.Value().(dbus.ObjectPath)
+		if ip6Path.IsValid() && ip6Path != "/" {
+			ip6 := c.readIPConfig(ip6Path, nmIP6ConfigInterface)
+			info.IP6Addresses = ip6.Addresses
+			info.IP6Nameservers = ip6.Nameservers
+			info.IP6HasDefaultRoute = ip6.HasDefaultRoute
+			info.IP6RoutesKnown = ip6.RoutesKnown
+			info.RouteMetric, routeMetricKnown = mergeDefaultRouteMetric(info.RouteMetric, routeMetricKnown, ip6)
 		}
 	}
 
 	return info, nil
 }
 
-// readIP4Config extracts the first address and gateway from an IP4Config object.
-func (c *DBusClient) readIP4Config(path dbus.ObjectPath) (addr, gw string) {
-	// Gateway
-	if gwV, err := c.prop(path, nmIP4ConfigInterface, "Gateway"); err == nil {
-		gw, _ = gwV.Value().(string)
+type ipConfigSnapshot struct {
+	Addresses        []string
+	Gateway          string
+	Nameservers      []string
+	HasDefaultRoute  bool
+	RoutesKnown      bool
+	RouteMetric      uint32
+	RouteMetricKnown bool
+}
+
+func mergeDefaultRouteMetric(current uint32, currentKnown bool, cfg ipConfigSnapshot) (uint32, bool) {
+	if !cfg.HasDefaultRoute {
+		return current, currentKnown
+	}
+	metric := cfg.RouteMetric
+	if !cfg.RouteMetricKnown {
+		metric = 0
+	}
+	if !currentKnown || metric < current {
+		return metric, true
+	}
+	return current, true
+}
+
+// readIPConfig extracts address, route, and DNS hints from an IP config object.
+func (c *DBusClient) readIPConfig(path dbus.ObjectPath, iface string) ipConfigSnapshot {
+	out := ipConfigSnapshot{}
+
+	if gwV, err := c.prop(path, iface, "Gateway"); err == nil {
+		out.Gateway, _ = gwV.Value().(string)
 	}
 
-	// AddressData is an array of dicts [{address: "x.x.x.x", prefix: N}, ...]
-	if addrV, err := c.prop(path, nmIP4ConfigInterface, "AddressData"); err == nil {
-		if addrs, ok := addrV.Value().([]map[string]dbus.Variant); ok && len(addrs) > 0 {
-			if a, ok := addrs[0]["address"]; ok {
-				addr, _ = a.Value().(string)
+	if addrV, err := c.prop(path, iface, "AddressData"); err == nil {
+		for _, row := range variantDictSlice(addrV.Value()) {
+			if a, ok := row["address"]; ok {
+				if addr, _ := a.Value().(string); addr != "" {
+					out.Addresses = append(out.Addresses, addr)
+				}
 			}
 		}
 	}
-	return
+
+	if routeV, err := c.prop(path, iface, "RouteData"); err == nil {
+		out.RoutesKnown = true
+		observeDefaultRoutes(&out, variantDictSlice(routeV.Value()))
+	}
+
+	if nsV, err := c.prop(path, iface, "NameserverData"); err == nil {
+		for _, row := range variantDictSlice(nsV.Value()) {
+			if a, ok := row["address"]; ok {
+				if addr, _ := a.Value().(string); addr != "" {
+					out.Nameservers = append(out.Nameservers, addr)
+				}
+			}
+		}
+	}
+	if len(out.Nameservers) == 0 {
+		if nsV, err := c.prop(path, iface, "Nameservers"); err == nil {
+			out.Nameservers = append(out.Nameservers, nameserverStrings(nsV.Value())...)
+		}
+	}
+
+	if out.HasDefaultRoute && !out.RouteMetricKnown {
+		out.RouteMetricKnown = true
+		out.RouteMetric = 0
+	}
+	return out
+}
+
+func observeDefaultRoutes(out *ipConfigSnapshot, routes []map[string]dbus.Variant) {
+	for _, row := range routes {
+		if !routeDataIsDefault(row) {
+			continue
+		}
+		out.HasDefaultRoute = true
+		observeDefaultRouteMetric(out, row["metric"])
+	}
+}
+
+func observeDefaultRouteMetric(out *ipConfigSnapshot, metricVariant dbus.Variant) {
+	metric, ok := variantUint32(metricVariant)
+	if !ok {
+		metric = 0
+	}
+	if !out.RouteMetricKnown || metric < out.RouteMetric {
+		out.RouteMetric = metric
+	}
+	out.RouteMetricKnown = true
+}
+
+func variantDictSlice(v any) []map[string]dbus.Variant {
+	if rows, ok := v.([]map[string]dbus.Variant); ok {
+		return rows
+	}
+	if rows, ok := v.([]map[string]interface{}); ok {
+		out := make([]map[string]dbus.Variant, 0, len(rows))
+		for _, row := range rows {
+			converted := make(map[string]dbus.Variant, len(row))
+			for k, v := range row {
+				converted[k] = dbus.MakeVariant(v)
+			}
+			out = append(out, converted)
+		}
+		return out
+	}
+	return nil
+}
+
+func routeDataIsDefault(row map[string]dbus.Variant) bool {
+	prefix, prefixOK := variantUint32(row["prefix"])
+	if prefixOK && prefix != 0 {
+		return false
+	}
+	destV, ok := row["dest"]
+	if !ok {
+		return prefixOK && prefix == 0
+	}
+	dest, _ := destV.Value().(string)
+	return dest == "" || dest == "0.0.0.0" || dest == "::"
+}
+
+func variantUint32(v dbus.Variant) (uint32, bool) {
+	switch n := v.Value().(type) {
+	case uint32:
+		return n, true
+	case uint64:
+		if n <= math.MaxUint32 {
+			return uint32(n), true
+		}
+	case int32:
+		if n >= 0 {
+			return uint32(n), true
+		}
+	case int64:
+		if n >= 0 && n <= math.MaxUint32 {
+			return uint32(n), true
+		}
+	case int:
+		if n >= 0 {
+			return uint32(n), true
+		}
+	}
+	return 0, false
+}
+
+func nameserverStrings(v any) []string {
+	switch ns := v.(type) {
+	case []string:
+		return ns
+	case []uint32:
+		out := make([]string, 0, len(ns))
+		for _, raw := range ns {
+			ip := make(net.IP, net.IPv4len)
+			ip[0] = byte(raw)
+			ip[1] = byte(raw >> 8)
+			ip[2] = byte(raw >> 16)
+			ip[3] = byte(raw >> 24)
+			out = append(out, ip.String())
+		}
+		return out
+	}
+	return nil
 }
 
 // errEmptyActiveConnPath is returned by WaitForActivation when called with
@@ -509,4 +682,3 @@ func isUnknownObjectErr(err error) bool {
 	}
 	return false
 }
-
