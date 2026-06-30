@@ -371,6 +371,11 @@ type interfaceRemoval struct {
 	state *InterfaceState
 }
 
+type interfaceCheckOptions struct {
+	announceNewInterfaces bool
+	retryFailedSetups     map[string]bool
+}
+
 func newInterfacePublishPolicy(setupIfaces []string) *interfacePublishPolicy {
 	p := &interfacePublishPolicy{setup: make(map[string]bool, len(setupIfaces))}
 	for _, iface := range setupIfaces {
@@ -444,7 +449,9 @@ func (m *Manager) ReconcileNetworkTransition(publishIfaces, preserveIfaces []str
 	}
 	announcementPolicy := newInterfacePublishPolicy(publishIfaces)
 	policy := m.updateInterfacePublishPolicy(publishIfaces, preserveIfaces)
-	m.checkInterfaceChangesWithPolicyOptions(policy, false)
+	m.checkInterfaceChangesWithPolicyOptions(policy, interfaceCheckOptions{
+		retryFailedSetups: announcementPolicy.ifaceSet(),
+	})
 	if len(announcementPolicy.setup) == 0 {
 		return
 	}
@@ -458,7 +465,7 @@ func (m *Manager) checkInterfaceChanges() {
 }
 
 func (m *Manager) checkInterfaceChangesWithPolicy(policy *interfacePublishPolicy) {
-	m.checkInterfaceChangesWithPolicyOptions(policy, true)
+	m.checkInterfaceChangesWithPolicyOptions(policy, interfaceCheckOptions{announceNewInterfaces: true})
 }
 
 func (m *Manager) currentInterfacePublishPolicy() *interfacePublishPolicy {
@@ -500,7 +507,7 @@ func (m *Manager) updateInterfacePublishPolicy(publishIfaces, preserveIfaces []s
 	return policy
 }
 
-func (m *Manager) checkInterfaceChangesWithPolicyOptions(policy *interfacePublishPolicy, announceNewInterfaces bool) {
+func (m *Manager) checkInterfaceChangesWithPolicyOptions(policy *interfacePublishPolicy, opts interfaceCheckOptions) {
 	interfaceFuncsMu.RLock()
 	listFn := listNetworkInterfaces
 	interfaceFuncsMu.RUnlock()
@@ -597,11 +604,16 @@ func (m *Manager) checkInterfaceChangesWithPolicyOptions(policy *interfacePublis
 
 			// Check if recently failed — avoid log spam from repeated failures
 			if info, failed := m.failedSetups[ifaceCopy.Name]; failed {
+				forceRetry := opts.retryFailedSetups != nil && opts.retryFailedSetups[ifaceCopy.Name]
 				cooldown := failedSetupBackoff(info.Attempts)
-				if time.Since(info.LastAttempt) < cooldown {
+				if !forceRetry && time.Since(info.LastAttempt) < cooldown {
 					continue
 				}
-				log.Printf("DEBUG: Retrying previously failed interface %s (cooldown %v expired, attempt %d)", ifaceCopy.Name, cooldown, info.Attempts+1)
+				if forceRetry && time.Since(info.LastAttempt) < cooldown {
+					log.Printf("DEBUG: Retrying previously failed interface %s after network transition (cooldown %v still pending, attempt %d)", ifaceCopy.Name, cooldown, info.Attempts+1)
+				} else {
+					log.Printf("DEBUG: Retrying previously failed interface %s (cooldown %v expired, attempt %d)", ifaceCopy.Name, cooldown, info.Attempts+1)
+				}
 			}
 
 			log.Printf("INFO: New interface detected: %s", ifaceCopy.Name)
@@ -652,7 +664,7 @@ func (m *Manager) checkInterfaceChangesWithPolicyOptions(policy *interfacePublis
 	}
 
 	// Announce on new interface join so device is immediately visible
-	if needsAnnounce && announceNewInterfaces {
+	if needsAnnounce && opts.announceNewInterfaces {
 		m.wg.Add(1)
 		go func() {
 			defer m.wg.Done()

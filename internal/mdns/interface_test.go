@@ -365,6 +365,73 @@ func TestCheckInterfaceChanges_FailedSetupRetryAfterCooldown(t *testing.T) {
 	}
 }
 
+func TestReconcileNetworkTransitionRetriesFailedPublishInterfaceImmediately(t *testing.T) {
+	env := stubNetworkEnv{
+		interfaces: []net.Interface{
+			{Index: 1, MTU: 1500, Name: "eth0", Flags: net.FlagUp | net.FlagMulticast},
+			{Index: 2, MTU: 1500, Name: "end0", Flags: net.FlagUp | net.FlagMulticast},
+		},
+		addrMap: map[string][]net.Addr{
+			"eth0": {&net.IPNet{IP: net.ParseIP("192.168.1.10"), Mask: net.CIDRMask(24, 32)}},
+			// end0 initially has no addresses, matching the boot-time no-IP failure.
+		},
+	}
+	installStubNetworkEnv(t, env)
+
+	manager := NewManager()
+	manager.ipv4SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4zero, Port: 0})
+	}
+	manager.ipv6SocketFactory = func(*net.Interface) (*net.UDPConn, error) {
+		return nil, nil
+	}
+	t.Cleanup(func() { _ = manager.Stop() })
+
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	initialFailure, failed := manager.failedSetups["end0"]
+	_, end0Exists := manager.interfaces["end0"]
+	manager.mutex.RUnlock()
+	if !failed {
+		t.Fatal("end0 should be in failedSetups after no-IP setup failure")
+	}
+	if end0Exists {
+		t.Fatal("end0 should not be configured before it has an address")
+	}
+
+	env.addrMap["end0"] = []net.Addr{
+		&net.IPNet{IP: net.ParseIP("192.168.1.20"), Mask: net.CIDRMask(24, 32)},
+	}
+
+	manager.checkInterfaceChanges()
+
+	manager.mutex.RLock()
+	cooldownFailure := manager.failedSetups["end0"]
+	_, end0Exists = manager.interfaces["end0"]
+	manager.mutex.RUnlock()
+	if end0Exists {
+		t.Fatal("periodic scan should still respect failed-setup cooldown")
+	}
+	if cooldownFailure == nil || !cooldownFailure.LastAttempt.Equal(initialFailure.LastAttempt) {
+		t.Fatal("periodic scan should not retry while failed-setup cooldown is pending")
+	}
+
+	manager.started.Store(true)
+	manager.ReconcileNetworkTransition([]string{"end0", "eth0"}, nil)
+
+	manager.mutex.RLock()
+	_, stillFailed := manager.failedSetups["end0"]
+	_, end0Exists = manager.interfaces["end0"]
+	manager.mutex.RUnlock()
+	if stillFailed {
+		t.Fatal("transition reconcile should clear failed setup after successful retry")
+	}
+	if !end0Exists {
+		t.Fatal("transition reconcile should configure publishable interface immediately")
+	}
+}
+
 func TestCheckInterfaceChanges_FailedSetupCleanupOnDisappear(t *testing.T) {
 	env := stubNetworkEnv{
 		interfaces: []net.Interface{
