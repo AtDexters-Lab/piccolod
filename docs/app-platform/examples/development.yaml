@@ -1,21 +1,31 @@
 # Development environment (workspace-style persistence)
-name: code-server
+type: user
+
+inputs:
+  __app_address__:
+    type: string
+    label: "App Address"
+    required: true
+    validation:
+      regex: "^[a-z][a-z0-9]{0,15}$"
+      message: "Lowercase letters and numbers only; max 16 chars"
+  password:
+    type: password
+    label: "Workspace Password"
+    required: true
+    generate: true
 
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 8080
     flow: tcp
     protocol: http
     remote_ports: [80, 443]
-  - name: ssh
-    guest_port: 22
-    flow: tcp
-    protocol: raw
 
 services:
   main:
     image: codercom/code-server:latest
-    bind_ports: [8080, 22]
+    bind_ports: [8080]
     storage:
       persistent:
         projects:
@@ -29,16 +39,12 @@ services:
           container: /tmp/cache
           size_limit: 10GB
     environment:
-      PASSWORD: mypassword
-      SUDO_PASSWORD: mypassword
+      PASSWORD: "{{ .Inputs.password }}"
+      SUDO_PASSWORD: "{{ .Inputs.password }}"
 
 permissions:
   network:
     internet: allow
-    allowed_domains:
-      - github.com
-      - npmjs.org
-      - pypi.org
 
 app_config:
   extensions:

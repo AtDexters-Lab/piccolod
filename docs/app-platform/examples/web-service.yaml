@@ -1,8 +1,27 @@
 # Web service example - typical self-hosted app
-name: nextcloud
+type: user
+
+inputs:
+  __app_address__:
+    type: string
+    label: "App Address"
+    required: true
+    validation:
+      regex: "^[a-z][a-z0-9]{0,15}$"
+      message: "Lowercase letters and numbers only; max 16 chars"
+  admin_password:
+    type: password
+    label: "Admin Password"
+    required: true
+    generate: true
+  db_password:
+    type: password
+    label: "Database Password"
+    required: true
+    generate: true
 
 listeners:
-  - name: web
+  - name: __primary
     guest_port: 80
     flow: tcp
     protocol: http
@@ -17,9 +36,9 @@ services:
       MYSQL_HOST: 127.0.0.1
       MYSQL_DATABASE: nextcloud
       MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: example
+      MYSQL_PASSWORD: "{{ .Inputs.db_password }}"
       NEXTCLOUD_ADMIN_USER: admin
-      NEXTCLOUD_ADMIN_PASSWORD: example
+      NEXTCLOUD_ADMIN_PASSWORD: "{{ .Inputs.admin_password }}"
     storage:
       persistent:
         data:
@@ -34,8 +53,8 @@ services:
     environment:
       MYSQL_DATABASE: nextcloud
       MYSQL_USER: nextcloud
-      MYSQL_PASSWORD: example
-      MYSQL_ROOT_PASSWORD: example
+      MYSQL_PASSWORD: "{{ .Inputs.db_password }}"
+      MYSQL_ROOT_PASSWORD: "{{ .Inputs.db_password }}"
     storage:
       persistent:
         db:
@@ -45,12 +64,11 @@ services:
 permissions:
   network:
     internet: allow     # Needs internet for app store, updates
-  preset: web_service
 
 healthcheck:
   http:
     path: /status.php
-    port: web
+    port: "{{ .Inputs.__app_address__ }}"
     timeout: 30s
     retries: 3
 

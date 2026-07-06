@@ -37,8 +37,7 @@
 # Apps are identified by their PRIMARY LISTENER NAME (service mode) or WORKSPACE_NAME (workspace mode).
 # There is no separate `name` field. The identity is derived from:
 #
-#   - Service mode: the listener marked with `name: __primary` (catalog apps) or the
-#     single listener's name (single-listener apps auto-select primary).
+#   - Service mode: the listener marked with `name: __primary` in author-written YAML.
 #   - Workspace mode: the `workspace_name` field under x-piccolo.
 #
 # The `__primary` marker is a magic placeholder that gets replaced at install time with
@@ -49,14 +48,19 @@
 #   api, www, admin, root, system, piccolo, piccoloos, __primary
 #
 # -----------------------------------------------------------------------------
-# Minimal app (service mode, single listener — auto-selects primary)
+# Minimal app (service mode)
 #
+# inputs:
+#   __app_address__:
+#     type: string
+#     label: "App Address"
+#     required: true
 # services:
 #   main:
 #     image: ghost:latest
 #     bind_ports: [2368]
 # listeners:
-#   - name: blog
+#   - name: __primary
 #     guest_port: 2368
 #     flow: tcp
 #     protocol: http
@@ -64,7 +68,7 @@
 #   mode: service
 #
 # -----------------------------------------------------------------------------
-# Catalog app (service mode, __primary marker for user-provided address)
+# Custom/catalog app (service mode, __primary marker for user-provided address)
 #
 # inputs:
 #   __app_address__:
@@ -233,8 +237,7 @@ services:
 #
 # App Identity (RFC 20260130):
 # - Service-mode apps derive their identity from the PRIMARY listener name.
-# - Single-listener apps: the listener is automatically marked as primary.
-# - Multi-listener apps (including catalog apps): exactly one listener must be named `__primary`.
+# - Author-written manifests: exactly one listener must be named `__primary`.
 # - The `__primary` marker is replaced at install time with the `__app_address__` input value.
 #
 # If remote_ports is omitted, Piccolo defaults to [80, 443].
@@ -255,7 +258,7 @@ listeners:
   #   (non-primary listeners are exempt — their derived hostname <listener>-<app> cannot collide)
   # - required for host-based routing (RFC 20260114)
   #
-  # Use `__primary` as the name for catalog apps. This marker is replaced with the
+  # Use `__primary` as the name for custom/catalog apps. This marker is replaced with the
   # user-provided `__app_address__` input value during installation.
   - name: __primary
     guest_port: 8080

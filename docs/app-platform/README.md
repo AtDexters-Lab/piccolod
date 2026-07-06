@@ -6,32 +6,41 @@ The Piccolo OS App Platform enables users to easily install, manage, and run con
 
 ### Minimal App
 ```yaml
-name: blog
+type: user
+inputs:
+  __app_address__:
+    type: string
+    label: "App Address"
+    required: true
+    validation:
+      regex: "^[a-z][a-z0-9]{0,15}$"
+      message: "Lowercase letters and numbers only; max 16 chars"
+listeners:
+  - name: __primary
+    guest_port: 2368
+    flow: tcp
+    protocol: http
 services:
   main:
     image: ghost:latest
     bind_ports: [2368]
-listeners:
-  - name: web
-    guest_port: 2368
-    flow: tcp
-    protocol: http
 x-piccolo:
   mode: service
 ```
 
 ## Documentation
 
+- **[creator-guide.md](./creator-guide.md)** - Guide for creators converting existing SaaS or SOHO apps into Custom Apps
 - **[specification.yaml](./specification.yaml)** - Complete app.yaml specification with all fields documented
 - **[examples/](./examples/)** - Common patterns and use cases
 
 ## Key Features
 
 ### 🏗️ **Flexible Container Sources**
-- **Registry images**: Docker Hub, GitHub Container Registry, private registries
+- **Registry images**: Public Docker Hub, GitHub Container Registry, or similar OCI images
 
-### 🔒 **Security by Default**
-- **Network isolation**: No internet access by default
+### 🔒 **Security Controls**
+- **Network controls**: Apps can explicitly allow or deny container internet access
 - **Encrypted app storage**: Each app gets an isolated encrypted volume under `$PICCOLO_STATE_DIR`
 - **Permission model**: Granular control over resources and capabilities
 - **Federated storage**: Hot/cold tier policies replicate app state across devices
@@ -63,19 +72,41 @@ Runtime:
 
 | Use Case | Example | Highlights |
 |----------|---------|------------|
-| **Developer workstation** | [development.yaml](./examples/development.yaml) | Multiple listeners, persistent volumes |
+| **Developer workstation** | [development.yaml](./examples/development.yaml) | Workspace persistence and generated access password |
 | **Web service** | [web-service.yaml](./examples/web-service.yaml) | Health checks and remote publish |
 
 ## API Integration
 
-Apps are deployed via HTTP API with flexible upload methods:
+Apps with `__primary` listeners need install inputs so Piccolo can replace the
+`__primary` marker with the chosen app address. First parse the manifest and
+collect the input schema:
 
 ```bash
-# Method 1: Inline YAML
-curl -X POST /api/v1/apps \
+curl -X POST /api/v1/apps/configure \
   -H "Content-Type: application/x-yaml" \
   --data-binary @app.yaml
 ```
+
+Then install with a JSON request that includes both the manifest and input
+values:
+
+```json
+{
+  "app_definition": "<contents of app.yaml>",
+  "inputs": {
+    "__app_address__": "blog"
+  }
+}
+```
+
+```bash
+curl -X POST /api/v1/apps \
+  -H "Content-Type: application/json" \
+  --data-binary @install.json
+```
+
+The raw YAML install form is only suitable for manifests that do not require
+inputs.
 
 ### Custom App Manifest Updates
 
