@@ -725,6 +725,41 @@ func (m *Manager) saveCertsAndEvents(cfg *Config) error {
 	return nil
 }
 
+// saveNexusCertsAndEvents persists the portal summary together with the
+// certificate inventory without restarting the relay adapter or reconfiguring
+// ACME. Events remain best-effort.
+func (m *Manager) saveNexusCertsAndEvents(cfg *Config) error {
+	if cfg == nil {
+		m.cfgMu.Unlock()
+		return errors.New("config cannot be nil")
+	}
+	if m.storage != nil {
+		if err := m.storage.SaveNexus(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		if err := m.storage.SaveCerts(context.Background(), cfg.NexusConfig, cfg.CertInventory); err != nil {
+			m.cfgMu.Unlock()
+			if errors.Is(err, ErrLocked) {
+				m.needsReload.Store(true)
+			}
+			return err
+		}
+		if err := m.storage.SaveEvents(context.Background(), cfg.EventLog); err != nil {
+			log.Printf("WARN: remote: event save failed: %v", err)
+		}
+	}
+	m.cfg = cfg
+	m.cfgMu.Unlock()
+
+	m.needsReload.Store(false)
+	m.publishConfigChanged()
+	return nil
+}
+
 // saveAll persists all three (nexus + certs + events).
 // Caller MUST hold cfgMu.Lock(); this method releases it before returning.
 // Used for full config changes (Configure, ConfigureManaged).
@@ -850,7 +885,8 @@ func (m *Manager) currentConfigLocked() *Config {
 func (m *Manager) Status() Status {
 	m.cfgMu.RLock()
 	cfg := m.currentConfigLocked()
-	warnings := computeWarnings(cfg)
+	now := m.now()
+	warnings := computeWarnings(cfg, now)
 
 	var latency *int
 	if cfg.LatencyMS > 0 {
@@ -865,7 +901,7 @@ func (m *Manager) Status() Status {
 		} else if len(warnings) > 0 {
 			state = string(RemoteStateWarning)
 		}
-		if !cfg.ExpiresAt.IsZero() && cfg.ExpiresAt.Before(m.now()) {
+		if !cfg.ExpiresAt.IsZero() && cfg.ExpiresAt.Before(now) {
 			state = string(RemoteStateError)
 		}
 	} else if cfg.Endpoint != "" && cfg.PortalHostname != "" {
@@ -2477,6 +2513,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 	// Modify certificate under lock to prevent races with scheduler reads
 	m.cfgMu.Lock()
 	cfg := m.currentConfigLocked()
+	updated := false
 	for i := range cfg.Certificates {
 		if cfg.Certificates[i].ID == id {
 			cfg.Certificates[i].IssuedAt = timePtr(now)
@@ -2488,8 +2525,15 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 			cfg.Certificates[i].RetryAt = nil
 			// Reset all failure tracking (RFC 20260125)
 			m.resetCertificateTracking(&cfg.Certificates[i])
+			updated = true
 			break
 		}
+	}
+	persist := m.saveCertsAndEvents
+	if id == "portal" && updated {
+		cfg.ExpiresAt = expiresAt
+		cfg.NextRenewal = next
+		persist = m.saveNexusCertsAndEvents
 	}
 	// Use retention policy for event appending
 	m.appendEventWithRetention(cfg, Event{
@@ -2499,7 +2543,7 @@ func (m *Manager) updateCertSuccess(id string, expiresAt time.Time) {
 		Message:   fmt.Sprintf("Certificate issuance succeeded (%s)", id),
 		CertID:    id,
 	})
-	_ = m.saveCertsAndEvents(cfg)
+	_ = persist(cfg)
 
 	// Emit certificate status change event
 	m.publishCertificateChanged(id, string(CertStatusOK), "", "ok")
@@ -3205,12 +3249,8 @@ func aliasCertStatus(cfg *Config, alias Alias) string {
 	return string(CertStatusPending)
 }
 
-func computeWarnings(cfg *Config) []string {
+func computeWarnings(cfg *Config, now time.Time) []string {
 	var warnings []string
-	now := time.Now()
-	if !cfg.NextRenewal.IsZero() && cfg.NextRenewal.Before(now.Add(7*24*time.Hour)) {
-		warnings = append(warnings, "Certificate renewal due soon")
-	}
 	if cfg.PortalHostname == "" {
 		warnings = append(warnings, "Portal hostname missing")
 	}

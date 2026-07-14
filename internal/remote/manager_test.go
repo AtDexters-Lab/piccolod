@@ -131,6 +131,80 @@ func TestRunPreflightSuccess(t *testing.T) {
 	}
 }
 
+func TestStatusScheduledRenewalRemainsActive(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	nextRenewal := now.Add(24 * time.Hour)
+	expiresAt := now.Add(30 * 24 * time.Hour)
+	lastPreflight := now.Add(-time.Hour)
+	m := newTestManagerWithDeps(t, nil, t.TempDir(), &stubDialer{}, &stubResolver{}, fixedNow(now))
+
+	m.cfgMu.Lock()
+	m.cfg = &Config{
+		NexusConfig: NexusConfig{
+			Enabled:        true,
+			PortalHostname: "portal.example.com",
+			NextRenewal:    nextRenewal,
+			ExpiresAt:      expiresAt,
+			LastPreflight:  &lastPreflight,
+		},
+		CertInventory: CertInventory{Certificates: []Certificate{{
+			ID:          "portal",
+			Domains:     []string{"portal.example.com"},
+			Status:      string(CertStatusOK),
+			NextRenewal: &nextRenewal,
+			ExpiresAt:   &expiresAt,
+		}}},
+	}
+	m.cfgMu.Unlock()
+
+	status := m.Status()
+	if status.State != string(RemoteStateActive) {
+		t.Fatalf("scheduled renewal should remain active, got state %q with warnings %v", status.State, status.Warnings)
+	}
+	if len(status.Warnings) != 0 {
+		t.Fatalf("scheduled renewal should not emit warnings, got %v", status.Warnings)
+	}
+	if status.NextRenewal == nil || !status.NextRenewal.Equal(nextRenewal) {
+		t.Fatalf("next renewal should remain visible, got %v", status.NextRenewal)
+	}
+	if status.ExpiresAt == nil || !status.ExpiresAt.Equal(expiresAt) {
+		t.Fatalf("certificate expiry should remain visible, got %v", status.ExpiresAt)
+	}
+}
+
+func TestStatusCertificateFailureStillWarns(t *testing.T) {
+	now := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
+	nextRenewal := now.Add(30 * 24 * time.Hour)
+	expiresAt := now.Add(60 * 24 * time.Hour)
+	lastPreflight := now.Add(-time.Hour)
+	m := newTestManagerWithDeps(t, nil, t.TempDir(), &stubDialer{}, &stubResolver{}, fixedNow(now))
+
+	m.cfgMu.Lock()
+	m.cfg = &Config{
+		NexusConfig: NexusConfig{
+			Enabled:        true,
+			PortalHostname: "portal.example.com",
+			NextRenewal:    nextRenewal,
+			ExpiresAt:      expiresAt,
+			LastPreflight:  &lastPreflight,
+		},
+		CertInventory: CertInventory{Certificates: []Certificate{{
+			ID:      "portal",
+			Domains: []string{"portal.example.com"},
+			Status:  string(CertStatusError),
+		}}},
+	}
+	m.cfgMu.Unlock()
+
+	status := m.Status()
+	if status.State != string(RemoteStateWarning) {
+		t.Fatalf("certificate failure should warn, got state %q with warnings %v", status.State, status.Warnings)
+	}
+	if len(status.Warnings) != 1 || status.Warnings[0] != "Certificate issuance failed" {
+		t.Fatalf("unexpected certificate warnings: %v", status.Warnings)
+	}
+}
+
 type fakeAdapter struct {
 	mu      sync.Mutex
 	config  nexusclient.Config
@@ -582,6 +656,53 @@ func TestUpdateCertFailureSetsRetryAt(t *testing.T) {
 	}
 	if portal.RetryAt == nil || !portal.RetryAt.After(now) {
 		t.Fatalf("expected retry_at after now, got %v", portal.RetryAt)
+	}
+}
+
+func TestUpdateCertSuccessRefreshesPortalStatusSchedule(t *testing.T) {
+	dir := t.TempDir()
+	storage, err := newFileStorage(dir)
+	if err != nil {
+		t.Fatalf("storage: %v", err)
+	}
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	m := newTestManagerWithDeps(t, storage, dir, &stubDialer{}, &stubResolver{}, fixedNow(now))
+	oldExpiry := now.Add(24 * time.Hour)
+	oldRenewal := now.Add(-time.Hour)
+
+	m.cfgMu.Lock()
+	cfg := m.currentConfig()
+	cfg.ExpiresAt = oldExpiry
+	cfg.NextRenewal = oldRenewal
+	cfg.Certificates = []Certificate{{
+		ID:      "portal",
+		Domains: []string{"portal.example.com"},
+		Status:  string(CertStatusPending),
+	}}
+	if err := m.saveAll(cfg); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+
+	newExpiry := now.Add(90 * 24 * time.Hour)
+	m.updateCertSuccess("portal", newExpiry)
+
+	// Reload the split files to prove status does not depend on an in-memory
+	// update to the legacy nexus summary.
+	persisted, err := storage.Load(context.Background())
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	m.cfgMu.Lock()
+	m.cfg = &persisted
+	m.cfgMu.Unlock()
+
+	status := m.Status()
+	wantRenewal := now.Add(60 * 24 * time.Hour)
+	if status.ExpiresAt == nil || !status.ExpiresAt.Equal(newExpiry) {
+		t.Fatalf("portal expiry summary = %v, want %v", status.ExpiresAt, newExpiry)
+	}
+	if status.NextRenewal == nil || !status.NextRenewal.Equal(wantRenewal) {
+		t.Fatalf("portal renewal summary = %v, want %v", status.NextRenewal, wantRenewal)
 	}
 }
 

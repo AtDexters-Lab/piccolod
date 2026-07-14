@@ -31,16 +31,16 @@ The backend returns a specific `state` string derived from the configuration and
 | **`stopped`** | `enabled: false`, config exists | **Paused.** Config is saved but off. Show Setup Wizard (pre-filled) or "Resume". |
 | **`preflight_required`** | `enabled: true`, no preflight run | **Incomplete.** Configuration is saved but not validated. Prompt to run Preflight. |
 | **`active`** | `enabled: true`, no issues | **Healthy.** Show full dashboard (Connection: Connected). |
-| **`warning`** | `enabled: true` + warnings present | **Degraded.** Show dashboard with warning badges (e.g., "Portal hostname missing"). |
+| **`warning`** | `enabled: true` + an actionable warning | **Degraded.** Show dashboard with warning badges (e.g., certificate issuance or relay failure). |
 | **`error`** | `enabled: true` + cert expired | **Critical.** Show error alert. Certificate is invalid/expired. |
 
 ### Key Fields for Dashboard
 *   `portal_hostname`: The main entry point.
 *   `latency_ms`: Round-trip time to Nexus relay.
-*   `next_renewal`: Date when the certificate will attempt renewal.
+*   `next_renewal`: Informational date when the certificate will attempt renewal. An upcoming scheduled attempt does not degrade remote access.
 *   `warnings`: Array of strings. **Must be displayed prominently.**
-    *   *"Portal hostname missing"* -> Critical configuration gap.
-    *   *"Certificate renewal due soon"* -> Warning.
+    * *"Portal hostname missing"* -> Critical configuration gap.
+    * Certificate issuance, alias, and relay failures remain warnings until resolved.
 
 ---
 
