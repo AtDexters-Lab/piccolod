@@ -217,6 +217,18 @@ permits exactly one new owner restart. Namek identity/config events remain
 serialized with this state; self-hosted remote uses the same one-restart
 invariant under its existing manager lock.
 
+Namek has a second egress owner outside the Nexus adapter: its authenticated
+token provider uses a long-lived HTTP client for nonce and token RPCs. That
+client must own a private cloned `http.Transport`; sharing
+`http.DefaultTransport` process-wide allows an HTTP/2 connection established on
+the previous interface to survive the adapter restart. Before the one Namek
+adapter stop/start, the identity service atomically replaces its Namek client
+and private transport while preserving configuration, enrollment, TPM, and
+in-flight RPC semantics. Existing RPCs may finish on the retired client; new
+token, domain, ACME, heartbeat, and endpoint-sync calls resolve the current
+client through their existing getter and therefore use the new route. The
+retired transport is closed for idle reuse.
+
 ### D5. Namek wake must preserve the single-owner invariant
 
 Do not call `applyNamekState` from the network transition goroutine. Instead, add a request channel owned by the same goroutine that currently processes identity events:
@@ -231,6 +243,12 @@ const (
 ```
 
 Identity events and network transition events both enqueue into that goroutine. The goroutine debounces them, then invokes the same owner-local state machine. On `namekApplyNetwork`, if the Namek config key is unchanged and an adapter is running, it requests `RestartForNetworkTransition` instead of skipping work solely because the config key is unchanged.
+
+For that network apply, the serialized owner resets the identity service's
+private Namek HTTP transport before starting the replacement adapter run. The
+transport reset and adapter restart are one transition repair action: periodic
+observation still must not repeat either operation while a backend handshake is
+in flight.
 
 The debounce loop must accumulate reasons across the whole window. Network reasons remain sticky until the owner satisfies them on a usable current uplink or explicitly drops them because Namek is disabled/no longer expected active; an identity event in the same window must not downgrade a network restart into the existing unchanged-config no-op path.
 
@@ -324,7 +342,7 @@ This is deferred from the current implementation because it changes the nexus ad
 3. Add unit tests for transition reason derivation and dedupe behavior, including default-route-only, DNS-default-only, interface-role-only, same-kind multi-NIC (`eth0=lan`, `usb0=wan`, Wi-Fi present), reordered-equivalent-address, IPv6-churn suppression, and partial route/DNS observation cases.
 4. Add the server-level owner-delta coordinator and owner reconciler interface, including full-buffer/coalesced-wake tests proving restart-relevant reasons survive a later connectivity-only generation, history overflow produces a conservative restart-relevant delta, and restart-relevant reasons observed while unusable are satisfied by a later connectivity-only usable generation.
 5. Add self-hosted remote transition restart/recovery monitoring through `remote.Manager`, with tests proving one owner restart per material transition, no cancellation of a slow in-flight reconnect, config disable, deadline state, and negative LAN-only role/address changes that must not restart remotes.
-6. Refactor Namek's identity subscriber goroutine into a serialized apply loop that accumulates both identity and network reasons, including tests for identity/network coalescence, one owner restart while a slow handshake is in flight, and unusable-uplink pending reasons.
+6. Refactor Namek's identity subscriber goroutine into a serialized apply loop that accumulates both identity and network reasons, resets Namek's private HTTP transport before the single adapter restart, and includes tests for identity/network coalescence, one owner repair while a slow handshake is in flight, private-transport replacement, and unusable-uplink pending reasons.
 7. Add mDNS transition reconciliation for interface loss/address/role change and tests for stale interface withdrawal versus active-uplink-only reannouncement, including a LAN-only interface that remains advertisable while Wi-Fi is the WAN uplink and an `unknown` role that preserves last known advertisable state during dampening.
 8. Add service-manager publication reapplication on transition for existing active port claims, with fake-firewall tests proving current claims are reopened only for safely LAN-publishable states and closed for unsafe/unknown ingress states.
 9. Add alpha VM netlab support for one management/WAN NIC plus one LAN-only test NIC and validate transition logs/roles under practical VirtualBox constraints.
@@ -353,6 +371,9 @@ Manual validation when device access returns:
   interval, verify the owner does not stop/start it again; the backend retry
   loop continues until the current-run relay aggregate connects or the
   transition monitoring deadline expires.
+- Verify the transition log shows one Namek HTTP client reset before the one
+  adapter restart, and that nonce/token requests do not remain bound to the
+  previous interface after the old link is removed.
 - Verify `piccolospace.com` route returns through Namek after the transition.
 - Verify `piccolo.local` and app hostnames withdraw old Ethernet addresses and announce Wi-Fi addresses.
 - Verify Pi-hole DNS on its claimed port responds on the LAN after transition. This remains manual validation rather than an automated RFC guarantee.
@@ -365,7 +386,7 @@ Manual validation when device access returns:
 - **Adapter restart flap:** Network changes can be noisy. Mitigation: generation dedupe plus per-owner cooldown on identical transition state.
 - **Pending-reason overreach:** Sticky restart reasons could cause a later connectivity event to restart after the original transition is no longer relevant. Mitigation: clear pending reasons when the owner is disabled, the adapter/app is no longer expected active, or a newer satisfied transition supersedes the same surface.
 - **Lossy bus delivery:** The existing event bus drops when subscriber buffers fill. Mitigation: owner recovery is driven by transition deltas read from retained supervisor state, while the bus topic is diagnostic only.
-- **Namek rate limits:** Restarting immediately can request nonce tokens. Mitigation: keep existing debounce, restart only on proven usable uplink transitions, and perform only one owner stop/start per material transition; the adapter's existing reconnect loop retains its own backoff while transition-specific observation is capped by a deadline.
+- **Namek rate limits:** Restarting immediately can request nonce tokens. Mitigation: keep existing debounce, restart only on proven usable uplink transitions, and perform only one owner transport-reset plus adapter stop/start per material transition; the adapter's existing reconnect loop retains its own backoff while transition-specific observation is capped by a deadline.
 - **mDNS goodbye behavior:** Immediate withdrawal can be wrong if transient DHCP renewal temporarily removes addresses. Mitigation: only immediate-withdraw for interface missing, down, or truly addressless; active-uplink/default-route changes reannounce or re-evaluate but do not withdraw an otherwise advertisable LAN interface.
 - **WAN/LAN role conflation:** A LAN-only interface can be valid for local discovery and app ingress even when it cannot reach WAN. Mitigation: classify roles per interface and keep WAN/egress owner decisions separate from LAN/ingress owner decisions.
 - **Role-classification uncertainty:** A temporarily unclassifiable LAN interface can look like a filtered or disconnected interface. Mitigation: keep `unknown` distinct from `filtered` and preserve last known advertisable state under dampening while role/firewall classification is retried.
@@ -403,15 +424,20 @@ Rejected. The incident shows Wi-Fi was usable at `09:44:01`, while Namek did not
 
 ## Implementation Notes & Status
 
-Status: implemented, with a 2026-07-16 recovery correction validated in tests
-and pending exact-image validation.
+Status: implemented, with 2026-07-16 recovery corrections reviewed and
+unit/race validated; exact-image validation remains pending.
 The scoped implementation covers transition state/deltas, owner-local
 remote/Namek restart and recovery monitoring, mDNS/service-publication wakeups,
 fail-closed firewall publication handling for unsafe mixed/unknown ingress,
 alpha netlab validation, and focused tests. Exact Build20.20 validation proved
 that repeating the owner restart every 10 seconds cancelled a slow Namek
-handshake indefinitely after route recovery; D4 now assigns reconnect retries
-to the adapter and limits the outer owner to one restart per material
-transition. Publication drift verification, positive firewalld zone
+handshake indefinitely after route recovery. Exact Build20.21 then proved that
+the separate Namek HTTP client could retain an HTTP/2 path on the removed
+interface even after that single adapter restart: restoring the old interface
+unblocked the same client while fresh host and appliance connectivity checks
+succeeded. D4 now assigns reconnect retries to the adapter, limits the outer
+owner to one repair per material transition, and includes replacement of the
+Namek-owned private HTTP transport in that repair. Publication drift
+verification, positive firewalld zone
 applicability proof/retry, stable IPv6 renumbering, and relay
 endpoint-generation fencing remain deferred follow-ups.

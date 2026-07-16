@@ -45,6 +45,10 @@ type Service struct {
 	configPath string
 	tpmDev     tpm.Device
 	client     *namekclient.Client
+	// clientTransport is private to client. Namek's default client otherwise
+	// shares http.DefaultTransport process-wide, which can retain an HTTP/2
+	// connection bound to a dead egress path after an uplink transition.
+	clientTransport *http.Transport
 
 	// identityMu serializes SetNamekURL against in-flight identity-bound
 	// RPC+persist sequences. Identity-bound operations (Enroll, syncEndpointsOnce,
@@ -173,10 +177,11 @@ func (s *Service) Start(ctx context.Context) error {
 	}
 
 	namekURL := resolveNamekURL(cfg)
-	client := newNamekClient(namekURL, s.tpmDev, cfg.DeviceID)
+	client, clientTransport := newManagedNamekClient(namekURL, s.tpmDev, cfg.DeviceID)
 
 	s.mu.Lock()
 	s.client = client
+	s.clientTransport = clientTransport
 	s.mu.Unlock()
 
 	if cfg.DeviceID != "" {
@@ -337,17 +342,21 @@ func (s *Service) Stop(ctx context.Context) error {
 		s.recoverWg.Wait()
 		close(waitCh)
 	}()
+	var stopErr error
 	select {
 	case <-waitCh:
 	case <-ctx.Done():
 		log.Printf("WARN: identity: Stop context expired waiting for recovery to finish")
-		return ctx.Err()
+		stopErr = ctx.Err()
 	}
 
 	s.mu.Lock()
+	clientTransport := s.clientTransport
 	s.client = nil
+	s.clientTransport = nil
 	s.mu.Unlock()
-	return nil
+	closeNamekTransport(clientTransport)
+	return stopErr
 }
 
 // SetEventsBus wires the event bus for publishing identity events.
@@ -365,6 +374,32 @@ func (s *Service) NotifyNetworkUp() {
 	case s.networkUp <- struct{}{}:
 	default: // coalesces rapid signals
 	}
+}
+
+// ResetNamekClientForNetworkTransition replaces the Namek HTTP connection
+// pool without changing enrollment, configuration, or TPM ownership. A route
+// transition can leave an HTTP/2 connection alive on the old interface; the
+// Nexus adapter restart alone does not replace that transport because its token
+// provider obtains tokens through this separately-owned client.
+//
+// Existing RPCs may finish against the old client. New callers use the fresh
+// client immediately through NamekClient, and the retired transport rejects new
+// idle reuse after any in-flight request completes.
+func (s *Service) ResetNamekClientForNetworkTransition() bool {
+	s.mu.Lock()
+	if s.stopped.Load() || !s.cfg.Enabled || s.tpmDev == nil || s.client == nil {
+		s.mu.Unlock()
+		return false
+	}
+	client, clientTransport := newManagedNamekClient(resolveNamekURL(s.cfg), s.tpmDev, s.cfg.DeviceID)
+	oldTransport := s.clientTransport
+	s.client = client
+	s.clientTransport = clientTransport
+	s.mu.Unlock()
+
+	closeNamekTransport(oldTransport)
+	log.Printf("INFO: identity: reset Namek HTTP client for network transition")
+	return true
 }
 
 // signalNamekURLChanged wakes an in-progress autoEnrollAtBoot backoff loop
@@ -498,10 +533,10 @@ func (s *Service) Status() IdentityStatus {
 	}
 }
 
-func (s *Service) IsEnrolled() bool   { return s.enrolled.Load() }
-func (s *Service) IsEnabled() bool    { s.mu.RLock(); defer s.mu.RUnlock(); return s.cfg.Enabled }
-func (s *Service) IsAvailable() bool  { return s.available.Load() }
-func (s *Service) IsSuspended() bool  { return s.suspended.Load() }
+func (s *Service) IsEnrolled() bool  { return s.enrolled.Load() }
+func (s *Service) IsEnabled() bool   { s.mu.RLock(); defer s.mu.RUnlock(); return s.cfg.Enabled }
+func (s *Service) IsAvailable() bool { return s.available.Load() }
+func (s *Service) IsSuspended() bool { return s.suspended.Load() }
 
 // DeviceID returns the persisted namek device.id, or empty if not yet
 // enrolled. Used as part of the auto-unlock blob's AAD.
@@ -687,9 +722,10 @@ func (s *Service) SetEnabled(ctx context.Context, enabled bool) error {
 
 	// Reinitialize client if enabling and it was never created (e.g., started disabled).
 	if needsClient {
-		client := newNamekClient(resolveNamekURL(cfg), s.tpmDev, cfg.DeviceID)
+		client, clientTransport := newManagedNamekClient(resolveNamekURL(cfg), s.tpmDev, cfg.DeviceID)
 		s.mu.Lock()
 		s.client = client
+		s.clientTransport = clientTransport
 		s.mu.Unlock()
 		s.available.Store(true)
 		if cfg.DeviceID != "" {
@@ -745,6 +781,7 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	defer s.identityMu.Unlock()
 
 	s.mu.Lock()
+	oldTransport := s.clientTransport
 	s.cfg.NamekURL = url
 	s.cfg.DeviceID = ""
 	s.cfg.AccountID = ""
@@ -755,8 +792,10 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	s.cfg.NexusEndpoints = nil
 	s.suggestedHostname = ""
 	s.client = nil
+	s.clientTransport = nil
 	cfg := s.cfg
 	s.mu.Unlock()
+	closeNamekTransport(oldTransport)
 
 	s.enrolled.Store(false)
 	s.suspended.Store(false)
@@ -778,9 +817,10 @@ func (s *Service) SetNamekURL(ctx context.Context, url string) error {
 	// which we only create when tpmDev is non-nil — without the gate we
 	// would spawn a perpetual fail-fast retry goroutine on no-TPM devices.
 	if s.tpmDev != nil {
-		client := newNamekClient(url, s.tpmDev, "")
+		client, clientTransport := newManagedNamekClient(url, s.tpmDev, "")
 		s.mu.Lock()
 		s.client = client
+		s.clientTransport = clientTransport
 		s.mu.Unlock()
 		if cfg.Enabled {
 			// Signal first so an in-progress backoff loop picks up the new
@@ -1202,13 +1242,21 @@ func (s *Service) recoverAndReenroll() {
 	}
 
 	s.mu.Lock()
+	if s.stopped.Load() {
+		s.mu.Unlock()
+		_ = result.Device.Close()
+		log.Printf("INFO: identity: discarding AK recovery completed after service stop")
+		return
+	}
 	oldDev := s.tpmDev
+	oldTransport := s.clientTransport
 	s.tpmDev = result.Device
 	onReplaced := s.onTPMReplaced
 	// Recreate client with new TPM device
 	cfg := s.cfg
-	s.client = newNamekClient(resolveNamekURL(cfg), s.tpmDev, cfg.DeviceID)
+	s.client, s.clientTransport = newManagedNamekClient(resolveNamekURL(cfg), s.tpmDev, cfg.DeviceID)
 	s.mu.Unlock()
+	closeNamekTransport(oldTransport)
 
 	// Notify owner so it can close the old device and track the new OpenResult.
 	if onReplaced != nil {
@@ -1253,7 +1301,17 @@ const maxHardwareModelLen = 128
 // hardware model, insecure skip). The hardware model ships in the enrollment
 // attest body so namek can surface it via the setup-discovery endpoint.
 func newNamekClient(url string, dev tpm.Device, deviceID string) *namekclient.Client {
-	var opts []namekclient.Option
+	client, _ := newManagedNamekClient(url, dev, deviceID)
+	return client
+}
+
+func newManagedNamekClient(url string, dev tpm.Device, deviceID string) (*namekclient.Client, *http.Transport) {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	httpClient := &http.Client{
+		Transport: transport,
+		Timeout:   30 * time.Second,
+	}
+	opts := []namekclient.Option{namekclient.WithHTTPClient(httpClient)}
 	if deviceID != "" {
 		opts = append(opts, namekclient.WithDeviceID(deviceID))
 	}
@@ -1263,7 +1321,13 @@ func newNamekClient(url string, dev tpm.Device, deviceID string) *namekclient.Cl
 	if os.Getenv("PICCOLO_NAMEK_INSECURE") == "1" {
 		opts = append(opts, namekclient.WithInsecureSkipVerify())
 	}
-	return namekclient.New(url, dev, opts...)
+	return namekclient.New(url, dev, opts...), transport
+}
+
+func closeNamekTransport(transport *http.Transport) {
+	if transport != nil {
+		transport.CloseIdleConnections()
+	}
 }
 
 // truncateHardwareModel clamps a hardware model string to namek's max length,

@@ -3216,6 +3216,12 @@ func (s *GinServer) applyNamekState(networkRestartReasons ...network.NetworkTran
 	adapter := s.namekAdapter
 	s.namekMu.Unlock()
 	forceNetworkRestart := len(networkRestartReasons) > 0
+	if forceNetworkRestart {
+		// The Namek token provider is separate from the Nexus adapter. Replace
+		// its HTTP pool first so the restarted adapter cannot reuse an HTTP/2
+		// connection bound to the previous egress interface.
+		svc.ResetNamekClientForNetworkTransition()
+	}
 
 	if adapter != nil {
 		if !changed && cancel != nil && !forceNetworkRestart {

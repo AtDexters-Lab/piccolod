@@ -1,9 +1,11 @@
 package identity
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httptrace"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -82,6 +84,132 @@ func deviceInfoHandlerWithError(status int, info *namekclient.DeviceInfo, errMsg
 			w.WriteHeader(404)
 		}
 	})
+}
+
+func TestResetNamekClientForNetworkTransitionReplacesPrivateTransport(t *testing.T) {
+	t.Setenv("PICCOLO_NAMEK_INSECURE", "1")
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/v1/nonce":
+			_ = json.NewEncoder(w).Encode(map[string]string{"nonce": "dGVzdA"})
+		case "/api/v1/tokens/nexus":
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "test-token"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+
+	client, transport := newManagedNamekClient(server.URL, &mockTPM{}, "dev-123")
+	svc := &Service{
+		cfg: Config{
+			Enabled:  true,
+			NamekURL: server.URL,
+			DeviceID: "dev-123",
+		},
+		tpmDev:          &mockTPM{},
+		client:          client,
+		clientTransport: transport,
+	}
+	t.Cleanup(func() {
+		svc.mu.RLock()
+		currentTransport := svc.clientTransport
+		svc.mu.RUnlock()
+		closeNamekTransport(currentTransport)
+	})
+
+	oldClient := svc.NamekClient()
+	oldTransport := transport
+	if oldTransport == http.DefaultTransport {
+		t.Fatal("managed Namek client must not share http.DefaultTransport")
+	}
+	var oldConn any
+	oldCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { oldConn = info.Conn },
+	})
+	if _, err := oldClient.RequestNexusToken(oldCtx, 0, ""); err != nil {
+		t.Fatalf("request through initial client: %v", err)
+	}
+	if oldConn == nil {
+		t.Fatal("initial request did not establish a connection")
+	}
+
+	if !svc.ResetNamekClientForNetworkTransition() {
+		t.Fatal("reset should succeed for an enabled initialized service")
+	}
+
+	newClient := svc.NamekClient()
+	svc.mu.RLock()
+	newTransport := svc.clientTransport
+	svc.mu.RUnlock()
+	if newClient == oldClient {
+		t.Fatal("reset retained the old Namek client")
+	}
+	if newTransport == oldTransport {
+		t.Fatal("reset retained the old Namek HTTP transport")
+	}
+	if newTransport == http.DefaultTransport {
+		t.Fatal("reset client must own a private HTTP transport")
+	}
+	var newConn any
+	newCtx := httptrace.WithClientTrace(context.Background(), &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) { newConn = info.Conn },
+	})
+	if _, err := newClient.RequestNexusToken(newCtx, 0, ""); err != nil {
+		t.Fatalf("request through reset client: %v", err)
+	}
+	if newConn == nil {
+		t.Fatal("reset request did not establish a connection")
+	}
+	if newConn == oldConn {
+		t.Fatal("reset request reused the old HTTP connection")
+	}
+}
+
+func TestResetNamekClientForNetworkTransitionSkipsInactiveService(t *testing.T) {
+	client, transport := newManagedNamekClient("https://namek.example.com", &mockTPM{}, "dev-123")
+	defer closeNamekTransport(transport)
+	svc := &Service{
+		cfg:             Config{Enabled: false, DeviceID: "dev-123"},
+		tpmDev:          &mockTPM{},
+		client:          client,
+		clientTransport: transport,
+	}
+
+	if svc.ResetNamekClientForNetworkTransition() {
+		t.Fatal("disabled service must not reset its client")
+	}
+	if got := svc.NamekClient(); got != client {
+		t.Fatal("inactive reset changed the client")
+	}
+}
+
+func TestStopRetiresNamekClientWhenRecoveryWaitTimesOut(t *testing.T) {
+	client, transport := newManagedNamekClient("https://namek.example.com", &mockTPM{}, "dev-123")
+	svc := &Service{
+		client:          client,
+		clientTransport: transport,
+		stopCh:          make(chan struct{}),
+	}
+	svc.recoverWg.Add(1)
+	t.Cleanup(svc.recoverWg.Done)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := svc.Stop(ctx); err != context.Canceled {
+		t.Fatalf("Stop error = %v, want context.Canceled", err)
+	}
+	if got := svc.NamekClient(); got != nil {
+		t.Fatal("Stop retained Namek client after timeout")
+	}
+	svc.mu.RLock()
+	retainedTransport := svc.clientTransport
+	svc.mu.RUnlock()
+	if retainedTransport != nil {
+		t.Fatal("Stop retained Namek transport after timeout")
+	}
 }
 
 func TestSyncEndpointsOnce_DetectsChange(t *testing.T) {
@@ -823,4 +951,3 @@ func TestSuggestedHostname_ClearedBySetNamekURL(t *testing.T) {
 		t.Errorf("SuggestedHostname() = %q, want empty after SetNamekURL", got)
 	}
 }
-
