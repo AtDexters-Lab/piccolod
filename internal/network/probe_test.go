@@ -3,6 +3,7 @@ package network
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -19,20 +20,25 @@ import (
 // stubRunner is a runner.CommandRunner for tests. Records invocations and
 // returns configurable per-command errors keyed by the command name.
 type stubRunner struct {
-	mu     sync.Mutex
-	errs   map[string]error
-	calls  []string
-	output []byte
+	mu      sync.Mutex
+	errs    map[string]error
+	calls   []string
+	output  []byte
+	runHook func(context.Context, string, ...string) error
 }
 
 func newStubRunner() *stubRunner {
 	return &stubRunner{errs: make(map[string]error)}
 }
-func (s *stubRunner) Run(_ context.Context, name string, _ ...string) error {
+func (s *stubRunner) Run(ctx context.Context, name string, args ...string) error {
 	s.mu.Lock()
 	s.calls = append(s.calls, name)
 	err := s.errs[name]
+	hook := s.runHook
 	s.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, name, args...)
+	}
 	return err
 }
 func (s *stubRunner) RunWithOutput(_ context.Context, name string, _ ...string) ([]byte, error) {
@@ -240,6 +246,94 @@ func TestProbeUsesDefaultRouteWhenSecondEthernetIsActive(t *testing.T) {
 	}
 	if !tick.DefaultRouteKnown || tick.DefaultRouteIface != "usb0" {
 		t.Fatalf("default route = (%v,%q), want known usb0", tick.DefaultRouteKnown, tick.DefaultRouteIface)
+	}
+	if got := tick.Connectivity; got != ConnectivityFull {
+		t.Fatalf("Connectivity = %s, want full from selected usb0 gateway", got)
+	}
+	snap := buildSnapshot(tick, nil, false, "", "")
+	if got := snap.Connectivity; got != ConnectivityFull {
+		t.Fatalf("snapshot Connectivity = %s, want full from selected usb0 gateway", got)
+	}
+}
+
+func TestProbeConnectivityIgnoresHealthyNonSelectedEthernetGateway(t *testing.T) {
+	f := newFixture(t)
+	primaryPath := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/1")
+	selectedPath := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/2")
+	f.nm.EthernetDevicesResult = []nmclient.EthernetDevice{
+		{
+			Path:      primaryPath,
+			Interface: "enp1s0",
+			Carrier:   true,
+			State:     nmclient.NMDeviceStateActivated,
+		},
+		{
+			Path:      selectedPath,
+			Interface: "enp2s0",
+			Carrier:   true,
+			State:     nmclient.NMDeviceStateActivated,
+		},
+	}
+	f.nm.ActiveConnByDevice = map[dbus.ObjectPath]*nmclient.ActiveConnectionInfo{
+		primaryPath: {
+			IP4Address:         "10.0.1.20",
+			IP4Addresses:       []string{"10.0.1.20"},
+			IP4Gateway:         "10.0.1.1",
+			IP4HasDefaultRoute: true,
+			RouteMetric:        100,
+		},
+		selectedPath: {
+			IP4Address:         "10.0.2.20",
+			IP4Addresses:       []string{"10.0.2.20"},
+			IP4Gateway:         "10.0.2.1",
+			IP4HasDefaultRoute: true,
+			RouteMetric:        10,
+		},
+	}
+	f.run.runHook = func(_ context.Context, name string, args ...string) error {
+		if name != "arping" {
+			return nil
+		}
+		for i, arg := range args {
+			if arg == "-I" && i+1 < len(args) && args[i+1] == "enp2s0" {
+				return errors.New("selected gateway unreachable")
+			}
+		}
+		return nil
+	}
+
+	tick := f.probeN(1)
+	if got := tick.ActiveUplinkIface; got != "enp2s0" {
+		t.Fatalf("ActiveUplinkIface = %q, want enp2s0", got)
+	}
+	if got := tick.Devices[DeviceEthernet].GwReachable; got != TriHealthy {
+		t.Fatalf("recovery Ethernet gateway = %s, want healthy from enp1s0", got)
+	}
+	if got := tick.Connectivity; got != ConnectivityLimited {
+		t.Fatalf("Connectivity = %s, want limited from selected enp2s0 gateway", got)
+	}
+}
+
+func TestProbeReusesSelectedGatewayResultForClassRecovery(t *testing.T) {
+	f := newFixture(t)
+	f.ethAt(true, nmclient.NMDeviceStateActivated, true, "10.0.0.1")
+	arpingCalls := 0
+	f.run.runHook = func(_ context.Context, name string, _ ...string) error {
+		if name == "arping" {
+			arpingCalls++
+		}
+		return nil
+	}
+
+	tick := f.probeN(1)
+	if got := tick.Connectivity; got != ConnectivityFull {
+		t.Fatalf("Connectivity = %s, want full", got)
+	}
+	if got := tick.Devices[DeviceEthernet].GwReachable; got != TriHealthy {
+		t.Fatalf("recovery Ethernet gateway = %s, want healthy", got)
+	}
+	if arpingCalls != 1 {
+		t.Fatalf("arping calls = %d, want one selected-interface probe shared with recovery", arpingCalls)
 	}
 }
 
@@ -510,11 +604,6 @@ func TestProbe_L3DampenerThreeOfThree(t *testing.T) {
 
 // ConnectivityClassification: L3 up + GwHealthy → Full; L3 up only → Limited.
 func TestClassifyConnectivity(t *testing.T) {
-	devs := func(gw Tri) map[DeviceKind]DeviceObservation {
-		return map[DeviceKind]DeviceObservation{
-			DeviceWiFi: {Kind: DeviceWiFi, GwReachable: gw},
-		}
-	}
 	tests := []struct {
 		name string
 		l3   L3ProbeResult
@@ -530,7 +619,7 @@ func TestClassifyConnectivity(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := classifyConnectivity(tt.l3, devs(tt.gw), tt.nm)
+			got := classifyConnectivityForGateway(tt.l3, tt.gw, tt.nm)
 			if got != tt.want {
 				t.Errorf("got %s, want %s", got, tt.want)
 			}

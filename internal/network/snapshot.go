@@ -74,7 +74,7 @@ func buildSnapshot(tick Tick, lastBounceAt map[DeviceKind]time.Time, apActive bo
 		}
 	}
 
-	connectivity := classifyConnectivity(tick.L3Probe, tick.Devices, tick.NMConn)
+	connectivity := tick.Connectivity
 	switch {
 	case !tick.InterfacesObserved || !tick.DefaultRouteObserved:
 		// Device enumeration or route ownership is incomplete. NM/L3 may still

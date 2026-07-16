@@ -12,6 +12,7 @@ import (
 
 type transitionProjection struct {
 	interfaces           []NetworkInterfaceState
+	probes               []transitionInterfaceProbe
 	interfacesObserved   bool
 	defaultRouteIface    string
 	defaultRouteObserved bool
@@ -57,8 +58,9 @@ func activeUplinkFromProjection(proj transitionProjection) (UplinkType, string, 
 
 func (p *Prober) probeTransitionProjection(connectivity Connectivity) transitionProjection {
 	probes, ok := p.probeTransitionInterfaces()
-	proj := transitionProjection{interfacesObserved: ok}
+	proj := transitionProjection{probes: probes, interfacesObserved: ok}
 	if !ok {
+		proj.probes = nil
 		return proj
 	}
 	proj.defaultRouteObserved = true
@@ -112,8 +114,21 @@ func (p *Prober) probeTransitionProjection(connectivity Connectivity) transition
 		proj.activeUplinkIface = proj.defaultRouteIface
 	}
 
-	proj.interfaces = make([]NetworkInterfaceState, 0, len(probes))
-	for _, probe := range probes {
+	proj.applyConnectivity(connectivity)
+	return proj
+}
+
+// applyConnectivity rebuilds the public interface projection after the
+// selected default-route interface has been classified. The retained probes
+// keep route selection, connectivity, and interface roles on one coherent
+// NetworkManager observation pass.
+func (proj *transitionProjection) applyConnectivity(connectivity Connectivity) {
+	if !proj.interfacesObserved {
+		proj.interfaces = nil
+		return
+	}
+	proj.interfaces = make([]NetworkInterfaceState, 0, len(proj.probes))
+	for _, probe := range proj.probes {
 		proj.interfaces = append(proj.interfaces, NetworkInterfaceState{
 			Kind:   probe.kind,
 			Iface:  probe.iface,
@@ -124,7 +139,15 @@ func (p *Prober) probeTransitionProjection(connectivity Connectivity) transition
 			IPv6:   probe.ipv6,
 		})
 	}
-	return proj
+}
+
+func (proj transitionProjection) probeForInterface(iface string) (transitionInterfaceProbe, bool) {
+	for _, probe := range proj.probes {
+		if probe.iface == iface {
+			return probe, true
+		}
+	}
+	return transitionInterfaceProbe{}, false
 }
 
 func (p *Prober) probeTransitionInterfaces() ([]transitionInterfaceProbe, bool) {

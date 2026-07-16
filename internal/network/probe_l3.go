@@ -17,7 +17,18 @@ var l3ProbeTargets = []string{"8.8.8.8:53", "1.1.1.1:53"}
 
 const l3ProbeTimeout = 2 * time.Second
 
-func (p *Prober) probeL3(ctx context.Context, devices map[DeviceKind]DeviceObservation) (L3ProbeResult, map[DeviceKind]Tri) {
+type gatewayProbeKey struct {
+	iface   string
+	gateway string
+}
+
+type gatewayProbeResult struct {
+	key       gatewayProbeKey
+	reachable Tri
+	probed    bool
+}
+
+func (p *Prober) probeL3(ctx context.Context, devices map[DeviceKind]DeviceObservation, selected gatewayProbeResult) (L3ProbeResult, map[DeviceKind]Tri) {
 	// TCP-connect probe — sequential dials, first success wins. Parent
 	// budget MUST cover the sum of per-target attempts so a silently-
 	// blackholed first target (corp guest WiFi DROP, regional blocks —
@@ -31,7 +42,7 @@ func (p *Prober) probeL3(ctx context.Context, devices map[DeviceKind]DeviceObser
 
 	gw := make(map[DeviceKind]Tri, len(devices))
 	for kind, obs := range devices {
-		gw[kind] = p.probeGateway(ctx, obs)
+		gw[kind] = p.probeGateway(ctx, obs, selected)
 	}
 
 	if tcpUp {
@@ -68,7 +79,7 @@ var tcpConnectAny = func(ctx context.Context, targets []string, perAttempt time.
 // Stage 1 implementation: shells out to `arping -c 1 -w 2 -I <iface> <gw>`
 // via the runner. The full netlink/in-process arping equivalent is a
 // follow-up; arping is universally available on piccolo OS.
-func (p *Prober) probeGateway(ctx context.Context, obs DeviceObservation) Tri {
+func (p *Prober) probeGateway(ctx context.Context, obs DeviceObservation, selected gatewayProbeResult) Tri {
 	if !obs.Present || !obs.LinkUp || obs.Iface == "" {
 		return TriInactive
 	}
@@ -76,9 +87,17 @@ func (p *Prober) probeGateway(ctx context.Context, obs DeviceObservation) Tri {
 	if gw == "" {
 		return TriInactive
 	}
+	key := gatewayProbeKey{iface: obs.Iface, gateway: gw}
+	if selected.probed && selected.key == key {
+		return selected.reachable
+	}
+	return p.probeGatewayAddress(ctx, key)
+}
+
+func (p *Prober) probeGatewayAddress(ctx context.Context, key gatewayProbeKey) Tri {
 	probeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
 	defer cancel()
-	if err := p.runner.Run(probeCtx, "arping", "-c", "1", "-w", "2", "-I", obs.Iface, gw); err != nil {
+	if err := p.runner.Run(probeCtx, "arping", "-c", "1", "-w", "2", "-I", key.iface, key.gateway); err != nil {
 		// arping returns non-zero on no reply — treat as unreachable.
 		// Don't distinguish "command failed" from "no reply"; both mean we
 		// can't confirm L2 reachability.
@@ -108,22 +127,60 @@ func (p *Prober) deviceGateway(kind DeviceKind) string {
 	return info.IP4Gateway
 }
 
-// classifyConnectivity maps the L3 probe + per-device GwReachable + advisory
-// NMConn into a single Connectivity classification used by snapshot readers.
+// probeProjectionGateway probes the gateway from the concrete default-route
+// interface selected by the completed projection. Its result is the sole
+// gateway input to published connectivity.
+func (p *Prober) probeProjectionGateway(ctx context.Context, proj transitionProjection) gatewayProbeResult {
+	if !proj.interfacesObserved || !proj.defaultRouteObserved || !proj.defaultRouteKnown {
+		return gatewayProbeResult{reachable: TriInactive}
+	}
+	probe, ok := proj.probeForInterface(proj.defaultRouteIface)
+	if !ok || probe.unknown || !probe.linkUp || !probe.hasIP || probe.info == nil || probe.info.IP4Gateway == "" {
+		return gatewayProbeResult{reachable: TriInactive}
+	}
+	key := gatewayProbeKey{iface: probe.iface, gateway: probe.info.IP4Gateway}
+	return gatewayProbeResult{
+		key:       key,
+		reachable: p.probeGatewayAddress(ctx, key),
+		probed:    true,
+	}
+}
+
+// connectivityForProjection classifies connectivity only from the concrete
+// interface selected by the completed default-route projection. Class-level
+// DeviceObservation remains available to recovery decisions, but cannot
+// influence published connectivity for a different same-kind interface.
+func connectivityForProjection(
+	l3 L3ProbeResult,
+	nmConn Connectivity,
+	proj transitionProjection,
+	gwReachable Tri,
+) Connectivity {
+	if !proj.interfacesObserved || !proj.defaultRouteObserved {
+		return ConnectivityUnknown
+	}
+	if !proj.defaultRouteKnown {
+		return ConnectivityNone
+	}
+	probe, ok := proj.probeForInterface(proj.defaultRouteIface)
+	if !ok || probe.unknown || !probe.linkUp || !probe.hasIP || probe.info == nil {
+		return ConnectivityUnknown
+	}
+
+	return classifyConnectivityForGateway(l3, gwReachable, nmConn)
+}
+
+// classifyConnectivityForGateway maps the L3 probe, the selected concrete
+// default-route interface's gateway result, and advisory NMConn into the
+// published connectivity classification.
 //
 // Priority:
-//   - Full   — L3 up AND any device GwReachable=Healthy
-//   - Limited — L3 up AND no GwReachable=Healthy (rare: ARP-suppressed network)
+//   - Full   — L3 up AND selected gateway is reachable
+//   - Limited — L3 up AND selected gateway is not confirmed reachable
 //   - Portal  — NMConn==Portal (advisory; only shown when L3 is reachable)
-//   - None    — L3 down AND no GwReachable=Healthy
-func classifyConnectivity(l3 L3ProbeResult, devs map[DeviceKind]DeviceObservation, nmConn Connectivity) Connectivity {
-	gwHealthy := false
-	for _, obs := range devs {
-		if obs.GwReachable == TriHealthy {
-			gwHealthy = true
-			break
-		}
-	}
+//   - None    — L3 down AND selected gateway is not reachable
+func classifyConnectivityForGateway(l3 L3ProbeResult, gwReachable Tri, nmConn Connectivity) Connectivity {
+	gwHealthy := gwReachable == TriHealthy
 	switch {
 	case l3 == L3ProbeUp && gwHealthy && nmConn == ConnectivityPortal:
 		return ConnectivityPortal
@@ -182,4 +239,3 @@ func activeUplinkFor(devs map[DeviceKind]DeviceObservation) UplinkType {
 	}
 	return UplinkNone
 }
-

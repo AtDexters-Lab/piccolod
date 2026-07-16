@@ -183,21 +183,7 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 		DeviceEthernet: p.resolveEth(rawEth, led, uptime, now),
 	}
 
-	// L3 + per-device gateway ARP. Run after device probes so we know which
-	// interfaces have IP and which gateway to ARP.
-	l3, gwMap := p.probeL3(ctx, devices)
-	for k, gw := range gwMap {
-		obs := devices[k]
-		obs.GwReachable = gw
-		devices[k] = obs
-	}
-
-	// Dampen L3 (3-of-3 Down → L3ProbeDown; otherwise L3ProbeUp).
-	l3Final := p.dampenL3(l3)
-
-	nmConn := nmConnAdvisory(p.nm)
-	connectivity := classifyConnectivity(l3Final, devices, nmConn)
-	projection := p.probeTransitionProjection(connectivity)
+	projection := p.probeTransitionProjection(ConnectivityUnknown)
 	activeUplink, activeUplinkIface, projected := activeUplinkFromProjection(projection)
 	if !projected {
 		// Class-level DeviceObservation is sufficient for recovery decisions,
@@ -214,6 +200,27 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 		projection.dnsDefaultKnown = false
 	}
 
+	// Probe the selected concrete gateway first. The class-level recovery
+	// observation may reuse this exact result, but published connectivity never
+	// consumes a result produced by the class-level path.
+	selectedGateway := p.probeProjectionGateway(ctx, projection)
+
+	// L3 + per-device gateway ARP. Run after device probes so we know which
+	// interfaces have IP and which gateway to ARP.
+	l3, gwMap := p.probeL3(ctx, devices, selectedGateway)
+	for k, gw := range gwMap {
+		obs := devices[k]
+		obs.GwReachable = gw
+		devices[k] = obs
+	}
+
+	// Dampen L3 (3-of-3 Down → L3ProbeDown; otherwise L3ProbeUp).
+	l3Final := p.dampenL3(l3)
+
+	nmConn := nmConnAdvisory(p.nm)
+	connectivity := connectivityForProjection(l3Final, nmConn, projection, selectedGateway.reachable)
+	projection.applyConnectivity(connectivity)
+
 	busy, reason := p.sys.SystemBusy()
 
 	return Tick{
@@ -222,6 +229,7 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 		InterfacesObserved:   projection.interfacesObserved,
 		NMConn:               nmConn,
 		L3Probe:              l3Final,
+		Connectivity:         connectivity,
 		ActiveUplink:         activeUplink,
 		ActiveUplinkIface:    activeUplinkIface,
 		DefaultRouteIface:    projection.defaultRouteIface,

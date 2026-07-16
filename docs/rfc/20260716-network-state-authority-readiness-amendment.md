@@ -207,6 +207,7 @@ authority or endpoint alias.
 
 - internal/network/observation.go
 - internal/network/probe.go
+- internal/network/probe_l3.go
 - internal/network/probe_transition.go
 - internal/network/decide_ap.go
 - internal/network/transition.go
@@ -224,7 +225,6 @@ Input contracts verified without implementation changes:
 
 - internal/network/probe_eth.go
 - internal/network/probe_wifi.go
-- internal/network/probe_l3.go
 - internal/network/nmclient/types.go
 
 ### Server and consumers
@@ -395,6 +395,8 @@ Review ledger:
 | CR-4 | Limited connectivity was reported as healthy rather than degraded diagnostic state | Fixed as warning while remaining optional for boot readiness | Network-health tests |
 | CR-5 | The anticipated site list included files that required inspection but no code change | Split changed sites from verified unchanged dependencies | Dirty-tree scope check |
 | CR-6 | Active WiFi band/frequency came from an SSID scan-cache match, which could select stale data or another AP sharing the SSID | Read the frequency from NetworkManager's concrete active access point | Concrete-active-interface status test |
+| CR-7 | Published connectivity still used gateway health from the class-level first Ethernet observation after route ownership moved to a second Ethernet interface | Store the authoritative connectivity classification on each tick and derive it from an independent gateway probe on the concrete default-route interface; retain class-level gateway health only for recovery decisions | Opposing multi-Ethernet regression tests, network race suite, and live primary-NIC failover on the three-interface alpha VM |
+| CR-8 | The first CR-7 correction could probe the selected gateway twice in one tick, allowing recovery and connectivity to publish different results for the same interface | Probe the selected gateway once as authoritative input, then allow class-level recovery to reuse only that exact interface-and-gateway result | Single-probe regression test and live primary-link recovery returning directly to full on its first observed generation |
 
 Security review found no remaining authorization-boundary issue: both REST and
 event-stream network status require admin plus LAN or same-public-IP access.
@@ -417,6 +419,23 @@ Validation evidence:
   typed status reported `ethernet` on the concrete `enp0s3` default-route
   interface while retaining both non-active Ethernet interfaces, readiness
   returned HTTP 200 with `ready: true`, and piccolod remained active.
+
+The released v0.2.35 binary in VirtualBox Build20.19 subsequently disproved the
+original D1 closure: after the primary Ethernet link was removed, NetworkManager
+and the active-uplink projection selected `enp0s8`, but connectivity remained
+limited because gateway classification still consumed the class-level first
+Ethernet observation. CR-7 corrected that remaining authority leak.
+
+The corrected dirty-tree build was then deployed to a clean three-interface
+alpha VM. Pre-setup passed 4/4, first-run setup passed 4/4, post-setup passed
+6/6, net-supervisor passed 7 checks with its two Wi-Fi-hardware checks skipped,
+and multi-interface transition validation passed 7/7. In the additional live
+failure scenario that exposed CR-7, removing primary `enp0s3` moved the default
+route to `enp0s8`; typed status reported `active_uplink_iface=enp0s8` and
+`connectivity=full`, `/api/v1/health/ready` returned HTTP 200 with `ready:true`,
+and piccolod remained active. Restoring `enp0s3` moved the route back and
+reported full connectivity on the first observed recovery generation, with
+readiness still HTTP 200 and piccolod active.
 
 The repository-wide Flutter suite still contains two pre-existing,
 target-incompatible groups: a browser-only `dart:js_interop` test cannot load

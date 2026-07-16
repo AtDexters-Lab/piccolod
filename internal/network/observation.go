@@ -67,7 +67,8 @@ type DeviceObservation struct {
 }
 
 // Connectivity is the supervisor's classification of upstream connectivity.
-// Sourced from L3Probe + GwReachable + NMConn (advisory).
+// Sourced from L3Probe + the concrete default-route interface's gateway probe
+// + NMConn (advisory).
 type Connectivity int
 
 const (
@@ -132,6 +133,11 @@ type Tick struct {
 
 	// L3Probe is the primary L3-truth: TCP-connect to 8.8.8.8:53 / 1.1.1.1:53.
 	L3Probe L3ProbeResult
+	// Connectivity is the authoritative classification for the concrete
+	// default-route interface. It is unknown when interface or route
+	// observation is incomplete, and none when a complete observation proves
+	// that no default route exists.
+	Connectivity Connectivity
 
 	// ActiveUplink is the kind of the concrete default-route interface when
 	// route projection succeeds. It remains none when that projection is
