@@ -199,7 +199,23 @@ This is a bounded owner-initiated restart, not config reconciliation. It applies
 
 The reason to restart rather than merely call `Start` is that the current adapter no-ops if already running (`internal/remote/nexusclient/backend.go:114`), while the stale connection path observed in the incident had already failed and entered retry behavior outside Piccolo's control.
 
-A transition-triggered restart also opens a bounded owner-local recovery window. If the first restart attempt fails before the current-run relay aggregate reaches connected, the owner schedules capped retry attempts until one of these happens: the aggregate relay state connects, adapter config/enablement changes, the uplink becomes unusable again, or the transition recovery deadline/cooldown expires. The retry window must respect the existing Namek identity debounce/cooldown so a settling DNS path cannot turn into a nonce-request storm.
+A transition-triggered restart also opens a bounded owner-local recovery window.
+The transition owner performs at most one stop/start for each accumulated
+material transition. After that attempt, the adapter's backend clients own
+handshake and reconnect retries; the owner timer observes relay state without
+stopping or replacing the in-flight adapter run. This separation is required
+because a Namek nonce or relay handshake can legitimately outlast the owner
+timer interval, and cancelling that run on every timer wake prevents recovery.
+
+The in-memory pending record retains the accumulated reasons, deadline, and
+whether the owner restart was attempted. A connected current-run relay clears
+the record. Disablement or an unusable uplink drops it without stopping a
+separately healthy owner. Deadline expiry stops transition-specific monitoring
+but leaves the adapter's ordinary reconnect loop running. A new material
+transition merges its reasons, supersedes the earlier observation attempt, and
+permits exactly one new owner restart. Namek identity/config events remain
+serialized with this state; self-hosted remote uses the same one-restart
+invariant under its existing manager lock.
 
 ### D5. Namek wake must preserve the single-owner invariant
 
@@ -307,8 +323,8 @@ This is deferred from the current implementation because it changes the nexus ad
 2. Extend supervisor transition state capture, all-managed-interface enumeration, canonicalization, bounded transition history/latest-state storage, and diagnostic bus publication after each successful tick.
 3. Add unit tests for transition reason derivation and dedupe behavior, including default-route-only, DNS-default-only, interface-role-only, same-kind multi-NIC (`eth0=lan`, `usb0=wan`, Wi-Fi present), reordered-equivalent-address, IPv6-churn suppression, and partial route/DNS observation cases.
 4. Add the server-level owner-delta coordinator and owner reconciler interface, including full-buffer/coalesced-wake tests proving restart-relevant reasons survive a later connectivity-only generation, history overflow produces a conservative restart-relevant delta, and restart-relevant reasons observed while unusable are satisfied by a later connectivity-only usable generation.
-5. Add self-hosted remote transition restart/retry wiring through `remote.Manager`, with tests for restart, config disable, deadline state, and negative LAN-only role/address changes that must not restart remotes.
-6. Refactor Namek's identity subscriber goroutine into a serialized apply loop that accumulates both identity and network reasons, including tests for identity/network coalescence and unusable-uplink pending reasons.
+5. Add self-hosted remote transition restart/recovery monitoring through `remote.Manager`, with tests proving one owner restart per material transition, no cancellation of a slow in-flight reconnect, config disable, deadline state, and negative LAN-only role/address changes that must not restart remotes.
+6. Refactor Namek's identity subscriber goroutine into a serialized apply loop that accumulates both identity and network reasons, including tests for identity/network coalescence, one owner restart while a slow handshake is in flight, and unusable-uplink pending reasons.
 7. Add mDNS transition reconciliation for interface loss/address/role change and tests for stale interface withdrawal versus active-uplink-only reannouncement, including a LAN-only interface that remains advertisable while Wi-Fi is the WAN uplink and an `unknown` role that preserves last known advertisable state during dampening.
 8. Add service-manager publication reapplication on transition for existing active port claims, with fake-firewall tests proving current claims are reopened only for safely LAN-publishable states and closed for unsafe/unknown ingress states.
 9. Add alpha VM netlab support for one management/WAN NIC plus one LAN-only test NIC and validate transition logs/roles under practical VirtualBox constraints.
@@ -333,7 +349,10 @@ Manual validation when device access returns:
 - Validate a LAN-only Ethernet plus WAN Wi-Fi case: Namek uses Wi-Fi for WAN/egress, while mDNS and claimed LAN app ports remain published on Ethernet.
 - Validate a same-kind multi-NIC case when hardware is available: one Ethernet-class interface is LAN-only, another Ethernet-class interface is WAN-capable, and the transition state keeps both by concrete interface name.
 - Verify Namek reconnect attempt starts immediately after the transition rather than waiting for the old retry cap.
-- If the first reconnect attempt fails during route/DNS settling, verify the transition-recovery window schedules bounded retries until the current-run relay aggregate connects or the deadline expires.
+- If the first reconnect attempt is still handshaking after the owner timer
+  interval, verify the owner does not stop/start it again; the backend retry
+  loop continues until the current-run relay aggregate connects or the
+  transition monitoring deadline expires.
 - Verify `piccolospace.com` route returns through Namek after the transition.
 - Verify `piccolo.local` and app hostnames withdraw old Ethernet addresses and announce Wi-Fi addresses.
 - Verify Pi-hole DNS on its claimed port responds on the LAN after transition. This remains manual validation rather than an automated RFC guarantee.
@@ -346,7 +365,7 @@ Manual validation when device access returns:
 - **Adapter restart flap:** Network changes can be noisy. Mitigation: generation dedupe plus per-owner cooldown on identical transition state.
 - **Pending-reason overreach:** Sticky restart reasons could cause a later connectivity event to restart after the original transition is no longer relevant. Mitigation: clear pending reasons when the owner is disabled, the adapter/app is no longer expected active, or a newer satisfied transition supersedes the same surface.
 - **Lossy bus delivery:** The existing event bus drops when subscriber buffers fill. Mitigation: owner recovery is driven by transition deltas read from retained supervisor state, while the bus topic is diagnostic only.
-- **Namek rate limits:** Restarting immediately can request nonce tokens. Mitigation: keep existing debounce, restart only on proven usable uplink transitions, and do not loop faster than the existing identity debounce/cooldown allows; transition-recovery retries are capped by a deadline/cooldown.
+- **Namek rate limits:** Restarting immediately can request nonce tokens. Mitigation: keep existing debounce, restart only on proven usable uplink transitions, and perform only one owner stop/start per material transition; the adapter's existing reconnect loop retains its own backoff while transition-specific observation is capped by a deadline.
 - **mDNS goodbye behavior:** Immediate withdrawal can be wrong if transient DHCP renewal temporarily removes addresses. Mitigation: only immediate-withdraw for interface missing, down, or truly addressless; active-uplink/default-route changes reannounce or re-evaluate but do not withdraw an otherwise advertisable LAN interface.
 - **WAN/LAN role conflation:** A LAN-only interface can be valid for local discovery and app ingress even when it cannot reach WAN. Mitigation: classify roles per interface and keep WAN/egress owner decisions separate from LAN/ingress owner decisions.
 - **Role-classification uncertainty:** A temporarily unclassifiable LAN interface can look like a filtered or disconnected interface. Mitigation: keep `unknown` distinct from `filtered` and preserve last known advertisable state under dampening while role/firewall classification is retried.
@@ -384,4 +403,15 @@ Rejected. The incident shows Wi-Fi was usable at `09:44:01`, while Namek did not
 
 ## Implementation Notes & Status
 
-Status: implementation in progress in the current dirty tree. The scoped implementation covers transition state/deltas, owner-local remote/Namek retry, mDNS/service-publication wakeups, fail-closed firewall publication handling for unsafe mixed/unknown ingress, alpha netlab validation, and focused tests. Publication drift verification, positive firewalld zone applicability proof/retry, stable IPv6 renumbering, and relay endpoint-generation fencing are deferred follow-ups.
+Status: implemented, with a 2026-07-16 recovery correction validated in tests
+and pending exact-image validation.
+The scoped implementation covers transition state/deltas, owner-local
+remote/Namek restart and recovery monitoring, mDNS/service-publication wakeups,
+fail-closed firewall publication handling for unsafe mixed/unknown ingress,
+alpha netlab validation, and focused tests. Exact Build20.20 validation proved
+that repeating the owner restart every 10 seconds cancelled a slow Namek
+handshake indefinitely after route recovery; D4 now assigns reconnect retries
+to the adapter and limits the outer owner to one restart per material
+transition. Publication drift verification, positive firewalld zone
+applicability proof/retry, stable IPv6 renumbering, and relay
+endpoint-generation fencing remain deferred follow-ups.

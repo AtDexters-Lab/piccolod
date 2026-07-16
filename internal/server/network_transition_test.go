@@ -1,6 +1,7 @@
 package server
 
 import (
+	"context"
 	"net/netip"
 	"sync"
 	"testing"
@@ -8,6 +9,7 @@ import (
 
 	"piccolod/internal/network"
 	"piccolod/internal/remote"
+	"piccolod/internal/remote/nexusclient"
 )
 
 func TestRemoteRelevantNetworkTransitionReasonsIgnoreLANOnlyAddressChurn(t *testing.T) {
@@ -537,9 +539,19 @@ func TestNetworkTransitionRetryMergesReasonsAndExpires(t *testing.T) {
 	if retry.hasAttempted() {
 		t.Fatal("retry should not be marked attempted before attempt")
 	}
+	if !retry.shouldRestart() {
+		t.Fatal("pending unattempted recovery should request one owner restart")
+	}
 	retry.markAttempted()
 	if !retry.hasAttempted() {
 		t.Fatal("retry should track attempted state")
+	}
+	if retry.shouldRestart() {
+		t.Fatal("attempted recovery should not request another owner restart")
+	}
+	retry.add([]network.NetworkTransitionReason{network.ReasonActiveUplinkChanged}, now.Add(2*time.Second))
+	if !retry.shouldRestart() {
+		t.Fatal("new material transition should permit one new owner restart")
 	}
 	retry.clear()
 	if retry.hasPending() {
@@ -568,6 +580,29 @@ func TestNetworkTransitionConnectedRelayDoesNotSatisfyUnattemptedRetry(t *testin
 	}
 }
 
+func TestNamekNetworkTransitionRetryRequestsSingleOwnerRestart(t *testing.T) {
+	var retry networkTransitionRetry
+	retry.add([]network.NetworkTransitionReason{network.ReasonDefaultRouteChanged}, time.Now())
+
+	got := takeNamekNetworkTransitionRestart(&retry)
+	if len(got) != 1 || got[0] != network.ReasonDefaultRouteChanged {
+		t.Fatalf("first recovery step reasons = %v, want [%s]", got, network.ReasonDefaultRouteChanged)
+	}
+	if !retry.hasAttempted() {
+		t.Fatal("first recovery step should record the owner restart attempt")
+	}
+
+	if got := takeNamekNetworkTransitionRestart(&retry); len(got) != 0 {
+		t.Fatalf("timer observation requested another owner restart: %v", got)
+	}
+
+	retry.add([]network.NetworkTransitionReason{network.ReasonDNSDefaultChanged}, time.Now())
+	got = takeNamekNetworkTransitionRestart(&retry)
+	if len(got) != 2 {
+		t.Fatalf("new material transition reasons = %v, want accumulated restart reasons", got)
+	}
+}
+
 func TestSelfHostedNetworkTransitionRetryKeepsConnectedPendingUntilAttempted(t *testing.T) {
 	rm, err := remote.NewManager(t.TempDir())
 	if err != nil {
@@ -593,6 +628,99 @@ func TestSelfHostedNetworkTransitionRetryKeepsConnectedPendingUntilAttempted(t *
 	}
 	if retry.hasPending() {
 		t.Fatal("connected relay should clear pending restart after an attempt")
+	}
+}
+
+func TestSelfHostedNetworkTransitionRetryDoesNotRestartSlowHandshake(t *testing.T) {
+	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
+	rm, err := remote.NewManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("remote manager: %v", err)
+	}
+	defer rm.Close()
+
+	adapter := newTransitionCountingAdapter()
+	rm.SetNexusAdapter(adapter)
+	if err := rm.Configure(remote.ConfigureRequest{
+		Endpoint:       "wss://nexus.example.com/connect",
+		DeviceSecret:   "secret",
+		PortalHostname: "portal.example.com",
+	}); err != nil {
+		t.Fatalf("configure remote manager: %v", err)
+	}
+	adapter.waitForStarts(t, 1)
+
+	var retry networkTransitionRetry
+	retry.add([]network.NetworkTransitionReason{network.ReasonDefaultRouteChanged}, time.Now())
+	state := testTransitionState(
+		"eth0",
+		network.ConnectivityFull,
+		testIface(network.DeviceEthernet, "eth0", network.InterfaceRoleWANLAN, "192.168.1.20"),
+	)
+	state.ActiveUplink = network.UplinkEthernet
+
+	server := &GinServer{}
+	if !server.attemptSelfHostedNetworkTransitionRetry(rm, &retry, state, true) {
+		t.Fatal("first transition attempt should schedule recovery observation")
+	}
+	adapter.waitForStarts(t, 2)
+
+	if !server.attemptSelfHostedNetworkTransitionRetry(rm, &retry, state, false) {
+		t.Fatal("disconnected in-flight adapter should remain under recovery observation")
+	}
+	if got := adapter.startCount(); got != 2 {
+		t.Fatalf("adapter starts = %d, want 2 (initial + one transition restart)", got)
+	}
+	if !retry.hasAttempted() || !retry.hasPending() {
+		t.Fatal("slow handshake should preserve attempted pending recovery state")
+	}
+
+	rm.RelayEventHandler()(selfHostedRelayName, true, "")
+	if server.attemptSelfHostedNetworkTransitionRetry(rm, &retry, state, false) {
+		t.Fatal("connected relay should complete recovery observation")
+	}
+	if retry.hasPending() {
+		t.Fatal("connected relay should clear pending recovery")
+	}
+}
+
+type transitionCountingAdapter struct {
+	mu     sync.Mutex
+	starts int
+	start  chan struct{}
+}
+
+func newTransitionCountingAdapter() *transitionCountingAdapter {
+	return &transitionCountingAdapter{start: make(chan struct{}, 8)}
+}
+
+func (a *transitionCountingAdapter) Configure(nexusclient.Config) error { return nil }
+
+func (a *transitionCountingAdapter) Start(ctx context.Context) error {
+	a.mu.Lock()
+	a.starts++
+	a.mu.Unlock()
+	a.start <- struct{}{}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (a *transitionCountingAdapter) Stop(context.Context) error { return nil }
+
+func (a *transitionCountingAdapter) startCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.starts
+}
+
+func (a *transitionCountingAdapter) waitForStarts(t *testing.T, want int) {
+	t.Helper()
+	for a.startCount() < want {
+		select {
+		case <-a.start:
+		case <-time.After(time.Second):
+			t.Fatalf("adapter starts = %d, want at least %d", a.startCount(), want)
+		}
 	}
 }
 

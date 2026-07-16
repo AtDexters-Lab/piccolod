@@ -116,6 +116,19 @@ func (r *networkTransitionRetry) hasAttempted() bool {
 	return r.attempted
 }
 
+func (r *networkTransitionRetry) shouldRestart() bool {
+	return r != nil && r.hasPending() && !r.hasAttempted()
+}
+
+func takeNamekNetworkTransitionRestart(retry *networkTransitionRetry) []network.NetworkTransitionReason {
+	if retry == nil || !retry.shouldRestart() {
+		return nil
+	}
+	reasons := retry.reasons()
+	retry.markAttempted()
+	return reasons
+}
+
 func (s *GinServer) subscribeSelfHostedNetworkTransitions(src network.NetworkTransitionSource, rm *remote.Manager) {
 	if s == nil || src == nil || rm == nil {
 		return
@@ -223,6 +236,17 @@ func (s *GinServer) attemptSelfHostedNetworkTransitionRetry(rm *remote.Manager, 
 		log.Printf("INFO: remote: dropping network transition recovery; uplink no longer usable (reasons=%s)", networkTransitionReasonString(retry.reasons()))
 		retry.clear()
 		return false
+	}
+	// Restarting the adapter is the transition owner's one-time repair action.
+	// Once attempted, the adapter's backend clients own handshake/reconnect
+	// retries. Repeated stop/start here can cancel a slow handshake forever.
+	if !retry.shouldRestart() {
+		status := rm.Status()
+		if !status.Enabled || strings.TrimSpace(status.PortalHostname) == "" {
+			retry.clear()
+			return false
+		}
+		return true
 	}
 	if !rm.RestartAdapterForNetworkTransition(retry.reasons()) {
 		retry.clear()

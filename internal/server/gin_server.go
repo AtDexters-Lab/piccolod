@@ -1730,9 +1730,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 				case !s.namekNetworkTransitionExpectedActive():
 					namekNetworkRetry.clear()
 					stopNamekNetworkRetry()
-				case forceNetworkRestart || networkRetryWake || networkWake:
-					restartReasons = namekNetworkRetry.reasons()
-					namekNetworkRetry.markAttempted()
+				case namekNetworkRetry.shouldRestart():
+					restartReasons = takeNamekNetworkTransitionRestart(&namekNetworkRetry)
+					scheduleNamekNetworkRetry()
+				case networkRetryWake || networkWake:
+					// The adapter's backend clients own reconnect attempts after
+					// the one transition-triggered restart. Keep observing without
+					// cancelling a handshake that outlasts this timer interval.
 					scheduleNamekNetworkRetry()
 				}
 			}
