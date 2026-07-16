@@ -5,15 +5,17 @@ class WifiService {
   WifiService(this._client);
   final ApiClient _client;
 
-  Future<WifiStatus> getStatus() async {
-    final data = await _client.get('/api/v1/wifi/status');
+  Future<NetworkStatus> getStatus() async {
+    final data = await _client.get('/api/v1/network/status');
     if (data is Map<String, dynamic>) {
-      return WifiStatus.fromJson(data);
+      return NetworkStatus.fromJson(data);
     }
-    return WifiStatus(
+    return NetworkStatus(
       available: false,
-      state: 'disconnected',
       activeUplink: 'none',
+      connectivity: 'unknown',
+      interfaces: const [],
+      apActive: false,
       hasSavedNetwork: false,
     );
   }
@@ -32,14 +34,17 @@ class WifiService {
   }
 
   Future<WifiConnectResult> connect(String ssid, String passphrase) async {
-    final data = await _client.post('/api/v1/wifi/connect', body: {
-      'ssid': ssid,
-      'passphrase': passphrase,
-    });
+    final data = await _client.post(
+      '/api/v1/wifi/connect',
+      body: {
+        'ssid': ssid,
+        'passphrase': passphrase,
+      },
+    );
     if (data is Map<String, dynamic>) {
       return WifiConnectResult.fromJson(data);
     }
-    return WifiConnectResult(success: false, state: 'disconnected');
+    return WifiConnectResult(success: false);
   }
 
   Future<void> disconnect() async {
@@ -55,8 +60,11 @@ class WifiService {
   }
 
   Future<void> suppressAP(bool suppress) async {
-    await _client.post('/api/v1/wifi/ap/suppress', body: {
-      'suppress': suppress,
-    });
+    await _client.post(
+      '/api/v1/wifi/ap/suppress',
+      body: {
+        'suppress': suppress,
+      },
+    );
   }
 }

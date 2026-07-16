@@ -1,5 +1,12 @@
 # Network Transition Reconciliation
 
+> **Superseded compatibility decision (2026-07-16):** Piccolod has no unknown
+> API or event consumers, so the legacy `ConnState`,
+> `TopicNetworkStateChanged`, and `/api/v1/wifi/status` contracts were removed
+> instead of being maintained beside the typed transition model. The bundled
+> UI and internal consumers now use the typed, per-interface network state. See
+> [Network State Authority and Boot Readiness Amendment](20260716-network-state-authority-readiness-amendment.md).
+
 ## Scope
 
 **Problem:** Piccolo already detects active uplink changes, but the emitted event is a legacy compatibility signal rather than a typed reconciliation boundary. In the June 29, 2026 RPi400 incident, Ethernet and Wi-Fi were both healthy, Ethernet was removed, NetworkManager moved the default route and DNS to Wi-Fi, and the supervisor reported Wi-Fi L3 up within seconds. Namek remote access still remained unavailable until its retry loop recovered later, and Pi-hole/DNS symptoms appeared around the same transition. The root class is not "DNS only"; it is that subsystems with network-facing state do not get a deterministic, owner-safe transition reconciliation pass.
@@ -7,7 +14,8 @@
 **In scope:**
 
 - Introduce a typed network transition event derived from the supervisor tick/snapshot when active uplink, default route/DNS interface, per-interface WAN/LAN role, interface address set, connectivity, or AP mode changes.
-- Preserve the existing `TopicNetworkStateChanged` / `NetworkStateChangedEvent` wire contract for UI, identity wakeups, STUN, and health tracking.
+- Migrate UI, identity wakeups, STUN, and health tracking to the typed network
+  state; do not preserve a parallel compatibility event.
 - Add owner-local reconcilers for remote adapters, mDNS interface advertisements, and app/service network publication checks. The event wakes owners; each owner decides whether to repair, restart, reload, or no-op under its own locking and serialization rules.
 - Make Namek and self-hosted Nexus adapters respond quickly to a proven uplink transition without depending only on backend retry timers.
 - Treat Pi-hole/DNS as part of app listener publication and port-claim routing, not as a special one-off DNS daemon path, unless static implementation work proves a narrower DNS-specific hook is required.

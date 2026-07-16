@@ -1480,6 +1480,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	}
 
 	var netTransitions network.NetworkTransitionSource
+	var netState network.NetworkStateSource
 
 	// Network manager + supervisor. D-Bus may be unavailable on dev machines —
 	// degrade gracefully, WiFi API returns available=false.
@@ -1511,31 +1512,19 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		} else {
 			networkMgr.AttachSupervisor(netSup)
 			netTransitions = netSup
+			netState = netSup
 			s.supervisor.Register(networkMgr) // must come before netSup
 			s.supervisor.Register(netSup)
 		}
 		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
 	}
 
-	// Notify enrollment and STUN when network connectivity becomes available.
-	// Single event bus subscriber, two method calls — keeps services decoupled.
-	netStateCh, cancelNetState := eventsBus.SubscribeWithCancel(events.TopicNetworkStateChanged, 4)
-	s.busUnsubs = append(s.busUnsubs, cancelNetState)
-	go func() {
-		for evt := range netStateCh {
-			nse, ok := evt.Payload.(network.NetworkStateChangedEvent)
-			if !ok {
-				continue
-			}
-			// Filter: only react to state transitions (uplink changed), not
-			// signal-tier updates (which also publish on this topic with
-			// SignalDBm set but no actual connectivity change).
-			if nse.SignalDBm == nil && (nse.ActiveUplink == string(network.UplinkEthernet) || nse.ActiveUplink == string(network.UplinkWiFi)) {
-				identitySvc.NotifyNetworkUp()
-				stunSvc.Trigger()
-			}
-		}
-	}()
+	// Notify enrollment and STUN from the authoritative state source. The
+	// initial established state wakes this path as well as later transitions.
+	s.subscribeNetworkAvailability(netState, func() {
+		identitySvc.NotifyNetworkUp()
+		stunSvc.Trigger()
+	})
 
 	// Self-hosted adapter (existing)
 	var nexusAdapter nexusclient.Adapter
@@ -2479,11 +2468,15 @@ func (s *GinServer) setupGinRoutes() {
 		// Identity / namek endpoints (Admin only)
 		s.registerIdentityRoutes(admin)
 
-		// WiFi management (Admin only, same-network or LAN)
+		// Typed network status and WiFi management (Admin only,
+		// same-network or LAN).
+		networkStatus := admin.Group("/network")
+		networkStatus.Use(s.allowLANOrSamePublicIP())
+		networkStatus.GET("/status", s.handleNetworkStatus)
+
 		wifi := admin.Group("/wifi")
 		wifi.Use(s.allowLANOrSamePublicIP())
 		{
-			wifi.GET("/status", s.handleWifiStatus)
 			wifi.POST("/scan", s.handleWifiScan)
 			wifi.POST("/connect", s.handleWifiConnect)
 			wifi.POST("/disconnect", s.handleWifiDisconnect)
@@ -3800,18 +3793,21 @@ func (s *GinServer) registerProxyOIDCClient(ctx context.Context, appName string)
 
 func (s *GinServer) handleGinReadinessCheck(c *gin.Context) {
 	if s.healthTracker == nil {
-		c.JSON(http.StatusOK, gin.H{"ready": true, "status": "unknown"})
+		c.JSON(http.StatusServiceUnavailable, gin.H{
+			"ready":      false,
+			"status":     "unknown",
+			"components": []gin.H{},
+		})
 		return
 	}
 	required := []string{"persistence", "app-manager", "service-manager"}
-	ready, snapshot := s.healthTracker.Ready(required...)
-	overall := s.healthTracker.Overall()
+	ready, bootHealthy, overall, snapshot := s.healthTracker.EvaluateReadiness(required...)
 	payload := gin.H{
 		"ready":      ready,
 		"status":     overall.String(),
 		"components": flattenHealth(snapshot),
 	}
-	if overall == health.LevelError {
+	if !bootHealthy {
 		c.JSON(http.StatusServiceUnavailable, payload)
 		return
 	}

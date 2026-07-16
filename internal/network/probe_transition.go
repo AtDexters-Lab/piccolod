@@ -37,6 +37,24 @@ type transitionInterfaceProbe struct {
 	unknown     bool
 }
 
+// activeUplinkFromProjection returns the kind and concrete owner of the
+// observed default route. A completed projection that proves there is no
+// default route authoritatively reports no uplink; an incomplete projection
+// fails closed without promoting class-level recovery observations.
+func activeUplinkFromProjection(proj transitionProjection) (UplinkType, string, bool) {
+	if !proj.interfacesObserved || !proj.defaultRouteObserved {
+		return UplinkNone, "", false
+	}
+	if !proj.defaultRouteKnown {
+		return UplinkNone, "", true
+	}
+	uplink, ok := activeUplinkForRoute(proj.interfaces, proj.defaultRouteIface)
+	if !ok {
+		return UplinkNone, "", false
+	}
+	return uplink, proj.defaultRouteIface, true
+}
+
 func (p *Prober) probeTransitionProjection(connectivity Connectivity) transitionProjection {
 	probes, ok := p.probeTransitionInterfaces()
 	proj := transitionProjection{interfacesObserved: ok}
@@ -243,11 +261,4 @@ func interfaceHasLANAddress(probe transitionInterfaceProbe) bool {
 		}
 	}
 	return false
-}
-
-func roleFromObservation(obs DeviceObservation, activeIface, defaultRouteIface string, defaultRouteKnown bool, connectivity Connectivity) NetworkInterfaceRole {
-	if !obs.LinkUp || !obs.HasIP {
-		return InterfaceRoleNotConnected
-	}
-	return InterfaceRoleUnknown
 }

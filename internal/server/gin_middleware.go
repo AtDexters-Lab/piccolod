@@ -426,32 +426,22 @@ func (s *GinServer) requireSetupState() gin.HandlerFunc {
 // This enables same-network access via Nexus relay for endpoints where the user
 // needs physical proximity but may be accessing via the remote domain.
 //
-// Used by: WiFi management routes (/api/v1/wifi/*).
+// Used by: typed network status and WiFi management routes.
 // Trust model: "same public IP" ≈ "same network". Note that CGNAT environments
 // may share a public IP across unrelated users — accepted risk since admin auth
 // is also required.
 func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if isLANRequest(c) {
+		if s.hasLANOrSamePublicIPAccess(c) {
 			c.Next()
 			return
 		}
 
-		// Remote: match Nexus-relayed client IP against device public IP.
-		// Uses cached value (refreshed every 5 min by background loop).
-		// Falls back to a synchronous query if cache is empty (fresh boot).
 		if s.stunService != nil {
 			clientIP := relayClientIP(c)
 			deviceIP := s.stunService.PublicIP()
-			if deviceIP == "" {
-				deviceIP = s.stunService.Refresh() // cold-cache fill, at most once
-			}
 			normClient := stun.NormalizeIP(clientIP)
 			normDevice := stun.NormalizeIP(deviceIP)
-			if clientIP != "" && deviceIP != "" && normClient == normDevice {
-				c.Next()
-				return
-			}
 			log.Printf("WARN: allowLANOrSamePublicIP denied %s %s: relayClientIP=%q (norm=%q) stunDeviceIP=%q (norm=%q)",
 				c.Request.Method, c.Request.URL.Path, clientIP, normClient, deviceIP, normDevice)
 		} else {
@@ -461,6 +451,26 @@ func (s *GinServer) allowLANOrSamePublicIP() gin.HandlerFunc {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Forbidden: LAN or same network required"})
 		c.Abort()
 	}
+}
+
+// hasLANOrSamePublicIPAccess is the shared factual access check for REST and
+// WebSocket network-status transports. It does not write a response.
+func (s *GinServer) hasLANOrSamePublicIPAccess(c *gin.Context) bool {
+	if isLANRequest(c) {
+		return true
+	}
+	if s == nil || s.stunService == nil {
+		return false
+	}
+	clientIP := relayClientIP(c)
+	deviceIP := s.stunService.PublicIP()
+	if deviceIP == "" {
+		deviceIP = s.stunService.Refresh()
+	}
+	if clientIP == "" || deviceIP == "" {
+		return false
+	}
+	return stun.NormalizeIP(clientIP) == stun.NormalizeIP(deviceIP)
 }
 
 // lanHostRoutingMiddleware implements LAN host-based routing per RFC 20260122.

@@ -215,6 +215,43 @@ func (c *DBusClient) DeviceStateReason(device dbus.ObjectPath) (NMDeviceState, N
 	return st, NMDeviceStateReasonUnknown, nil
 }
 
+// ActiveAccessPoint returns the access point currently associated with a WiFi
+// device. Frequency is required because callers use it as factual radio state;
+// the remaining descriptive properties are populated on a best-effort basis.
+func (c *DBusClient) ActiveAccessPoint(device dbus.ObjectPath) (*AccessPoint, error) {
+	v, err := c.prop(device, nmWirelessInterface, "ActiveAccessPoint")
+	if err != nil {
+		return nil, err
+	}
+	apPath, ok := v.Value().(dbus.ObjectPath)
+	if !ok || !apPath.IsValid() || apPath == "/" {
+		return nil, nil
+	}
+
+	ap := &AccessPoint{Path: apPath}
+	if sv, err := c.prop(apPath, nmAPInterface, "Ssid"); err == nil {
+		if ssidBytes, ok := sv.Value().([]byte); ok {
+			ap.SSID = string(ssidBytes)
+		}
+	}
+	if sv, err := c.prop(apPath, nmAPInterface, "HwAddress"); err == nil {
+		ap.HWAddress, _ = sv.Value().(string)
+	}
+	fv, err := c.prop(apPath, nmAPInterface, "Frequency")
+	if err != nil {
+		return nil, err
+	}
+	frequency, ok := fv.Value().(uint32)
+	if !ok {
+		return nil, fmt.Errorf("nmclient: active AP frequency has type %T", fv.Value())
+	}
+	ap.Frequency = frequency
+	if sv, err := c.prop(apPath, nmAPInterface, "Strength"); err == nil {
+		ap.Strength, _ = sv.Value().(uint8)
+	}
+	return ap, nil
+}
+
 // SignalStrength returns the WiFi signal strength (0–100) for the active AP.
 func (c *DBusClient) SignalStrength(device dbus.ObjectPath) (uint8, error) {
 	v, err := c.prop(device, nmWirelessInterface, "ActiveAccessPoint")

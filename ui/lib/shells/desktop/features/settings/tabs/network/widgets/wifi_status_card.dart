@@ -5,10 +5,13 @@ import 'package:piccolo_os/theme/piccolo_theme.dart';
 
 class WifiStatusCard extends StatelessWidget {
   const WifiStatusCard({
-    required this.status, required this.onForgetNetwork, required this.onScanNetworks, super.key,
+    required this.status,
+    required this.onForgetNetwork,
+    required this.onScanNetworks,
+    super.key,
   });
 
-  final WifiStatus status;
+  final NetworkStatus status;
   final VoidCallback onForgetNetwork;
   final VoidCallback onScanNetworks;
 
@@ -39,32 +42,46 @@ class WifiStatusCard extends StatelessWidget {
                     ],
                   ),
                 ),
-                if (status.signalTier != null) _SignalBars(tier: status.signalTier!),
+                if (status.isWifiConnected && status.signalTier != null)
+                  _SignalBars(tier: status.signalTier!),
               ],
             ),
-            if (status.isWifiConnected && status.ssid != null) ...[
+            if (_hasConnectionDetails) ...[
               const Divider(height: 24),
-              _InfoRow('Network', status.ssid!),
+              if (status.activeUplinkIface != null)
+                _InfoRow('Interface', status.activeUplinkIface!),
+              if (status.isWifiConnected && status.ssid != null)
+                _InfoRow('Network', status.ssid!),
               if (status.band != null) _InfoRow('Band', status.band!),
-              if (status.ipAddress != null) _InfoRow('IP Address', status.ipAddress!),
+              if (status.ipAddress != null)
+                _InfoRow('IP Address', status.ipAddress!),
               if (status.signalDbm != null)
-                _InfoRow('Signal', '${status.signalDbm} dBm (${status.signalTier ?? ""})'),
-            ],
-            const SizedBox(height: 16),
-            Wrap(
-              spacing: 8,
-              children: [
-                FilledButton.tonal(
-                  onPressed: onScanNetworks,
-                  child: Text(status.hasSavedNetwork ? 'Change Network' : 'Connect to WiFi'),
+                _InfoRow(
+                  'Signal',
+                  '${status.signalDbm} dBm (${status.signalTier ?? ""})',
                 ),
-                if (status.hasSavedNetwork)
-                  OutlinedButton(
-                    onPressed: onForgetNetwork,
-                    child: const Text('Forget Network'),
+            ],
+            if (status.available) ...[
+              const SizedBox(height: 16),
+              Wrap(
+                spacing: 8,
+                children: [
+                  FilledButton.tonal(
+                    onPressed: onScanNetworks,
+                    child: Text(
+                      status.hasSavedNetwork
+                          ? 'Change Network'
+                          : 'Connect to WiFi',
+                    ),
                   ),
-              ],
-            ),
+                  if (status.hasSavedNetwork)
+                    OutlinedButton(
+                      onPressed: onForgetNetwork,
+                      child: const Text('Forget Network'),
+                    ),
+                ],
+              ),
+            ],
           ],
         ),
       ),
@@ -72,35 +89,66 @@ class WifiStatusCard extends StatelessWidget {
   }
 
   IconData get _uplinkIcon {
+    if (status.isAPMode) return PiccoloIcons.accessPoint;
+    if (status.isPortal) return Icons.login;
+    if (status.isUnknown) return Icons.sync;
+    if (status.isLimitedConnectivity) {
+      return Icons.signal_wifi_statusbar_connected_no_internet_4;
+    }
     if (status.isEthernet) return PiccoloIcons.ethernet;
     if (status.isWifiConnected) return PiccoloIcons.wifi;
     if (status.isReconnecting) return PiccoloIcons.wifiNone;
-    if (status.isAPMode) return PiccoloIcons.accessPoint;
     return PiccoloIcons.wifiOff;
   }
 
   Color get _statusColor {
-    if (status.isEthernet || status.isWifiConnected) return PiccoloTheme.success;
-    if (status.isReconnecting) return PiccoloTheme.warning;
     if (status.isAPMode) return PiccoloTheme.info;
+    if (status.isUnknown) return PiccoloTheme.inkMuted;
+    if (status.isLimitedConnectivity ||
+        status.isPortal ||
+        status.isReconnecting) {
+      return PiccoloTheme.warning;
+    }
+    if (status.isEthernet || status.isWifiConnected) {
+      return PiccoloTheme.success;
+    }
     return PiccoloTheme.critical;
   }
 
   String get _connectionLabel {
+    if (status.isAPMode) return 'Setup Mode';
+    if (status.isPortal) return 'Sign-in required';
+    if (status.isUnknown) return 'Checking network';
+    if (status.isLimitedConnectivity) return 'Connected (limited)';
     if (status.isEthernet) return 'Connected via Ethernet';
     if (status.isWifiConnected) return 'Connected via WiFi';
     if (status.isReconnecting) return 'Reconnecting…';
-    if (status.isAPMode) return 'Setup Mode';
     return 'Disconnected';
   }
 
   String get _statusDescription {
+    if (status.isAPMode) return 'Broadcasting access point for WiFi setup.';
+    if (status.isPortal) {
+      return 'This network requires browser sign-in, which Piccolo cannot complete. Choose another network.';
+    }
+    if (status.isUnknown) {
+      return 'Network status is temporarily unavailable. Piccolo will retry.';
+    }
+    if (status.isLimitedConnectivity) {
+      final transport = status.activeUplink == 'ethernet' ? 'Ethernet' : 'WiFi';
+      return 'Connected via $transport, but internet access is limited.';
+    }
     if (status.isEthernet) return 'Ethernet is the preferred connection.';
     if (status.isWifiConnected) return status.ssid ?? 'WiFi connected';
-    if (status.isReconnecting) return 'Attempting to reconnect to ${status.savedSsid ?? "WiFi"}…';
-    if (status.isAPMode) return 'Broadcasting access point for WiFi setup.';
+    if (status.isReconnecting) {
+      return 'Attempting to reconnect to ${status.savedSsid ?? "WiFi"}…';
+    }
     return 'No network connection available.';
   }
+
+  bool get _hasConnectionDetails =>
+      status.activeUplinkIface != null ||
+      (status.isWifiConnected && status.ssid != null);
 }
 
 class _InfoRow extends StatelessWidget {
@@ -116,7 +164,13 @@ class _InfoRow extends StatelessWidget {
         children: [
           SizedBox(
             width: 100,
-            child: Text(label, style: const TextStyle(color: PiccoloTheme.inkMuted, fontSize: 13)),
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: PiccoloTheme.inkMuted,
+                fontSize: 13,
+              ),
+            ),
           ),
           Text(value, style: const TextStyle(fontSize: 13)),
         ],

@@ -10,19 +10,19 @@ import (
 // catalog ID (A1, B1, ...) to its expected HW + AP decisions and Snapshot
 // shape. The 41 catalog scenarios from the RFC are the acceptance bar.
 type scenario struct {
-	id     string
-	desc   string
-	tick   Tick
-	led    ActionLedger
-	intent UserIntent
+	id       string
+	desc     string
+	tick     Tick
+	led      ActionLedger
+	intent   UserIntent
 	apActive bool
 
-	wantHWWiFi    HWAction
-	wantHWEth     HWAction
-	wantAP        APAction
-	wantHint      string
-	wantStatusW   DeviceStatus // wifi
-	wantStatusE   DeviceStatus // eth
+	wantHWWiFi  HWAction
+	wantHWEth   HWAction
+	wantAP      APAction
+	wantHint    string
+	wantStatusW DeviceStatus // wifi
+	wantStatusE DeviceStatus // eth
 }
 
 var (
@@ -121,7 +121,7 @@ func catalogScenarios() []scenario {
 			),
 			led: ActionLedger{
 				// Already bounced 3 times in last 1h
-				Bounces: map[DeviceKind][]time.Time{DeviceWiFi: {now.Add(-30 * time.Minute), now.Add(-20 * time.Minute), now.Add(-10 * time.Minute)}},
+				Bounces:      map[DeviceKind][]time.Time{DeviceWiFi: {now.Add(-30 * time.Minute), now.Add(-20 * time.Minute), now.Add(-10 * time.Minute)}},
 				LastBounceAt: map[DeviceKind]time.Time{DeviceWiFi: now.Add(-10 * time.Minute)},
 			},
 			wantHWWiFi:  HWReboot{},
@@ -389,7 +389,7 @@ func catalogScenarios() []scenario {
 			},
 			wantHWWiFi:  HWWait{},
 			wantHWEth:   HWWait{},
-			wantAP:      APUnchanged{}, // wifi HW Faulted, AP impossible
+			wantAP:      APUnchanged{},    // wifi HW Faulted, AP impossible
 			wantStatusW: StatusRecovering, // quiet period wins
 			wantStatusE: StatusInactive,
 		},
@@ -892,50 +892,23 @@ func TestDecideAP_RateShape(t *testing.T) {
 	}
 }
 
-// TestDeriveLegacyState verifies the wire-contract mapping.
-func TestDeriveLegacyState(t *testing.T) {
-	tests := []struct {
-		name     string
-		tick     Tick
-		apActive bool
-		want     ConnState
-	}{
-		{
-			"AP mode highest priority",
-			tick(dev(DeviceWiFi, TriHealthy, TriHealthy, TriHealthy, true, true), absent(DeviceEthernet), L3ProbeUp, false, UplinkWiFi),
-			true, StateAPMode,
+func TestAnyDeviceWorkingUsesAuthoritativeSecondEthernet(t *testing.T) {
+	tk := Tick{
+		Devices: map[DeviceKind]DeviceObservation{
+			DeviceEthernet: absent(DeviceEthernet),
 		},
-		{
-			"Eth GwReachable wins over WiFi",
-			tick(dev(DeviceWiFi, TriHealthy, TriHealthy, TriHealthy, true, true), dev(DeviceEthernet, TriHealthy, TriHealthy, TriHealthy, true, true), L3ProbeUp, false, UplinkEthernet),
-			false, StateEthernet,
+		InterfacesObserved:   true,
+		DefaultRouteObserved: true,
+		DefaultRouteKnown:    true,
+		DefaultRouteIface:    "enp2s0",
+		Interfaces: []NetworkInterfaceState{
+			{Kind: DeviceEthernet, Iface: "enp1s0", Role: InterfaceRoleNotConnected},
+			{Kind: DeviceEthernet, Iface: "enp2s0", Role: InterfaceRoleWANLAN, LinkUp: true, HasIP: true},
 		},
-		{
-			"WiFi only",
-			tick(dev(DeviceWiFi, TriHealthy, TriHealthy, TriHealthy, true, true), absent(DeviceEthernet), L3ProbeUp, false, UplinkWiFi),
-			false, StateWiFiSTA,
-		},
-		{
-			"WiFi reconnecting (config faulted)",
-			tick(dev(DeviceWiFi, TriHealthy, TriFaulted, TriInactive, false, false), absent(DeviceEthernet), L3ProbeDown, false, UplinkNone),
-			false, StateReconnecting,
-		},
-		{
-			"C8/C9 ARP-suppressed but L3 reachable — wifi_connected",
-			tick(dev(DeviceWiFi, TriHealthy, TriHealthy, TriFaulted, true, true), absent(DeviceEthernet), L3ProbeUp, false, UplinkWiFi),
-			false, StateWiFiSTA,
-		},
-		{
-			"Disconnected fallthrough",
-			tick(dev(DeviceWiFi, TriFaulted, TriInactive, TriInactive, false, false), absent(DeviceEthernet), L3ProbeDown, false, UplinkNone),
-			false, StateDisconnected,
-		},
+		ActiveUplink:      UplinkEthernet,
+		ActiveUplinkIface: "enp2s0",
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := deriveLegacyState(tt.tick, tt.apActive); got != tt.want {
-				t.Errorf("got %s, want %s", got, tt.want)
-			}
-		})
+	if !anyDeviceWorking(tk) {
+		t.Fatal("working second Ethernet interface should suppress AP recovery")
 	}
 }

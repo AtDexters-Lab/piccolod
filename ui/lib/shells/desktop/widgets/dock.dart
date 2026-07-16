@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/models/wifi_models.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
@@ -380,9 +381,7 @@ class _NetworkStatusIndicator extends StatefulWidget {
 
 class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
   StreamSubscription<Map<String, dynamic>>? _subscription;
-  String _state = '';
-  String _uplink = '';
-  String? _signalTier;
+  NetworkStatus? _status;
 
   @override
   void initState() {
@@ -424,9 +423,7 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
   void _handleEvent(Map<String, dynamic> event) {
     if (!mounted) return;
     setState(() {
-      _state = event['state'] as String? ?? '';
-      _uplink = event['active_uplink'] as String? ?? '';
-      _signalTier = event['signal_tier'] as String?;
+      _status = NetworkStatus.fromJson(event);
     });
   }
 
@@ -439,37 +436,63 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
 
   @override
   Widget build(BuildContext context) {
-    // Only show when not on Ethernet (Ethernet is the normal/default state)
-    if (_state == '' || _state == 'ethernet') {
+    // Full Ethernet is the normal/default state. Limited Ethernet remains
+    // visible because it requires operator attention.
+    final status = _status;
+    if (status == null ||
+        (status.isEthernet && !status.isLimitedConnectivity)) {
       return const SizedBox.shrink();
     }
 
-    final (color, icon, label, tooltip) = switch (_state) {
-      'wifi_connected' => (
-        _signalColor,
-        PiccoloIcons.wifiOff, // we'll use a wifi icon below
-        _signalLabel,
-        'Connected via WiFi${_signalTier != null ? " ($_signalTier)" : ""}',
-      ),
-      'reconnecting' => (
-        PiccoloTheme.warning,
-        PiccoloIcons.wifiOff,
-        'Reconnecting',
-        'WiFi lost — attempting to reconnect',
-      ),
-      'disconnected' => (
-        PiccoloTheme.critical,
-        PiccoloIcons.wifiOff,
-        'Disconnected',
-        'No network connection',
-      ),
-      'ap_mode' => (
+    final (color, icon, label, tooltip) = switch (status) {
+      NetworkStatus(isAPMode: true) => (
         PiccoloTheme.cobalt600,
         Icons.wifi_tethering,
         'AP Mode',
         'Broadcasting setup access point',
       ),
-      _ => (PiccoloTheme.inkMuted, PiccoloIcons.wifiOff, _state, ''),
+      NetworkStatus(isLimitedConnectivity: true) => (
+        PiccoloTheme.warning,
+        Icons.signal_wifi_statusbar_connected_no_internet_4,
+        'Limited',
+        'Connected via ${status.activeUplink}, but internet access is limited',
+      ),
+      NetworkStatus(isPortal: true) => (
+        PiccoloTheme.warning,
+        Icons.login,
+        'Sign-in required',
+        'This network requires browser sign-in; choose another network',
+      ),
+      NetworkStatus(isUnknown: true) => (
+        PiccoloTheme.inkMuted,
+        Icons.sync,
+        'Checking network',
+        'Network status is temporarily unavailable',
+      ),
+      NetworkStatus(isWifiConnected: true) => (
+        _signalColor,
+        Icons.wifi,
+        _signalLabel,
+        'Connected via WiFi${status.signalTier != null ? " (${status.signalTier})" : ""}',
+      ),
+      NetworkStatus(isReconnecting: true) => (
+        PiccoloTheme.warning,
+        PiccoloIcons.wifiOff,
+        'Reconnecting',
+        'WiFi lost — attempting to reconnect',
+      ),
+      NetworkStatus(isDisconnected: true) => (
+        PiccoloTheme.critical,
+        PiccoloIcons.wifiOff,
+        'Disconnected',
+        'No network connection',
+      ),
+      _ => (
+        PiccoloTheme.inkMuted,
+        PiccoloIcons.wifiOff,
+        status.connectivity,
+        '',
+      ),
     };
 
     return Padding(
@@ -486,11 +509,7 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
           child: Row(
             mainAxisSize: MainAxisSize.min,
             children: [
-              Icon(
-                _state == 'wifi_connected' ? Icons.wifi : icon,
-                size: 14,
-                color: color,
-              ),
+              Icon(icon, size: 14, color: color),
               const SizedBox(width: 6),
               Text(
                 label,
@@ -507,7 +526,7 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
   }
 
   Color get _signalColor {
-    return switch (_signalTier) {
+    return switch (_status?.signalTier) {
       'good' || 'fair' => PiccoloTheme.success,
       'weak' => PiccoloTheme.warning,
       'poor' => PiccoloTheme.critical,
@@ -516,7 +535,7 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
   }
 
   String get _signalLabel {
-    return switch (_signalTier) {
+    return switch (_status?.signalTier) {
       'good' => 'WiFi',
       'fair' => 'WiFi',
       'weak' => 'WiFi (weak)',

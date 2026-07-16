@@ -12,6 +12,7 @@ import (
 	"github.com/gorilla/websocket"
 
 	"piccolod/internal/events"
+	"piccolod/internal/network"
 	"piccolod/internal/services"
 )
 
@@ -27,15 +28,15 @@ const (
 	topicStorageAlert   = "storage_alert"
 )
 
-var supportedTopics = map[string]events.Topic{
-	topicAppStatus:      events.TopicAppStatusChanged,
-	topicListenerHealth: events.TopicListenerHealthChanged,
-	topicRemoteConfig:   events.TopicRemoteConfigChanged,
-	topicCertificate:    events.TopicCertificateChanged,
-	topicNetworkPeers:   events.TopicNetworkPeersChanged,
-	topicIdentity:       events.TopicIdentityChanged,
-	topicNetworkStatus:  events.TopicNetworkStateChanged,
-	topicStorageAlert:   events.TopicStorageAlert,
+var supportedTopics = map[string][]events.Topic{
+	topicAppStatus:      {events.TopicAppStatusChanged},
+	topicListenerHealth: {events.TopicListenerHealthChanged},
+	topicRemoteConfig:   {events.TopicRemoteConfigChanged},
+	topicCertificate:    {events.TopicCertificateChanged},
+	topicNetworkPeers:   {events.TopicNetworkPeersChanged},
+	topicIdentity:       {events.TopicIdentityChanged},
+	topicNetworkStatus:  {events.TopicNetworkTransition, events.TopicWiFiSignalChanged},
+	topicStorageAlert:   {events.TopicStorageAlert},
 }
 
 type streamMessage struct {
@@ -48,9 +49,11 @@ type streamMessage struct {
 //
 // Query parameters:
 //   - topics: (optional) comma-separated list of topics to subscribe to.
-//     Supported: app_status, listener_health, remote_config, certificate, network_peers, identity
+//     Supported: app_status, listener_health, remote_config, certificate,
+//     network_peers, identity, network_status, storage_alert
 //     If omitted, subscribes to all topics.
 //     network_peers is automatically stripped for remote clients (via Nexus proxy).
+//     network_status requires admin plus LAN or same-public-IP access.
 //
 // WebSocket message format:
 //
@@ -60,6 +63,8 @@ type streamMessage struct {
 //	{ "type": "certificate", "payload": CertificateChangedEvent }
 //	{ "type": "network_peers", "payload": NetworkPeersChangedEvent }
 //	{ "type": "identity", "payload": IdentityStatusPayload }
+//	{ "type": "network_status", "payload": network.NetworkStatus }
+//	{ "type": "storage_alert", "payload": events.StorageAlertEvent }
 //
 // Keep-alive uses WebSocket Ping frames (not application-level messages).
 //
@@ -96,11 +101,6 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 		delete(requestedTopics, topicNetworkPeers)
 	}
 
-	if len(requestedTopics) == 0 {
-		writeGinError(c, http.StatusBadRequest, "No valid topics specified")
-		return
-	}
-
 	// Validate session BEFORE WebSocket upgrade (so we can return proper HTTP errors)
 	sess := s.getSessionFromContext(c)
 	if sess == nil {
@@ -110,6 +110,19 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 		return
 	}
 	isAdmin := sess.Role == "admin"
+	networkStatusDenied := false
+	if requestedTopics[topicNetworkStatus] {
+		networkAccess := isAdmin && s.hasLANOrSamePublicIPAccess(c)
+		networkStatusDenied = filterNetworkStatusTopic(requestedTopics, isAdmin, networkAccess)
+	}
+	if len(requestedTopics) == 0 {
+		if networkStatusDenied {
+			writeGinError(c, http.StatusForbidden, "Network status requires local admin access")
+		} else {
+			writeGinError(c, http.StatusBadRequest, "No valid topics specified")
+		}
+		return
+	}
 
 	conn, err := wsupgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
@@ -164,13 +177,14 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	var subscriptions []subscription
 
 	for topicName := range requestedTopics {
-		busTopic := supportedTopics[topicName]
-		ch, cancelFn := s.events.SubscribeWithCancel(busTopic, 256)
-		subscriptions = append(subscriptions, subscription{
-			topic:  topicName,
-			ch:     ch,
-			cancel: cancelFn,
-		})
+		for _, busTopic := range supportedTopics[topicName] {
+			ch, cancelFn := s.events.SubscribeWithCancel(busTopic, 256)
+			subscriptions = append(subscriptions, subscription{
+				topic:  topicName,
+				ch:     ch,
+				cancel: cancelFn,
+			})
+		}
 	}
 	defer func() {
 		for _, sub := range subscriptions {
@@ -205,6 +219,9 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	}
 	if requestedTopics[topicNetworkPeers] {
 		s.sendInitialNetworkPeers(sendJSON)
+	}
+	if requestedTopics[topicNetworkStatus] {
+		s.sendInitialNetworkStatus(sendJSON)
 	}
 	// Certificate topic doesn't need initial snapshot (included in remote_config)
 
@@ -256,6 +273,14 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 			}
 		}
 	}
+}
+
+func filterNetworkStatusTopic(requestedTopics map[string]bool, isAdmin, hasNetworkAccess bool) bool {
+	if !requestedTopics[topicNetworkStatus] || (isAdmin && hasNetworkAccess) {
+		return false
+	}
+	delete(requestedTopics, topicNetworkStatus)
+	return true
 }
 
 // processEvent converts an event bus event to a stream message, applying access control.
@@ -313,6 +338,19 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 		}
 		return s.buildIdentitySnapshot()
 
+	case topicNetworkStatus:
+		switch evt.Payload.(type) {
+		case network.NetworkTransitionEvent, network.WiFiSignalChangedEvent:
+		default:
+			return nil
+		}
+		if s.networkManager == nil {
+			return nil
+		}
+		// The transport emits one complete status shape even though topology
+		// and signal changes remain distinct internal facts.
+		return &streamMessage{Type: topicNetworkStatus, Payload: s.networkManager.Status()}
+
 	case topicStorageAlert:
 		payload, ok := evt.Payload.(events.StorageAlertEvent)
 		if !ok {
@@ -326,6 +364,16 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 		return &streamMessage{Type: topicStorageAlert, Payload: payload}
 	}
 	return nil
+}
+
+func (s *GinServer) sendInitialNetworkStatus(sendJSON func(any) error) {
+	if s.networkManager == nil {
+		return
+	}
+	_ = sendJSON(streamMessage{
+		Type:    topicNetworkStatus,
+		Payload: s.networkManager.Status(),
+	})
 }
 
 // sendInitialAppStatus sends current status for all accessible apps.
@@ -450,4 +498,3 @@ func toEventsListenerHealth(h services.ListenerHealth) events.ListenerHealth {
 		LastOK:         h.LastOK,
 	}
 }
-

@@ -58,9 +58,11 @@ const (
 	TopicIdentityReady   Topic = "identity.ready"   // Emitted when identity service finishes initialization
 	TopicIdentityChanged Topic = "identity.changed" // Emitted on enrollment, enable/disable, hostname change
 
-	// Network state events (WiFi uplink + watchdog)
-	TopicNetworkStateChanged Topic = "network_state_changed" // Emitted on connectivity state transitions, signal tier changes
-	TopicNetworkTransition   Topic = "network_transition"    // Diagnostic-only payload; owners read retained deltas from network supervisor
+	// Network events. Topology/reconciliation and WiFi signal changes are
+	// separate facts; consumers read the supervisor's current typed state or
+	// retained transition deltas after a wake.
+	TopicNetworkTransition Topic = "network_transition"
+	TopicWiFiSignalChanged Topic = "wifi_signal_changed"
 )
 
 // Event represents a message broadcast on the event bus.

@@ -29,8 +29,10 @@ func (t Tri) String() string {
 	}
 }
 
-// DeviceKind enumerates the device kinds the supervisor manages. Single
-// device per kind — first NM-managed device of each kind wins (catalog A8).
+// DeviceKind enumerates the hardware classes managed by recovery actuators.
+// Connectivity truth is per-interface in Tick.Interfaces; this map remains a
+// class-level recovery observation and must not be used to discard another
+// working interface of the same kind.
 type DeviceKind int
 
 const (
@@ -116,12 +118,12 @@ func (r L3ProbeResult) String() string {
 // field is set by the probe layer before deciders run.
 type Tick struct {
 	Devices map[DeviceKind]DeviceObservation
-	// Interfaces is the reconciliation-grade projection of all NM-managed
-	// physical interfaces. It is separate from Devices because legacy
-	// watchdog deciders intentionally keep the first-device-per-kind model.
+	// Interfaces is the authoritative connectivity projection of all
+	// NM-managed physical interfaces. Devices remains a class-level input for
+	// hardware recovery decisions.
 	Interfaces []NetworkInterfaceState
 	// InterfacesObserved says the all-interface projection completed. This
-	// distinguishes a proven empty interface set from legacy fallback data.
+	// distinguishes a proven empty interface set from a partial projection.
 	InterfacesObserved bool
 
 	// NMConn is advisory only — read from NM's Connectivity property as it
@@ -131,10 +133,9 @@ type Tick struct {
 	// L3Probe is the primary L3-truth: TCP-connect to 8.8.8.8:53 / 1.1.1.1:53.
 	L3Probe L3ProbeResult
 
-	// ActiveUplink — the uplink that currently carries traffic, derived from
-	// device observations. Predicate: HWHealth==Healthy AND LinkUp; priority
-	// ethernet-if-eligible-else-wifi-if-eligible-else-none. AP mode maps to
-	// UplinkNone per existing wire convention.
+	// ActiveUplink is the kind of the concrete default-route interface when
+	// route projection succeeds. It remains none when that projection is
+	// incomplete; class-level recovery observations never populate it.
 	ActiveUplink UplinkType
 	// ActiveUplinkIface is the concrete interface that owns ActiveUplink
 	// when known. Same-kind multi-NIC owners must consume this rather than

@@ -70,7 +70,9 @@ type NetworkTransitionState struct {
 }
 
 // NetworkTransitionEvent is published to the event bus as a diagnostic wake.
-// Consumers that require reliable delivery should call TransitionDeltaSince.
+// The first observation has a Current state but no Previous state or Reasons;
+// later events describe actual transitions. Consumers that require reliable
+// delivery should call TransitionDeltaSince.
 type NetworkTransitionEvent struct {
 	Generation        uint64                    `json:"generation"`
 	Reasons           []NetworkTransitionReason `json:"reasons"`
@@ -94,6 +96,14 @@ type NetworkTransitionDelta struct {
 // NetworkTransitionSource is the owner-facing retained transition API.
 type NetworkTransitionSource interface {
 	TransitionDeltaSince(lastIngested uint64) (NetworkTransitionDelta, bool)
+	SubscribeNetworkTransitionWake(func()) func()
+}
+
+// NetworkStateSource exposes the latest authoritative state and a coalescing
+// wake. Unlike transition deltas, the wake also fires when the first observed
+// state is established so status consumers can initialize without polling.
+type NetworkStateSource interface {
+	CurrentNetworkState() (NetworkTransitionState, uint64, bool)
 	SubscribeNetworkTransitionWake(func()) func()
 }
 
@@ -121,17 +131,15 @@ func (s *networkTransitionStore) record(state NetworkTransitionState) (NetworkTr
 	if s.latest == nil {
 		s.generation = 1
 		s.latest = cloneNetworkTransitionStatePtr(state)
-		return NetworkTransitionEvent{}, false, nil
+		return NetworkTransitionEvent{
+			Generation: s.generation,
+			Current:    cloneNetworkTransitionState(state),
+		}, false, s.watchersLocked()
 	}
 
-	state = preserveLastKnownRouteDNS(*s.latest, state)
 	reasons := transitionReasons(*s.latest, state)
 	if len(reasons) == 0 {
-		if routeDNSKnowledgeGained(*s.latest, state) {
-			reasons = []NetworkTransitionReason{ReasonRouteDNSObservationChanged}
-		} else {
-			return NetworkTransitionEvent{}, false, nil
-		}
+		return NetworkTransitionEvent{}, false, nil
 	}
 
 	s.generation++
@@ -149,11 +157,24 @@ func (s *networkTransitionStore) record(state NetworkTransitionState) (NetworkTr
 		s.history = s.history[:retainedNetworkTransitionHistory]
 	}
 
+	return event, true, s.watchersLocked()
+}
+
+func (s *networkTransitionStore) watchersLocked() []func() {
 	watches := make([]func(), 0, len(s.watches))
 	for _, cb := range s.watches {
 		watches = append(watches, cb)
 	}
-	return event, true, watches
+	return watches
+}
+
+func (s *networkTransitionStore) current() (NetworkTransitionState, uint64, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.latest == nil {
+		return NetworkTransitionState{}, 0, false
+	}
+	return cloneNetworkTransitionState(*s.latest), s.generation, true
 }
 
 func (s *networkTransitionStore) deltaSince(lastIngested uint64) (NetworkTransitionDelta, bool) {
@@ -227,7 +248,7 @@ func (s *networkTransitionStore) subscribeWake(cb func()) func() {
 }
 
 func transitionReasons(prev, cur NetworkTransitionState) []NetworkTransitionReason {
-	reasons := make([]NetworkTransitionReason, 0, 7)
+	reasons := make([]NetworkTransitionReason, 0, 8)
 	if prev.ActiveUplink != cur.ActiveUplink || prev.ActiveUplinkIface != cur.ActiveUplinkIface {
 		reasons = append(reasons, ReasonActiveUplinkChanged)
 	}
@@ -240,6 +261,10 @@ func transitionReasons(prev, cur NetworkTransitionState) []NetworkTransitionReas
 		(prev.DNSDefaultKnown != cur.DNSDefaultKnown ||
 			prev.DNSDefaultIface != cur.DNSDefaultIface) {
 		reasons = append(reasons, ReasonDNSDefaultChanged)
+	}
+	if prev.defaultRouteObserved() != cur.defaultRouteObserved() ||
+		prev.dnsDefaultObserved() != cur.dnsDefaultObserved() {
+		reasons = append(reasons, ReasonRouteDNSObservationChanged)
 	}
 	if !interfaceRolesEqual(prev.Interfaces, cur.Interfaces) {
 		reasons = append(reasons, ReasonInterfaceRolesChanged)
@@ -254,27 +279,6 @@ func transitionReasons(prev, cur NetworkTransitionState) []NetworkTransitionReas
 		reasons = append(reasons, ReasonAPModeChanged)
 	}
 	return canonicalTransitionReasons(reasons)
-}
-
-func preserveLastKnownRouteDNS(prev, cur NetworkTransitionState) NetworkTransitionState {
-	if !cur.defaultRouteObserved() && prev.DefaultRouteKnown {
-		cur.DefaultRouteObserved = prev.defaultRouteObserved()
-		cur.DefaultRouteKnown = true
-		cur.DefaultRouteIface = prev.DefaultRouteIface
-	}
-	if !cur.dnsDefaultObserved() && prev.DNSDefaultKnown {
-		cur.DNSDefaultObserved = prev.dnsDefaultObserved()
-		cur.DNSDefaultKnown = true
-		cur.DNSDefaultIface = prev.DNSDefaultIface
-	}
-	return cur
-}
-
-func routeDNSKnowledgeGained(prev, cur NetworkTransitionState) bool {
-	return (!prev.defaultRouteObserved() && cur.defaultRouteObserved()) ||
-		(!prev.DefaultRouteKnown && cur.DefaultRouteKnown) ||
-		(!prev.dnsDefaultObserved() && cur.dnsDefaultObserved()) ||
-		(!prev.DNSDefaultKnown && cur.DNSDefaultKnown)
 }
 
 func canonicalNetworkTransitionState(state NetworkTransitionState) NetworkTransitionState {
@@ -511,45 +515,47 @@ func buildNetworkTransitionState(tick Tick, snap Snapshot) NetworkTransitionStat
 		DNSDefaultObserved:   tick.DNSDefaultObserved,
 		DNSDefaultKnown:      tick.DNSDefaultKnown,
 		Interfaces:           tick.Interfaces,
-		InterfacesObserved:   tick.InterfacesObserved || len(tick.Interfaces) > 0,
+		InterfacesObserved:   tick.InterfacesObserved,
 		At:                   tick.At,
 	}
-	if len(state.Interfaces) == 0 && !state.InterfacesObserved {
-		state.Interfaces = legacyInterfacesFromDevices(tick)
-	}
-	if state.ActiveUplinkIface == "" {
-		state.ActiveUplinkIface = activeUplinkIfaceFromDevices(tick.Devices, tick.ActiveUplink)
+	if !state.InterfacesObserved || !state.defaultRouteObserved() {
+		markNetworkProjectionUnknown(&state)
+	} else if !state.DefaultRouteKnown {
+		state.ActiveUplink = UplinkNone
+		state.ActiveUplinkIface = ""
+		state.Connectivity = ConnectivityNone
+	} else if uplink, ok := activeUplinkForRoute(state.Interfaces, state.DefaultRouteIface); ok {
+		state.ActiveUplink = uplink
+		state.ActiveUplinkIface = state.DefaultRouteIface
+	} else {
+		markNetworkProjectionUnknown(&state)
 	}
 	return canonicalNetworkTransitionState(state)
 }
 
-func legacyInterfacesFromDevices(tick Tick) []NetworkInterfaceState {
-	out := make([]NetworkInterfaceState, 0, len(tick.Devices))
-	for kind, obs := range tick.Devices {
-		if !obs.Present || obs.Iface == "" {
+func activeUplinkForRoute(interfaces []NetworkInterfaceState, routeIface string) (UplinkType, bool) {
+	for _, iface := range interfaces {
+		if iface.Iface != routeIface || !iface.LinkUp || !iface.HasIP {
 			continue
 		}
-		out = append(out, NetworkInterfaceState{
-			Kind:   kind,
-			Iface:  obs.Iface,
-			Role:   roleFromObservation(obs, tick.ActiveUplinkIface, tick.DefaultRouteIface, tick.DefaultRouteKnown, tick.NMConn),
-			LinkUp: obs.LinkUp,
-			HasIP:  obs.HasIP,
-		})
+		switch iface.Kind {
+		case DeviceEthernet:
+			return UplinkEthernet, true
+		case DeviceWiFi:
+			return UplinkWiFi, true
+		}
 	}
-	return out
+	return UplinkNone, false
 }
 
-func activeUplinkIfaceFromDevices(devices map[DeviceKind]DeviceObservation, uplink UplinkType) string {
-	switch uplink {
-	case UplinkEthernet:
-		if obs, ok := devices[DeviceEthernet]; ok {
-			return obs.Iface
-		}
-	case UplinkWiFi:
-		if obs, ok := devices[DeviceWiFi]; ok {
-			return obs.Iface
-		}
-	}
-	return ""
+func markNetworkProjectionUnknown(state *NetworkTransitionState) {
+	state.ActiveUplink = UplinkNone
+	state.ActiveUplinkIface = ""
+	state.Connectivity = ConnectivityUnknown
+	state.DefaultRouteIface = ""
+	state.DefaultRouteObserved = false
+	state.DefaultRouteKnown = false
+	state.DNSDefaultIface = ""
+	state.DNSDefaultObserved = false
+	state.DNSDefaultKnown = false
 }

@@ -131,9 +131,12 @@ func (f *scenarioFixture) wifiAt(state nmclient.NMDeviceState, hasIP bool, gatew
 	f.nm.DeviceStateResult = state
 	if hasIP || gateway != "" {
 		f.nm.ActiveConnResult = &nmclient.ActiveConnectionInfo{
-			Path:       "/org/freedesktop/NetworkManager/ActiveConnection/0",
-			IP4Address: "192.168.1.42",
-			IP4Gateway: gateway,
+			Path:               "/org/freedesktop/NetworkManager/ActiveConnection/0",
+			IP4Address:         "192.168.1.42",
+			IP4Addresses:       []string{"192.168.1.42"},
+			IP4Gateway:         gateway,
+			IP4HasDefaultRoute: gateway != "",
+			IP4RoutesKnown:     true,
 		}
 	}
 	return path
@@ -152,9 +155,12 @@ func (f *scenarioFixture) ethAt(carrier bool, state nmclient.NMDeviceState, hasI
 	// the stub returns the same value).
 	if hasIP || gateway != "" {
 		f.nm.ActiveConnResult = &nmclient.ActiveConnectionInfo{
-			Path:       "/org/freedesktop/NetworkManager/ActiveConnection/1",
-			IP4Address: "10.0.0.42",
-			IP4Gateway: gateway,
+			Path:               "/org/freedesktop/NetworkManager/ActiveConnection/1",
+			IP4Address:         "10.0.0.42",
+			IP4Addresses:       []string{"10.0.0.42"},
+			IP4Gateway:         gateway,
+			IP4HasDefaultRoute: gateway != "",
+			IP4RoutesKnown:     true,
 		}
 	}
 	return path
@@ -197,7 +203,7 @@ func TestProbe_B1_EthCableUnplugged(t *testing.T) {
 	}
 }
 
-func TestProbeKeepsLegacyActiveUplinkWhenDefaultRouteIsSecondEthernet(t *testing.T) {
+func TestProbeUsesDefaultRouteWhenSecondEthernetIsActive(t *testing.T) {
 	f := newFixture(t)
 	eth0Path := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/1")
 	usb0Path := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/2")
@@ -226,11 +232,11 @@ func TestProbeKeepsLegacyActiveUplinkWhenDefaultRouteIsSecondEthernet(t *testing
 	}
 
 	tick := f.probeN(1)
-	if got := tick.ActiveUplink; got != UplinkNone {
-		t.Fatalf("ActiveUplink = %s, want legacy none from first ethernet device", got)
+	if got := tick.ActiveUplink; got != UplinkEthernet {
+		t.Fatalf("ActiveUplink = %s, want ethernet", got)
 	}
-	if got := tick.ActiveUplinkIface; got != "" {
-		t.Fatalf("ActiveUplinkIface = %q, want empty legacy iface", got)
+	if got := tick.ActiveUplinkIface; got != "usb0" {
+		t.Fatalf("ActiveUplinkIface = %q, want usb0", got)
 	}
 	if !tick.DefaultRouteKnown || tick.DefaultRouteIface != "usb0" {
 		t.Fatalf("default route = (%v,%q), want known usb0", tick.DefaultRouteKnown, tick.DefaultRouteIface)

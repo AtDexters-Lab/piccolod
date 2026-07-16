@@ -4,18 +4,6 @@
 // manager that runs as a supervisor component.
 package network
 
-// ConnState represents the current connectivity state in the three-tier
-// priority stack: Ethernet > WiFi STA > AP Mode.
-type ConnState string
-
-const (
-	StateEthernet     ConnState = "ethernet"       // Ethernet up (preferred)
-	StateWiFiSTA      ConnState = "wifi_connected"  // WiFi STA connected
-	StateReconnecting ConnState = "reconnecting"    // WiFi lost, auto-retrying
-	StateDisconnected ConnState = "disconnected"    // Retries at backoff ceiling
-	StateAPMode       ConnState = "ap_mode"         // Broadcasting setup AP
-)
-
 // UplinkType identifies which interface carries traffic.
 type UplinkType string
 
@@ -49,30 +37,48 @@ func ClassifySignal(dbm int) SignalTier {
 	}
 }
 
-// Status is the public snapshot of the network manager's state, returned
-// by Manager.Status() and used by API handlers.
-type Status struct {
-	WifiAvailable   bool       `json:"wifi_available"`
-	State           ConnState  `json:"state"`
-	ActiveUplink    UplinkType `json:"active_uplink"`
-	SSID            string     `json:"ssid,omitempty"`
-	SignalDBm       *int       `json:"signal_dbm,omitempty"`
-	SignalTier      SignalTier `json:"signal_tier,omitempty"`
-	FrequencyMHz    *uint32    `json:"frequency_mhz,omitempty"`
-	Band            string     `json:"band,omitempty"`
-	IPAddress       string     `json:"ip_address,omitempty"`
-	HasSavedNetwork bool       `json:"has_saved_network"`
-	SavedSSID       string     `json:"saved_ssid,omitempty"`
+// NetworkStatusInterface is the API projection of one managed physical
+// interface. The API uses string kinds and addresses instead of exposing the
+// supervisor's internal enum and netip representations.
+type NetworkStatusInterface struct {
+	Kind   string               `json:"kind"`
+	Iface  string               `json:"iface"`
+	Role   NetworkInterfaceRole `json:"role"`
+	LinkUp bool                 `json:"link_up"`
+	HasIP  bool                 `json:"has_ip"`
+	IPv4   []string             `json:"ipv4,omitempty"`
+	IPv6   []string             `json:"ipv6,omitempty"`
+}
+
+// NetworkStatus is the public, factual network snapshot returned by
+// Manager.Status. Connectivity and interface ownership come from the typed
+// multi-interface supervisor state; WiFi-specific fields support management
+// actions and presentation without creating a second connection-state model.
+type NetworkStatus struct {
+	ActiveUplink      UplinkType               `json:"active_uplink"`
+	ActiveUplinkIface string                   `json:"active_uplink_iface,omitempty"`
+	Connectivity      string                   `json:"connectivity"`
+	Interfaces        []NetworkStatusInterface `json:"interfaces"`
+	APActive          bool                     `json:"ap_active"`
+	WiFiAvailable     bool                     `json:"wifi_available"`
+	SSID              string                   `json:"ssid,omitempty"`
+	SignalDBM         *int                     `json:"signal_dbm,omitempty"`
+	SignalTier        SignalTier               `json:"signal_tier,omitempty"`
+	FrequencyMHz      *uint32                  `json:"frequency_mhz,omitempty"`
+	Band              string                   `json:"band,omitempty"`
+	IPAddress         string                   `json:"ip_address,omitempty"`
+	HasSavedNetwork   bool                     `json:"has_saved_network"`
+	SavedSSID         string                   `json:"saved_ssid,omitempty"`
 }
 
 // ScanResult represents a WiFi network found during a scan.
 type ScanResult struct {
 	SSID         string     `json:"ssid"`
-	Security     string     `json:"security"`       // "open", "wpa", "wpa2", "wpa3", "wep", "enterprise"
+	Security     string     `json:"security"` // "open", "wpa", "wpa2", "wpa3", "wep", "enterprise"
 	SignalDBm    int        `json:"signal_dbm"`
 	SignalTier   SignalTier `json:"signal_tier"`
-	FrequencyMHz uint32    `json:"frequency_mhz"`
-	Band         string     `json:"band"`            // "2.4GHz", "5GHz"
+	FrequencyMHz uint32     `json:"frequency_mhz"`
+	Band         string     `json:"band"` // "2.4GHz", "5GHz"
 }
 
 // APStatus is the public snapshot of AP mode state.
@@ -83,16 +89,9 @@ type APStatus struct {
 	Clients    int    `json:"clients"`
 }
 
-// NetworkStateChangedEvent is the payload for events.TopicNetworkStateChanged.
-// Preserved as a wire contract — existing subscribers (identity, stun, ui)
-// pattern-match on (ActiveUplink, SignalDBm) to react to uplink-up.
-type NetworkStateChangedEvent struct {
-	State        string `json:"state"`
-	ActiveUplink string `json:"active_uplink"`
-	SSID         string `json:"ssid,omitempty"`
-	SignalDBm    *int   `json:"signal_dbm,omitempty"`
-	SignalTier   string `json:"signal_tier,omitempty"`
-	APActive     bool   `json:"ap_active"`
-	APSSID       string `json:"ap_ssid,omitempty"`
-	Error        string `json:"error,omitempty"`
+// WiFiSignalChangedEvent is independent of topology transitions. Consumers
+// that need a full status snapshot should read Manager.Status after this wake.
+type WiFiSignalChangedEvent struct {
+	SignalDBM  int        `json:"signal_dbm"`
+	SignalTier SignalTier `json:"signal_tier"`
 }

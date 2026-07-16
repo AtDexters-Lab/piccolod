@@ -10,8 +10,8 @@ class NetworkController extends ChangeNotifier {
   NetworkController({
     required ApiClient apiClient,
     EventStreamClient? eventStreamClient,
-  })  : _wifiService = WifiService(apiClient),
-        _eventStreamClient = eventStreamClient {
+  }) : _wifiService = WifiService(apiClient),
+       _eventStreamClient = eventStreamClient {
     _init();
   }
 
@@ -25,7 +25,7 @@ class NetworkController extends ChangeNotifier {
   // State
   bool isLoading = true;
   String? error;
-  WifiStatus? status;
+  NetworkStatus? status;
   WifiAPStatus? apStatus;
   List<WifiNetwork>? scanResults;
   bool isScanning = false;
@@ -57,7 +57,7 @@ class NetworkController extends ChangeNotifier {
         _wifiService.getAPStatus(),
       ]);
       if (_disposed) return;
-      status = statusResult as WifiStatus;
+      status = statusResult as NetworkStatus;
       apStatus = apResult as WifiAPStatus;
       error = null;
     } on ApiException catch (e) {

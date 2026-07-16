@@ -197,8 +197,22 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 
 	nmConn := nmConnAdvisory(p.nm)
 	connectivity := classifyConnectivity(l3Final, devices, nmConn)
-	legacyActiveUplink := activeUplinkFor(devices)
 	projection := p.probeTransitionProjection(connectivity)
+	activeUplink, activeUplinkIface, projected := activeUplinkFromProjection(projection)
+	if !projected {
+		// Class-level DeviceObservation is sufficient for recovery decisions,
+		// but it cannot identify the active member of a same-kind interface
+		// set. Fail the connectivity projection closed instead of selecting
+		// the first Ethernet or WiFi device.
+		activeUplink = UplinkNone
+		activeUplinkIface = ""
+		projection.defaultRouteIface = ""
+		projection.defaultRouteObserved = false
+		projection.defaultRouteKnown = false
+		projection.dnsDefaultIface = ""
+		projection.dnsDefaultObserved = false
+		projection.dnsDefaultKnown = false
+	}
 
 	busy, reason := p.sys.SystemBusy()
 
@@ -208,8 +222,8 @@ func (p *Prober) Probe(ctx context.Context, led ActionLedger, now time.Time) Tic
 		InterfacesObserved:   projection.interfacesObserved,
 		NMConn:               nmConn,
 		L3Probe:              l3Final,
-		ActiveUplink:         legacyActiveUplink,
-		ActiveUplinkIface:    activeUplinkIfaceFromDevices(devices, legacyActiveUplink),
+		ActiveUplink:         activeUplink,
+		ActiveUplinkIface:    activeUplinkIface,
 		DefaultRouteIface:    projection.defaultRouteIface,
 		DefaultRouteObserved: projection.defaultRouteObserved,
 		DefaultRouteKnown:    projection.defaultRouteKnown,

@@ -3,10 +3,8 @@
 //
 // The state machine and procedural watchdog from earlier versions have been
 // replaced with a layered probe → decide → act architecture rooted in
-// internal/network/supervisor.go. The Manager is now a thin facade that
-// preserves existing public API surface (Status, APStatus, Connect,
-// ForgetNetwork, ScanNetworks, ForceAPMode, SetAPSuppressed) while
-// delegating connectivity classification to the Supervisor.
+// internal/network/supervisor.go. The Manager is a thin management/API facade;
+// connectivity truth belongs to the Supervisor's typed per-interface state.
 package network
 
 import (
@@ -47,6 +45,7 @@ type Manager struct {
 
 	mu            sync.RWMutex
 	wifiDevice    *nmclient.WiFiDevice
+	wifiDevices   []nmclient.WiFiDevice
 	ethDevices    []nmclient.EthernetDevice
 	wifiAvailable bool
 
@@ -179,10 +178,9 @@ func (m *Manager) Start(ctx context.Context) error {
 		},
 	)
 
-	// Subscribe to the supervisor's legacy state events so we can update
-	// the health tracker. Stage-4 cutover collapses the old onTransition
-	// callback into this loop.
-	if m.events != nil {
+	// Track the supervisor's authoritative state directly. The wake fires for
+	// both the first established state and subsequent transitions.
+	if m.supervisor != nil {
 		go m.healthLoop(m.ctx)
 	}
 
@@ -203,27 +201,34 @@ func (m *Manager) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Status returns a snapshot of the current network state for API responses.
-// Wire contract preserved via deriveLegacyState.
-func (m *Manager) Status() Status {
+// Status returns the current typed multi-interface state plus WiFi management
+// details. It does not synthesize a second connection-state machine.
+func (m *Manager) Status() NetworkStatus {
 	tick := m.lastTick()
 	snap := m.snapshot()
-
-	connState := deriveLegacyState(tick, snap.APMode.Active)
-	uplink := tick.ActiveUplink
+	state := buildNetworkTransitionState(tick, snap)
+	if m.supervisor != nil {
+		if current, _, ok := m.supervisor.CurrentNetworkState(); ok {
+			state = current
+		}
+	}
 
 	wifiAvail := m.wifiPresent()
-	var ssid, ipAddr string
+	var ssid, ipAddr, band string
 	var signalDBm *int
 	var signalTier SignalTier
+	var frequencyMHz *uint32
 
-	m.mu.RLock()
-	dev := m.wifiDevice
-	m.mu.RUnlock()
-	if dev != nil && uplink == UplinkWiFi {
+	dev := m.wifiDeviceForInterface(state.ActiveUplinkIface)
+	if dev != nil && state.ActiveUplink == UplinkWiFi {
 		if info, err := m.nm.ActiveConnectionInfo(dev.Path); err == nil && info != nil {
 			ssid = info.ID
 			ipAddr = info.IP4Address
+		}
+		if ap, err := m.nm.ActiveAccessPoint(dev.Path); err == nil && ap != nil && ap.Frequency != 0 {
+			frequency := ap.Frequency
+			frequencyMHz = &frequency
+			band = ap.Band()
 		}
 		dbm, tier := m.sigMon.snapshot()
 		if dbm != 0 {
@@ -234,20 +239,46 @@ func (m *Manager) Status() Status {
 
 	hasSaved, savedSSID := m.savedWifiInfo()
 
-	s := Status{
-		WifiAvailable:   wifiAvail,
-		State:           connState,
-		ActiveUplink:    uplink,
-		SSID:            ssid,
-		HasSavedNetwork: hasSaved,
-		SavedSSID:       savedSSID,
-		IPAddress:       ipAddr,
+	s := NetworkStatus{
+		ActiveUplink:      state.ActiveUplink,
+		ActiveUplinkIface: state.ActiveUplinkIface,
+		Connectivity:      state.Connectivity.String(),
+		Interfaces:        networkStatusInterfaces(state.Interfaces),
+		APActive:          state.APActive,
+		WiFiAvailable:     wifiAvail,
+		SSID:              ssid,
+		FrequencyMHz:      frequencyMHz,
+		Band:              band,
+		HasSavedNetwork:   hasSaved,
+		SavedSSID:         savedSSID,
+		IPAddress:         ipAddr,
 	}
 	if signalDBm != nil {
-		s.SignalDBm = signalDBm
+		s.SignalDBM = signalDBm
 		s.SignalTier = signalTier
 	}
 	return s
+}
+
+func networkStatusInterfaces(in []NetworkInterfaceState) []NetworkStatusInterface {
+	out := make([]NetworkStatusInterface, 0, len(in))
+	for _, iface := range in {
+		item := NetworkStatusInterface{
+			Kind:   iface.Kind.String(),
+			Iface:  iface.Iface,
+			Role:   iface.Role,
+			LinkUp: iface.LinkUp,
+			HasIP:  iface.HasIP,
+		}
+		for _, addr := range iface.IPv4 {
+			item.IPv4 = append(item.IPv4, addr.String())
+		}
+		for _, addr := range iface.IPv6 {
+			item.IPv6 = append(item.IPv6, addr.String())
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 // APStatus reports AP mode state. Reads ap.Manager directly (not the
@@ -637,35 +668,68 @@ func (m *Manager) waitForAP() bool {
 	return false
 }
 
-// healthLoop subscribes to TopicNetworkStateChanged and updates the health
-// tracker level.
+// healthLoop reads the authoritative current state after each coalesced
+// supervisor wake. Network health remains diagnostic; boot readiness chooses
+// its required local components independently.
 func (m *Manager) healthLoop(ctx context.Context) {
-	if m.events == nil {
+	if m.supervisor == nil {
 		return
 	}
-	ch, cancel := m.events.SubscribeWithCancel(events.TopicNetworkStateChanged, 8)
+	wakeCh := make(chan struct{}, 1)
+	cancel := m.supervisor.SubscribeNetworkTransitionWake(func() {
+		select {
+		case wakeCh <- struct{}{}:
+		default:
+		}
+	})
 	defer cancel()
+	update := func() {
+		if m.healthTracker == nil {
+			return
+		}
+		state, _, ok := m.supervisor.CurrentNetworkState()
+		if !ok {
+			return
+		}
+		m.updateNetworkHealth(state)
+	}
+	update()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case evt, ok := <-ch:
-			if !ok {
-				return
-			}
-			ne, ok := evt.Payload.(NetworkStateChangedEvent)
-			if !ok || m.healthTracker == nil {
-				continue
-			}
-			switch ConnState(ne.State) {
-			case StateEthernet, StateWiFiSTA:
-				m.healthTracker.Setf("network", health.LevelOK, "connected (%s)", ne.State)
-			case StateReconnecting, StateAPMode:
-				m.healthTracker.Setf("network", health.LevelWarn, "%s", ne.State)
-			case StateDisconnected:
-				m.healthTracker.Setf("network", health.LevelError, "disconnected")
-			}
+		case <-wakeCh:
+			update()
 		}
+	}
+}
+
+func (m *Manager) updateNetworkHealth(state NetworkTransitionState) {
+	if state.APActive {
+		m.healthTracker.Setf("network", health.LevelWarn, "access point mode")
+		return
+	}
+	switch state.Connectivity {
+	case ConnectivityUnknown:
+		m.healthTracker.Setf("network", health.LevelWarn, "connectivity projection unknown")
+	case ConnectivityNone:
+		m.healthTracker.Setf("network", health.LevelError, "no active uplink")
+	case ConnectivityPortal:
+		m.healthTracker.Setf("network", health.LevelWarn, "captive portal (%s)", state.ActiveUplinkIface)
+	case ConnectivityFull:
+		if state.ActiveUplink == UplinkNone || state.ActiveUplinkIface == "" {
+			m.healthTracker.Setf("network", health.LevelWarn, "connectivity projection inconsistent")
+			return
+		}
+		m.healthTracker.Setf("network", health.LevelOK, "connected (%s via %s)", state.ActiveUplink, state.ActiveUplinkIface)
+	case ConnectivityLimited:
+		if state.ActiveUplink == UplinkNone || state.ActiveUplinkIface == "" {
+			m.healthTracker.Setf("network", health.LevelWarn, "connectivity projection inconsistent")
+			return
+		}
+		m.healthTracker.Setf("network", health.LevelWarn, "limited connectivity (%s via %s)", state.ActiveUplink, state.ActiveUplinkIface)
+	default:
+		m.healthTracker.Setf("network", health.LevelError, "no external connectivity (%s)", state.ActiveUplinkIface)
 	}
 }
 
@@ -700,6 +764,28 @@ func (m *Manager) wifiPresent() bool {
 	return m.wifiAvailable
 }
 
+// wifiDeviceForInterface resolves read-only status/signal queries to the
+// concrete active interface. The primary wifiDevice remains the deliberate
+// class-level management/recovery choice.
+func (m *Manager) wifiDeviceForInterface(iface string) *nmclient.WiFiDevice {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if iface != "" {
+		for i := range m.wifiDevices {
+			if m.wifiDevices[i].Interface == iface {
+				dev := m.wifiDevices[i]
+				return &dev
+			}
+		}
+		return nil
+	}
+	if m.wifiDevice == nil {
+		return nil
+	}
+	dev := *m.wifiDevice
+	return &dev
+}
+
 // discoverDevices queries NM for current devices and selects the primary
 // WiFi + Ethernet interfaces. Re-run on every device add/remove event.
 func (m *Manager) discoverDevices() error {
@@ -715,15 +801,16 @@ func (m *Manager) discoverDevices() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
+	m.wifiDevices = append(m.wifiDevices[:0], wifiDevs...)
 	m.ethDevices = ethDevs
 
 	if len(wifiDevs) > 0 {
 		dev := wifiDevs[0]
 		m.wifiDevice = &dev
 		m.wifiAvailable = true
-		m.sigMon.setDevice(dev.Path)
 		log.Printf("INFO: network: WiFi device: %s (driver=%s)", dev.Interface, dev.Driver)
 	} else {
+		m.wifiDevice = nil
 		m.wifiAvailable = false
 		log.Printf("INFO: network: no WiFi device found")
 	}

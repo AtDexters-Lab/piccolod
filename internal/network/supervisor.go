@@ -53,25 +53,13 @@ type Supervisor struct {
 	// Early-tick request channel; size 1, drop-if-pending.
 	requestCh chan struct{}
 
-	// Latest tick (for legacy wire-contract derivation in manager.go).
+	// Latest tick for current status and recovery consumers.
 	tickPtr atomic.Pointer[Tick]
 
 	// Whether actuators are wired (Stage 4+ flips this to true). When false,
 	// the orchestrator only probes + classifies; decisions are computed but
 	// no side effects fire. Stage-1/2 testing path.
 	enableActuation bool
-
-	// Dedupe key for publishLegacyEvent so subscribers (identity, stun,
-	// health) are woken only on actual transitions, not every 30s tick.
-	legacyEventMu   sync.Mutex
-	lastLegacyEvent legacyEventKey
-}
-
-type legacyEventKey struct {
-	state    string
-	uplink   string
-	apActive bool
-	apSSID   string
 }
 
 // NewSupervisor constructs a probe-only supervisor. Use SetActuators to
@@ -94,9 +82,8 @@ func (s *Supervisor) SetActuators(dev DeviceActuator, apA APModeActuator, sysA S
 	s.sysAct = sysA
 }
 
-// SetEventBus sets the optional event bus. Network state-change events are
-// published to TopicNetworkStateChanged for backwards compatibility with
-// existing subscribers (identity, stun).
+// SetEventBus sets the optional event bus used for typed topology and signal
+// notifications.
 func (s *Supervisor) SetEventBus(bus *events.Bus) { s.bus = bus }
 
 // EnableActuation flips the supervisor from observer-only to active. Once
@@ -163,8 +150,7 @@ func (s *Supervisor) Snapshot() Snapshot {
 	return Snapshot{}
 }
 
-// LastTick returns the most recent Tick observation. Used by Manager.Status
-// to construct legacy wire-contract responses (deriveLegacyState).
+// LastTick returns the most recent complete probe observation.
 func (s *Supervisor) LastTick() Tick {
 	if p := s.tickPtr.Load(); p != nil {
 		return *p
@@ -286,8 +272,7 @@ func (s *Supervisor) runTick(ctx context.Context) {
 	snap := buildSnapshot(tick, s.led.LastBounceAtSnapshot(), s.isAPActive(), apSSID, apReason)
 	s.snap.Store(&snap)
 
-	// Step 6: emit legacy wire-contract event for existing subscribers.
-	s.publishLegacyEvent(tick, snap)
+	// Step 6: record and publish the typed network transition.
 	s.recordNetworkTransition(tick, snap)
 
 	logTick(tick, hwWiFi, hwEth, apA)
@@ -466,75 +451,37 @@ func apReasonFor(a APAction, intent UserIntent, apActive bool) string {
 	return ""
 }
 
-// publishLegacyEvent emits NetworkStateChangedEvent on TopicNetworkStateChanged
-// so existing subscribers (identity.NotifyNetworkUp, stun.Trigger, health
-// tracker) continue receiving uplink-up signals after the cutover.
-//
-// Dedupes against the previously-published (state, uplink, apActive, apSSID)
-// tuple so subscribers are only woken on actual transitions — pre-cutover
-// publishers fired only on state changes, and the new code's downstream
-// subscribers (identity refresh, STUN trigger) coalesce poorly with 30s-tick
-// spam.
-func (s *Supervisor) publishLegacyEvent(tick Tick, snap Snapshot) {
-	if s.bus == nil {
-		return
-	}
-	state := deriveLegacyState(tick, snap.APMode.Active)
-	uplink := tick.ActiveUplink
-	cur := legacyEventKey{
-		state:    string(state),
-		uplink:   string(uplink),
-		apActive: snap.APMode.Active,
-		apSSID:   snap.APMode.SSID,
-	}
-	s.legacyEventMu.Lock()
-	if s.lastLegacyEvent == cur {
-		s.legacyEventMu.Unlock()
-		return
-	}
-	s.lastLegacyEvent = cur
-	s.legacyEventMu.Unlock()
-
-	s.bus.Publish(events.Event{
-		Topic: events.TopicNetworkStateChanged,
-		Payload: NetworkStateChangedEvent{
-			State:        cur.state,
-			ActiveUplink: cur.uplink,
-			APActive:     cur.apActive,
-			APSSID:       cur.apSSID,
-		},
-	})
-}
-
 func (s *Supervisor) recordNetworkTransition(tick Tick, snap Snapshot) {
 	if s.transition == nil {
 		return
 	}
 	state := buildNetworkTransitionState(tick, snap)
 	evt, changed, wakes := s.transition.record(state)
-	if !changed {
-		return
-	}
-	if s.bus != nil {
+	// Publish the initial observation too. A WebSocket client can subscribe
+	// while the first asynchronous probe is still running; without this wake it
+	// would retain the empty startup snapshot until a later network transition.
+	if evt.Generation != 0 && s.bus != nil {
 		s.bus.Publish(events.Event{
 			Topic:   events.TopicNetworkTransition,
 			Payload: evt,
 		})
 	}
-	log.Printf("INFO: net-supervisor.transition: gen=%d reasons=%s uplink=%s iface=%s route_observed=%t route=%t/%s dns_observed=%t dns=%t/%s connectivity=%s lan=%s",
-		evt.Generation,
-		networkTransitionReasonLog(evt.Reasons),
-		evt.Current.ActiveUplink,
-		evt.Current.ActiveUplinkIface,
-		evt.Current.DefaultRouteObserved,
-		evt.Current.DefaultRouteKnown,
-		evt.Current.DefaultRouteIface,
-		evt.Current.DNSDefaultObserved,
-		evt.Current.DNSDefaultKnown,
-		evt.Current.DNSDefaultIface,
-		evt.Current.Connectivity,
-		networkTransitionLANLog(evt.Current.Interfaces),
-	)
+	if changed {
+		log.Printf("INFO: net-supervisor.transition: gen=%d reasons=%s uplink=%s iface=%s route_observed=%t route=%t/%s dns_observed=%t dns=%t/%s connectivity=%s lan=%s",
+			evt.Generation,
+			networkTransitionReasonLog(evt.Reasons),
+			evt.Current.ActiveUplink,
+			evt.Current.ActiveUplinkIface,
+			evt.Current.DefaultRouteObserved,
+			evt.Current.DefaultRouteKnown,
+			evt.Current.DefaultRouteIface,
+			evt.Current.DNSDefaultObserved,
+			evt.Current.DNSDefaultKnown,
+			evt.Current.DNSDefaultIface,
+			evt.Current.Connectivity,
+			networkTransitionLANLog(evt.Current.Interfaces),
+		)
+	}
 	for _, wake := range wakes {
 		go wake()
 	}
@@ -579,6 +526,13 @@ func (s *Supervisor) SubscribeNetworkTransitionWake(cb func()) func() {
 	return s.transition.subscribeWake(cb)
 }
 
+func (s *Supervisor) CurrentNetworkState() (NetworkTransitionState, uint64, bool) {
+	if s.transition == nil {
+		return NetworkTransitionState{}, 0, false
+	}
+	return s.transition.current()
+}
+
 func logTick(t Tick, hwW, hwE HWAction, apA APAction) {
 	wifi := t.Devices[DeviceWiFi]
 	eth := t.Devices[DeviceEthernet]
@@ -620,7 +574,7 @@ func apActionString(a APAction) string {
 // The caller must subsequently:
 //   - call SetActuators (typically by calling WireActuators below or
 //     building actuators directly)
-//   - call SetEventBus(bus) for legacy wire-contract events
+//   - call SetEventBus(bus) for typed topology and signal events
 //   - call EnableActuation(true) once the cutover is complete
 func BuildSupervisor(_ context.Context, r runner.CommandRunner, sys SystemState) (*Supervisor, error) {
 	cli, err := nmclient.NewPrivateDBusClient(r)

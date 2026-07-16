@@ -48,6 +48,10 @@ type StubClient struct {
 	ActiveConnByDevice          map[dbus.ObjectPath]*ActiveConnectionInfo
 	ActiveConnErr               error
 	ActiveConnErrByDevice       map[dbus.ObjectPath]error
+	ActiveAPResult              *AccessPoint
+	ActiveAPByDevice            map[dbus.ObjectPath]*AccessPoint
+	ActiveAPErr                 error
+	ActiveAPErrByDevice         map[dbus.ObjectPath]error
 	SignalStrengthResult        uint8
 	SignalStrengthErr           error
 	WirelessEnabledResult       bool
@@ -228,6 +232,21 @@ func (s *StubClient) ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnec
 		}
 	}
 	return s.ActiveConnResult, s.ActiveConnErr
+}
+
+func (s *StubClient) ActiveAccessPoint(device dbus.ObjectPath) (*AccessPoint, error) {
+	s.record("ActiveAccessPoint", device)
+	if s.ActiveAPErrByDevice != nil {
+		if err, ok := s.ActiveAPErrByDevice[device]; ok {
+			return nil, err
+		}
+	}
+	if s.ActiveAPByDevice != nil {
+		if ap, ok := s.ActiveAPByDevice[device]; ok {
+			return ap, nil
+		}
+	}
+	return s.ActiveAPResult, s.ActiveAPErr
 }
 
 func (s *StubClient) SignalStrength(device dbus.ObjectPath) (uint8, error) {

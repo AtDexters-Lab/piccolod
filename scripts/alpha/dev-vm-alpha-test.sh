@@ -2249,12 +2249,12 @@ for l in ls:
 # ─────────────────────────────────────────────────────────
 # Stage 15: Net-supervisor (probe-decide-act, RFC 20260505)
 #
-# Validates the cutover from the procedural watchdog + ConnState machine to
-# the new probe→decide→act architecture. Covers the failure modes that the
+# Validates the probe→decide→act architecture and its typed multi-interface
+# status. Covers the failure modes that the
 # rewrite was designed to handle, exercised non-destructively from the host:
 #
 #   - Supervisor tick observability + cadence
-#   - /api/v1/admin/wifi/status legacy wire contract preserved
+#   - /api/v1/network/status exposes the concrete active interface
 #   - Private dbus connection (F3-B1 fix)
 #   - No NM connectivity-check externality per tick (UR1 bug002)
 #   - Piccolod restart mid-state — ledger reload + supervisor resume (1.D.G6)
@@ -2323,23 +2323,28 @@ stage_net_supervisor() {
     ((FAIL_COUNT++)) || true
   fi
 
-  # 15.3 wire contract — /api/v1/wifi/status returns valid legacy ConnState
+  # 15.3 typed network status — no compatibility ConnState projection
   ensure_session
-  local wifi_status state
-  wifi_status=$(curl -s -b "$COOKIE_JAR" --connect-timeout 5 "http://$IP/api/v1/wifi/status" 2>/dev/null || true)
-  if echo "$wifi_status" | grep -qi 'Unauthorized'; then
-    skip "15.3" "Legacy wire contract" "auth session unavailable; run setup/pre-setup stages first for API contract validation"
+  local network_status parsed uplink active_iface connectivity interfaces_typed has_state valid
+  network_status=$(curl -s -b "$COOKIE_JAR" --connect-timeout 5 "http://$IP/api/v1/network/status" 2>/dev/null || true)
+  if echo "$network_status" | grep -qi 'Unauthorized'; then
+    skip "15.3" "Typed network status" "auth session unavailable; run setup/pre-setup stages first for API contract validation"
   else
-  state=$(echo "$wifi_status" | python3 -c "import sys,json
-try: print(json.load(sys.stdin).get('state',''))
-except: print('')" 2>/dev/null || true)
-    case "$state" in
-      ethernet|wifi_connected|ap_mode|reconnecting|disconnected)
-        echo -e "  ${GREEN}PASS${NC} [15.3] Legacy wire contract: state=\"$state\""
+    parsed=$(echo "$network_status" | python3 -c "import sys,json
+try:
+ d=json.load(sys.stdin)
+ uplink=str(d.get('active_uplink','')); iface=str(d.get('active_uplink_iface','')); conn=str(d.get('connectivity',''))
+ valid=(uplink in ('ethernet','wifi','none') and conn in ('unknown','none','portal','limited','full') and isinstance(d.get('interfaces'),list) and 'state' not in d and ((uplink == 'none' and not iface) or (uplink != 'none' and bool(iface))))
+ print('|'.join([uplink,iface,conn,str(isinstance(d.get('interfaces'),list)).lower(),str('state' in d).lower(),str(valid).lower()]))
+except: print('|||||false')" 2>/dev/null || true)
+    IFS='|' read -r uplink active_iface connectivity interfaces_typed has_state valid <<< "$parsed"
+    case "$valid" in
+      true)
+        echo -e "  ${GREEN}PASS${NC} [15.3] Typed network status: uplink=\"$uplink\" iface=\"$active_iface\" connectivity=\"$connectivity\""
         ((PASS_COUNT++)) || true
         ;;
       *)
-        echo -e "  ${RED}FAIL${NC} [15.3] Unexpected state: \"$state\" (response: $(echo "$wifi_status" | head -c 200))"
+        echo -e "  ${RED}FAIL${NC} [15.3] Invalid typed status (response: $(echo "$network_status" | head -c 240))"
         ((FAIL_COUNT++)) || true
         ;;
     esac

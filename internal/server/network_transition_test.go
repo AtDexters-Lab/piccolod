@@ -2,6 +2,7 @@ package server
 
 import (
 	"net/netip"
+	"sync"
 	"testing"
 	"time"
 
@@ -128,26 +129,170 @@ func TestRemoteRelevantNetworkTransitionReasonsIgnoreUnknownActiveObservationChu
 	}
 }
 
-func TestNetworkTransitionRemoteUsableUsesKnownDefaultRouteWhenLegacyActiveIsNone(t *testing.T) {
+func TestNetworkTransitionRemoteUsableRequiresAuthoritativeActiveUplink(t *testing.T) {
 	state := network.NetworkTransitionState{
-		ActiveUplink:         network.UplinkNone,
+		ActiveUplink:         network.UplinkEthernet,
+		ActiveUplinkIface:    "usb0",
 		Connectivity:         network.ConnectivityLimited,
 		DefaultRouteObserved: true,
 		DefaultRouteKnown:    true,
 		DefaultRouteIface:    "usb0",
+		InterfacesObserved:   true,
+		Interfaces: []network.NetworkInterfaceState{
+			{Kind: network.DeviceEthernet, Iface: "usb0", LinkUp: true, HasIP: true},
+		},
 	}
 	if !networkTransitionRemoteUsable(state) {
-		t.Fatal("known default route should be usable even when legacy active uplink is none")
+		t.Fatal("matching active uplink and default route should be usable")
 	}
-	state.DefaultRouteKnown = false
-	state.DefaultRouteIface = ""
+	state.ActiveUplink = network.UplinkNone
+	state.ActiveUplinkIface = ""
 	if networkTransitionRemoteUsable(state) {
-		t.Fatal("observed no-default-route state should not be usable")
+		t.Fatal("state without an authoritative active uplink should not be usable")
 	}
 	state.DefaultRouteObserved = false
+	state.DefaultRouteKnown = false
+	state.DefaultRouteIface = ""
 	state.ActiveUplink = network.UplinkWiFi
-	if !networkTransitionRemoteUsable(state) {
-		t.Fatal("unavailable route projection should fall back to legacy active uplink")
+	state.ActiveUplinkIface = "wlan0"
+	if networkTransitionRemoteUsable(state) {
+		t.Fatal("unavailable route projection must not claim a usable uplink")
+	}
+}
+
+func TestSubscribeNetworkAvailabilityInitializesAfterGenerationOne(t *testing.T) {
+	source := &testNetworkStateSource{
+		state: network.NetworkTransitionState{
+			ActiveUplink:         network.UplinkEthernet,
+			ActiveUplinkIface:    "enp2s0",
+			Connectivity:         network.ConnectivityFull,
+			DefaultRouteObserved: true,
+			DefaultRouteKnown:    true,
+			DefaultRouteIface:    "enp2s0",
+			InterfacesObserved:   true,
+			Interfaces: []network.NetworkInterfaceState{
+				{Kind: network.DeviceEthernet, Iface: "enp2s0", LinkUp: true, HasIP: true},
+			},
+		},
+		generation: 1,
+		ok:         true,
+	}
+	notified := make(chan struct{}, 1)
+	srv := &GinServer{}
+	srv.subscribeNetworkAvailability(source, func() { notified <- struct{}{} })
+	defer srv.busUnsubs[0]()
+
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("late availability subscriber did not consume current generation")
+	}
+}
+
+func TestSubscribeNetworkAvailabilityNotifiesOnlyOnProvenGeneration(t *testing.T) {
+	source := &testNetworkStateSource{
+		state: network.NetworkTransitionState{
+			ActiveUplink: network.UplinkNone,
+			Connectivity: network.ConnectivityUnknown,
+		},
+		generation: 1,
+		ok:         true,
+	}
+	notified := make(chan struct{}, 1)
+	srv := &GinServer{}
+	srv.subscribeNetworkAvailability(source, func() { notified <- struct{}{} })
+	defer srv.busUnsubs[0]()
+
+	select {
+	case <-notified:
+		t.Fatal("uncertain initial generation triggered availability")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	source.setState(network.NetworkTransitionState{
+		ActiveUplink:         network.UplinkEthernet,
+		ActiveUplinkIface:    "enp2s0",
+		Connectivity:         network.ConnectivityLimited,
+		DefaultRouteObserved: true,
+		DefaultRouteKnown:    true,
+		DefaultRouteIface:    "enp2s0",
+		InterfacesObserved:   true,
+		Interfaces: []network.NetworkInterfaceState{
+			{Kind: network.DeviceEthernet, Iface: "enp2s0", LinkUp: true, HasIP: true},
+		},
+	}, 2)
+	source.wake()
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("later proven generation did not trigger availability")
+	}
+
+	// A duplicate wake without a new topology generation models signal-only
+	// activity and must not retrigger identity or STUN availability work.
+	source.wake()
+	select {
+	case <-notified:
+		t.Fatal("duplicate generation retriggered availability")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestSubscribeNetworkAvailabilityCancellationDropsQueuedWake(t *testing.T) {
+	source := &testNetworkStateSource{
+		state: network.NetworkTransitionState{
+			ActiveUplink:         network.UplinkEthernet,
+			ActiveUplinkIface:    "enp2s0",
+			Connectivity:         network.ConnectivityFull,
+			DefaultRouteObserved: true,
+			DefaultRouteKnown:    true,
+			DefaultRouteIface:    "enp2s0",
+			InterfacesObserved:   true,
+			Interfaces: []network.NetworkInterfaceState{
+				{Kind: network.DeviceEthernet, Iface: "enp2s0", LinkUp: true, HasIP: true},
+			},
+		},
+		generation: 1,
+		ok:         true,
+	}
+	notified := make(chan struct{}, 2)
+	srv := &GinServer{}
+	srv.subscribeNetworkAvailability(source, func() { notified <- struct{}{} })
+
+	select {
+	case <-notified:
+	case <-time.After(time.Second):
+		t.Fatal("initial availability notification missing")
+	}
+	entered, release := source.blockNextCurrent()
+	source.setGeneration(2)
+	source.wake()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("availability consumer did not begin reading queued generation")
+	}
+	cancelled := make(chan struct{})
+	go func() {
+		srv.busUnsubs[0]()
+		close(cancelled)
+	}()
+	select {
+	case <-source.unsubscribed():
+	case <-time.After(time.Second):
+		t.Fatal("availability cancellation did not unregister its wake")
+	}
+	close(release)
+	select {
+	case <-cancelled:
+	case <-time.After(time.Second):
+		t.Fatal("availability cancellation did not wait for consumer exit")
+	}
+
+	select {
+	case <-notified:
+		t.Fatal("cancelled availability subscriber received a queued wake")
+	case <-time.After(50 * time.Millisecond):
 	}
 }
 
@@ -476,4 +621,82 @@ func testIface(kind network.DeviceKind, iface string, role network.NetworkInterf
 		HasIP:  true,
 		IPv4:   []netip.Addr{netip.MustParseAddr(ipv4)},
 	}
+}
+
+type testNetworkStateSource struct {
+	mu         sync.Mutex
+	state      network.NetworkTransitionState
+	generation uint64
+	ok         bool
+	wakeFn     func()
+	blockEnter chan struct{}
+	blockExit  chan struct{}
+	unsubCh    chan struct{}
+}
+
+func (s *testNetworkStateSource) CurrentNetworkState() (network.NetworkTransitionState, uint64, bool) {
+	s.mu.Lock()
+	state, generation, ok := s.state, s.generation, s.ok
+	enter, exit := s.blockEnter, s.blockExit
+	s.blockEnter = nil
+	s.blockExit = nil
+	s.mu.Unlock()
+	if enter != nil {
+		close(enter)
+		<-exit
+	}
+	return state, generation, ok
+}
+
+func (s *testNetworkStateSource) SubscribeNetworkTransitionWake(wake func()) func() {
+	s.mu.Lock()
+	s.wakeFn = wake
+	s.unsubCh = make(chan struct{})
+	unsubCh := s.unsubCh
+	s.mu.Unlock()
+	return func() {
+		s.mu.Lock()
+		s.wakeFn = nil
+		s.mu.Unlock()
+		close(unsubCh)
+	}
+}
+
+func (s *testNetworkStateSource) setGeneration(generation uint64) {
+	s.mu.Lock()
+	s.generation = generation
+	s.mu.Unlock()
+}
+
+func (s *testNetworkStateSource) setState(state network.NetworkTransitionState, generation uint64) {
+	s.mu.Lock()
+	s.state = state
+	s.generation = generation
+	s.ok = true
+	s.mu.Unlock()
+}
+
+func (s *testNetworkStateSource) wake() {
+	s.mu.Lock()
+	wake := s.wakeFn
+	s.mu.Unlock()
+	if wake != nil {
+		wake()
+	}
+}
+
+func (s *testNetworkStateSource) blockNextCurrent() (<-chan struct{}, chan struct{}) {
+	enter := make(chan struct{})
+	exit := make(chan struct{})
+	s.mu.Lock()
+	s.blockEnter = enter
+	s.blockExit = exit
+	s.mu.Unlock()
+	return enter, exit
+}
+
+func (s *testNetworkStateSource) unsubscribed() <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.unsubCh
 }

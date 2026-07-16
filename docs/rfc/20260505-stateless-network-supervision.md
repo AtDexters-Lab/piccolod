@@ -1,5 +1,11 @@
 # Stateless Probe-Decide-Act Network Supervision
 
+> **Superseded compatibility decision (2026-07-16):** Piccolod has no unknown
+> API clients, so the single-device `ConnState` projection and
+> `/api/v1/wifi/status` endpoint were removed. The typed, per-interface network
+> state is now authoritative for the bundled UI and internal consumers. See
+> [Network State Authority and Boot Readiness Amendment](20260716-network-state-authority-readiness-amendment.md).
+
 ## Scope
 
 **Problem:** A 24×7 single-user appliance lost LAN + remote reachability for 13 days because `internal/network/watchdog.go::tick()` silently early-returns when `gateway == ""`, the `state.go` ConnState machine has 7 fragmented AP entry paths, and `internal/mdns/interface.go::checkInterfaceChanges` reconfigures every 10s when an interface loses its IP — together producing a silent stuck state that violates the never-silent-failure constraint stated in the supervision PS.
@@ -10,7 +16,9 @@
 - Rewrite `internal/mdns/interface.go::checkInterfaceChanges` to treat IP-loss as transient (eliminate the 10s reconfig storm).
 - Introduce a Tri-state observation model (Healthy / Faulted / Inactive) for HW and Config health per device.
 - Introduce a single ActionLedger (bounces, reboots, AP-toggles) as the only persistent state, used purely for self-rate-shaping; no world-state caching.
-- Expose a `Supervisor.Snapshot()` reader for three on-demand consumers (captive portal, mDNS TXT updater, journald-as-it-happens). No fan-out, no event bus, no namek channel. Existing `/api/wifi/status` wire contract preserved via a `deriveLegacyState` mapping.
+- Expose a typed supervisor state reader for captive portal, status, health,
+  identity/STUN wakeups, and other internal consumers without a compatibility
+  projection.
 
 **Out of scope:**
 - NM driver-level fixes (`rtw88_8723de` Realtek, `brcmfmac` Broadcom) — OS-team concern.

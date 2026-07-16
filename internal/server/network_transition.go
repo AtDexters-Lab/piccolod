@@ -26,6 +26,53 @@ type networkTransitionRetry struct {
 	attempted bool
 }
 
+type networkTransitionWakeSource interface {
+	SubscribeNetworkTransitionWake(func()) func()
+}
+
+func (s *GinServer) subscribeNetworkAvailability(src network.NetworkStateSource, notify func()) {
+	if s == nil || src == nil || notify == nil {
+		return
+	}
+	wakeCh, doneCh, cancel := s.networkTransitionWakeChannel(src)
+	var worker sync.WaitGroup
+	worker.Add(1)
+	s.busUnsubs = append(s.busUnsubs, func() {
+		cancel()
+		worker.Wait()
+	})
+
+	go func() {
+		defer worker.Done()
+		var lastGeneration uint64
+		for {
+			select {
+			case <-doneCh:
+				return
+			case <-wakeCh:
+				select {
+				case <-doneCh:
+					return
+				default:
+				}
+				state, generation, ok := src.CurrentNetworkState()
+				if !ok || generation == lastGeneration {
+					continue
+				}
+				select {
+				case <-doneCh:
+					return
+				default:
+				}
+				lastGeneration = generation
+				if networkTransitionRemoteUsable(state) {
+					notify()
+				}
+			}
+		}
+	}()
+}
+
 type networkPublicationMode int
 
 const (
@@ -74,9 +121,15 @@ func (s *GinServer) subscribeSelfHostedNetworkTransitions(src network.NetworkTra
 		return
 	}
 	wakeCh, doneCh, cancel := s.networkTransitionWakeChannel(src)
-	s.busUnsubs = append(s.busUnsubs, cancel)
+	var worker sync.WaitGroup
+	worker.Add(1)
+	s.busUnsubs = append(s.busUnsubs, func() {
+		cancel()
+		worker.Wait()
+	})
 
 	go func() {
+		defer worker.Done()
 		var lastIngested uint64
 		var lastState network.NetworkTransitionState
 		var retry networkTransitionRetry
@@ -117,9 +170,19 @@ func (s *GinServer) subscribeSelfHostedNetworkTransitions(src network.NetworkTra
 			case <-doneCh:
 				return
 			case <-wakeCh:
+				select {
+				case <-doneCh:
+					return
+				default:
+				}
 				delta, ok := src.TransitionDeltaSince(lastIngested)
 				if !ok {
 					continue
+				}
+				select {
+				case <-doneCh:
+					return
+				default:
 				}
 				lastIngested = delta.ToGeneration
 				lastState = delta.Current
@@ -178,18 +241,34 @@ func (s *GinServer) subscribeLANNetworkTransitions(src network.NetworkTransition
 		return
 	}
 	wakeCh, doneCh, cancel := s.networkTransitionWakeChannel(src)
-	s.busUnsubs = append(s.busUnsubs, cancel)
+	var worker sync.WaitGroup
+	worker.Add(1)
+	s.busUnsubs = append(s.busUnsubs, func() {
+		cancel()
+		worker.Wait()
+	})
 
 	go func() {
+		defer worker.Done()
 		var lastIngested uint64
 		for {
 			select {
 			case <-doneCh:
 				return
 			case <-wakeCh:
+				select {
+				case <-doneCh:
+					return
+				default:
+				}
 				delta, ok := src.TransitionDeltaSince(lastIngested)
 				if !ok {
 					continue
+				}
+				select {
+				case <-doneCh:
+					return
+				default:
 				}
 				lastIngested = delta.ToGeneration
 				publicationMode := servicePublicationMode(delta)
@@ -216,7 +295,7 @@ func (s *GinServer) subscribeLANNetworkTransitions(src network.NetworkTransition
 	}()
 }
 
-func (s *GinServer) networkTransitionWakeChannel(src network.NetworkTransitionSource) (<-chan struct{}, <-chan struct{}, func()) {
+func (s *GinServer) networkTransitionWakeChannel(src networkTransitionWakeSource) (<-chan struct{}, <-chan struct{}, func()) {
 	wakeCh := make(chan struct{}, 1)
 	doneCh := make(chan struct{})
 	cancelSrc := src.SubscribeNetworkTransitionWake(func() {
@@ -227,11 +306,15 @@ func (s *GinServer) networkTransitionWakeChannel(src network.NetworkTransitionSo
 		default:
 		}
 	})
+	// Subscribe before reading current state. Seeding a coalesced wake makes
+	// late attachment initialize from the latest generation even if generation
+	// 1 was published before this subscriber existed.
+	wakeCh <- struct{}{}
 	var once sync.Once
 	return wakeCh, doneCh, func() {
 		once.Do(func() {
-			cancelSrc()
 			close(doneCh)
+			cancelSrc()
 		})
 	}
 }
@@ -259,10 +342,23 @@ func networkTransitionRemoteUsable(state network.NetworkTransitionState) bool {
 	if state.Connectivity != network.ConnectivityFull && state.Connectivity != network.ConnectivityLimited {
 		return false
 	}
-	if state.DefaultRouteObserved || state.DefaultRouteKnown {
-		return state.DefaultRouteKnown && state.DefaultRouteIface != ""
+	if state.ActiveUplink == network.UplinkNone || state.ActiveUplinkIface == "" {
+		return false
 	}
-	return state.ActiveUplink != network.UplinkNone
+	if !state.InterfacesObserved ||
+		!state.DefaultRouteObserved ||
+		!state.DefaultRouteKnown ||
+		state.DefaultRouteIface != state.ActiveUplinkIface {
+		return false
+	}
+	for _, iface := range state.Interfaces {
+		if iface.Iface != state.ActiveUplinkIface || !iface.LinkUp || !iface.HasIP {
+			continue
+		}
+		return (state.ActiveUplink == network.UplinkEthernet && iface.Kind == network.DeviceEthernet) ||
+			(state.ActiveUplink == network.UplinkWiFi && iface.Kind == network.DeviceWiFi)
+	}
+	return false
 }
 
 func servicePublicationRelevantNetworkTransition(delta network.NetworkTransitionDelta) bool {

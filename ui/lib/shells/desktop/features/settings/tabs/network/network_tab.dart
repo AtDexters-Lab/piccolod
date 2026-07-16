@@ -69,10 +69,18 @@ class _NetworkTabState extends State<NetworkTab> {
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Icon(PiccoloIcons.lock, size: 48, color: PiccoloTheme.inkMuted),
+                    const Icon(
+                      PiccoloIcons.lock,
+                      size: 48,
+                      color: PiccoloTheme.inkMuted,
+                    ),
                     const SizedBox(height: Spacing.base),
-                    Text('Local Access Required',
-                        style: PiccoloTheme.textTheme.bodyLarge?.copyWith(fontWeight: FontWeight.bold)),
+                    Text(
+                      'Local Access Required',
+                      style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                        fontWeight: FontWeight.bold,
+                      ),
+                    ),
                     const SizedBox(height: Spacing.sm),
                     Text(
                       'WiFi settings can only be managed when you are\nconnected to the same local network as your Piccolo.',
@@ -105,11 +113,7 @@ class _NetworkTabState extends State<NetworkTab> {
         }
 
         final status = _controller.status;
-        if (status == null || !status.available) {
-          return const Center(
-            child: Text('No WiFi hardware detected on this device.'),
-          );
-        }
+        if (status == null) return const SizedBox.shrink();
 
         return SingleChildScrollView(
           padding: const EdgeInsets.all(24),
@@ -123,7 +127,7 @@ class _NetworkTabState extends State<NetworkTab> {
                   await _controller.scanNetworks();
                 },
               ),
-              if (_controller.scanResults != null) ...[
+              if (status.available && _controller.scanResults != null) ...[
                 const SizedBox(height: 16),
                 WifiNetworkList(
                   networks: _controller.scanResults!,

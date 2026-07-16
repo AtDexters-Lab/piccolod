@@ -6,8 +6,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/godbus/dbus/v5"
-
 	"piccolod/internal/events"
 	"piccolod/internal/network/nmclient"
 )
@@ -15,25 +13,18 @@ import (
 const signalPollInterval = 30 * time.Second
 
 // signalMonitor periodically polls WiFi RSSI when WiFi is the active uplink
-// and publishes a NetworkStateChangedEvent on tier transitions.
+// and publishes a signal-only event on tier transitions.
 type signalMonitor struct {
 	nm  nmclient.Client
 	mgr *Manager
 
 	mu             sync.Mutex
-	wifiDevice     dbus.ObjectPath
 	lastSignalDBm  int
 	lastSignalTier SignalTier
 }
 
 func newSignalMonitor(nm nmclient.Client, mgr *Manager) *signalMonitor {
 	return &signalMonitor{nm: nm, mgr: mgr}
-}
-
-func (m *signalMonitor) setDevice(path dbus.ObjectPath) {
-	m.mu.Lock()
-	m.wifiDevice = path
-	m.mu.Unlock()
 }
 
 // snapshot returns the latest cached signal reading (thread-safe).
@@ -57,17 +48,13 @@ func (m *signalMonitor) run(ctx context.Context) {
 }
 
 func (m *signalMonitor) poll() {
-	m.mu.Lock()
-	dev := m.wifiDevice
-	m.mu.Unlock()
-	if dev == "" {
+	if m.mgr == nil || m.mgr.supervisor == nil {
 		return
 	}
-
-	// Gate on WiFi being the active uplink — read from supervisor's snapshot.
-	if m.mgr == nil || m.mgr.snapshot().ActiveUplink != UplinkWiFi {
-		// Clear cached tier when leaving WiFi STA so stale dBm doesn't
-		// linger on the legacy wire contract.
+	state, _, ok := m.mgr.supervisor.CurrentNetworkState()
+	if !ok || state.ActiveUplink != UplinkWiFi {
+		// Clear cached tier when leaving WiFi so status readers do not see a
+		// stale signal after the uplink changes.
 		m.mu.Lock()
 		if m.lastSignalDBm != 0 {
 			m.lastSignalDBm = 0
@@ -76,8 +63,12 @@ func (m *signalMonitor) poll() {
 		m.mu.Unlock()
 		return
 	}
+	dev := m.mgr.wifiDeviceForInterface(state.ActiveUplinkIface)
+	if dev == nil {
+		return
+	}
 
-	strength, err := m.nm.SignalStrength(dev)
+	strength, err := m.nm.SignalStrength(dev.Path)
 	if err != nil {
 		log.Printf("DEBUG: signal-monitor: poll failed: %v", err)
 		return
@@ -96,15 +87,11 @@ func (m *signalMonitor) poll() {
 	m.mu.Unlock()
 
 	if tier != oldTier && m.mgr.events != nil {
-		state := deriveLegacyState(m.mgr.lastTick(), m.mgr.snapshot().APMode.Active)
-		uplink := m.mgr.lastTick().ActiveUplink
 		m.mgr.events.Publish(events.Event{
-			Topic: events.TopicNetworkStateChanged,
-			Payload: NetworkStateChangedEvent{
-				State:        string(state),
-				ActiveUplink: string(uplink),
-				SignalDBm:    &dbm,
-				SignalTier:   string(tier),
+			Topic: events.TopicWiFiSignalChanged,
+			Payload: WiFiSignalChangedEvent{
+				SignalDBM:  dbm,
+				SignalTier: tier,
 			},
 		})
 	}

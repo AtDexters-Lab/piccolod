@@ -126,13 +126,22 @@ func apEntryPermitted(led ActionLedger, now time.Time) bool {
 	return false
 }
 
-// anyDeviceWorking returns true when any device has a working uplink —
-// HW + Config Healthy + LinkUp + HasIP + (gateway-ARP-reachable OR L3
-// probe Up). HasIP is required so DHCP-in-flight (LinkUp=true but no
-// lease yet) doesn't count as working — paired with the L3 dampener's
-// initial Up classification, that would prematurely exit AP. Mirrors
-// deriveLegacyState's deviceWorking and probe_l3's activeUplinkFor.
+// anyDeviceWorking uses the authoritative per-interface/default-route
+// projection only when both interface enumeration and route ownership were
+// observed. Class-level recovery observations remain the fallback for an
+// incomplete projection, without becoming public connectivity truth.
 func anyDeviceWorking(tick Tick) bool {
+	if tick.InterfacesObserved && tick.DefaultRouteObserved {
+		if tick.ActiveUplink == UplinkNone || tick.ActiveUplinkIface == "" {
+			return false
+		}
+		for _, iface := range tick.Interfaces {
+			if iface.Iface == tick.ActiveUplinkIface {
+				return iface.LinkUp && iface.HasIP
+			}
+		}
+		return false
+	}
 	for _, obs := range tick.Devices {
 		if obs.HWHealth != TriHealthy || obs.ConfigHealth != TriHealthy || !obs.LinkUp || !obs.HasIP {
 			continue

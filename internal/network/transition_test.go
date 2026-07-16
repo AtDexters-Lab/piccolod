@@ -92,7 +92,7 @@ func TestTransitionReasonsClassifyIndependentAxes(t *testing.T) {
 		cur.DNSDefaultObserved = false
 		cur.DNSDefaultKnown = false
 		cur.DNSDefaultIface = ""
-		assertReasons(t, transitionReasons(base, cur))
+		assertReasons(t, transitionReasons(base, cur), ReasonRouteDNSObservationChanged)
 	})
 
 	t.Run("known route and dns loss", func(t *testing.T) {
@@ -163,7 +163,34 @@ func TestTransitionStoreCoalescesReasonsAfterLastIngested(t *testing.T) {
 	}
 }
 
-func TestTransitionStorePreservesRouteDNSBaselineAcrossUnknownObservation(t *testing.T) {
+func TestTransitionStoreInitialStateWakesStatusConsumers(t *testing.T) {
+	store := newNetworkTransitionStore()
+	cancel := store.subscribeWake(func() {})
+	defer cancel()
+	base := transitionStateWithInterfaces(
+		UplinkEthernet,
+		"enp2s0",
+		ConnectivityFull,
+		ifaceState(DeviceEthernet, "enp2s0", InterfaceRoleWANLAN, "10.42.0.38"),
+	)
+
+	event, changed, callbacks := store.record(base)
+	if changed || len(callbacks) != 1 {
+		t.Fatalf("initial record = changed %v, callbacks %d; want false, 1", changed, len(callbacks))
+	}
+	if event.Generation != 1 || event.Current.ActiveUplinkIface != "enp2s0" || len(event.Reasons) != 0 {
+		t.Fatalf("initial event = %+v, want generation 1 current snapshot without transition reasons", event)
+	}
+	current, generation, ok := store.current()
+	if !ok || generation != 1 {
+		t.Fatalf("current = ok %v generation %d; want true, 1", ok, generation)
+	}
+	if current.ActiveUplink != UplinkEthernet || current.ActiveUplinkIface != "enp2s0" {
+		t.Fatalf("current uplink = %s/%s, want ethernet/enp2s0", current.ActiveUplink, current.ActiveUplinkIface)
+	}
+}
+
+func TestTransitionStoreDoesNotPreserveRouteDNSAcrossUnknownObservation(t *testing.T) {
 	store := newNetworkTransitionStore()
 	base := transitionStateWithInterfaces(
 		UplinkWiFi,
@@ -177,16 +204,26 @@ func TestTransitionStorePreservesRouteDNSBaselineAcrossUnknownObservation(t *tes
 	base.DNSDefaultIface = "wlan0"
 	store.record(base)
 
-	unknown := base
-	unknown.DefaultRouteObserved = false
-	unknown.DefaultRouteKnown = false
-	unknown.DefaultRouteIface = ""
-	unknown.DNSDefaultObserved = false
-	unknown.DNSDefaultKnown = false
-	unknown.DNSDefaultIface = ""
-	unknown.Connectivity = ConnectivityLimited
+	unknown := NetworkTransitionState{
+		ActiveUplink:       UplinkNone,
+		Connectivity:       ConnectivityUnknown,
+		InterfacesObserved: false,
+	}
 	if _, changed, _ := store.record(unknown); !changed {
 		t.Fatal("connectivity transition not recorded")
+	}
+	current, _, ok := store.current()
+	if !ok {
+		t.Fatal("current state missing")
+	}
+	if current.ActiveUplink != UplinkNone || current.ActiveUplinkIface != "" {
+		t.Fatalf("unknown uplink = %s/%q, want none", current.ActiveUplink, current.ActiveUplinkIface)
+	}
+	if current.DefaultRouteObserved || current.DefaultRouteKnown || current.DefaultRouteIface != "" {
+		t.Fatalf("unknown route = observed %v known %v iface %q", current.DefaultRouteObserved, current.DefaultRouteKnown, current.DefaultRouteIface)
+	}
+	if current.DNSDefaultObserved || current.DNSDefaultKnown || current.DNSDefaultIface != "" {
+		t.Fatalf("unknown DNS = observed %v known %v iface %q", current.DNSDefaultObserved, current.DNSDefaultKnown, current.DNSDefaultIface)
 	}
 
 	ethernet := base
@@ -204,8 +241,7 @@ func TestTransitionStorePreservesRouteDNSBaselineAcrossUnknownObservation(t *tes
 	}
 	assertReasons(t, event.Reasons,
 		ReasonActiveUplinkChanged,
-		ReasonDefaultRouteChanged,
-		ReasonDNSDefaultChanged,
+		ReasonRouteDNSObservationChanged,
 		ReasonInterfaceRolesChanged,
 		ReasonInterfaceAddressesChanged,
 		ReasonConnectivityChanged,
@@ -293,6 +329,31 @@ func TestTransitionStoreWakesWhenRouteDNSFactsBecomeKnown(t *testing.T) {
 		t.Fatal("DNS default change after silent baseline was not recorded")
 	}
 	assertReasons(t, event.Reasons, ReasonDNSDefaultChanged)
+}
+
+func TestTransitionStoreRecordsRouteDNSObservationLoss(t *testing.T) {
+	store := newNetworkTransitionStore()
+	observed := transitionStateWithInterfaces(
+		UplinkNone,
+		"",
+		ConnectivityUnknown,
+	)
+	observed.DefaultRouteObserved = true
+	observed.DNSDefaultObserved = true
+	store.record(observed)
+
+	unknown := observed
+	unknown.DefaultRouteObserved = false
+	unknown.DNSDefaultObserved = false
+	event, changed, _ := store.record(unknown)
+	if !changed {
+		t.Fatal("losing route/DNS observation must replace the current state")
+	}
+	assertReasons(t, event.Reasons, ReasonRouteDNSObservationChanged)
+	current, _, ok := store.current()
+	if !ok || current.DefaultRouteObserved || current.DNSDefaultObserved {
+		t.Fatalf("current observation = ok %v route %v DNS %v, want both unknown", ok, current.DefaultRouteObserved, current.DNSDefaultObserved)
+	}
 }
 
 func TestTransitionStoreReportsHistoryOverflow(t *testing.T) {
@@ -494,7 +555,7 @@ func TestProbeTransitionProjectionIgnoresLANOnlyNameserversForDNSDefault(t *test
 	}
 }
 
-func TestProbeTransitionProjectionFallsBackOnPartialDeviceEnumerationFailure(t *testing.T) {
+func TestProbeTransitionProjectionIsUnknownOnPartialDeviceEnumerationFailure(t *testing.T) {
 	wifiPath := dbus.ObjectPath("/org/freedesktop/NetworkManager/Devices/1")
 	stub := nmclient.NewStubClient()
 	stub.WiFiDevicesResult = []nmclient.WiFiDevice{{
@@ -512,13 +573,13 @@ func TestProbeTransitionProjectionFallsBackOnPartialDeviceEnumerationFailure(t *
 
 	proj := (&Prober{nm: stub}).probeTransitionProjection(ConnectivityFull)
 	if len(proj.interfaces) != 0 {
-		t.Fatalf("projection interfaces = %v, want fallback-empty on partial enumeration failure", proj.interfaces)
+		t.Fatalf("projection interfaces = %v, want empty on partial enumeration failure", proj.interfaces)
 	}
 	if proj.interfacesObserved {
 		t.Fatal("interfacesObserved = true, want false on partial enumeration failure")
 	}
 	if proj.defaultRouteKnown || proj.activeUplinkIface != "" {
-		t.Fatalf("projection route/uplink = (%v,%q), want unknown fallback", proj.defaultRouteKnown, proj.activeUplinkIface)
+		t.Fatalf("projection route/uplink = (%v,%q), want explicit uncertainty", proj.defaultRouteKnown, proj.activeUplinkIface)
 	}
 }
 
@@ -588,7 +649,7 @@ func TestProbeTransitionProjectionClassifiesObservedPrivateNoDefaultAsLAN(t *tes
 	}
 }
 
-func TestBuildNetworkTransitionStateMarksLegacyConnectedInterfacesUnknown(t *testing.T) {
+func TestBuildNetworkTransitionStateDoesNotPublishRecoveryFallback(t *testing.T) {
 	tick := Tick{
 		Devices: map[DeviceKind]DeviceObservation{
 			DeviceWiFi: {
@@ -615,17 +676,22 @@ func TestBuildNetworkTransitionStateMarksLegacyConnectedInterfacesUnknown(t *tes
 
 	state := buildNetworkTransitionState(tick, Snapshot{Connectivity: ConnectivityFull})
 	if state.InterfacesObserved {
-		t.Fatal("interfacesObserved = true, want false for legacy fallback")
+		t.Fatal("interfacesObserved = true, want false without a typed projection")
 	}
-	roles := map[string]NetworkInterfaceRole{}
-	for _, iface := range state.Interfaces {
-		roles[iface.Iface] = iface.Role
+	if len(state.Interfaces) != 0 {
+		t.Fatalf("interfaces = %+v, want no public projection from recovery observations", state.Interfaces)
 	}
-	if roles["wlan0"] != InterfaceRoleUnknown {
-		t.Fatalf("wlan0 role = %s, want unknown", roles["wlan0"])
+	if state.ActiveUplink != UplinkNone || state.ActiveUplinkIface != "" {
+		t.Fatalf("active uplink = %s/%q, want none", state.ActiveUplink, state.ActiveUplinkIface)
 	}
-	if roles["eth0"] != InterfaceRoleNotConnected {
-		t.Fatalf("eth0 role = %s, want not_connected", roles["eth0"])
+	if state.Connectivity != ConnectivityUnknown {
+		t.Fatalf("connectivity = %s, want unknown", state.Connectivity)
+	}
+	if state.DefaultRouteObserved || state.DefaultRouteKnown || state.DefaultRouteIface != "" {
+		t.Fatalf("default route = observed %v known %v iface %q, want unknown", state.DefaultRouteObserved, state.DefaultRouteKnown, state.DefaultRouteIface)
+	}
+	if state.DNSDefaultObserved || state.DNSDefaultKnown || state.DNSDefaultIface != "" {
+		t.Fatalf("DNS default = observed %v known %v iface %q, want unknown", state.DNSDefaultObserved, state.DNSDefaultKnown, state.DNSDefaultIface)
 	}
 }
 
@@ -651,7 +717,49 @@ func TestBuildNetworkTransitionStatePreservesObservedEmptyInterfaceProjection(t 
 		t.Fatal("interfacesObserved = false, want true for completed empty projection")
 	}
 	if len(state.Interfaces) != 0 {
-		t.Fatalf("interfaces = %v, want no legacy fallback when projection completed empty", state.Interfaces)
+		t.Fatalf("interfaces = %v, want no recovery fallback when projection completed empty", state.Interfaces)
+	}
+}
+
+func TestBuildNetworkTransitionStateDerivesActiveUplinkFromDefaultRoute(t *testing.T) {
+	tick := Tick{
+		InterfacesObserved:   true,
+		DefaultRouteObserved: true,
+		DefaultRouteKnown:    true,
+		DefaultRouteIface:    "enp2s0",
+		ActiveUplink:         UplinkEthernet,
+		ActiveUplinkIface:    "enp1s0",
+		Interfaces: []NetworkInterfaceState{
+			{Kind: DeviceEthernet, Iface: "enp1s0", Role: InterfaceRoleNotConnected},
+			{Kind: DeviceEthernet, Iface: "enp2s0", Role: InterfaceRoleWANLAN, LinkUp: true, HasIP: true},
+		},
+	}
+
+	state := buildNetworkTransitionState(tick, Snapshot{Connectivity: ConnectivityFull})
+	if state.ActiveUplink != UplinkEthernet || state.ActiveUplinkIface != "enp2s0" {
+		t.Fatalf("active uplink = %s/%q, want default-route owner ethernet/enp2s0", state.ActiveUplink, state.ActiveUplinkIface)
+	}
+}
+
+func TestBuildNetworkTransitionStateRejectsRouteWithoutConcreteInterface(t *testing.T) {
+	tick := Tick{
+		InterfacesObserved:   true,
+		DefaultRouteObserved: true,
+		DefaultRouteKnown:    true,
+		DefaultRouteIface:    "enp2s0",
+		ActiveUplink:         UplinkEthernet,
+		ActiveUplinkIface:    "enp2s0",
+		Interfaces: []NetworkInterfaceState{
+			{Kind: DeviceEthernet, Iface: "enp1s0", Role: InterfaceRoleNotConnected},
+		},
+	}
+
+	state := buildNetworkTransitionState(tick, Snapshot{Connectivity: ConnectivityFull})
+	if state.ActiveUplink != UplinkNone || state.ActiveUplinkIface != "" || state.Connectivity != ConnectivityUnknown {
+		t.Fatalf("inconsistent projection = uplink %s/%q connectivity %s, want none/unknown", state.ActiveUplink, state.ActiveUplinkIface, state.Connectivity)
+	}
+	if state.DefaultRouteObserved || state.DefaultRouteKnown || state.DefaultRouteIface != "" {
+		t.Fatalf("inconsistent route remained current: %+v", state)
 	}
 }
 

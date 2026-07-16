@@ -108,16 +108,40 @@ func (t *Tracker) Overall() Level {
 }
 
 func (t *Tracker) Ready(required ...string) (bool, map[string]Status) {
-	snapshot := t.Snapshot()
-	if len(required) == 0 {
-		return true, snapshot
-	}
-	ok := true
-	for _, name := range required {
-		st, exists := snapshot[name]
-		if !exists || st.Level > LevelOK {
-			ok = false
+	ready, _, _, snapshot := t.EvaluateReadiness(required...)
+	return ready, snapshot
+}
+
+// EvaluateReadiness returns both strict service readiness and boot health from
+// one coherent snapshot. Warnings make strict readiness false but remain
+// boot-healthy because pre-unlock and initialization warnings are expected.
+// Missing or error-level required components fail both.
+func (t *Tracker) EvaluateReadiness(required ...string) (ready bool, bootHealthy bool, overall Level, snapshot map[string]Status) {
+	snapshot = t.Snapshot()
+	overall = LevelOK
+	for _, st := range snapshot {
+		if st.Level > overall {
+			overall = st.Level
 		}
 	}
-	return ok, snapshot
+	if len(required) == 0 {
+		return true, true, overall, snapshot
+	}
+	ready = true
+	bootHealthy = true
+	for _, name := range required {
+		st, exists := snapshot[name]
+		if !exists {
+			ready = false
+			bootHealthy = false
+			continue
+		}
+		if st.Level > LevelOK {
+			ready = false
+		}
+		if st.Level >= LevelError {
+			bootHealthy = false
+		}
+	}
+	return ready, bootHealthy, overall, snapshot
 }

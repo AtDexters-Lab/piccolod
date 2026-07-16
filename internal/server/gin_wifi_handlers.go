@@ -11,9 +11,16 @@ import (
 // During onboarding (no admin account), WiFi is configured exclusively via
 // the captive portal — these REST endpoints are not accessible pre-setup.
 
-func (s *GinServer) handleWifiStatus(c *gin.Context) {
+func (s *GinServer) handleNetworkStatus(c *gin.Context) {
 	if s.networkManager == nil {
-		c.JSON(http.StatusOK, gin.H{"available": false})
+		c.JSON(http.StatusOK, gin.H{
+			"active_uplink":     "none",
+			"connectivity":      "unknown",
+			"interfaces":        []any{},
+			"ap_active":         false,
+			"wifi_available":    false,
+			"has_saved_network": false,
+		})
 		return
 	}
 	status := s.networkManager.Status()
@@ -56,13 +63,11 @@ func (s *GinServer) handleWifiConnect(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{
 			"success": false,
 			"error":   err.Error(),
-			"state":   string(s.networkManager.Status().State),
 		})
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"state":   string(s.networkManager.Status().State),
 	})
 }
 
@@ -77,7 +82,6 @@ func (s *GinServer) handleWifiDisconnect(c *gin.Context) {
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"success": true,
-		"state":   string(s.networkManager.Status().State),
 	})
 }
 

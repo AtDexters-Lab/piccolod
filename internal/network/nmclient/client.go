@@ -78,6 +78,10 @@ type Client interface {
 	// device, or nil if no connection is active.
 	ActiveConnectionInfo(device dbus.ObjectPath) (*ActiveConnectionInfo, error)
 
+	// ActiveAccessPoint returns the access point currently associated with a
+	// WiFi device, or nil if the device is not associated.
+	ActiveAccessPoint(device dbus.ObjectPath) (*AccessPoint, error)
+
 	// SignalStrength returns the current WiFi signal strength in NM's 0–100
 	// percentage scale for the active AP on the given WiFi device.
 	// Returns 0 if no AP is associated.

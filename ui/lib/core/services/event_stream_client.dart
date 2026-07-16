@@ -18,6 +18,7 @@ import 'package:piccolo_os/core/services/websocket_connection.dart';
 /// - remote_config: Remote access configuration changes (admin only)
 /// - certificate: Certificate status changes (admin only)
 /// - network_peers: Network peer discovery updates (LAN-only, stripped by server for remote)
+/// - network_status: Typed active-uplink, connectivity, interface, AP, and WiFi status
 class EventStreamClient extends ChangeNotifier {
 
   /// Creates an EventStreamClient that subscribes to all event topics.
