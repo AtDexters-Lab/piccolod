@@ -176,6 +176,7 @@ func parseK8sFileLogLine(raw string) (ts time.Time, partial bool, msg string, ok
 // compare heads. Files are read in append (chronological) order.
 type logicalLineReader struct {
 	service string
+	source  io.ReadSeeker
 	br      *bufio.Reader
 	closer  io.Closer
 
@@ -185,6 +186,30 @@ type logicalLineReader struct {
 	eof    bool
 }
 
+func newLogicalLineReader(service string, source io.ReadSeeker, closer io.Closer) *logicalLineReader {
+	return &logicalLineReader{
+		service: service,
+		source:  source,
+		br:      bufio.NewReader(source),
+		closer:  closer,
+	}
+}
+
+// reset rewinds a stable snapshot for another merge pass. Historic downloads
+// use this to count matching lines before emitting the newest maxLines without
+// buffering those lines in memory.
+func (r *logicalLineReader) reset() error {
+	if _, err := r.source.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	r.br.Reset(r.source)
+	r.curTS = time.Time{}
+	r.curMsg = ""
+	r.valid = false
+	r.eof = false
+	return nil
+}
+
 // advance buffers the next logical line into cur*. Sets valid=false at EOF.
 func (r *logicalLineReader) advance() {
 	if r.eof {
@@ -192,10 +217,10 @@ func (r *logicalLineReader) advance() {
 		return
 	}
 	var (
-		acc        strings.Builder
-		firstTS    time.Time
-		haveFirst  bool
-		truncated  bool
+		acc       strings.Builder
+		firstTS   time.Time
+		haveFirst bool
+		truncated bool
 	)
 	for {
 		raw, err := r.br.ReadString('\n')
@@ -246,10 +271,10 @@ func (r *logicalLineReader) advance() {
 // are never early-terminated, so a backward step only locally misorders.
 type logicalLineHeap []*logicalLineReader
 
-func (h logicalLineHeap) Len() int            { return len(h) }
-func (h logicalLineHeap) Less(i, j int) bool  { return h[i].curTS.Before(h[j].curTS) }
-func (h logicalLineHeap) Swap(i, j int)       { h[i], h[j] = h[j], h[i] }
-func (h *logicalLineHeap) Push(x any)         { *h = append(*h, x.(*logicalLineReader)) }
+func (h logicalLineHeap) Len() int           { return len(h) }
+func (h logicalLineHeap) Less(i, j int) bool { return h[i].curTS.Before(h[j].curTS) }
+func (h logicalLineHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *logicalLineHeap) Push(x any)        { *h = append(*h, x.(*logicalLineReader)) }
 func (h *logicalLineHeap) Pop() any {
 	old := *h
 	n := len(old)
@@ -260,10 +285,10 @@ func (h *logicalLineHeap) Pop() any {
 
 // WriteHistoricLogsForApp streams an app's persistent logs in [since, until],
 // combined and time-interleaved across all services, to w. Each line is tagged
-// "TS [service] message". Lines are bounded by maxLines (a truncation marker is
-// emitted if exceeded). Returns ErrAppLogsUnavailable when the app-logs volume
-// is not mounted (retryable); an absent/empty subtree yields zero lines and a
-// nil error.
+// "TS [service] message". Output keeps the newest maxLines matching lines and
+// emits an omission marker when older matches exceed the cap. Returns
+// ErrAppLogsUnavailable when the app-logs volume is not mounted (retryable); an
+// absent/empty subtree yields zero lines and a nil error.
 func (m *AppManager) WriteHistoricLogsForApp(ctx context.Context, instanceID string, since, until time.Time, maxLines int, w io.Writer) error {
 	mount := paths.MountDir(persistence.AppLogsVolumeID)
 	mounted, err := persistence.IsMountPoint(mount)
@@ -327,19 +352,60 @@ func (m *AppManager) WriteHistoricLogsForApp(ctx context.Context, instanceID str
 			log.Printf("WARN: open app-logs snapshot %s: %v", snap, err)
 			continue
 		}
-		readers = append(readers, &logicalLineReader{service: service, br: bufio.NewReader(f), closer: f})
+		readers = append(readers, newLogicalLineReader(service, f, f))
 	}
 
 	return writeMergedLogs(ctx, readers, since, until, maxLines, w)
 }
 
 // writeMergedLogs performs the k-way merge over per-service readers and writes
-// the interleaved, window-filtered result to w. Split out from
-// WriteHistoricLogsForApp so the merge/parse logic is testable without a
-// mounted volume.
+// the newest maxLines of the interleaved, window-filtered result to w. It makes
+// two passes over the stable snapshots: one to count matching lines, then one
+// to omit the oldest overflow and emit the tail. This preserves O(k) memory
+// without allowing a chatty app to hide recent incident evidence behind the
+// download cap. Split out from WriteHistoricLogsForApp so the merge/parse logic
+// is testable without a mounted volume.
 func writeMergedLogs(ctx context.Context, readers []*logicalLineReader, since, until time.Time, maxLines int, w io.Writer) error {
 	bw := bufio.NewWriter(w)
 	defer bw.Flush()
+	if maxLines < 0 {
+		maxLines = 0
+	}
+
+	newHeap := func() *logicalLineHeap {
+		h := &logicalLineHeap{}
+		for _, r := range readers {
+			r.advance()
+			if r.valid {
+				heap.Push(h, r)
+			}
+		}
+		return h
+	}
+
+	// Count matching logical lines first so the second pass can skip exactly
+	// the oldest overflow while keeping only one head per service in memory.
+	total := 0
+	h := newHeap()
+	for h.Len() > 0 {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		r := heap.Pop(h).(*logicalLineReader)
+		ts := r.curTS
+		r.advance()
+		if r.valid {
+			heap.Push(h, r)
+		}
+		if !ts.Before(since) && !ts.After(until) {
+			total++
+		}
+	}
+	for _, r := range readers {
+		if err := r.reset(); err != nil {
+			return fmt.Errorf("rewind app-logs snapshot for %s: %w", r.service, err)
+		}
+	}
 
 	// Per-service header when the oldest retained line is later than `since`:
 	// the window starts before what this service's file still holds. Stated
@@ -348,7 +414,7 @@ func writeMergedLogs(ctx context.Context, readers []*logicalLineReader, since, u
 	// here would over-claim eviction for young apps.
 	// Computed from each reader's first buffered line, then the reader is reused
 	// for the merge.
-	h := &logicalLineHeap{}
+	h = &logicalLineHeap{}
 	for _, r := range readers {
 		r.advance()
 		if r.valid {
@@ -360,7 +426,13 @@ func writeMergedLogs(ctx context.Context, readers []*logicalLineReader, since, u
 		}
 	}
 
-	emitted := 0
+	omitted := max(0, total-maxLines)
+	if omitted > 0 {
+		fmt.Fprintf(bw, "# Showing newest %d of %d matching log lines; older matching lines omitted: %d.\n",
+			maxLines, total, omitted)
+	}
+
+	skipped := 0
 	for h.Len() > 0 {
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -377,12 +449,11 @@ func writeMergedLogs(ctx context.Context, readers []*logicalLineReader, since, u
 		if ts.Before(since) || ts.After(until) {
 			continue
 		}
-		if emitted >= maxLines {
-			fmt.Fprintf(bw, "… [truncated at %d lines]\n", maxLines)
-			break
+		if skipped < omitted {
+			skipped++
+			continue
 		}
 		fmt.Fprintf(bw, "%s [%s] %s\n", ts.Format(time.RFC3339), svc, msg)
-		emitted++
 	}
 	return nil
 }

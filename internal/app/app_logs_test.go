@@ -1,7 +1,6 @@
 package app
 
 import (
-	"bufio"
 	"context"
 	"strings"
 	"testing"
@@ -45,7 +44,8 @@ func TestParseK8sFileLogLine(t *testing.T) {
 }
 
 func newReader(service, content string) *logicalLineReader {
-	return &logicalLineReader{service: service, br: bufio.NewReader(strings.NewReader(content))}
+	source := strings.NewReader(content)
+	return newLogicalLineReader(service, source, nil)
 }
 
 // drain reads all logical lines from a reader for assertions.
@@ -150,8 +150,9 @@ func TestWriteMergedLogs_InterleaveAndWindow(t *testing.T) {
 	}
 }
 
-func TestWriteMergedLogs_MaxLinesTruncates(t *testing.T) {
+func TestWriteMergedLogs_MaxLinesKeepsNewest(t *testing.T) {
 	web := newReader("web", strings.Join([]string{
+		"2026-05-20T08:00:00Z stdout F outside-window",
 		"2026-05-20T10:00:01Z stdout F a",
 		"2026-05-20T10:00:02Z stdout F b",
 		"2026-05-20T10:00:03Z stdout F c",
@@ -163,11 +164,47 @@ func TestWriteMergedLogs_MaxLinesTruncates(t *testing.T) {
 		t.Fatalf("writeMergedLogs: %v", err)
 	}
 	out := sb.String()
-	if !strings.Contains(out, "truncated at 2 lines") {
-		t.Errorf("expected truncation marker, got:\n%s", out)
+	if !strings.Contains(out, "Showing newest 2 of 3 matching log lines; older matching lines omitted: 1") {
+		t.Errorf("expected omission marker, got:\n%s", out)
 	}
-	if strings.Contains(out, "] c") {
-		t.Errorf("third line should not appear past maxLines:\n%s", out)
+	if strings.Contains(out, "] a") {
+		t.Errorf("oldest line should be omitted past maxLines:\n%s", out)
+	}
+	if strings.Contains(out, "outside-window") {
+		t.Errorf("line before the requested window should not affect the cap:\n%s", out)
+	}
+	if !strings.Contains(out, "] b") || !strings.Contains(out, "] c") {
+		t.Errorf("newest lines should be retained:\n%s", out)
+	}
+}
+
+func TestWriteMergedLogs_MaxLinesKeepsNewestAcrossServices(t *testing.T) {
+	web := newReader("web", strings.Join([]string{
+		"2026-05-20T10:00:01Z stdout F web-old",
+		"2026-05-20T10:00:04Z stdout F web-new",
+	}, "\n")+"\n")
+	db := newReader("db", strings.Join([]string{
+		"2026-05-20T10:00:02Z stdout F db-old",
+		"2026-05-20T10:00:03Z stdout F db-new",
+	}, "\n")+"\n")
+	since := time.Date(2026, 5, 20, 9, 0, 0, 0, time.UTC)
+	until := time.Date(2026, 5, 20, 11, 0, 0, 0, time.UTC)
+	var sb strings.Builder
+	if err := writeMergedLogs(context.Background(), []*logicalLineReader{web, db}, since, until, 2, &sb); err != nil {
+		t.Fatalf("writeMergedLogs: %v", err)
+	}
+	out := sb.String()
+	if strings.Contains(out, "web-old") || strings.Contains(out, "db-old") {
+		t.Errorf("oldest interleaved lines should be omitted:\n%s", out)
+	}
+	wantOrder := []string{"db-new", "web-new"}
+	idx := -1
+	for _, tag := range wantOrder {
+		i := strings.Index(out, tag)
+		if i < 0 || i < idx {
+			t.Fatalf("newest lines missing or out of order:\n%s", out)
+		}
+		idx = i
 	}
 }
 
