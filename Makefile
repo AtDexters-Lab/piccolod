@@ -100,6 +100,7 @@ service: ## Build and install/update piccolod systemd service
 	@echo 'RestartSec=5' >> piccolod.service
 	@echo 'TimeoutStopSec=120' >> piccolod.service
 	@echo 'KillMode=mixed' >> piccolod.service
+	@echo 'OOMScoreAdjust=-500' >> piccolod.service
 	@echo '' >> piccolod.service
 	@echo '[Install]' >> piccolod.service
 	@echo 'WantedBy=multi-user.target' >> piccolod.service

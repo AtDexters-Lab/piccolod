@@ -3,6 +3,11 @@
 **Date:** 2026-02-06
 **Status:** Draft
 
+> **OOM-policy amendment (2026-07-18):** Credential switching alone does not
+> neutralize the daemon's inherited `oom_score_adj`. Rootless Podman commands
+> now cross the pre-exec neutralization boundary defined by
+> [20260718-per-app-runtime-oom-session-recovery-amendment.md](20260718-per-app-runtime-oom-session-recovery-amendment.md).
+
 ## 1. Problem Statement
 
 piccolod runs as root (required for port 80, gocryptfs mounts, mDNS). All `podman` commands are executed via `exec.CommandContext(ctx, "podman", args...)` without any user switching, meaning containers run under **rootful Podman**. A container escape exploit would yield root on the host.

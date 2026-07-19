@@ -8,18 +8,21 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
 )
 
 type MockContainerManager struct {
+	stopMu                 sync.Mutex
 	containers             map[string]*mockContainer
 	nextID                 int
 	createError            error
 	startError             error
 	startErrorForContainer map[string]error // per-container start errors (checked before global startError)
 	stopError              error
+	resolveErrorForName    map[string]error
 	removeError            error
 	removeRunningError     bool
 	removedImages          []string
@@ -70,6 +73,9 @@ func (m *MockContainerManager) StartContainer(ctx context.Context, runtime conta
 }
 
 func (m *MockContainerManager) StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
+	m.stopMu.Lock()
+	defer m.stopMu.Unlock()
+
 	_ = runtime
 	if m.stopError != nil {
 		return m.stopError
@@ -171,6 +177,9 @@ func (m *MockContainerManager) LogsStream(ctx context.Context, runtime container
 func (m *MockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
 	_ = ctx
 	_ = runtime
+	if err := m.resolveErrorForName[name]; err != nil {
+		return "", err
+	}
 	for id, c := range m.containers {
 		if c.Spec.Name == name {
 			return id, nil
@@ -186,7 +195,7 @@ func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtim
 	if !ok {
 		return container.ContainerState{Exists: false, Running: false}, nil
 	}
-	return container.ContainerState{Exists: true, Running: c.Status == "running"}, nil
+	return container.ContainerState{Exists: true, Running: c.Status == "running", Stale: c.Status == "stale"}, nil
 }
 
 // NOTE: duplicated in internal/server/gin_app_handlers_test.go (cross-package).

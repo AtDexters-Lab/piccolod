@@ -705,10 +705,7 @@ func (m *AppManager) flattenExportToDir(ctx context.Context, rt container.Podman
 	}
 	var exportStderr, tarStderr bytes.Buffer
 
-	exportCmd := exec.CommandContext(ctx, "podman", exportArgs...)
-	exportCmd.Stdout = pw
-	exportCmd.Stderr = &exportStderr
-	container.ApplyRuntimeCredential(exportCmd, rt)
+	exportCmd := newRootfsExportCommand(ctx, rt, exportArgs, pw, &exportStderr)
 
 	tarCmd := exec.CommandContext(ctx, "tar", "x",
 		"--numeric-owner", "--xattrs", "--xattrs-include=*", "-C", targetDir)
@@ -742,4 +739,18 @@ func (m *AppManager) flattenExportToDir(ctx context.Context, rt container.Podman
 	}
 
 	return nil
+}
+
+func newRootfsExportCommand(
+	ctx context.Context,
+	rt container.PodmanRuntime,
+	args []string,
+	stdout io.Writer,
+	stderr io.Writer,
+) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	container.ApplyRuntimeCredential(cmd, rt)
+	return cmd
 }

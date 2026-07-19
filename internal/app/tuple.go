@@ -18,14 +18,14 @@ type TupleState struct {
 
 // TupleGeneration captures the volume state at a point in time.
 type TupleGeneration struct {
-	ID           string            `json:"id"`                          // "gen-1", "gen-2", ...
-	RootfsVolIDs map[string]string `json:"rootfs"`                     // svcName → rootfs volume ID
-	DataSnapshot string            `json:"data_snapshot"`              // snapshot LV name (empty = live data volume)
+	ID           string            `json:"id"`            // "gen-1", "gen-2", ...
+	RootfsVolIDs map[string]string `json:"rootfs"`        // svcName → rootfs volume ID
+	DataSnapshot string            `json:"data_snapshot"` // snapshot LV name (empty = live data volume)
 	CreatedAt    time.Time         `json:"created_at"`
 	DeprecatedAt *time.Time        `json:"deprecated_at,omitempty"`
-	FailedAt     *time.Time        `json:"failed_at,omitempty"`        // when generation was marked failed (for GC retention)
-	Status       string            `json:"status"`                     // "active" | "snapshot" | "deprecated" | "failed"
-	FailedLVName string            `json:"failed_lv_name,omitempty"`   // data LV name after rollback (for GC)
+	FailedAt     *time.Time        `json:"failed_at,omitempty"`      // when generation was marked failed (for GC retention)
+	Status       string            `json:"status"`                   // "active" | "snapshot" | "deprecated" | "failed"
+	FailedLVName string            `json:"failed_lv_name,omitempty"` // data LV name after rollback (for GC)
 
 	// EverHealthy is set to true when the reconciler first confirms all containers running.
 	// Prevents auto-rollback on transient errors after a successful post-update startup.
@@ -35,6 +35,19 @@ type TupleGeneration struct {
 	// RollbackAttempted guards against auto-rollback retry loops.
 	// Set to true and persisted before attempting auto-rollback.
 	RollbackAttempted bool `json:"rollback_attempted,omitempty"`
+	// RollbackPending and RollbackFailedLVName persist the intended LV swap
+	// before RollbackDataVolume crosses its first rename boundary. Recovery can
+	// therefore replay both a partial swap and a fully-promoted swap whose first
+	// post-LV tuple write was interrupted.
+	RollbackPending      bool   `json:"rollback_pending,omitempty"`
+	RollbackFailedLVName string `json:"rollback_failed_lv_name,omitempty"`
+
+	// RollbackAppStateCommitted is a crash-recovery phase marker for a promoted
+	// rollback generation. false means the tuple/LV promotion is authoritative,
+	// but app.yaml and metadata.json still need to be rewritten from that tuple
+	// before any runtime may start. nil identifies generations created before
+	// this protocol (or generations that have never been rollback targets).
+	RollbackAppStateCommitted *bool `json:"rollback_app_state_committed,omitempty"`
 }
 
 // Generation status constants.

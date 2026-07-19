@@ -280,8 +280,8 @@ func (t *installedAppApplyTransaction) recreateRuntimeIfNeeded() error {
 		}
 		return fmt.Errorf("%s: %w", t.spec.RollbackPrefix, cause)
 	}
-	if err := t.quiesceRuntimeForPrecommitDataSnapshotIfNeeded(); err != nil {
-		cause := fmt.Errorf("quiesce runtime before precommit data snapshot: %w", err)
+	if err := t.quiesceRuntimeForSwitch(); err != nil {
+		cause := fmt.Errorf("quiesce runtime before transactional switch: %w", err)
 		if restoreErr := t.rollback(cause); restoreErr != nil {
 			return restoreErr
 		}
@@ -441,10 +441,7 @@ func (t *installedAppApplyTransaction) preflightPrecommitDataSnapshotIfNeeded() 
 	return nil
 }
 
-func (t *installedAppApplyTransaction) quiesceRuntimeForPrecommitDataSnapshotIfNeeded() error {
-	if !t.precommitDataSnapshotRequired() {
-		return nil
-	}
+func (t *installedAppApplyTransaction) quiesceRuntimeForSwitch() error {
 	if t.spec.PreviousDefinition == nil {
 		return fmt.Errorf("previous manifest required")
 	}
@@ -452,16 +449,8 @@ func (t *installedAppApplyTransaction) quiesceRuntimeForPrecommitDataSnapshotIfN
 	if err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
 	}
-	mode := piccoloModeFromExtensions(t.spec.PreviousDefinition.Extensions)
-	runtime, err := t.manager.podmanRuntimeForApp(t.spec.InstanceID, layout, mode)
-	if err != nil {
-		return fmt.Errorf("podman runtime: %w", err)
-	}
 	t.manager.emitProgress(t.ctx, t.spec.TaskType, t.spec.InstanceID, taskPhaseStopping, 48, "Stopping containers", false, nil)
-	if err := t.manager.stopContainersForMultiApp(t.ctx, t.spec.AppInst, t.spec.PreviousDefinition, runtime); err != nil {
-		return err
-	}
-	return nil
+	return t.manager.quiesceContainerGroup(t.ctx, t.state, t.spec.AppInst, t.spec.PreviousDefinition, layout)
 }
 
 func (t *installedAppApplyTransaction) createPrecommitDataSnapshotIfNeeded() error {

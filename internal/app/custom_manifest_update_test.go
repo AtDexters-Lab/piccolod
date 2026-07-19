@@ -5778,7 +5778,7 @@ func TestRestorePrecommitDataSnapshotRetriesAfterPartialRenameError(t *testing.T
 	}
 }
 
-func TestRestorePrecommitDataSnapshotRollsBackWhenLayoutMissing(t *testing.T) {
+func TestRestorePrecommitDataSnapshotRefusesRollbackWithoutQuiescenceProof(t *testing.T) {
 	tempDir := t.TempDir()
 	paths.SetCoreRootForTest(t, tempDir)
 	paths.SetPodmanRootForTest(t, filepath.Join(tempDir, "podman"))
@@ -5803,14 +5803,14 @@ func TestRestorePrecommitDataSnapshotRollsBackWhenLayoutMissing(t *testing.T) {
 	}
 
 	err = mgr.restorePrecommitDataSnapshot(context.Background(), state, &AppInstance{InstanceID: "piclu"}, customManifestPolicyBaseDef(), txn)
-	if err != nil {
-		t.Fatalf("restore precommit snapshot: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "ensure layout before data snapshot restore") {
+		t.Fatalf("restore precommit snapshot error = %v, want quiescence precondition failure", err)
 	}
-	if txn.PrecommitDataSnapshotID != "" {
-		t.Fatalf("snapshot marker after rollback = %q, want cleared", txn.PrecommitDataSnapshotID)
+	if txn.PrecommitDataSnapshotID == "" {
+		t.Fatal("snapshot marker cleared without a safe rollback")
 	}
-	if len(volumes.rollbacks) != 1 {
-		t.Fatalf("rollback attempts = %v, want one attempt despite layout failure", volumes.rollbacks)
+	if len(volumes.rollbacks) != 0 {
+		t.Fatalf("rollback attempts = %v, want none without quiescence proof", volumes.rollbacks)
 	}
 }
 
@@ -6356,6 +6356,7 @@ type manifestUpdateSnapshotVolumeManager struct {
 	rollbackRenamesCommitted bool
 	rollbackSnapshotPromoted bool
 	rollbackErr              error
+	rollbackHook             func(call int, instanceID, snapshotLVName, failedLVName string) (bool, bool, error)
 	snapshotHook             func(instanceID, snapshotLVName string) error
 	viabilityHook            func(instanceID string) error
 	artifacts                []string
@@ -6413,6 +6414,9 @@ func (m *manifestUpdateSnapshotVolumeManager) RollbackDataVolume(ctx context.Con
 	_ = ctx
 	_ = instanceID
 	m.rollbacks = append(m.rollbacks, snapshotLVName+"->"+failedLVName)
+	if m.rollbackHook != nil {
+		return m.rollbackHook(len(m.rollbacks), instanceID, snapshotLVName, failedLVName)
+	}
 	if m.rollbackResultSet {
 		return m.rollbackRenamesCommitted, m.rollbackSnapshotPromoted, m.rollbackErr
 	}

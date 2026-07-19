@@ -48,9 +48,9 @@ type FilesystemStateManager struct {
 	// Test hook for fault-injecting tuple generation writes.
 	storeTupleStateHook func(instanceID string, state *TupleState) error
 
-	// Test hook for fault-injecting StoreApp after app.yaml is written and
-	// before metadata.json is written.
-	storeAppMetadataHook func(instanceID string, app *AppInstance) error
+	// Test hooks for fault-injecting StoreApp at the two split-file boundaries.
+	storeAppDefinitionHook func(instanceID string, app *AppInstance) error
+	storeAppMetadataHook   func(instanceID string, app *AppInstance) error
 }
 
 // AppMetadata represents runtime metadata stored separately from app.yaml.
@@ -420,6 +420,11 @@ func (fsm *FilesystemStateManager) StoreApp(app *AppInstance) error {
 		return fmt.Errorf("failed to serialize app definition: %w", err)
 	}
 
+	if fsm.storeAppDefinitionHook != nil {
+		if err := fsm.storeAppDefinitionHook(app.InstanceID, app); err != nil {
+			return fmt.Errorf("failed to write app.yaml: %w", err)
+		}
+	}
 	if err := fsutil.AtomicWriteFile(appDefPath, appDefData, 0644); err != nil {
 		return fmt.Errorf("failed to write app.yaml: %w", err)
 	}
@@ -529,16 +534,49 @@ func (fsm *FilesystemStateManager) StoreAppMetadata(app *AppInstance) error {
 // UpdateAppEnabled updates the app's Enabled flag and persists it.
 // The instanceID parameter is the unique instance identifier.
 func (fsm *FilesystemStateManager) UpdateAppEnabled(instanceID string, enabled bool) error {
-	fsm.cacheMu.Lock()
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+
+	fsm.cacheMu.RLock()
 	app, exists := fsm.cache[instanceID]
 	if !exists {
-		fsm.cacheMu.Unlock()
+		fsm.cacheMu.RUnlock()
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
-	app.Enabled = enabled
-	app.UpdatedAt = time.Now()
+	updated := *app
+	updated.Enabled = enabled
+	updated.UpdatedAt = time.Now()
+	metadata := instanceToMetadata(&updated)
+	fsm.cacheMu.RUnlock()
+
+	metadataData, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to serialize metadata: %w", err)
+	}
+	if fsm.storeAppMetadataHook != nil {
+		if err := fsm.storeAppMetadataHook(instanceID, &updated); err != nil {
+			return fmt.Errorf("failed to write metadata.json: %w", err)
+		}
+	}
+	metadataPath := filepath.Join(fsm.appsDir, instanceID, "metadata.json")
+	if err := fsutil.AtomicWriteFile(metadataPath, metadataData, 0644); err != nil {
+		return fmt.Errorf("failed to write metadata.json: %w", err)
+	}
+
+	// Publish the committed value to the existing cache only after the atomic
+	// file replacement succeeds. A failed write leaves disk and memory aligned.
+	fsm.cacheMu.Lock()
+	if current, ok := fsm.cache[instanceID]; ok {
+		current.Enabled = enabled
+		current.UpdatedAt = updated.UpdatedAt
+	} else {
+		// fsMu serializes cache membership changes with this commit. Retaining
+		// this fallback keeps disk and memory coherent even if that invariant is
+		// relaxed later.
+		fsm.cache[instanceID] = &updated
+	}
 	fsm.cacheMu.Unlock()
-	return fsm.StoreAppMetadata(app)
+	return nil
 }
 
 // GetApp retrieves an app instance from cache by instance ID (fast access).

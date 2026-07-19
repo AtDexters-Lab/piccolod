@@ -2,6 +2,8 @@ package app
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"piccolod/internal/api"
@@ -24,7 +26,7 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
+	runtime, err := mgr.podmanRuntimeForApp(context.Background(), "demo", layout, ModeService, appRuntimeEnsureReady)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}
@@ -51,8 +53,17 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create db container: %v", err)
 	}
+	zombieCID, err := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{
+		Name:   "demo__unexpected",
+		Image:  "alpine:latest",
+		Labels: piccoloLabels("demo", "unexpected", "service"),
+	})
+	if err != nil {
+		t.Fatalf("create unexpected label-owned container: %v", err)
+	}
 	_ = mock.StartContainer(ctx, runtime, mainCID)
 	_ = mock.StartContainer(ctx, runtime, dbCID)
+	_ = mock.StartContainer(ctx, runtime, zombieCID)
 
 	appInst := &AppInstance{
 		InstanceID:     "demo",
@@ -65,9 +76,10 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 		Definition: def,
 	}
 
-	// Stop uses resolved deterministic names even if stored IDs are non-empty and stale.
-	if err := mgr.stopContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
-		t.Fatalf("stopContainersForMultiApp: %v", err)
+	// The lifecycle quiescence proof uses deterministic names even if stored
+	// IDs are non-empty and stale.
+	if err := mgr.stopContainerGroup(ctx, nil, appInst, def, layout, runtime); err != nil {
+		t.Fatalf("stopContainerGroup: %v", err)
 	}
 	mainState, _ := mock.InspectContainerState(ctx, runtime, mainCID)
 	if mainState.Running {
@@ -76,6 +88,10 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	dbState, _ := mock.InspectContainerState(ctx, runtime, dbCID)
 	if dbState.Running {
 		t.Fatalf("expected db container to be stopped")
+	}
+	zombieState, _ := mock.InspectContainerState(ctx, runtime, zombieCID)
+	if zombieState.Running {
+		t.Fatalf("expected unexpected label-owned container to be stopped")
 	}
 
 	// Remove uses resolved deterministic names even if stored IDs are non-empty and stale.
@@ -87,6 +103,43 @@ func TestStopRemoveContainersForMultiApp_UsesNamesWhenIDsStale(t *testing.T) {
 	}
 	if _, err := mock.ResolveContainerIDByName(ctx, runtime, "demo__db"); err == nil {
 		t.Fatalf("expected db container to be removed")
+	}
+}
+
+func TestStopContainerGroupResolutionFailureDoesNotDetachRootfs(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mock.resolveErrorForName = map[string]error{"demo": errors.New("podman control unavailable")}
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{"rootfs-main": true}
+	mgr.SetRootfsManager(rootfs)
+
+	def := &api.AppDefinition{
+		PrimaryService: "main",
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine:latest"},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	appInst := &AppInstance{
+		InstanceID:     "demo",
+		PrimaryService: "main",
+		Containers:     map[string]string{},
+		ActiveRootfs:   map[string]string{"main": "rootfs-main"},
+		Definition:     def,
+	}
+
+	err = mgr.stopContainerGroup(context.Background(), nil, appInst, def, appVolumeLayout{}, container.PodmanRuntime{})
+	if err == nil || !strings.Contains(err.Error(), "podman control unavailable") {
+		t.Fatalf("resolution failure authorized quiescence: %v", err)
+	}
+	if len(rootfs.detached) != 0 {
+		t.Fatalf("rootfs detached without process-absence proof: %v", rootfs.detached)
 	}
 }
 
@@ -107,7 +160,7 @@ func TestRemoveContainersForMultiApp_StopsRunningContainersAndResolvesAnchor(t *
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
+	runtime, err := mgr.podmanRuntimeForApp(context.Background(), "demo", layout, ModeService, appRuntimeEnsureReady)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}

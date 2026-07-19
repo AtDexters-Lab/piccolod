@@ -22,7 +22,9 @@ const (
 )
 
 // handleDiagnosticLog: GET /api/v1/system/diagnostic-log (emergency)
-//                      GET /api/v1/system/admin/diagnostic-log (admin)
+//
+//	GET /api/v1/system/admin/diagnostic-log (admin)
+//
 // Serves redacted full system journal. Auth/health gating done via middleware.
 // Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD narrows to a date range (max 7 days).
 // Default (no params): current boot, 50k line cap.
@@ -216,8 +218,7 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 	}
 	imagesArgs = append(imagesArgs, "images", "--format", "{{.Repository}}:{{.Tag}}")
 
-	cmd := exec.CommandContext(ctx, "podman", imagesArgs...)
-	container.ApplyRuntimeCredential(cmd, ephRT)
+	cmd := newDiagnosticPodmanImagesCommand(ctx, ephRT, imagesArgs)
 	out, cmdErr := cmd.CombinedOutput()
 	r := checkResult{
 		Name:    "podman_images",
@@ -231,6 +232,16 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 	results = append(results, r)
 
 	c.JSON(http.StatusOK, gin.H{"checks": results})
+}
+
+func newDiagnosticPodmanImagesCommand(
+	ctx context.Context,
+	rt container.PodmanRuntime,
+	args []string,
+) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "podman", args...)
+	container.ApplyRuntimeCredential(cmd, rt)
+	return cmd
 }
 
 // fetchRedactedJournal runs journalctl with the given extra args and applies redaction.

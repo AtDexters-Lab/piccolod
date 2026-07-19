@@ -1,6 +1,9 @@
 package container
 
-import "os/exec"
+import (
+	"context"
+	"os/exec"
+)
 
 // SystemExecutor abstracts OS command execution for testability.
 // The default implementation delegates to exec.Command().CombinedOutput().
@@ -8,12 +11,17 @@ import "os/exec"
 // without requiring root privileges.
 type SystemExecutor interface {
 	Run(name string, args ...string) ([]byte, error)
+	RunContext(ctx context.Context, name string, args ...string) ([]byte, error)
 }
 
 type osExecutor struct{}
 
 func (osExecutor) Run(name string, args ...string) ([]byte, error) {
 	return exec.Command(name, args...).CombinedOutput()
+}
+
+func (osExecutor) RunContext(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 
 // defaultExecutor is the package-level executor used by appuser provisioning functions.

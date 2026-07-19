@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -749,6 +750,7 @@ func TestAppManager_Uninstall(t *testing.T) {
 	}
 	allowHostStorage(t, manager)
 	manager.ForceLockState(false)
+	manager.userSessionQuiescer = func(context.Context, string) error { return nil }
 
 	ctx := context.Background()
 
@@ -802,6 +804,75 @@ func TestAppManager_Uninstall(t *testing.T) {
 	err = manager.Uninstall(ctx, "nonexistent")
 	if err == nil {
 		t.Error("Expected error when uninstalling nonexistent app")
+	}
+}
+
+func TestAppManager_UninstallUserCleanupFailureRetainsDisabledRetryOwner(t *testing.T) {
+	tempDir := t.TempDir()
+	manager, err := NewAppManagerForTest(NewMockContainerManager(), tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManagerForTest: %v", err)
+	}
+	allowHostStorage(t, manager)
+	manager.ForceLockState(false)
+
+	def := &api.AppDefinition{
+		Type:      "user",
+		Listeners: []api.AppListener{{Name: "testapp", GuestPort: 80, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true}},
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{80}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	if _, err := manager.Install(context.Background(), def); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	destroyErr := errors.New("runtime-dir owner remains active")
+	failDestroy := true
+	destroyCalls := 0
+	manager.appUserDestroyer = func(instanceID string) error {
+		destroyCalls++
+		if instanceID != "testapp" {
+			t.Fatalf("destroy instance = %q, want testapp", instanceID)
+		}
+		if failDestroy {
+			return destroyErr
+		}
+		return nil
+	}
+
+	err = manager.Uninstall(context.Background(), "testapp")
+	if !errors.Is(err, destroyErr) {
+		t.Fatalf("uninstall cleanup error = %v, want %v", err, destroyErr)
+	}
+	state, err := manager.ensureStateManager()
+	if err != nil {
+		t.Fatalf("ensure state: %v", err)
+	}
+	retained, exists := state.GetApp("testapp")
+	if !exists {
+		t.Fatal("failed user cleanup removed durable retry owner")
+	}
+	if retained.Enabled {
+		t.Fatal("failed uninstall retained app as enabled")
+	}
+	if got := manager.getObservedStatus("testapp"); got != StatusStopped {
+		t.Fatalf("failed uninstall observed status = %q, want stopped", got)
+	}
+	if _, err := os.Stat(filepath.Join(tempDir, AppsDir, "testapp", "metadata.json")); err != nil {
+		t.Fatalf("failed uninstall removed retry metadata: %v", err)
+	}
+
+	failDestroy = false
+	if err := manager.Uninstall(context.Background(), "testapp"); err != nil {
+		t.Fatalf("retry uninstall: %v", err)
+	}
+	if destroyCalls != 2 {
+		t.Fatalf("destroy calls = %d, want 2", destroyCalls)
+	}
+	if _, exists := state.GetApp("testapp"); exists {
+		t.Fatal("successful retry retained app state")
 	}
 }
 
@@ -938,6 +1009,7 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 	tempDir := t.TempDir()
 	mock := NewMockContainerManager()
 	svcMgr := services.NewServiceManager()
+	svcMgr.UseInMemoryNetworkForTest()
 	mgr, err := NewAppManagerForTestWithServices(mock, tempDir, svcMgr, nil)
 	if err != nil {
 		t.Fatalf("NewAppManagerWithServices: %v", err)
@@ -966,6 +1038,89 @@ func TestAppManager_RestoreServicesSkipsStoppedApps(t *testing.T) {
 	mgr.RestoreServices(context.Background())
 	if _, err := svcMgr.GetByApp("demo"); err == nil {
 		t.Fatalf("expected no services for stopped app")
+	}
+}
+
+func TestAppManager_RestoreServicesDeactivatesStaleEndpointsWhenRuntimeUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	svcMgr.UseInMemoryNetworkForTest()
+	mgr, err := NewAppManagerForTestWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	def := &api.AppDefinition{
+		Type: "user",
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		},
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	if _, err := mgr.Install(context.Background(), def); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if _, err := svcMgr.GetByApp("demo"); err != nil {
+		t.Fatalf("expected installed service registration: %v", err)
+	}
+	mgr.credentialResolver = func(string) (*syscall.Credential, string, error) {
+		return nil, "", errors.New("session unavailable")
+	}
+
+	mgr.RestoreServices(context.Background())
+	if _, err := svcMgr.GetByApp("demo"); err == nil {
+		t.Fatal("stale service registration survived runtime observation failure")
+	}
+}
+
+func TestAppManager_RestoreServicesDeactivatesStaleEndpointsWithoutPublishContainer(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	svcMgr.UseInMemoryNetworkForTest()
+	mgr, err := NewAppManagerForTestWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	def := &api.AppDefinition{
+		Type: "user",
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		},
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	inst, err := mgr.Install(context.Background(), def)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	if _, err := svcMgr.GetByApp(inst.InstanceID); err != nil {
+		t.Fatalf("expected installed service registration: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	inst.NetworkAnchorID = ""
+	inst.SetPrimaryContainerID("")
+	if err := state.StoreApp(inst); err != nil {
+		t.Fatalf("persist missing publish container: %v", err)
+	}
+
+	mgr.RestoreServices(context.Background())
+	if _, err := svcMgr.GetByApp(inst.InstanceID); err == nil {
+		t.Fatal("stale service registration survived missing publish container")
 	}
 }
 
@@ -1147,9 +1302,7 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	// Simulate follower transition: stop container.
-	// The stopForFollowerTransition helper stops containers without updating observed status,
-	// since the caller (leadership handler) typically updates status separately.
+	// Simulate follower transition: stop container and publish local stopped state.
 	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
 		t.Fatalf("follower stop: %v", err)
 	}
@@ -1158,8 +1311,6 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get: %v", err)
 	}
-	// After stopForFollowerTransition, observed status may still be "running" (not updated yet).
-	// The key check is that the container is stopped.
 	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "stopped" {
 		t.Fatalf("expected container to be stopped after follower transition")
 	}
@@ -1189,6 +1340,161 @@ func TestAppManager_ReconcileOnceDoesNotRestartOnFollower(t *testing.T) {
 	}
 	if _, err := svcMgr.GetByApp("demo"); err == nil {
 		t.Fatalf("expected no services for follower app")
+	}
+}
+
+func TestAppManager_FollowerTransitionDoesNotSucceedWithoutFallbackProof(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	svcMgr := services.NewServiceManager()
+	svcMgr.UseInMemoryNetworkForTest()
+	mgr, err := NewAppManagerForTestWithServices(mock, tempDir, svcMgr, nil)
+	if err != nil {
+		t.Fatalf("NewAppManagerWithServices: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	def := &api.AppDefinition{
+		Type: "user",
+		Listeners: []api.AppListener{
+			{Name: "demo", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		},
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	inst, err := mgr.Install(context.Background(), def)
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	mock.stopError = errors.New("podman stop unavailable")
+	mgr.userSessionQuiescer = func(context.Context, string) error {
+		return errors.New("PID 1 proof unavailable")
+	}
+
+	err = mgr.stopForFollowerTransition(context.Background(), inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "podman stop unavailable") {
+		t.Fatalf("follower transition succeeded without graceful or PID 1 proof: %v", err)
+	}
+	if c := mock.containers[inst.PrimaryContainerID()]; c == nil || c.Status != "running" {
+		t.Fatalf("mock workload unexpectedly changed after failed proof: %+v", c)
+	}
+	if _, err := svcMgr.GetByApp(inst.InstanceID); err != nil {
+		t.Fatalf("service access was deactivated despite failed demotion proof: %v", err)
+	}
+}
+
+func TestAppManager_StopUsesPID1ProofWhenVolumeLayoutUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	def := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+	if _, err := mgr.Install(context.Background(), def); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	mgr.SetVolumeManager(&manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		ensureErr:         errors.New("active app LV unavailable"),
+	})
+	quiesceCalls := 0
+	mgr.userSessionQuiescer = func(context.Context, string) error {
+		quiesceCalls++
+		return nil
+	}
+
+	if err := mgr.Stop(context.Background(), "demo"); err != nil {
+		t.Fatalf("Stop with PID 1 fallback: %v", err)
+	}
+	if quiesceCalls != 1 {
+		t.Fatalf("PID 1 quiesce calls = %d, want 1", quiesceCalls)
+	}
+	stopped, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if stopped.Enabled || stopped.Status != StatusStopped {
+		t.Fatalf("stopped state = enabled:%v status:%q", stopped.Enabled, stopped.Status)
+	}
+}
+
+func TestAppManager_FollowerUsesPID1ProofWhenVolumeLayoutUnavailable(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	def := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "docker.io/library/nginx:alpine", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+	if _, err := mgr.Install(context.Background(), def); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	mgr.SetVolumeManager(&manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tempDir},
+		ensureErr:         errors.New("active app LV unavailable"),
+	})
+	quiesceCalls := 0
+	mgr.userSessionQuiescer = func(context.Context, string) error {
+		quiesceCalls++
+		return nil
+	}
+
+	if err := mgr.stopForFollowerTransition(context.Background(), "demo"); err != nil {
+		t.Fatalf("follower transition with PID 1 fallback: %v", err)
+	}
+	if quiesceCalls != 1 {
+		t.Fatalf("PID 1 quiesce calls = %d, want 1", quiesceCalls)
+	}
+	stopped, err := mgr.Get(context.Background(), "demo")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if !stopped.Enabled || stopped.Status != StatusStopped {
+		t.Fatalf("follower state = enabled:%v status:%q", stopped.Enabled, stopped.Status)
+	}
+}
+
+func TestQuiesceRuntimeFallsBackForNonSessionRuntimeFailure(t *testing.T) {
+	mgr, err := NewAppManagerForTest(NewMockContainerManager(), t.TempDir())
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	mgr.credentialResolver = func(string) (*syscall.Credential, string, error) {
+		return nil, "", errors.New("runtime ownership unavailable")
+	}
+	quiesceCalls := 0
+	mgr.userSessionQuiescer = func(context.Context, string) error {
+		quiesceCalls++
+		return nil
+	}
+	_, sessionQuiesced, err := mgr.quiesceRuntimeForApp(context.Background(), "demo", appVolumeLayout{}, ModeService)
+	if err != nil {
+		t.Fatalf("quiesceRuntimeForApp: %v", err)
+	}
+	if !sessionQuiesced || quiesceCalls != 1 {
+		t.Fatalf("sessionQuiesced=%v quiesceCalls=%d, want true/1", sessionQuiesced, quiesceCalls)
 	}
 }
 

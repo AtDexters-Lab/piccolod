@@ -1,10 +1,14 @@
 package app
 
 import (
+	"bytes"
 	"context"
+	"reflect"
 	"slices"
+	"syscall"
 	"testing"
 
+	"piccolod/internal/container"
 	"piccolod/internal/persistence"
 )
 
@@ -27,5 +31,36 @@ func TestReadImageConfigForRootfsFallsBackToLegacyRepoQualifiedGolden(t *testing
 	}
 	if want := []string{canonicalGolden, legacyGolden}; !slices.Equal(rootfs.goldenReads, want) {
 		t.Fatalf("golden reads = %v, want %v", rootfs.goldenReads, want)
+	}
+}
+
+func TestNewRootfsExportCommandAppliesRootlessWrapperAndPreservesPipe(t *testing.T) {
+	stdout := &bytes.Buffer{}
+	stderr := &bytes.Buffer{}
+	rt := container.PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 475, Gid: 475},
+		HomeDir:    "/var/lib/piccolo/apps/namek/home",
+	}
+
+	cmd := newRootfsExportCommand(
+		context.Background(),
+		rt,
+		[]string{"--root", "/apps/namek/podman", "export", "container-id"},
+		stdout,
+		stderr,
+	)
+
+	wantArgs := []string{
+		"/usr/bin/choom", "-n", "0", "--", "/usr/bin/podman",
+		"--root", "/apps/namek/podman", "export", "container-id",
+	}
+	if cmd.Path != "/usr/bin/choom" || !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("rootfs export command = path %q args %v, want %q %v", cmd.Path, cmd.Args, "/usr/bin/choom", wantArgs)
+	}
+	if cmd.Stdout != stdout || cmd.Stderr != stderr {
+		t.Fatal("rootfs export pipe or stderr sink was not preserved")
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential != rt.Credential {
+		t.Fatal("rootfs export command did not receive the runtime credential")
 	}
 }

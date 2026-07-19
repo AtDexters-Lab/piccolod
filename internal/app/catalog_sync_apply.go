@@ -923,7 +923,7 @@ func (m *AppManager) recreateContainersInPlaceWithHook(
 		return fmt.Errorf("ensure layout: %w", err)
 	}
 	mode := piccoloModeFromExtensions(newDef.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return fmt.Errorf("podman runtime: %w", err)
 	}

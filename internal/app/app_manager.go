@@ -63,6 +63,9 @@ type AppManager struct {
 	observedStatus        map[string]string
 	observedStatusMessage map[string]string // transient status message for UI context
 	observedStatusMu      sync.RWMutex
+	startupRecoveryMu     sync.Mutex
+	startupRecovery       map[string]startupRecoveryWindow
+	quiesceFinalizeMu     sync.Mutex
 
 	// Internal CA path for OIDC trust
 	internalCAPath string
@@ -77,6 +80,10 @@ type AppManager struct {
 	// credentialResolver overrides per-app user provisioning for tests.
 	// When non-nil, resolveAppCredential returns this instead of calling ProvisionAppUser.
 	credentialResolver func(instanceID string) (*syscall.Credential, string, error)
+	// userSessionQuiescer overrides PID 1 user-unit quiescence for tests.
+	userSessionQuiescer func(context.Context, string) error
+	// appUserDestroyer overrides final per-app identity cleanup for tests.
+	appUserDestroyer func(string) error
 
 	// Per-app user orphan cleanup runs once at first reconciliation.
 	orphanCleanupOnce sync.Once
@@ -206,6 +213,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		runtimeReadinessProbe:    defaultRuntimeReadinessProbe,
 		observedStatus:           make(map[string]string),
 		observedStatusMessage:    make(map[string]string),
+		startupRecovery:          make(map[string]startupRecoveryWindow),
 		oidcHostname:             "piccolo.local",
 		runtimeUser:              *runtimeUser,
 		syncInFlight:             make(map[string]bool),
@@ -751,11 +759,12 @@ func (m *AppManager) StopBackground() {
 	}
 }
 
-// StopAllApps stops all running applications and detaches their volumes.
-// This is called during graceful shutdown to ensure containers are stopped
-// before volumes are unmounted. Apps are stopped in parallel for efficiency.
+// StopAllApps proves every app cgroup quiescent before detaching its volume.
+// Cached observed status is not sufficient evidence that no process can still
+// write to the mounted filesystem. Apps are processed in parallel for
+// efficiency, with detach skipped for any app whose quiescence proof fails.
 func (m *AppManager) StopAllApps(ctx context.Context) error {
-	log.Printf("INFO: Stopping all running apps for graceful shutdown...")
+	log.Printf("INFO: Quiescing all apps for graceful shutdown...")
 
 	// Release the shared scratch volume on all exit paths (best-effort).
 	// Uses a fresh context so the unmount runs even if the shutdown ctx expired.
@@ -785,86 +794,50 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 		return nil
 	}
 
-	// Separate running apps (need container stop) from stopped apps (only need volume detach)
-	var runningApps []*AppInstance
-	var stoppedApps []*AppInstance
-	for _, app := range apps {
-		observed := m.getObservedStatus(app.InstanceID)
-		if observed == StatusRunning || observed == StatusStarting {
-			runningApps = append(runningApps, app)
-		} else {
-			stoppedApps = append(stoppedApps, app)
-		}
-	}
-
-	if len(runningApps) == 0 && len(stoppedApps) == 0 {
-		log.Printf("INFO: No apps to process")
-		return nil
-	}
-
 	var errs []error
+	log.Printf("INFO: Quiescing %d apps in parallel...", len(apps))
 
-	// Stop running apps in parallel with a concurrency limit of 4
-	if len(runningApps) > 0 {
-		log.Printf("INFO: Stopping %d running apps in parallel...", len(runningApps))
+	const maxConcurrency = 4
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
 
-		const maxConcurrency = 4
-		sem := make(chan struct{}, maxConcurrency)
-		var wg sync.WaitGroup
-		var errMu sync.Mutex
+	for i, app := range apps {
+		wg.Add(1)
+		go func(idx int, appInst *AppInstance) {
+			defer wg.Done()
 
-		for i, app := range runningApps {
-			wg.Add(1)
-			go func(idx int, appInst *AppInstance) {
-				defer wg.Done()
-
-				// Acquire semaphore
-				select {
-				case sem <- struct{}{}:
-					defer func() { <-sem }()
-				case <-ctx.Done():
-					errMu.Lock()
-					errs = append(errs, fmt.Errorf("app %s: context cancelled before stop", appInst.InstanceID))
-					errMu.Unlock()
-					return
-				}
-
-				log.Printf("INFO: [%d/%d] Stopping app %s...", idx+1, len(runningApps), appInst.InstanceID)
-
-				// Stop container group for this app
-				if err := m.stopAppForShutdown(ctx, appInst.InstanceID); err != nil {
-					log.Printf("WARN: Failed to stop app %s: %v", appInst.InstanceID, err)
-					errMu.Lock()
-					errs = append(errs, fmt.Errorf("stop %s: %w", appInst.InstanceID, err))
-					errMu.Unlock()
-				}
-
-				// Detach the app's encrypted volume
-				if err := m.detachAppVolume(ctx, appInst.InstanceID); err != nil {
-					log.Printf("WARN: Failed to detach volume for %s: %v", appInst.InstanceID, err)
-					errMu.Lock()
-					errs = append(errs, fmt.Errorf("detach %s: %w", appInst.InstanceID, err))
-					errMu.Unlock()
-				}
-
-				log.Printf("INFO: [%d/%d] Stopped app %s", idx+1, len(runningApps), appInst.InstanceID)
-			}(i, app)
-		}
-
-		wg.Wait()
-		log.Printf("INFO: Finished stopping running apps")
-	}
-
-	// Detach volumes for stopped apps (they may still have mounted volumes from earlier)
-	if len(stoppedApps) > 0 {
-		log.Printf("INFO: Detaching volumes for %d stopped apps...", len(stoppedApps))
-		for _, app := range stoppedApps {
-			if err := m.detachAppVolume(ctx, app.InstanceID); err != nil {
-				log.Printf("DEBUG: Volume detach for stopped app %s: %v", app.InstanceID, err)
-				// Don't treat as error - volume may already be detached
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("app %s: context cancelled before quiesce: %w", appInst.InstanceID, ctx.Err()))
+				errMu.Unlock()
+				return
 			}
-		}
+
+			log.Printf("INFO: [%d/%d] Quiescing app %s...", idx+1, len(apps), appInst.InstanceID)
+			if err := m.stopAppForShutdown(ctx, appInst.InstanceID); err != nil {
+				log.Printf("WARN: Failed to prove app %s quiescent; leaving volume attached: %v", appInst.InstanceID, err)
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("quiesce %s: %w", appInst.InstanceID, err))
+				errMu.Unlock()
+				return
+			}
+
+			if err := m.detachAppVolume(ctx, appInst.InstanceID); err != nil {
+				log.Printf("WARN: Failed to detach volume for %s: %v", appInst.InstanceID, err)
+				errMu.Lock()
+				errs = append(errs, fmt.Errorf("detach %s: %w", appInst.InstanceID, err))
+				errMu.Unlock()
+				return
+			}
+			log.Printf("INFO: [%d/%d] Quiesced app %s", idx+1, len(apps), appInst.InstanceID)
+		}(i, app)
 	}
+
+	wg.Wait()
 
 	log.Printf("INFO: Finished stopping all apps")
 
@@ -897,22 +870,19 @@ func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) 
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
-		// Volume might already be detached or unavailable
-		log.Printf("DEBUG: Could not get volume layout for %s: %v", instanceID, err)
+		// Runtime storage may already be unavailable, but PID 1 can still prove
+		// that the dedicated user cgroup is empty without consulting Podman.
+		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+			return errors.Join(fmt.Errorf("resolve volume layout: %w", err), quiesceErr)
+		}
+		m.finalizeQuiescedContainerGroup(ctx, app, def, piccoloModeFromExtensions(def.Extensions))
 		return nil
-	}
-
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
-	if err != nil {
-		return err
 	}
 
 	// Daemon shutdown is a transition-boundary quiesce exception: it may stop
 	// processes, but must not mutate app source/rootfs metadata or transition
 	// records. Startup recovery remains responsible for any active transition.
-	return m.stopContainerGroupWithOpts(ctx, stateMgr, app, def, layout, runtime, stopContainerGroupOpts{
-		ShutdownMode: true,
-	})
+	return m.quiesceContainerGroup(ctx, stateMgr, app, def, layout)
 }
 
 // detachAppVolume detaches (unmounts) an app's encrypted volume.
@@ -1232,6 +1202,7 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		},
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
+		startupRecovery:       make(map[string]startupRecoveryWindow),
 		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
@@ -1240,6 +1211,7 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 	}, nil
@@ -1267,6 +1239,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		},
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
+		startupRecovery:       make(map[string]startupRecoveryWindow),
 		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
@@ -1275,6 +1248,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 	}, nil
@@ -1296,6 +1270,9 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 	for _, app := range apps {
 		publishCID := strings.TrimSpace(app.PublishContainerID())
 		if publishCID == "" {
+			if m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(app.InstanceID)
+			}
 			continue
 		}
 		if m.manifestUpdateServiceRestoreBlocked(state, app.InstanceID) {
@@ -1327,21 +1304,25 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		def, err := state.GetAppDefinition(app.InstanceID)
 		if err != nil {
 			log.Printf("WARN: restore services: failed to read app definition for %s: %v", app.InstanceID, err)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
 		layout, err := m.ensureAppVolumeLayout(ctx, app.InstanceID)
 		if err != nil {
 			log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.InstanceID, err)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
-		runtime, err := m.podmanRuntimeForApp(app.InstanceID, layout, piccoloModeFromExtensions(def.Extensions))
+		runtime, err := m.podmanRuntimeForApp(ctx, app.InstanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeObserve)
 		if err != nil {
 			log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.InstanceID, err)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
 		ports, err := m.containerManager.InspectPublishedPorts(ctx, runtime, publishCID)
 		if err != nil {
 			log.Printf("WARN: restore services: podman port inspect failed for %s: %v", app.InstanceID, err)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
 		if len(ports) == 0 {
@@ -1350,6 +1331,7 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 		}
 		if _, err := m.serviceManager.RestoreFromPodman(app.InstanceID, def.Listeners, ports); err != nil {
 			log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.InstanceID, err)
+			m.serviceManager.DeactivateApp(app.InstanceID)
 			continue
 		}
 		m.configureOIDCAuthorizePaths(app.InstanceID, def)
@@ -1777,28 +1759,97 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 }
 
 func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
+	if _, err := m.reconcilePartialRollback(ctx, state, appInst); err != nil {
+		m.setObservedStatus(appInst.InstanceID, StatusError)
+		return fmt.Errorf("recover pending rollback before runtime: %w", err)
+	}
+
 	desiredRunning := appInst.Enabled
 	if m.LastObservedRole(cluster.ResourceForApp(appInst.InstanceID)) == cluster.RoleFollower {
 		desiredRunning = false
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
-	if err != nil {
-		return err
-	}
-
 	def, err := state.GetAppDefinition(appInst.InstanceID)
 	if err != nil {
+		if !desiredRunning {
+			if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr == nil {
+				m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
+				if m.serviceManager != nil {
+					m.serviceManager.DeactivateApp(appInst.InstanceID)
+				}
+				m.interruptStartupProbation(appInst.InstanceID)
+				if !appInst.Enabled {
+					m.clearStartupRecovery(appInst)
+				}
+				return nil
+			} else {
+				return errors.Join(err, quiesceErr)
+			}
+		}
 		return err
 	}
 
-	runtime, err := m.podmanRuntimeForApp(appInst.InstanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	layout, err := m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
 	if err != nil {
+		if !desiredRunning {
+			if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr != nil {
+				return errors.Join(err, quiesceErr)
+			}
+			m.finalizeQuiescedContainerGroup(ctx, appInst, def, piccoloModeFromExtensions(def.Extensions))
+			if !appInst.Enabled {
+				m.clearStartupRecovery(appInst)
+			}
+			return nil
+		}
+		return err
+	}
+
+	if !desiredRunning {
+		if err := m.quiesceContainerGroup(ctx, state, appInst, def, layout); err != nil {
+			return err
+		}
+		// Manual Stop may have committed Enabled=false before runtime cleanup
+		// failed. A later disabled reconcile that completes the stop owns the
+		// same successful stop boundary and clears the old startup budget. A
+		// follower keeps Enabled=true and therefore retains that history.
+		if !appInst.Enabled {
+			m.clearStartupRecovery(appInst)
+		}
+		return nil
+	}
+
+	mode := piccoloModeFromExtensions(def.Extensions)
+	if runtime, observeErr := m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeObserve); observeErr == nil &&
+		m.containerGroupObservedRunning(ctx, runtime, appInst, def) {
+		err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true)
+		if err != nil {
+			if m.startupAttemptActive(appInst.InstanceID) {
+				m.handleStartupFailure(state, appInst)
+			}
+			return err
+		}
+		m.markStartupRecoverySucceeded(state, appInst)
+		return nil
+	}
+
+	if !m.beginAutomaticStartupAttempt(state, appInst) {
+		return nil
+	}
+	runtime, err := m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeEnsureReady)
+	if err != nil {
+		m.handleStartupFailure(state, appInst)
 		return err
 	}
 
 	// Unified reconcile path: all apps (service and workspace) use container groups.
-	return m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, desiredRunning)
+	if err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true); err != nil {
+		if m.startupAttemptActive(appInst.InstanceID) {
+			m.handleStartupFailure(state, appInst)
+		}
+		return err
+	}
+	m.markStartupRecoverySucceeded(state, appInst)
+	return nil
 }
 
 func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.AppDefinition, instanceID, containerID string, runtime container.PodmanRuntime) error {
@@ -1997,7 +2048,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	if err != nil {
 		return nil, err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(appDef.Extensions))
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, piccoloModeFromExtensions(appDef.Extensions), appRuntimeEnsureReady)
 	if err != nil {
 		// Volume was created but runtime setup failed. Clean up the volume and
 		// any partially-created resources (per-app user, runroot).
@@ -2149,6 +2200,13 @@ func (m *AppManager) cleanupInstallResources(instanceID string, runtime containe
 	}
 }
 
+func (m *AppManager) destroyAppUser(instanceID string) error {
+	if m.appUserDestroyer != nil {
+		return m.appUserDestroyer(instanceID)
+	}
+	return container.DestroyAppUser(instanceID)
+}
+
 // Upsert installs a new application instance.
 // Deprecated: With multi-instance support, use Install() directly.
 // This method now always creates a new instance (no update behavior).
@@ -2214,7 +2272,7 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 	if err != nil {
 		return nil, fmt.Errorf("clone %s from %s: volume layout: %w", cloneID, originID, err)
 	}
-	runtime, err := m.podmanRuntimeForApp(cloneID, layout, ModeWorkspace)
+	runtime, err := m.podmanRuntimeForApp(ctx, cloneID, layout, ModeWorkspace, appRuntimeEnsureReady)
 	if err != nil {
 		m.cleanupInstallResources(cloneID, container.PodmanRuntime{}, originDef)
 		return nil, fmt.Errorf("clone %s from %s: podman runtime: %w", cloneID, originID, err)
@@ -2627,6 +2685,28 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 			return fmt.Errorf("app instance not found after image update recovery: %s", instanceID)
 		}
 	}
+	if !app.Enabled {
+		if err := state.UpdateAppEnabled(instanceID, true); err != nil {
+			return fmt.Errorf("failed to persist enabled state: %w", err)
+		}
+		var ok bool
+		app, ok = state.GetApp(instanceID)
+		if !ok {
+			return fmt.Errorf("app instance not found after enabling: %s", instanceID)
+		}
+	}
+	// A manual start is a new recovery observation/effect. It must not reuse
+	// healthy time accumulated before the loss that prompted this request.
+	m.interruptStartupProbation(instanceID)
+	defer func() {
+		if err != nil {
+			if !m.startupAttemptActive(instanceID) {
+				m.handleStartupFailure(state, app)
+			}
+			return
+		}
+		m.markStartupRecoverySucceeded(state, app)
+	}()
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
@@ -2638,7 +2718,7 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 		return fmt.Errorf("failed to load app definition: %w", defErr)
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeEnsureReady)
 	if err != nil {
 		return err
 	}
@@ -2646,10 +2726,6 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	// Unified start path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting containers", false, nil)
 	if strings.TrimSpace(app.NetworkAnchorID) == "" {
-		app.Enabled = true
-		if err := state.UpdateAppEnabled(instanceID, true); err != nil {
-			log.Printf("WARN: start %s: failed to persist enabled state before recovery recreate: %v", instanceID, err)
-		}
 		bn, rootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app)
 		if rootfsErr != nil {
 			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
@@ -2699,78 +2775,48 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		return nil
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
-	if err != nil {
-		return err
-	}
-
-	def, defErr := state.GetAppDefinition(instanceID)
-	mode := ModeService
-	if defErr == nil {
-		mode = piccoloModeFromExtensions(def.Extensions)
-	}
-
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
-	if err != nil {
-		return err
+	finish := func() {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
+		m.updateStatusWithEvent(instanceID, StatusStopped)
+		m.interruptStartupProbation(instanceID)
 	}
 
 	// Follower demotion is a transition-boundary quiesce exception: it may stop
 	// local containers, but must not change app source/rootfs metadata or consume
 	// transition records. The leader/recovery path owns the active transition.
-	if defErr == nil && mode == ModeService {
-		primary := primaryServiceFor(def, app)
-		order, _ := serviceStartOrder(def.Services)
-		for i := len(order) - 1; i >= 0; i-- {
-			svcName := order[i]
-			cid := strings.TrimSpace(app.Containers[svcName])
-			if cid == "" {
-				name := containerNameForService(instanceID, svcName, primary)
-				if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-					cid = id
-				}
-			}
-			if cid == "" {
-				continue
-			}
-			if err := m.containerManager.StopContainer(ctx, runtime, cid); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					return err
-				}
-			}
+	def, defErr := state.GetAppDefinition(instanceID)
+	if defErr != nil {
+		if err := m.quiesceAppUserSession(ctx, instanceID); err != nil {
+			return errors.Join(fmt.Errorf("read app definition before follower quiesce: %w", defErr), err)
 		}
-
-		anchorID := strings.TrimSpace(app.NetworkAnchorID)
-		if anchorID == "" {
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(instanceID)); err == nil {
-				anchorID = id
-			}
-		}
-		if anchorID != "" {
-			if err := m.containerManager.StopContainer(ctx, runtime, anchorID); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					return err
-				}
-			}
-		}
-
-		if m.serviceManager != nil {
-			m.serviceManager.DeactivateApp(instanceID)
-		}
+		finish()
 		return nil
 	}
 
-	if err := m.containerManager.StopContainer(ctx, runtime, app.PrimaryContainerID()); err != nil {
-		var notFound *container.ContainerNotFoundError
-		if !errors.As(err, &notFound) {
-			return err
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+			return errors.Join(fmt.Errorf("resolve volume layout before follower quiesce: %w", err), quiesceErr)
+		}
+		finish()
+		return nil
+	}
+	mode := piccoloModeFromExtensions(def.Extensions)
+	runtime, sessionQuiesced, err := m.quiesceRuntimeForApp(ctx, instanceID, layout, mode)
+	if err != nil {
+		return err
+	}
+	if !sessionQuiesced {
+		if stopErr := m.stopContainersForMultiApp(ctx, app, def, runtime); stopErr != nil {
+			log.Printf("WARN: follower demotion graceful stop failed for %s, quiescing dedicated user unit: %v", instanceID, stopErr)
+			if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+				return errors.Join(stopErr, quiesceErr)
+			}
 		}
 	}
-	if m.serviceManager != nil {
-		m.serviceManager.DeactivateApp(instanceID)
-	}
+	finish()
 	return nil
 }
 
@@ -2792,25 +2838,41 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	if !exists {
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
-
-	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
-	if err != nil {
-		return err
+	if err := state.UpdateAppEnabled(instanceID, false); err != nil {
+		return fmt.Errorf("failed to persist disabled state: %w", err)
 	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr != nil {
-		return fmt.Errorf("failed to load app definition: %w", defErr)
+		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+			return errors.Join(fmt.Errorf("failed to load app definition: %w", defErr), quiesceErr)
+		}
+		m.updateStatusWithEvent(instanceID, StatusStopped)
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
+		m.interruptStartupProbation(instanceID)
+		m.clearStartupRecovery(app)
+		return nil
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
-		return err
+		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+			return errors.Join(fmt.Errorf("resolve volume layout before stop: %w", err), quiesceErr)
+		}
+		m.finalizeQuiescedContainerGroup(ctx, app, def, piccoloModeFromExtensions(def.Extensions))
+		m.clearStartupRecovery(app)
+		return nil
 	}
 
 	// Unified stop path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseStopping, 40, "Stopping containers", false, nil)
-	return m.stopContainerGroup(ctx, state, app, def, layout, runtime)
+	if err := m.quiesceContainerGroup(ctx, state, app, def, layout); err != nil {
+		return err
+	}
+	m.clearStartupRecovery(app)
+	return nil
 }
 
 // Uninstall removes an application instance completely by instanceID,
@@ -2875,15 +2937,25 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	if !exists {
 		return fmt.Errorf("app instance not found: %s", instanceID)
 	}
+	// Persist the existing desired-state bit before teardown. If any later
+	// cleanup proof fails, the retained app record is both the retry owner and
+	// a durable instruction not to restart partially removed resources.
+	if err := state.UpdateAppEnabled(instanceID, false); err != nil {
+		return fmt.Errorf("disable app before uninstall: %w", err)
+	}
 
 	// Mark as uninstalling early so concurrent readers (log streams, exec) get a clean rejection
 	// instead of racing against infrastructure teardown. Rollback on failure so the app doesn't
 	// get stuck in "uninstalling" permanently.
 	prevStatus := m.getObservedStatus(instanceID)
+	quiesced := false
 	m.updateStatusWithEvent(instanceID, StatusUninstalling)
 	defer func() {
 		if err != nil {
 			rollback := prevStatus
+			if quiesced {
+				rollback = StatusStopped
+			}
 			if rollback == "" {
 				rollback = StatusStopped
 			}
@@ -2901,27 +2973,42 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return fmt.Errorf("failed to load app definition: %w", defErr)
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	mode := piccoloModeFromExtensions(def.Extensions)
+	runtime, runtimeUsable, err := m.quiesceContainerGroupRuntime(ctx, state, app, def, layout)
 	if err != nil {
 		return err
 	}
+	quiesced = true
 
-	// Unified uninstall path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseRemovingContainer, 40, "Removing containers", false, nil)
-	if err := m.uninstallContainerGroup(ctx, app, def, layout, runtime); err != nil {
-		return err
+	if !runtimeUsable {
+		if m.serviceManager != nil {
+			m.serviceManager.RemoveApp(instanceID)
+		}
+	} else {
+		if err := m.uninstallContainerGroup(ctx, app, def, runtime); err != nil {
+			return err
+		}
 	}
 
 	// Destroy block-native rootfs if applicable (before volume destroy).
-	mode := piccoloModeFromExtensions(def.Extensions)
 	m.destroyAllServiceRootfs(ctx, instanceID, mode, def)
 
 	// Reset podman storage BEFORE unmounting the volume.
 	// This allows podman to properly clean its metadata files (db.sql, locks, etc.)
 	// which live inside the encrypted volume.
 	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseCleaningVolumes, 80, "Purging app data", false, nil)
-	if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
-		log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
+	if runtimeUsable {
+		if err := m.containerManager.ResetStorage(ctx, runtime); err != nil {
+			log.Printf("WARN: podman storage reset for %s failed: %v", instanceID, err)
+		}
+		// ResetStorage is the final rootless command in this teardown. Quiesce
+		// once more afterward so volume destruction is gated not only on the
+		// container scopes, but also on UID-owned Podman helpers that may have
+		// been launched outside the dedicated user cgroup.
+		if err := m.quiesceAppUserSession(ctx, instanceID); err != nil {
+			return fmt.Errorf("quiesce per-app processes before purging data: %w", err)
+		}
 	}
 
 	// Destroy the volume (detaches, then removes ciphertext, metadata, mount directory)
@@ -2935,19 +3022,32 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	}
 
 	// Remove podman runRoot which lives outside the encrypted volume
-	if err := os.RemoveAll(runtime.RunRoot); err != nil {
-		log.Printf("WARN: failed to remove podman runRoot %s: %v", runtime.RunRoot, err)
+	runRoot := runtime.RunRoot
+	if runRoot == "" {
+		runRoot = filepath.Join(podmanRunRootBase(), volID)
+	}
+	if err := os.RemoveAll(runRoot); err != nil {
+		log.Printf("WARN: failed to remove podman runRoot %s: %v", runRoot, err)
+	}
+	serviceRoot := runtime.Root
+	if serviceRoot == "" {
+		serviceRoot = paths.PodmanJoin("apps", instanceID)
+	}
+	if err := os.RemoveAll(serviceRoot); err != nil {
+		log.Printf("WARN: failed to remove podman service root %s: %v", serviceRoot, err)
 	}
 
-	// Destroy the per-app Linux user. Non-fatal — the user has no data left to access.
-	if err := container.DestroyAppUser(instanceID); err != nil {
-		log.Printf("WARN: failed to destroy per-app user for %s: %v", instanceID, err)
+	// User/session cleanup is part of successful uninstall. Keep the disabled
+	// app record until it succeeds so a later uninstall can retry safely.
+	if err := m.destroyAppUser(instanceID); err != nil {
+		return fmt.Errorf("failed to destroy per-app user: %w", err)
 	}
 
 	// Remove from filesystem and cache (state only)
 	if err := state.RemoveApp(instanceID); err != nil {
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
+	m.clearStartupRecovery(app)
 
 	// Clean up observed status and emit "uninstalled" event.
 	// Status is deterministically StatusUninstalling here (set at entry, no rollback on success).
@@ -3019,7 +3119,7 @@ func (m *AppManager) updateImageLocked(ctx context.Context, instanceID string) (
 		return fmt.Errorf("image update not supported for mode %q", mode)
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return err
 	}
@@ -3647,9 +3747,17 @@ func (m *AppManager) updateServiceModeImage(
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseStopping, 50, "Stopping containers", false, nil)
 
-	// 5. Stop ALL containers (services in reverse dep order, then anchor).
-	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
-		log.Printf("WARN: update %s: stop containers: %v", instanceID, err)
+	// 5. Prove the app quiescent before creating any data snapshot or
+	// detaching/replacing rootfs. A failed proof leaves the existing runtime and
+	// storage untouched.
+	if err := m.quiesceContainerGroup(ctx, state, appInst, curDef, layout); err != nil {
+		return fmt.Errorf("quiesce before image update: %w", err)
+	}
+	// PID 1 fallback may have stopped the user manager. Reacquire it for the
+	// later Podman cleanup/recreate commands; no workload is started here.
+	runtime, err = m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
+	if err != nil {
+		return fmt.Errorf("reacquire runtime after image-update quiesce: %w", err)
 	}
 	if imageTxn != nil {
 		imageTxn.Phase = imageUpdatePhaseRuntimeSwitch
@@ -4088,6 +4196,11 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 			m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseComplete, 100, "Rollback complete", true, nil)
 		}
 	}()
+	if recovered, recoverErr := m.reconcilePartialRollback(ctx, state, appInst); recoverErr != nil {
+		return fmt.Errorf("recover pending rollback: %w", recoverErr)
+	} else if recovered {
+		return m.reconcileApp(ctx, state, appInst)
+	}
 
 	ts, err := state.LoadTupleState(instanceID)
 	if err != nil {
@@ -4110,20 +4223,14 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 	if err != nil {
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
-	if err != nil {
-		return err
-	}
-
-	// 1. Stop ALL containers.
-	if err := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
-		log.Printf("WARN: rollback %s: stop containers: %v", instanceID, err)
+	// 1. Prove process absence before any data LV rename or rootfs detach.
+	if err := m.quiesceContainerGroup(ctx, state, appInst, curDef, layout); err != nil {
+		return fmt.Errorf("quiesce before rollback: %w", err)
 	}
 
 	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseSnapshotting, 30, "Restoring data volume", false, nil)
 
 	// 2. Rollback data volume if snapshot has one.
-	dataVolumeOK := true
 	snapshotCanPromote := true // false only in partial-rename case
 	if snap.DataSnapshot != "" {
 		rollbacker, ok := m.currentVolumeManager().(dataVolumeRollbacker)
@@ -4141,9 +4248,30 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 					instanceID, activeGen.ID, failedGenNumber)
 			}
 		}
-		failedLVName, err := m.allocateFailedDataLVName(ctx, state, instanceID, failedGenNumber, ts)
-		if err != nil {
-			return fmt.Errorf("allocate failed data LV name: %w", err)
+		failedLVName := ""
+		trackingGen := activeGen
+		if trackingGen == nil {
+			if current := ts.GenerationByID(ts.CurrentGeneration); current != nil && current.Status == TupleStatusFailed {
+				trackingGen = current
+			}
+		}
+		if trackingGen != nil && trackingGen.Status == TupleStatusFailed {
+			failedLVName = strings.TrimSpace(trackingGen.FailedLVName)
+		}
+		if failedLVName == "" {
+			failedLVName, err = m.allocateFailedDataLVName(ctx, state, instanceID, failedGenNumber, ts)
+			if err != nil {
+				return fmt.Errorf("allocate failed data LV name: %w", err)
+			}
+		}
+		// Persist the intended LV swap before the first irreversible rename.
+		// If the daemon exits anywhere inside RollbackDataVolume or before the
+		// promoted tuple write, startup recovery can safely invoke the idempotent
+		// rollback primitive with the same names.
+		snap.RollbackPending = true
+		snap.RollbackFailedLVName = failedLVName
+		if err := state.StoreTupleState(instanceID, ts); err != nil {
+			return fmt.Errorf("persist rollback LV intent: %w", err)
 		}
 
 		renamesCommitted, snapshotPromoted, rollbackErr := rollbacker.RollbackDataVolume(ctx, instanceID, snap.DataSnapshot, failedLVName)
@@ -4152,11 +4280,15 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 			// Containers were stopped in step 1 but no LV state changed, so the reconciler
 			// will detect stopped containers and restart them on the next pass.
 			log.Printf("ERROR: rollback %s: data volume rollback failed (no LV change): %v", instanceID, rollbackErr)
+			snap.RollbackPending = false
+			snap.RollbackFailedLVName = ""
+			if storeErr := state.StoreTupleState(instanceID, ts); storeErr != nil {
+				return errors.Join(fmt.Errorf("data volume rollback: %w", rollbackErr), fmt.Errorf("clear rollback LV intent: %w", storeErr))
+			}
 			return fmt.Errorf("data volume rollback: %w", rollbackErr)
 		}
 		if rollbackErr != nil {
 			log.Printf("ERROR: rollback %s: LV rename(s) committed but incomplete: %v", instanceID, rollbackErr)
-			dataVolumeOK = false
 		}
 		if !snapshotPromoted {
 			// Partial rename: active→failed succeeded but snapshot→active failed.
@@ -4166,32 +4298,20 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 
 		// Record failed LV name for GC tracking.
 		if renamesCommitted {
-			if activeGen != nil {
-				activeGen.FailedLVName = failedLVName
-			} else {
-				// No active generation (update failed before recordPostUpdateGeneration).
-				// Create a tracking entry so GC can clean the orphaned LV.
-				failedNow := time.Now()
-				ts.Generations = append(ts.Generations, TupleGeneration{
-					ID:           fmt.Sprintf("gen-failed-%d", failedGenNumber),
-					Status:       TupleStatusFailed,
-					FailedLVName: failedLVName,
-					FailedAt:     &failedNow,
-					CreatedAt:    failedNow,
-				})
-			}
+			recordFailedRollbackLV(ts, trackingGen, failedLVName, failedGenNumber)
 		}
 	}
 
-	// Re-resolve snap pointer — the append above may have reallocated the slice.
+	// 3. Commit generation and app truth immediately after the irreversible LV
+	// rename boundary. Runtime/session reacquisition is deliberately later: a
+	// failed user-manager repair must not leave durable metadata describing the
+	// pre-rename world.
+	// Re-resolve snap pointer because failed-generation tracking may have
+	// reallocated the slice.
 	snap = ts.LatestSnapshot()
 	if snap == nil {
-		// Should not happen — snapshot was validated above. Defensive check.
 		return fmt.Errorf("rollback %s: snapshot generation lost after slice mutation", instanceID)
 	}
-
-	// 3. Update generation statuses EARLY — LV renames are committed at this point
-	// and tuple state must reflect reality even if container creation is skipped.
 	if active := ts.ActiveGeneration(); active != nil {
 		active.Status = TupleStatusFailed
 		failedNow := time.Now()
@@ -4200,51 +4320,50 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 	if snapshotCanPromote {
 		snap.Status = TupleStatusActive
 		snap.DataSnapshot = "" // promoted — no longer a snapshot LV
+		snap.RollbackAttempted = true
+		snap.RollbackPending = false
+		snap.RollbackFailedLVName = ""
+		appStateCommitted := false
+		snap.RollbackAppStateCommitted = &appStateCommitted
 		ts.CurrentGeneration = snap.ID
 	}
 
-	// 4. Swap ActiveRootfs to snapshot generation's rootfs.
-	appInst.ActiveRootfs = make(map[string]string, len(snap.RootfsVolIDs))
-	for k, v := range snap.RootfsVolIDs {
-		appInst.ActiveRootfs[k] = v
-	}
-	appInst.UpdatedAt = time.Now()
-
-	// Restore pre-update definition (best-effort)
-	if prevDef, defErr := state.GetPreviousAppDefinition(instanceID); defErr == nil {
-		appInst.Definition = prevDef
-		curDef = prevDef // ensure container recreation uses restored definition
-	} else {
-		log.Printf("WARN: rollback %s: no previous definition to restore: %v", instanceID, defErr)
-	}
-
-	// 5. Persist state BEFORE container creation — ensures metadata matches LV reality
-	// even if subsequent steps fail.
 	if err := state.StoreTupleState(instanceID, ts); err != nil {
-		log.Printf("WARN: rollback %s: persist tuple state: %v", instanceID, err)
-	}
-	if err := state.StoreApp(appInst); err != nil {
 		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("store app state during rollback: %w", err)
+		return fmt.Errorf("persist tuple state after rollback LV commit: %w", err)
 	}
-
-	// 6. If data volume attach failed, remove old containers and clear container state.
-	// Reconciler will retry mount + container recreation using updated ActiveRootfs.
-	if !dataVolumeOK {
-		if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
-			log.Printf("WARN: rollback %s: remove containers after attach failure: %v", instanceID, err)
+	if snapshotCanPromote {
+		if err := m.commitRollbackAppState(state, appInst, ts, snap); err != nil {
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("commit app state during rollback: %w", err)
 		}
-		appInst.NetworkAnchorID = ""
-		appInst.Containers = nil
-		_ = state.StoreAppMetadata(appInst)
+		curDef = appInst.Definition
+		mode = piccoloModeFromExtensions(curDef.Extensions)
+	} else {
 		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("rollback %s: data volume not mounted (LV renames committed, reconciler will retry)", instanceID)
+		return fmt.Errorf("rollback %s: active LV renamed but snapshot promotion is incomplete; durable tuple state retained for retry", instanceID)
 	}
 
-	// 7. Capture endpoints for port reuse (keep service registry intact for proxies).
+	// 4. Rollback may have replaced the active data LV, and PID 1 fallback may
+	// have stopped the user manager. Resolve both only after durable truth is
+	// committed, then use them for Podman cleanup/recreation.
+	layout, err = m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("resolve layout after rollback: %w", err)
+	}
+	// A promoted-but-unattached LV is recoverable: successful layout resolution
+	// above proves the attach retry completed, so runtime recreation may proceed.
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
+	if err != nil {
+		m.setObservedStatus(instanceID, StatusError)
+		return fmt.Errorf("reacquire runtime after rollback: %w", err)
+	}
+
+	// 5. Capture endpoints for port reuse (keep service registry intact for proxies).
 	endpoints, _ := m.serviceManager.GetByApp(instanceID)
 
-	// 8. Remove ALL containers (but preserve service registry — proxies stay running).
+	// 6. Remove ALL containers (but preserve service registry — proxies stay running).
 	if err := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); err != nil {
 		log.Printf("WARN: rollback %s: remove containers: %v", instanceID, err)
 	}
@@ -4262,7 +4381,7 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 
 	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseRecreatingContainer, 60, "Recreating containers", false, nil)
 
-	// 9. Attach snapshot rootfs and recreate containers.
+	// 8. Attach snapshot rootfs and recreate containers.
 	rootfs := m.currentRootfsManager()
 	var prebuiltRootfs map[string]*rootfsMountInfo
 	if rootfs != nil {
@@ -4280,7 +4399,7 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 		return fmt.Errorf("recreate containers after rollback: %w", err)
 	}
 
-	// 10. Update container IDs and persist final state.
+	// 9. Update container IDs and persist final state.
 	appInst.NetworkAnchorID = result.NetworkAnchorID
 	appInst.Containers = result.Containers
 	appInst.PrimaryService = result.PrimaryService
@@ -4358,7 +4477,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		return nil, fmt.Errorf("listener updates are only supported for workspace mode apps")
 	}
 
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return nil, err
 	}
@@ -4410,9 +4529,19 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		// stop/remove/recreate the container wrapper without data loss.
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseRecreatingContainer, 50, "Recreating containers", false, nil)
 
-		// Stop and remove ALL containers (services + anchor).
-		if stopErr := m.stopContainersForMultiApp(ctx, appInst, curDef, runtime); stopErr != nil {
-			log.Printf("WARN: update listeners %s: stop containers: %v", instanceID, stopErr)
+		// Reuse the lifecycle quiescence boundary before replacing the wrapper.
+		// If proof fails, restore the old listener allocation and leave runtime
+		// storage untouched.
+		if quiesceErr := m.quiesceContainerGroup(ctx, state, appInst, curDef, layout); quiesceErr != nil {
+			_, _, rollbackErr := m.serviceManager.Reconcile(instanceID, curDef.Listeners)
+			if rollbackErr != nil {
+				return nil, errors.Join(fmt.Errorf("quiesce before listener update: %w", quiesceErr), fmt.Errorf("restore listener allocation: %w", rollbackErr))
+			}
+			return nil, fmt.Errorf("quiesce before listener update: %w", quiesceErr)
+		}
+		runtime, err = m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
+		if err != nil {
+			return nil, fmt.Errorf("reacquire runtime after listener quiesce: %w", err)
 		}
 		if rmErr := m.removeContainersForMultiApp(ctx, appInst, curDef, runtime); rmErr != nil {
 			log.Printf("WARN: update listeners %s: remove containers: %v", instanceID, rmErr)
@@ -4539,7 +4668,7 @@ func (m *AppManager) LogsForService(ctx context.Context, instanceID, service str
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeObserve)
 	if err != nil {
 		return nil, err
 	}
@@ -4605,7 +4734,7 @@ func (m *AppManager) LogsStreamForService(ctx context.Context, instanceID, servi
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeObserve)
 	if err != nil {
 		return nil, err
 	}
@@ -4757,7 +4886,7 @@ func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, ser
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeObserve)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create podman runtime: %w", err)
 	}

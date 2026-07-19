@@ -24,6 +24,15 @@ const (
 	msgStartupFailed             = "Startup failed after repeated attempts"
 )
 
+// startupRecoveryWindow contains the process-local portion of startup
+// recovery tracking. AppInstance retains the existing attempt count and first
+// failure time; this map records whether that attempt is currently in flight
+// and when continuous-running probation began.
+type startupRecoveryWindow struct {
+	AttemptActive  bool
+	ProbationSince time.Time
+}
+
 // shouldEscalateToError checks if startup failures have exceeded escalation thresholds.
 func shouldEscalateToError(app *AppInstance) bool {
 	if app.StartupAttempts >= startupEscalateAfterAttempts {
@@ -51,10 +60,139 @@ func recordStartupFailure(app *AppInstance) string {
 	return "starting"
 }
 
-// resetStartupTracking clears startup failure tracking on successful start.
+// resetStartupTracking clears the existing process-local startup history.
 func resetStartupTracking(app *AppInstance) {
 	app.StartupAttempts = 0
 	app.FirstStartupFailureAt = nil
+}
+
+// beginAutomaticStartupAttempt checks the existing escalation guard before
+// consuming an attempt. An already-active attempt belongs to the current
+// reconcile pass and must not be counted twice by a nested repair path.
+func (m *AppManager) beginAutomaticStartupAttempt(state *FilesystemStateManager, appInst *AppInstance) bool {
+	m.startupRecoveryMu.Lock()
+	if m.startupRecovery == nil {
+		m.startupRecovery = make(map[string]startupRecoveryWindow)
+	}
+	window := m.startupRecovery[appInst.InstanceID]
+	if window.AttemptActive {
+		m.startupRecoveryMu.Unlock()
+		log.Printf("INFO: startup recovery reusing active attempt instance=%s attempt=%d", appInst.InstanceID, appInst.StartupAttempts)
+		return true
+	}
+	// Reaching this path means the desired-running app was observed lost or
+	// unusable. That observation breaks continuous-running probation even when
+	// the existing attempt/time guard rejects the next automatic effect.
+	window.ProbationSince = time.Time{}
+	m.startupRecovery[appInst.InstanceID] = window
+	if shouldEscalateToError(appInst) {
+		m.startupRecoveryMu.Unlock()
+		m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
+		return false
+	}
+
+	appInst.StartupAttempts++
+	if appInst.FirstStartupFailureAt == nil {
+		now := time.Now()
+		appInst.FirstStartupFailureAt = &now
+	}
+	window.AttemptActive = true
+	m.startupRecovery[appInst.InstanceID] = window
+	m.startupRecoveryMu.Unlock()
+	log.Printf("INFO: startup recovery attempt started instance=%s attempt=%d", appInst.InstanceID, appInst.StartupAttempts)
+
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		log.Printf("WARN: begin startup recovery %s: failed to persist state: %v", appInst.InstanceID, err)
+	}
+	m.updateStatusPreservingMessageWithEvent(appInst.InstanceID, StatusStarting)
+	return true
+}
+
+func (m *AppManager) startupAttemptActive(instanceID string) bool {
+	m.startupRecoveryMu.Lock()
+	defer m.startupRecoveryMu.Unlock()
+	return m.startupRecovery[instanceID].AttemptActive
+}
+
+// markStartupRecoverySucceeded starts (or advances) the continuous-running
+// probation window. Recovery history is cleared only after a full healthy
+// window has been observed by ordinary reconciliation.
+func (m *AppManager) markStartupRecoverySucceeded(state *FilesystemStateManager, appInst *AppInstance) {
+	m.startupRecoveryMu.Lock()
+	window := m.startupRecovery[appInst.InstanceID]
+	window.AttemptActive = false
+	if appInst.StartupAttempts == 0 || appInst.FirstStartupFailureAt == nil {
+		delete(m.startupRecovery, appInst.InstanceID)
+		m.startupRecoveryMu.Unlock()
+		return
+	}
+
+	now := time.Now()
+	if window.ProbationSince.IsZero() {
+		window.ProbationSince = now
+		m.startupRecovery[appInst.InstanceID] = window
+		m.startupRecoveryMu.Unlock()
+		return
+	}
+	if now.Sub(window.ProbationSince) < startupEscalateAfterDuration {
+		m.startupRecovery[appInst.InstanceID] = window
+		m.startupRecoveryMu.Unlock()
+		return
+	}
+
+	resetStartupTracking(appInst)
+	delete(m.startupRecovery, appInst.InstanceID)
+	m.startupRecoveryMu.Unlock()
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		log.Printf("WARN: startup probation %s: failed to persist cleared state: %v", appInst.InstanceID, err)
+	}
+}
+
+func (m *AppManager) clearStartupRecovery(appInst *AppInstance) {
+	if appInst == nil {
+		return
+	}
+	m.startupRecoveryMu.Lock()
+	resetStartupTracking(appInst)
+	delete(m.startupRecovery, appInst.InstanceID)
+	m.startupRecoveryMu.Unlock()
+}
+
+func (m *AppManager) interruptStartupProbation(instanceID string) {
+	m.startupRecoveryMu.Lock()
+	if window, ok := m.startupRecovery[instanceID]; ok {
+		// Quiescence breaks continuous-running probation, but it must not erase
+		// ownership of an in-flight recovery attempt. Nested recreate failures
+		// would otherwise count the same attempt twice.
+		window.ProbationSince = time.Time{}
+		m.startupRecovery[instanceID] = window
+	}
+	m.startupRecoveryMu.Unlock()
+}
+
+// containerGroupObservedRunning is deliberately observe-only. It is used to
+// distinguish a healthy reconcile pass from one that is about to perform a
+// session or container recovery effect.
+func (m *AppManager) containerGroupObservedRunning(ctx context.Context, runtime container.PodmanRuntime, appInst *AppInstance, def *api.AppDefinition) bool {
+	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
+	if anchorID == "" {
+		return false
+	}
+	anchorState, err := m.containerManager.InspectContainerState(ctx, runtime, anchorID)
+	if err != nil || !anchorState.Exists || !anchorState.Running {
+		return false
+	}
+	for svcName := range def.Services {
+		cid := strings.TrimSpace(appInst.Containers[svcName])
+		if cid == "" {
+			return false
+		}
+		state, err := m.containerManager.InspectContainerState(ctx, runtime, cid)
+		if err != nil || !state.Exists || !state.Running {
+			return false
+		}
+	}
+	return true
 }
 
 // handleStartupFailure records a startup failure, persists state, and emits the appropriate status event.
@@ -62,7 +200,26 @@ func resetStartupTracking(app *AppInstance) {
 // When escalating to "error", sets a user-facing message. When remaining in "starting",
 // preserves whatever message was set by the caller (e.g., "Containers not found, recreating").
 func (m *AppManager) handleStartupFailure(state *FilesystemStateManager, appInst *AppInstance) string {
-	status := recordStartupFailure(appInst)
+	m.startupRecoveryMu.Lock()
+	window := m.startupRecovery[appInst.InstanceID]
+	ownedAttempt := window.AttemptActive
+	if window.AttemptActive {
+		window.AttemptActive = false
+		window.ProbationSince = time.Time{}
+		m.startupRecovery[appInst.InstanceID] = window
+	} else {
+		recordStartupFailure(appInst)
+	}
+	status := StatusStarting
+	if shouldEscalateToError(appInst) {
+		status = StatusError
+	}
+	m.startupRecoveryMu.Unlock()
+	if ownedAttempt {
+		log.Printf("WARN: startup recovery attempt failed instance=%s attempt=%d", appInst.InstanceID, appInst.StartupAttempts)
+	} else {
+		log.Printf("WARN: startup failure recorded outside an owned attempt instance=%s attempt=%d", appInst.InstanceID, appInst.StartupAttempts)
+	}
 	if err := state.StoreAppMetadata(appInst); err != nil {
 		log.Printf("WARN: handleStartupFailure %s: failed to persist state: %v", appInst.InstanceID, err)
 	}
@@ -111,11 +268,27 @@ func (m *AppManager) recreateServiceContainer(ctx context.Context, state *Filesy
 func (m *AppManager) recoverStaleAnchor(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, reason string, prebuiltRootfs map[string]*rootfsMountInfo) error {
 	log.Printf("INFO: app %s: %s", appInst.InstanceID, reason)
 
-	// Stop and remove with strict error handling.
-	// If stop/remove fails (e.g. unkillable zombie), abort recreation to avoid
-	// duplicate container conflicts or resource leaks.
+	// Prefer Podman's graceful stop. A dead per-app user manager can leave
+	// Podman metadata claiming that containers are running even though their
+	// conmon processes were killed. In that case, use the existing PID 1
+	// quiescence proof, repair the user session, and continue metadata cleanup
+	// through the reacquired rootless runtime.
 	if err := m.stopContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
-		return fmt.Errorf("stop failed during recovery: %w", err)
+		log.Printf("WARN: app %s: graceful stop failed during recovery, quiescing dedicated user unit: %v", appInst.InstanceID, err)
+		if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr != nil {
+			return errors.Join(
+				fmt.Errorf("stop failed during recovery: %w", err),
+				fmt.Errorf("PID 1 quiesce failed during recovery: %w", quiesceErr),
+			)
+		}
+		repairedRuntime, runtimeErr := m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeEnsureReady)
+		if runtimeErr != nil {
+			return errors.Join(
+				fmt.Errorf("stop failed during recovery: %w", err),
+				fmt.Errorf("reacquire rootless runtime after PID 1 quiesce: %w", runtimeErr),
+			)
+		}
+		runtime = repairedRuntime
 	}
 	if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
 		return fmt.Errorf("remove failed during recovery: %w", err)
@@ -152,11 +325,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-
-	// Recover from partially-completed rollbacks (crash between LV rename steps).
-	if err := m.reconcilePartialRollback(ctx, state, appInst.InstanceID); err != nil {
-		log.Printf("WARN: reconcile app %s: partial rollback recovery: %v", appInst.InstanceID, err)
-	}
 
 	// Tuple health: auto-rollback (StatusError from previous pass) and auto-deprecation (24h healthy).
 	// Must run before container state checks so auto-rollback triggers before container recreation attempts.
@@ -230,7 +398,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		// If startup failures have exceeded escalation thresholds, stop retrying
 		// expensive recreation. This prevents infinite loops when recreation
 		// consistently fails (e.g., storage path mismatch after upgrade).
-		if shouldEscalateToError(appInst) {
+		if shouldEscalateToError(appInst) && !m.startupAttemptActive(appInst.InstanceID) {
 			// Clean up stale containers/proxies once on first escalation,
 			// then skip on subsequent cycles (status already error).
 			if m.getObservedStatus(appInst.InstanceID) != StatusError {
@@ -285,6 +453,19 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		// Observed status reflects local container state - containers are stopped on this machine.
 		m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 		return nil
+	}
+
+	// A killed user manager can leave Podman claiming that the recorded PID is
+	// running after it has disappeared or been reused. Starting that metadata is
+	// a successful no-op, so route the stale state through the existing strict
+	// whole-group recovery boundary instead.
+	if anchorState.Stale {
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+		return m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+			"anchor process no longer belongs to its libpod cgroup", bn)
 	}
 
 	// Ensure anchor running.
@@ -383,6 +564,15 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			continue
 		}
 
+		if st.Stale {
+			bn, rootfsErr := rootfsMap()
+			if rootfsErr != nil {
+				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+			}
+			return m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+				fmt.Sprintf("service %q process no longer belongs to its libpod cgroup", svcName), bn)
+		}
+
 		if !st.Running {
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 				log.Printf("INFO: reconcile app %s: service '%s' (cid=%s) start failed (%v), recreating",
@@ -416,10 +606,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	if m.getObservedStatus(appInst.InstanceID) != StatusRunning {
-		resetStartupTracking(appInst)
-		if err := state.StoreAppMetadata(appInst); err != nil {
-			log.Printf("WARN: reconcile %s: failed to persist startup tracking reset: %v", appInst.InstanceID, err)
-		}
 		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 	} else {
 		// Clear any transient message from in-place recovery (e.g. single service recreation)
@@ -437,7 +623,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 	if err := m.ensurePodmanPublishes(ctx, def, appInst.InstanceID, anchorID, runtime); err != nil {
 		if errors.Is(err, container.ErrPortReconciliationRequired) {
-			if shouldEscalateToError(appInst) {
+			if !m.beginAutomaticStartupAttempt(state, appInst) {
 				if m.getObservedStatus(appInst.InstanceID) != StatusError {
 					m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusError, msgStartupFailed)
 				}
@@ -496,13 +682,12 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			if time.Since(appInst.UpdatedAt) < 2*time.Minute {
 				log.Printf("WARN: reconcile app %s: backend unhealthy but recently updated, deferring DNAT repair",
 					appInst.InstanceID)
-			} else if shouldEscalateToError(appInst) {
+			} else if !m.beginAutomaticStartupAttempt(state, appInst) {
 				log.Printf("WARN: reconcile app %s: backend unhealthy after %d DNAT repair attempts, escalating to error",
 					appInst.InstanceID, appInst.StartupAttempts)
-				m.handleStartupFailure(state, appInst)
 			} else {
 				log.Printf("INFO: reconcile app %s: backend unhealthy with running containers, likely stale DNAT — recreating with new ports (attempt %d)",
-					appInst.InstanceID, appInst.StartupAttempts+1)
+					appInst.InstanceID, appInst.StartupAttempts)
 				m.setObservedStatusMessage(appInst.InstanceID, "Repairing stale network routes")
 				// Resolve rootfs handles before handleStartupFailure / teardown:
 				// a transient attach error must not escalate a running app to
@@ -511,21 +696,8 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				if rootfsErr != nil {
 					return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 				}
-				m.handleStartupFailure(state, appInst)
-				// Preserve the startup attempt counter across recreation.
-				// recreateMissingMultiContainer resets it on success, but for DNAT repair
-				// we need to accumulate attempts so the escalation threshold works.
-				savedAttempts := appInst.StartupAttempts
-				savedFirstFailure := appInst.FirstStartupFailureAt
 				err := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
 					"stale DNAT rules detected: backend unhealthy with running containers", bn)
-				if err == nil {
-					appInst.StartupAttempts = savedAttempts
-					appInst.FirstStartupFailureAt = savedFirstFailure
-					if storeErr := state.StoreAppMetadata(appInst); storeErr != nil {
-						log.Printf("WARN: reconcile app %s: failed to persist DNAT repair tracking: %v", appInst.InstanceID, storeErr)
-					}
-				}
 				return err
 			}
 		}
@@ -570,13 +742,12 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 
 		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs)
 		if err == nil {
-			// Preserve timestamps and reset failure tracking after successful recovery.
+			// Preserve timestamps and recovery tracking after successful recovery.
 			newInst.CreatedAt = appInst.CreatedAt
 			newInst.UpdatedAt = time.Now()
 			appInst.PrimaryService = newInst.PrimaryService
 			appInst.NetworkAnchorID = newInst.NetworkAnchorID
 			appInst.Containers = newInst.Containers
-			resetStartupTracking(appInst)
 			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 			if err := state.StoreAppMetadata(appInst); err != nil {
 				log.Printf("WARN: reconcile app %s: failed to persist recovered state: %v", appInst.InstanceID, err)
@@ -664,41 +835,71 @@ func (m *AppManager) createContainerWithRetry(ctx context.Context, runtime conta
 
 func (m *AppManager) stopContainersForMultiApp(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
 	primary := primaryServiceFor(def, appInst)
-	order, _ := serviceStartOrder(def.Services)
+	order, err := serviceStartOrder(def.Services)
+	if err != nil {
+		return err
+	}
 	var errs []error
-
-	for i := len(order) - 1; i >= 0; i-- {
-		svcName := order[i]
-		stored := strings.TrimSpace(appInst.Containers[svcName])
-		if stored != "" {
-			if err := m.containerManager.StopContainer(ctx, runtime, stored); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					errs = append(errs, fmt.Errorf("stop %s: %w", svcName, err))
-				}
-			}
+	seenIDs := make(map[string]struct{})
+	stopID := func(label, id string) {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			return
 		}
-		name := containerNameForService(appInst.InstanceID, svcName, primary)
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" && id != stored {
-			if err := m.containerManager.StopContainer(ctx, runtime, id); err != nil {
-				var notFound *container.ContainerNotFoundError
-				if !errors.As(err, &notFound) {
-					errs = append(errs, fmt.Errorf("stop %s (resolved): %w", svcName, err))
-				}
-			}
+		if _, seen := seenIDs[id]; seen {
+			return
 		}
-	}
-	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
-	if anchorID == "" {
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil {
-			anchorID = id
-		}
-	}
-	if anchorID != "" {
-		if err := m.containerManager.StopContainer(ctx, runtime, anchorID); err != nil {
+		seenIDs[id] = struct{}{}
+		if err := m.containerManager.StopContainer(ctx, runtime, id); err != nil {
 			var notFound *container.ContainerNotFoundError
 			if !errors.As(err, &notFound) {
-				errs = append(errs, fmt.Errorf("stop anchor: %w", err))
+				errs = append(errs, fmt.Errorf("stop %s (%s): %w", label, id, err))
+			}
+		}
+	}
+	stopResolved := func(label, name, stored string) {
+		id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name)
+		if err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				errs = append(errs, fmt.Errorf("resolve %s by deterministic name %s: %w", label, name, err))
+			}
+			return
+		}
+		id = strings.TrimSpace(id)
+		if id != "" && id != strings.TrimSpace(stored) {
+			stopID(label+" (resolved)", id)
+		}
+	}
+
+	for i := len(order) - 1; i >= 0; i-- {
+		if ctx.Err() != nil {
+			errs = append(errs, ctx.Err())
+			break
+		}
+		svcName := order[i]
+		stored := strings.TrimSpace(appInst.Containers[svcName])
+		stopID(svcName, stored)
+		name := containerNameForService(appInst.InstanceID, svcName, primary)
+		stopResolved(svcName, name, stored)
+	}
+	if ctx.Err() == nil {
+		anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
+		stopID("anchor", anchorID)
+		stopResolved("anchor", networkAnchorContainerName(appInst.InstanceID), anchorID)
+	}
+	if ctx.Err() == nil {
+		items, listErr := m.containerManager.ListContainersByLabel(ctx, runtime, "io.piccolo.instance", appInst.InstanceID)
+		if listErr != nil {
+			errs = append(errs, fmt.Errorf("list containers owned by app %s: %w", appInst.InstanceID, listErr))
+		} else {
+			for _, item := range items {
+				id := strings.TrimSpace(item.ID)
+				if id == "" {
+					errs = append(errs, fmt.Errorf("container owned by app %s has no ID (name %q)", appInst.InstanceID, item.Name))
+					continue
+				}
+				stopID("label-owned container "+item.Name, id)
 			}
 		}
 	}

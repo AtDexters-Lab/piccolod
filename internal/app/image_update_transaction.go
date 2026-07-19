@@ -292,17 +292,23 @@ func (m *AppManager) abortV2OnlyImageUpdateTransition(ctx context.Context, state
 		return err
 	}
 	mode := piccoloModeFromExtensions(def.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, runtimeUsable, err := m.quiesceContainerGroupRuntime(ctx, state, appInst, def, layout)
 	if err != nil {
-		return err
+		return fmt.Errorf("quiesce uncertain image update runtime: %w", err)
 	}
-	if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
-		return fmt.Errorf("remove uncertain image update runtime: %w", err)
+	if runtimeUsable {
+		if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
+			return fmt.Errorf("remove uncertain image update runtime: %w", err)
+		}
 	}
 	if err := m.cleanupV2OnlyImageUpdateStagedRootfs(ctx, appInst, record); err != nil {
 		return err
 	}
 	if appInst.Enabled {
+		runtime, err = m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
+		if err != nil {
+			return fmt.Errorf("reacquire runtime for previous image generation: %w", err)
+		}
 		endpoints, _ := m.serviceManager.GetByApp(instanceID)
 		if len(endpoints) == 0 {
 			var allocErr error
@@ -629,18 +635,20 @@ func (m *AppManager) forwardCompleteImageUpdate(ctx context.Context, state *File
 		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	runtime, runtimeUsable, err := m.quiesceContainerGroupRuntime(ctx, state, appInst, def, layout)
 	if err != nil {
 		txn.Phase = imageUpdatePhaseForwardRepairFailed
-		txn.LastError = fmt.Sprintf("podman runtime: %v", err)
+		txn.LastError = fmt.Sprintf("quiesce runtime: %v", err)
 		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		return err
 	}
 	candidateMetadataAlreadyStored := len(txn.CandidateActiveRootfs) > 0 && mapsEqual(appInst.ActiveRootfs, txn.CandidateActiveRootfs)
 	if len(txn.CandidateContainers) == 0 && txn.CandidateNetworkAnchorID == "" {
 		if !candidateMetadataAlreadyStored {
-			if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
-				log.Printf("WARN: image update recovery %s: remove pre-commit containers: %v", instanceID, err)
+			if runtimeUsable {
+				if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
+					log.Printf("WARN: image update recovery %s: remove pre-commit containers: %v", instanceID, err)
+				}
 			}
 			appInst.Containers = nil
 			appInst.NetworkAnchorID = ""
@@ -719,10 +727,10 @@ func (m *AppManager) restorePreCommitImageUpdate(ctx context.Context, state *Fil
 		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		return err
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	runtime, runtimeUsable, err := m.quiesceContainerGroupRuntime(ctx, state, appInst, def, layout)
 	if err != nil {
 		txn.Phase = imageUpdatePhaseRestoreFailed
-		txn.LastError = fmt.Sprintf("podman runtime: %v", err)
+		txn.LastError = fmt.Sprintf("quiesce runtime: %v", err)
 		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		return err
 	}
@@ -730,7 +738,7 @@ func (m *AppManager) restorePreCommitImageUpdate(ctx context.Context, state *Fil
 	txn.LastError = ""
 	_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 
-	if txn.RuntimeSwitchStarted {
+	if txn.RuntimeSwitchStarted && runtimeUsable {
 		if err := m.removeContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
 			log.Printf("WARN: image update recovery %s: remove candidate containers: %v", instanceID, err)
 		}

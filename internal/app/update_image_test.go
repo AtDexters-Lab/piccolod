@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
@@ -2163,6 +2165,498 @@ func TestRollbackToSnapshot_RoutesAroundStaleFailedDataLV(t *testing.T) {
 	}
 	if got, want := volumes.rollbacks, []string{DataSnapshotLVName(inst.InstanceID, 1) + "->" + staleFailedName + "-1"}; len(got) != len(want) || got[0] != want[0] {
 		t.Fatalf("rollbacks = %v, want %v", got, want)
+	}
+}
+
+func TestRollbackToSnapshotPersistsPromotedTruthBeforeRuntimeReacquire(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{
+		stubVolumeManager: &stubVolumeManager{root: tmp},
+	}
+	mgr.SetVolumeManager(volumes)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	setMockRegistryDigest(mock, "sha256:rollback-reacquire-failure")
+	if err := mgr.UpdateImage(ctx, inst.InstanceID); err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	before, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState before rollback: %v", err)
+	}
+	snapshot := before.LatestSnapshot()
+	if snapshot == nil {
+		t.Fatal("snapshot missing before rollback")
+	}
+	wantGeneration := snapshot.ID
+	wantRootfs := cloneStringMap(snapshot.RootfsVolIDs)
+
+	volumes.rollbackResultSet = true
+	volumes.rollbackRenamesCommitted = true
+	volumes.rollbackSnapshotPromoted = true
+	originalResolver := mgr.credentialResolver
+	resolverCalls := 0
+	mgr.credentialResolver = func(instanceID string) (*syscall.Credential, string, error) {
+		resolverCalls++
+		if resolverCalls > 1 {
+			return nil, "", errors.New("session reacquire failed")
+		}
+		return originalResolver(instanceID)
+	}
+
+	err = mgr.RollbackToSnapshot(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "session reacquire failed") {
+		t.Fatalf("RollbackToSnapshot error = %v, want runtime reacquire failure", err)
+	}
+	after, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after rollback: %v", err)
+	}
+	active := after.ActiveGeneration()
+	if active == nil || active.ID != wantGeneration || active.DataSnapshot != "" {
+		t.Fatalf("durable tuple truth = %+v, want promoted generation %s", active, wantGeneration)
+	}
+	stored, ok := state.GetApp(inst.InstanceID)
+	if !ok || !mapsEqual(stored.ActiveRootfs, wantRootfs) {
+		t.Fatalf("durable app rootfs = %v, want %v", stored.ActiveRootfs, wantRootfs)
+	}
+}
+
+func TestRollbackToSnapshotMetadataFailureReplaysBeforeRuntimeAfterRestart(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tmp}}
+	rootfs := newStubRootfsManager(tmp)
+	rootfs.exists = map[string]bool{}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	setMockRegistryDigest(mock, "sha256:rollback-metadata-replay")
+	if err := mgr.UpdateImage(ctx, inst.InstanceID); err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	before, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState before rollback: %v", err)
+	}
+	snapshot := before.LatestSnapshot()
+	if snapshot == nil {
+		t.Fatal("snapshot missing before rollback")
+	}
+	wantRootfs := cloneStringMap(snapshot.RootfsVolIDs)
+
+	resolverCalls := 0
+	originalResolver := mgr.credentialResolver
+	mgr.credentialResolver = func(instanceID string) (*syscall.Credential, string, error) {
+		resolverCalls++
+		return originalResolver(instanceID)
+	}
+	state.storeAppMetadataHook = func(instanceID string, app *AppInstance) error {
+		return errors.New("rollback metadata write interrupted")
+	}
+	err = mgr.RollbackToSnapshot(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "rollback metadata write interrupted") {
+		t.Fatalf("RollbackToSnapshot error = %v, want metadata interruption", err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("runtime resolver calls = %d, want only pre-rollback quiesce", resolverCalls)
+	}
+	afterFailure, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after failure: %v", err)
+	}
+	failedActive := afterFailure.ActiveGeneration()
+	if failedActive == nil || failedActive.RollbackAppStateCommitted == nil || *failedActive.RollbackAppStateCommitted {
+		t.Fatalf("rollback commit marker after metadata failure = %+v, want explicit false", failedActive)
+	}
+
+	// A new manager proves recovery is driven by durable tuple state, not the
+	// mutated in-process AppInstance left behind by StoreApp's partial write.
+	fresh, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new manager after restart: %v", err)
+	}
+	allowHostStorage(t, fresh)
+	fresh.SetVolumeManager(volumes)
+	fresh.SetRootfsManager(rootfs)
+	fresh.ForceLockState(false)
+	fresh.userSessionQuiescer = func(context.Context, string) error { return nil }
+	fresh.ReconcileOnce(ctx)
+	freshState, err := fresh.ensureStateManager()
+	if err != nil {
+		t.Fatalf("fresh state: %v", err)
+	}
+	repairedTuple, err := freshState.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after replay: %v", err)
+	}
+	repairedActive := repairedTuple.ActiveGeneration()
+	if repairedActive == nil || repairedActive.RollbackAppStateCommitted == nil || !*repairedActive.RollbackAppStateCommitted {
+		t.Fatalf("rollback commit marker after replay = %+v, want true", repairedActive)
+	}
+	repairedApp, ok := freshState.GetApp(inst.InstanceID)
+	if !ok || !mapsEqual(repairedApp.ActiveRootfs, wantRootfs) {
+		t.Fatalf("repaired app rootfs = %v, want %v", repairedApp.ActiveRootfs, wantRootfs)
+	}
+}
+
+func TestRollbackToSnapshotDefinitionFailureReplaysBeforeRuntimeAfterRestart(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tmp}}
+	rootfs := newStubRootfsManager(tmp)
+	rootfs.exists = map[string]bool{}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	setMockRegistryDigest(mock, "sha256:rollback-definition-replay")
+	if err := mgr.UpdateImage(ctx, inst.InstanceID); err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	resolverCalls := 0
+	originalResolver := mgr.credentialResolver
+	mgr.credentialResolver = func(instanceID string) (*syscall.Credential, string, error) {
+		resolverCalls++
+		return originalResolver(instanceID)
+	}
+	state.storeAppDefinitionHook = func(instanceID string, app *AppInstance) error {
+		return errors.New("rollback definition write interrupted")
+	}
+	err = mgr.RollbackToSnapshot(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "rollback definition write interrupted") {
+		t.Fatalf("RollbackToSnapshot error = %v, want definition interruption", err)
+	}
+	if resolverCalls != 1 {
+		t.Fatalf("runtime resolver calls = %d, want only pre-rollback quiesce", resolverCalls)
+	}
+	failedTuple, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after failure: %v", err)
+	}
+	failedActive := failedTuple.ActiveGeneration()
+	if failedActive == nil || failedActive.RollbackAppStateCommitted == nil || *failedActive.RollbackAppStateCommitted {
+		t.Fatalf("rollback commit marker after definition failure = %+v, want false", failedActive)
+	}
+
+	fresh, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new manager after restart: %v", err)
+	}
+	allowHostStorage(t, fresh)
+	fresh.SetVolumeManager(volumes)
+	fresh.SetRootfsManager(rootfs)
+	fresh.ForceLockState(false)
+	fresh.userSessionQuiescer = func(context.Context, string) error { return nil }
+	fresh.ReconcileOnce(ctx)
+	freshState, err := fresh.ensureStateManager()
+	if err != nil {
+		t.Fatalf("fresh state: %v", err)
+	}
+	repairedTuple, err := freshState.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after replay: %v", err)
+	}
+	repairedActive := repairedTuple.ActiveGeneration()
+	if repairedActive == nil || repairedActive.RollbackAppStateCommitted == nil || !*repairedActive.RollbackAppStateCommitted {
+		t.Fatalf("rollback commit marker after replay = %+v, want true", repairedActive)
+	}
+}
+
+func TestRollbackPartialRenameResumesBeforeVolumeLayoutAfterRestart(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tmp}}
+	rootfs := newStubRootfsManager(tmp)
+	rootfs.exists = map[string]bool{}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	setMockRegistryDigest(mock, "sha256:rollback-partial-replay")
+	if err := mgr.UpdateImage(ctx, inst.InstanceID); err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	before, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState before rollback: %v", err)
+	}
+	wantSnapshot := before.LatestSnapshot()
+	if wantSnapshot == nil {
+		t.Fatal("snapshot missing before rollback")
+	}
+	wantGeneration := wantSnapshot.ID
+	wantRootfs := cloneStringMap(wantSnapshot.RootfsVolIDs)
+
+	volumes.rollbackHook = func(call int, instanceID, snapshotLVName, failedLVName string) (bool, bool, error) {
+		if call == 1 {
+			return true, false, errors.New("crash between LV renames")
+		}
+		// The active LV becomes available only after promotion. If recovery
+		// attempted ensureAppVolumeLayout first, it would fail on ensureErr.
+		volumes.ensureErr = nil
+		return true, true, nil
+	}
+	err = mgr.RollbackToSnapshot(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "promotion is incomplete") {
+		t.Fatalf("RollbackToSnapshot error = %v, want partial promotion", err)
+	}
+	partial, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after partial rename: %v", err)
+	}
+	current := partial.GenerationByID(partial.CurrentGeneration)
+	if current == nil || current.Status != TupleStatusFailed || current.FailedLVName == "" {
+		t.Fatalf("partial rollback tracking = %+v", current)
+	}
+	if snap := partial.LatestSnapshot(); snap == nil || snap.DataSnapshot == "" {
+		t.Fatalf("partial rollback lost promotable snapshot: %+v", snap)
+	}
+	volumes.ensureErr = errors.New("active LV missing until snapshot promotion")
+
+	fresh, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new manager after restart: %v", err)
+	}
+	allowHostStorage(t, fresh)
+	fresh.SetVolumeManager(volumes)
+	fresh.SetRootfsManager(rootfs)
+	fresh.ForceLockState(false)
+	fresh.userSessionQuiescer = func(context.Context, string) error { return nil }
+	fresh.ReconcileOnce(ctx)
+	if len(volumes.rollbacks) != 2 {
+		t.Fatalf("rollback calls = %v, want interrupted attempt plus one replay", volumes.rollbacks)
+	}
+	freshState, err := fresh.ensureStateManager()
+	if err != nil {
+		t.Fatalf("fresh state: %v", err)
+	}
+	repairedTuple, err := freshState.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after recovery: %v", err)
+	}
+	active := repairedTuple.ActiveGeneration()
+	if active == nil || active.ID != wantGeneration || active.DataSnapshot != "" ||
+		active.RollbackAppStateCommitted == nil || !*active.RollbackAppStateCommitted {
+		t.Fatalf("recovered rollback tuple = %+v, want committed %s", active, wantGeneration)
+	}
+	repairedApp, ok := freshState.GetApp(inst.InstanceID)
+	if !ok || !mapsEqual(repairedApp.ActiveRootfs, wantRootfs) {
+		t.Fatalf("repaired app rootfs = %v, want %v", repairedApp.ActiveRootfs, wantRootfs)
+	}
+}
+
+func TestRollbackPromotedLVReplaysWhenFirstPostLVTupleWriteFails(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tmp}}
+	rootfs := newStubRootfsManager(tmp)
+	rootfs.exists = map[string]bool{}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{}
+	mgr.SetVolumeManager(volumes)
+	mgr.SetRootfsManager(rootfs)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	setMockRegistryDigest(mock, "sha256:rollback-post-lv-tuple-replay")
+	if err := mgr.UpdateImage(ctx, inst.InstanceID); err != nil {
+		t.Fatalf("UpdateImage: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+
+	failPromotedTuple := true
+	state.storeTupleStateHook = func(instanceID string, tuple *TupleState) error {
+		if instanceID != inst.InstanceID || !failPromotedTuple {
+			return nil
+		}
+		active := tuple.ActiveGeneration()
+		if active != nil && active.RollbackAppStateCommitted != nil && !*active.RollbackAppStateCommitted {
+			failPromotedTuple = false
+			return errors.New("promoted tuple write interrupted")
+		}
+		return nil
+	}
+	err = mgr.RollbackToSnapshot(ctx, inst.InstanceID)
+	if err == nil || !strings.Contains(err.Error(), "promoted tuple write interrupted") {
+		t.Fatalf("RollbackToSnapshot error = %v, want promoted tuple interruption", err)
+	}
+	if len(volumes.rollbacks) != 1 {
+		t.Fatalf("rollback calls = %v, want one physical promotion", volumes.rollbacks)
+	}
+	durablePlan, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after interrupted promotion commit: %v", err)
+	}
+	plannedSnapshot := durablePlan.LatestSnapshot()
+	if plannedSnapshot == nil || !plannedSnapshot.RollbackPending || plannedSnapshot.RollbackFailedLVName == "" {
+		t.Fatalf("durable pre-LV intent missing after post-LV tuple failure: %+v", plannedSnapshot)
+	}
+	state.storeTupleStateHook = nil
+
+	fresh, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new manager after restart: %v", err)
+	}
+	allowHostStorage(t, fresh)
+	fresh.SetVolumeManager(volumes)
+	fresh.SetRootfsManager(rootfs)
+	fresh.ForceLockState(false)
+	fresh.userSessionQuiescer = func(context.Context, string) error { return nil }
+	fresh.ReconcileOnce(ctx)
+	if len(volumes.rollbacks) != 2 {
+		t.Fatalf("rollback calls = %v, want idempotent replay of promoted physical state", volumes.rollbacks)
+	}
+	freshState, err := fresh.ensureStateManager()
+	if err != nil {
+		t.Fatalf("fresh state: %v", err)
+	}
+	repairedTuple, err := freshState.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState after replay: %v", err)
+	}
+	active := repairedTuple.ActiveGeneration()
+	if active == nil || active.RollbackPending || active.RollbackFailedLVName != "" ||
+		active.RollbackAppStateCommitted == nil || !*active.RollbackAppStateCommitted {
+		t.Fatalf("recovered rollback tuple = %+v, want fully committed", active)
+	}
+}
+
+func TestRollbackRecoveryTracksFailedLVWhenNoActiveGenerationExists(t *testing.T) {
+	tmp := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tmp)
+	if err != nil {
+		t.Fatalf("new app manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	volumes := &manifestUpdateSnapshotVolumeManager{stubVolumeManager: &stubVolumeManager{root: tmp}}
+	mgr.SetVolumeManager(volumes)
+	mgr.ForceLockState(false)
+	ctx := context.Background()
+
+	inst, err := mgr.Install(ctx, updateImagePersistentAppDef())
+	if err != nil {
+		t.Fatalf("install: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state: %v", err)
+	}
+	if err := state.BackupCurrentAppDefinition(inst.InstanceID); err != nil {
+		t.Fatalf("backup app definition: %v", err)
+	}
+	failedLVName := FailedDataLVName(inst.InstanceID, 1)
+	if err := state.StoreTupleState(inst.InstanceID, &TupleState{
+		InstanceID:    inst.InstanceID,
+		NextGenNumber: 2,
+		Generations: []TupleGeneration{{
+			ID:                   "gen-1",
+			RootfsVolIDs:         cloneStringMap(inst.ActiveRootfs),
+			DataSnapshot:         DataSnapshotLVName(inst.InstanceID, 1),
+			CreatedAt:            time.Now(),
+			Status:               TupleStatusSnapshot,
+			RollbackPending:      true,
+			RollbackFailedLVName: failedLVName,
+		}},
+	}); err != nil {
+		t.Fatalf("store no-active rollback plan: %v", err)
+	}
+	mgr.userSessionQuiescer = func(context.Context, string) error { return nil }
+	recovered, err := mgr.reconcilePartialRollback(ctx, state, inst)
+	if err != nil {
+		t.Fatalf("reconcilePartialRollback: %v", err)
+	}
+	if !recovered {
+		t.Fatal("pending no-active rollback was not recovered")
+	}
+	tuple, err := state.LoadTupleState(inst.InstanceID)
+	if err != nil {
+		t.Fatalf("LoadTupleState: %v", err)
+	}
+	if active := tuple.ActiveGeneration(); active == nil || active.ID != "gen-1" {
+		t.Fatalf("promoted active generation = %+v", active)
+	}
+	foundFailedLV := false
+	for _, gen := range tuple.Generations {
+		if gen.Status == TupleStatusFailed && gen.FailedLVName == failedLVName {
+			foundFailedLV = true
+		}
+	}
+	if !foundFailedLV {
+		t.Fatalf("failed LV %q has no tuple GC owner: %+v", failedLVName, tuple.Generations)
 	}
 }
 

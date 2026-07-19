@@ -2,8 +2,10 @@ package container
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -13,11 +15,33 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
 	// maxLinuxUsername is the maximum length of a Linux username.
 	maxLinuxUsername = 32
+
+	userSessionReadyTimeout = 5 * time.Second
+	userSessionPollInterval = 100 * time.Millisecond
+)
+
+var (
+	// ErrUserSessionUnavailable identifies a per-app systemd user session that
+	// cannot currently support rootless Podman. Callers use errors.Is to choose
+	// observe-only failure or the PID 1 quiescence fallback.
+	ErrUserSessionUnavailable = errors.New("per-app user session unavailable")
+
+	userSessionCgroupRoot = "/sys/fs/cgroup"
+	userProcessRoot       = "/proc"
+	userRuntimeRoot       = "/run/user"
+	userLingerRoot        = "/var/lib/systemd/linger"
+	openProcessPIDFD      = unix.PidfdOpen
+	signalProcessPIDFD    = func(fd int, signal unix.Signal) error {
+		return unix.PidfdSendSignal(fd, signal, nil, 0)
+	}
+	closeProcessPIDFD = unix.Close
 )
 
 // provisionMu serializes user provisioning to prevent race conditions
@@ -56,6 +80,12 @@ func AppUsername(instanceID string) string {
 // the user is rolled back (userdel --remove). Serialized via provisionMu to
 // prevent concurrent subuid allocation races.
 func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
+	return ProvisionAppUserContext(context.Background(), instanceID)
+}
+
+// ProvisionAppUserContext is ProvisionAppUser with cancellation propagated to
+// systemd session activation and D-Bus readiness checks.
+func ProvisionAppUserContext(ctx context.Context, instanceID string) (au *AppUser, err error) {
 	username := appUsername(instanceID)
 
 	// Fast path: user already exists and has subuid allocation.
@@ -63,9 +93,9 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 	// defer (registered later) does not fire on these early-return success paths.
 	if au, err := resolveAppUser(username); err == nil {
 		if hasSubUIDAllocation(username) {
-			// Ensure the systemd user session is active. After daemon restarts
-			// the user exists but linger/dbus may be dead (tmpfs lost on reboot).
-			ensureUserSession(username, au.Credential.Uid)
+			if err := ensureUserSession(ctx, instanceID, username, au.Credential.Uid); err != nil {
+				return nil, err
+			}
 			return au, nil
 		}
 		// User exists but subuid not configured (interrupted provisioning).
@@ -79,7 +109,9 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 
 	// Re-check after acquiring lock (another goroutine may have completed it).
 	if au, err := resolveAppUser(username); err == nil && hasSubUIDAllocation(username) {
-		ensureUserSession(username, au.Credential.Uid)
+		if err := ensureUserSession(ctx, instanceID, username, au.Credential.Uid); err != nil {
+			return nil, err
+		}
 		return au, nil
 	}
 
@@ -138,7 +170,7 @@ func ProvisionAppUser(instanceID string) (au *AppUser, err error) {
 		}
 	}
 
-	if lingerErr := enableLinger(username); lingerErr != nil {
+	if lingerErr := enableLinger(ctx, instanceID, username); lingerErr != nil {
 		return nil, fmt.Errorf("provision user %s: enable linger: %w", username, lingerErr)
 	}
 
@@ -177,8 +209,15 @@ func destroyAppUserByName(username string) error {
 		return fmt.Errorf("destroy user %s: UID is 0, refusing to proceed", username)
 	}
 
-	killUserProcesses(username, uint32(uid))
-	disableLinger(username)
+	if err := killUserProcesses(username, uint32(uid)); err != nil {
+		return fmt.Errorf("destroy user %s: terminate UID-owned processes: %w", username, err)
+	}
+	if err := disableLinger(username); err != nil {
+		return fmt.Errorf("destroy user %s: disable linger: %w", username, err)
+	}
+	if err := releaseUserRuntime(uint32(uid)); err != nil {
+		return fmt.Errorf("destroy user %s: release runtime directory: %w", username, err)
+	}
 
 	out, delErr := defaultExecutor.Run("userdel", "--remove", username)
 	if delErr != nil {
@@ -427,63 +466,477 @@ func EnsureCgroupDelegation() error {
 	return nil
 }
 
-// enableLinger enables systemd linger for the given user and ensures the
-// user's systemd session is fully started. The session provides dbus and
-// cgroup delegation that rootless Podman requires.
-func enableLinger(username string) error {
-	if out, err := defaultExecutor.Run("loginctl", "enable-linger", username); err != nil {
-		return fmt.Errorf("loginctl enable-linger %s: %w: %s", username, err, strings.TrimSpace(string(out)))
-	}
+// userSessionState is the PID 1 view of a per-app user manager. The D-Bus
+// endpoint is probed separately because a socket inode is not liveness proof.
+type userSessionState struct {
+	ActiveState  string
+	SubState     string
+	Result       string
+	ControlGroup string
+}
 
-	// Resolve UID for the user service name.
-	u, err := defaultResolver.LookupUser(username)
+type userSessionUnavailableError struct {
+	InstanceID      string
+	Username        string
+	UID             uint32
+	Unit            string
+	PreActionState  userSessionState
+	PostActionState userSessionState
+	RepairAction    string
+	RepairResult    string
+	Cause           error
+}
+
+func (e *userSessionUnavailableError) Error() string {
+	return fmt.Sprintf("%v: instance=%s user=%s uid=%d unit=%s pre_active=%s pre_sub=%s pre_result=%s post_active=%s post_sub=%s post_result=%s repair_action=%s repair_result=%s: %v",
+		ErrUserSessionUnavailable, e.InstanceID, e.Username, e.UID, e.Unit,
+		e.PreActionState.ActiveState, e.PreActionState.SubState, e.PreActionState.Result,
+		e.PostActionState.ActiveState, e.PostActionState.SubState, e.PostActionState.Result,
+		e.RepairAction, e.RepairResult, e.Cause)
+}
+
+func (e *userSessionUnavailableError) Unwrap() []error {
+	return []error{ErrUserSessionUnavailable, e.Cause}
+}
+
+type userSessionRepairContext struct {
+	Action   string
+	PreState userSessionState
+	Result   string
+}
+
+func normalizeUserSessionRepairContext(state userSessionState, repair userSessionRepairContext) userSessionRepairContext {
+	if repair.Action == "" {
+		repair.Action = "none"
+		repair.Result = "not-attempted"
+		repair.PreState = state
+	}
+	return repair
+}
+
+func newUserSessionUnavailable(instanceID, username string, uid uint32, state userSessionState, cause error, repair userSessionRepairContext) error {
+	if cause == nil {
+		cause = errors.New("session not ready")
+	}
+	repair = normalizeUserSessionRepairContext(state, repair)
+	return &userSessionUnavailableError{
+		InstanceID:      instanceID,
+		Username:        username,
+		UID:             uid,
+		Unit:            fmt.Sprintf("user@%d.service", uid),
+		PreActionState:  repair.PreState,
+		PostActionState: state,
+		RepairAction:    repair.Action,
+		RepairResult:    repair.Result,
+		Cause:           cause,
+	}
+}
+
+func querySystemUnitState(ctx context.Context, unit string) (userSessionState, error) {
+	out, err := defaultExecutor.RunContext(ctx, "systemctl", "show", unit,
+		"--property=ActiveState", "--property=SubState", "--property=Result",
+		"--property=ControlGroup", "--no-pager")
 	if err != nil {
-		return nil // Linger enabled, just can't verify session.
+		return userSessionState{}, fmt.Errorf("systemctl show %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
 	}
-
-	// Explicitly start the user service. loginctl enable-linger is async
-	// and may not start the service immediately, especially for newly
-	// created users. systemctl start is synchronous and blocks until the
-	// service is active.
-	svcName := fmt.Sprintf("user@%s.service", u.Uid)
-	if out, err := defaultExecutor.Run("systemctl", "start", svcName); err != nil {
-		log.Printf("WARN: systemctl start %s failed: %v: %s", svcName, err, strings.TrimSpace(string(out)))
-	}
-
-	// Wait for the dbus socket — confirms the user session is fully ready.
-	dbusSocket := fmt.Sprintf("/run/user/%s/bus", u.Uid)
-	for i := 0; i < 50; i++ { // 50 × 100ms = 5s max
-		if _, err := os.Stat(dbusSocket); err == nil {
-			log.Printf("INFO: user session ready for %s (dbus socket at %s)", username, dbusSocket)
-			return nil
+	state := userSessionState{}
+	for _, line := range strings.Split(string(out), "\n") {
+		key, value, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
 		}
-		time.Sleep(100 * time.Millisecond)
+		switch key {
+		case "ActiveState":
+			state.ActiveState = strings.TrimSpace(value)
+		case "SubState":
+			state.SubState = strings.TrimSpace(value)
+		case "Result":
+			state.Result = strings.TrimSpace(value)
+		case "ControlGroup":
+			state.ControlGroup = strings.TrimSpace(value)
+		}
 	}
-	// Non-fatal: dbus socket is a readiness hint, not a hard requirement.
-	// Rootless Podman may still work if the socket appears shortly after.
-	// Failing provisioning here would cause avoidable failures on slow systems.
-	log.Printf("WARN: dbus socket %s not ready after 5s for user %s — rootless Podman cgroup management may fail", dbusSocket, username)
+	if state.ActiveState == "" {
+		return userSessionState{}, fmt.Errorf("systemctl show %s returned no ActiveState", unit)
+	}
+	return state, nil
+}
+
+func queryUserSession(ctx context.Context, uid uint32) (userSessionState, error) {
+	return querySystemUnitState(ctx, fmt.Sprintf("user@%d.service", uid))
+}
+
+func probeUserBus(ctx context.Context, username string, uid uint32) error {
+	runtimeDir := fmt.Sprintf("/run/user/%d", uid)
+	busAddress := "unix:path=" + filepath.Join(runtimeDir, "bus")
+	out, err := defaultExecutor.RunContext(ctx, "/usr/sbin/runuser",
+		"--user", username, "--",
+		"/usr/bin/env",
+		"XDG_RUNTIME_DIR="+runtimeDir,
+		"DBUS_SESSION_BUS_ADDRESS="+busAddress,
+		"/usr/bin/busctl", "--user", "--no-pager", "--quiet", "list")
+	if err != nil {
+		return fmt.Errorf("probe user bus: %w: %s", err, strings.TrimSpace(string(out)))
+	}
 	return nil
 }
 
-// ensureUserSession verifies the systemd user session is active for a per-app
-// user and re-enables linger if the dbus socket is missing. After daemon restarts,
-// the user exists and has subuid but the session may be dead (tmpfs lost on reboot).
-func ensureUserSession(username string, uid uint32) {
-	dbusSocket := fmt.Sprintf("/run/user/%d/bus", uid)
-	if _, err := os.Stat(dbusSocket); err == nil {
-		return // Session is active.
+func runUserSessionAction(ctx context.Context, action string, uid uint32) error {
+	unit := fmt.Sprintf("user@%d.service", uid)
+	out, err := defaultExecutor.RunContext(ctx, "systemctl", action, unit)
+	if err != nil {
+		return fmt.Errorf("systemctl %s %s: %w: %s", action, unit, err, strings.TrimSpace(string(out)))
 	}
-	log.Printf("INFO: re-enabling linger for %s (dbus socket missing)", username)
-	if err := enableLinger(username); err != nil {
-		log.Printf("WARN: failed to re-enable linger for %s: %v", username, err)
+	return nil
+}
+
+func waitForUserSession(ctx context.Context, instanceID, username string, uid uint32, allowRepair bool) error {
+	var (
+		lastState       userSessionState
+		lastErr         error
+		repairAttempted bool
+		repair          userSessionRepairContext
+	)
+	for {
+		state, err := queryUserSession(ctx, uid)
+		if err != nil {
+			return newUserSessionUnavailable(instanceID, username, uid, lastState, err, repair)
+		}
+		lastState = state
+		switch state.ActiveState {
+		case "active":
+			if err := probeUserBus(ctx, username, uid); err == nil {
+				repair = normalizeUserSessionRepairContext(state, repair)
+				log.Printf("INFO: user session ready instance=%s user=%s uid=%d unit=user@%d.service pre_active=%s pre_sub=%s pre_result=%s post_active=%s post_sub=%s post_result=%s repair_action=%s repair_result=%s",
+					instanceID, username, uid, uid,
+					repair.PreState.ActiveState, repair.PreState.SubState, repair.PreState.Result,
+					state.ActiveState, state.SubState, state.Result, repair.Action, repair.Result)
+				return nil
+			} else {
+				lastErr = err
+			}
+			if !allowRepair {
+				return newUserSessionUnavailable(instanceID, username, uid, state, lastErr, repair)
+			}
+			if allowRepair && !repairAttempted {
+				log.Printf("WARN: repairing active but unusable user session user=%s uid=%d unit=user@%d.service active=%s sub=%s result=%s: %v",
+					username, uid, uid, state.ActiveState, state.SubState, state.Result, lastErr)
+				repair = userSessionRepairContext{Action: "restart", PreState: state}
+				if err := runUserSessionAction(ctx, repair.Action, uid); err != nil {
+					repair.Result = "failed"
+					postState, postErr := queryUserSession(ctx, uid)
+					if postErr != nil {
+						postState = state
+					}
+					return newUserSessionUnavailable(instanceID, username, uid, postState, errors.Join(err, postErr), repair)
+				}
+				repair.Result = "success"
+				repairAttempted = true
+				continue
+			}
+		case "inactive", "failed":
+			lastErr = fmt.Errorf("unit is %s/%s result=%s", state.ActiveState, state.SubState, state.Result)
+			if !allowRepair {
+				return newUserSessionUnavailable(instanceID, username, uid, state, lastErr, repair)
+			}
+			if !repairAttempted {
+				log.Printf("INFO: starting unavailable user session user=%s uid=%d unit=user@%d.service active=%s sub=%s result=%s",
+					username, uid, uid, state.ActiveState, state.SubState, state.Result)
+				repair = userSessionRepairContext{Action: "start", PreState: state}
+				if err := runUserSessionAction(ctx, repair.Action, uid); err != nil {
+					repair.Result = "failed"
+					postState, postErr := queryUserSession(ctx, uid)
+					if postErr != nil {
+						postState = state
+					}
+					return newUserSessionUnavailable(instanceID, username, uid, postState, errors.Join(err, postErr), repair)
+				}
+				repair.Result = "success"
+				repairAttempted = true
+				continue
+			}
+		case "activating", "deactivating", "reloading":
+			lastErr = fmt.Errorf("unit remains transitional: %s/%s", state.ActiveState, state.SubState)
+		default:
+			return newUserSessionUnavailable(instanceID, username, uid, state,
+				fmt.Errorf("unsupported unit state %q/%q", state.ActiveState, state.SubState), repair)
+		}
+
+		timer := time.NewTimer(userSessionPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return newUserSessionUnavailable(instanceID, username, uid, lastState, errors.Join(lastErr, ctx.Err()), repair)
+		case <-timer.C:
+		}
+	}
+}
+
+func withUserSessionDeadline(ctx context.Context) (context.Context, context.CancelFunc) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithTimeout(ctx, userSessionReadyTimeout)
+}
+
+// enableLinger enables systemd linger and proves that the resulting session is
+// usable by rootless Podman. Provisioning fails if readiness cannot be proven.
+func enableLinger(ctx context.Context, instanceID, username string) error {
+	deadlineCtx, cancel := withUserSessionDeadline(ctx)
+	defer cancel()
+
+	if out, err := defaultExecutor.RunContext(deadlineCtx, "loginctl", "enable-linger", username); err != nil {
+		return fmt.Errorf("loginctl enable-linger %s: %w: %s", username, err, strings.TrimSpace(string(out)))
+	}
+	u, err := defaultResolver.LookupUser(username)
+	if err != nil {
+		return fmt.Errorf("resolve user %s after enabling linger: %w", username, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil || uid == 0 {
+		return fmt.Errorf("resolve user %s after enabling linger: invalid UID %q", username, u.Uid)
+	}
+	return waitForUserSession(deadlineCtx, instanceID, username, uint32(uid), true)
+}
+
+// ensureUserSession proves or repairs the dedicated per-app user session.
+func ensureUserSession(ctx context.Context, instanceID, username string, uid uint32) error {
+	deadlineCtx, cancel := withUserSessionDeadline(ctx)
+	defer cancel()
+	return waitForUserSession(deadlineCtx, instanceID, username, uid, true)
+}
+
+// ResolveReadyAppUser resolves an existing per-app user and observes its
+// session without starting or restarting it.
+func ResolveReadyAppUser(ctx context.Context, instanceID string) (*AppUser, error) {
+	appUser, err := ResolveAppUser(instanceID)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve app user %s: %w", ErrUserSessionUnavailable, appUsername(instanceID), err)
+	}
+	deadlineCtx, cancel := withUserSessionDeadline(ctx)
+	defer cancel()
+	if err := waitForUserSession(deadlineCtx, instanceID, appUser.Username, appUser.Credential.Uid, false); err != nil {
+		return nil, err
+	}
+	return appUser, nil
+}
+
+func userSessionCgroupEmpty(state userSessionState) (bool, error) {
+	if state.ControlGroup == "" {
+		return userSessionUnitInactive(state), nil
+	}
+	clean := filepath.Clean("/" + strings.TrimPrefix(state.ControlGroup, "/"))
+	if !strings.HasPrefix(clean, "/user.slice/") {
+		return false, fmt.Errorf("refusing unexpected user-session cgroup path %q", state.ControlGroup)
+	}
+	eventsPath := filepath.Join(userSessionCgroupRoot, strings.TrimPrefix(clean, "/"), "cgroup.events")
+	data, err := os.ReadFile(eventsPath)
+	if errors.Is(err, os.ErrNotExist) {
+		return userSessionUnitInactive(state), nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read %s: %w", eventsPath, err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 2 && fields[0] == "populated" {
+			return fields[1] == "0", nil
+		}
+	}
+	return false, fmt.Errorf("%s has no populated field", eventsPath)
+}
+
+func userSessionUnitInactive(state userSessionState) bool {
+	return state.ActiveState == "inactive" || state.ActiveState == "failed"
+}
+
+// QuiesceAppUserSession asks PID 1 to stop the dedicated app user manager and
+// returns only after the unit is non-active, its cgroup is proven empty, and
+// no process remains under the app's numeric UID. The UID proof also covers
+// rootless helpers launched by a privileged parent before systemd moves their
+// container workloads into the dedicated user hierarchy.
+func QuiesceAppUserSession(ctx context.Context, instanceID string) error {
+	appUser, err := ResolveAppUser(instanceID)
+	if err != nil {
+		// A missing passwd entry is not process-absence proof: processes can
+		// outlive deletion of their numeric UID. Without the UID we cannot query
+		// the dedicated user unit/cgroup, so teardown must fail closed.
+		return fmt.Errorf("resolve app user before quiesce (cannot prove cgroup empty): %w", err)
+	}
+	uid := appUser.Credential.Uid
+	if uid == 0 {
+		return errors.New("app user UID is 0, refusing to quiesce root session")
+	}
+	deadlineCtx, cancel := withUserSessionDeadline(ctx)
+	defer cancel()
+
+	state, err := queryUserSession(deadlineCtx, uid)
+	if err != nil {
+		return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, err, userSessionRepairContext{})
+	}
+	if empty, emptyErr := userSessionCgroupEmpty(state); emptyErr == nil && empty && userSessionUnitInactive(state) {
+		if err := terminateUserProcesses(deadlineCtx, uid); err != nil {
+			return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, err, userSessionRepairContext{})
+		}
+		return nil
+	}
+	if err := runUserSessionAction(deadlineCtx, "stop", uid); err != nil {
+		return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, err, userSessionRepairContext{Action: "stop", PreState: state, Result: "failed"})
+	}
+	repair := userSessionRepairContext{Action: "stop", PreState: state, Result: "success"}
+
+	for {
+		state, err = queryUserSession(deadlineCtx, uid)
+		if err != nil {
+			return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, err, repair)
+		}
+		empty, emptyErr := userSessionCgroupEmpty(state)
+		if emptyErr == nil && empty && userSessionUnitInactive(state) {
+			if processErr := terminateUserProcesses(deadlineCtx, uid); processErr != nil {
+				return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, processErr, repair)
+			}
+			log.Printf("INFO: user session quiesced instance=%s user=%s uid=%d unit=user@%d.service pre_active=%s pre_sub=%s pre_result=%s post_active=%s post_sub=%s post_result=%s repair_action=%s repair_result=%s",
+				instanceID, appUser.Username, uid, uid,
+				repair.PreState.ActiveState, repair.PreState.SubState, repair.PreState.Result,
+				state.ActiveState, state.SubState, state.Result, repair.Action, repair.Result)
+			return nil
+		}
+		if emptyErr != nil {
+			err = emptyErr
+		}
+		timer := time.NewTimer(userSessionPollInterval)
+		select {
+		case <-deadlineCtx.Done():
+			timer.Stop()
+			repair.Result = "timeout"
+			return newUserSessionUnavailable(instanceID, appUser.Username, uid, state, errors.Join(err, deadlineCtx.Err()), repair)
+		case <-timer.C:
+		}
+	}
+}
+
+func processStatusHasUID(data []byte, uid uint32) (bool, error) {
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 || fields[0] != "Uid:" {
+			continue
+		}
+		if len(fields) != 5 {
+			return false, fmt.Errorf("malformed Uid field %q", line)
+		}
+		for _, raw := range fields[1:] {
+			value, err := strconv.ParseUint(raw, 10, 32)
+			if err != nil {
+				return false, fmt.Errorf("parse Uid field %q: %w", line, err)
+			}
+			if uint32(value) == uid {
+				return true, nil
+			}
+		}
+		return false, nil
+	}
+	return false, errors.New("process status has no Uid field")
+}
+
+func processHasUID(pid int, uid uint32) (bool, error) {
+	data, err := os.ReadFile(filepath.Join(userProcessRoot, strconv.Itoa(pid), "status"))
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return processStatusHasUID(data, uid)
+}
+
+func userProcessIDs(uid uint32) ([]int, error) {
+	entries, err := os.ReadDir(userProcessRoot)
+	if err != nil {
+		return nil, fmt.Errorf("scan process root %s: %w", userProcessRoot, err)
+	}
+	pids := make([]int, 0)
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		owned, err := processHasUID(pid, uid)
+		if err != nil {
+			return nil, fmt.Errorf("inspect process %d: %w", pid, err)
+		}
+		if owned {
+			pids = append(pids, pid)
+		}
+	}
+	sort.Ints(pids)
+	return pids, nil
+}
+
+// terminateUserProcesses kills every process whose real, effective, saved, or
+// filesystem UID matches the per-app UID, then waits until /proc proves none
+// remain. A pidfd binds the signal to the inspected process; ownership is
+// re-read after opening it so PID exit/reuse cannot redirect SIGKILL.
+func terminateUserProcesses(ctx context.Context, uid uint32) error {
+	if uid == 0 {
+		return errors.New("UID is 0, refusing to terminate processes")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	for {
+		pids, err := userProcessIDs(uid)
+		if err != nil {
+			return err
+		}
+		if len(pids) == 0 {
+			return nil
+		}
+
+		for _, pid := range pids {
+			fd, err := openProcessPIDFD(pid, 0)
+			if errors.Is(err, unix.ESRCH) {
+				continue
+			}
+			if err != nil {
+				return fmt.Errorf("open pidfd for UID %d process %d: %w", uid, pid, err)
+			}
+
+			owned, ownershipErr := processHasUID(pid, uid)
+			if ownershipErr != nil {
+				_ = closeProcessPIDFD(fd)
+				return fmt.Errorf("recheck UID %d process %d: %w", uid, pid, ownershipErr)
+			}
+			if !owned {
+				_ = closeProcessPIDFD(fd)
+				continue
+			}
+
+			signalErr := signalProcessPIDFD(fd, unix.SIGKILL)
+			_ = closeProcessPIDFD(fd)
+			if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) {
+				return fmt.Errorf("kill UID %d process %d: %w", uid, pid, signalErr)
+			}
+			log.Printf("INFO: terminated escaped per-app process uid=%d pid=%d", uid, pid)
+		}
+
+		timer := time.NewTimer(userSessionPollInterval)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			remaining, _ := userProcessIDs(uid)
+			return fmt.Errorf("wait for UID %d process absence (remaining=%v): %w", uid, remaining, ctx.Err())
+		case <-timer.C:
+		}
 	}
 }
 
 // killUserProcesses terminates all processes owned by the given UID.
-// Required before userdel — lingering user sessions keep processes alive
-// that prevent user deletion (userdel exit code 8).
-func killUserProcesses(username string, uid uint32) {
+// Required before userdel — lingering user sessions and helpers outside the
+// user cgroup can otherwise prevent deletion (userdel exit code 8).
+func killUserProcesses(username string, uid uint32) error {
 	// Stop the systemd user service first (graceful).
 	svcName := fmt.Sprintf("user@%d.service", uid)
 	if out, err := defaultExecutor.Run("systemctl", "stop", svcName); err != nil {
@@ -493,13 +946,73 @@ func killUserProcesses(username string, uid uint32) {
 	if out, err := defaultExecutor.Run("loginctl", "kill-user", username); err != nil {
 		log.Printf("DEBUG: loginctl kill-user %s: %v: %s", username, err, strings.TrimSpace(string(out)))
 	}
-	// Brief pause for process cleanup.
-	time.Sleep(500 * time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), userSessionReadyTimeout)
+	defer cancel()
+	return terminateUserProcesses(ctx, uid)
 }
 
-// disableLinger disables systemd linger for the given user. Best-effort.
-func disableLinger(username string) {
-	if out, err := defaultExecutor.Run("loginctl", "disable-linger", username); err != nil {
-		log.Printf("WARN: loginctl disable-linger %s: %v: %s", username, err, strings.TrimSpace(string(out)))
+// releaseUserRuntime asks systemd's existing per-UID runtime-dir owner to stop,
+// then removes any directory left by Piccolo's own EnsureXDGRuntimeDir fallback.
+// The caller has already proven the nonzero UID has no processes, so no live
+// session can race the cleanup or retain files across UID reuse.
+func releaseUserRuntime(uid uint32) error {
+	if uid == 0 {
+		return errors.New("UID is 0, refusing to release runtime directory")
 	}
+	unit := fmt.Sprintf("user-runtime-dir@%d.service", uid)
+	ctx, cancel := context.WithTimeout(context.Background(), userSessionReadyTimeout)
+	defer cancel()
+	out, stopErr := defaultExecutor.RunContext(ctx, "systemctl", "stop", unit)
+	state, stateErr := querySystemUnitState(ctx, unit)
+	if stateErr != nil {
+		return fmt.Errorf("prove runtime directory owner %s inactive after stop: %w", unit,
+			errors.Join(stopErr, stateErr))
+	}
+	if !userSessionUnitInactive(state) {
+		if stopErr == nil {
+			stopErr = errors.New("stop returned success without reaching an inactive state")
+		}
+		return fmt.Errorf("runtime directory owner %s remains %s/%s after stop: %w: %s",
+			unit, state.ActiveState, state.SubState, stopErr, strings.TrimSpace(string(out)))
+	}
+	if stopErr != nil {
+		log.Printf("DEBUG: systemctl stop %s failed but PID 1 proves it inactive: %v: %s",
+			unit, stopErr, strings.TrimSpace(string(out)))
+	}
+	runtimeDir := filepath.Join(userRuntimeRoot, strconv.FormatUint(uint64(uid), 10))
+	if err := os.RemoveAll(runtimeDir); err != nil {
+		return fmt.Errorf("remove %s: %w", runtimeDir, err)
+	}
+	postState, err := querySystemUnitState(ctx, unit)
+	if err != nil {
+		return fmt.Errorf("prove runtime directory owner %s stayed inactive: %w", unit, err)
+	}
+	if !userSessionUnitInactive(postState) {
+		return fmt.Errorf("runtime directory owner %s reactivated as %s/%s during cleanup",
+			unit, postState.ActiveState, postState.SubState)
+	}
+	if _, err := os.Stat(runtimeDir); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("runtime directory %s still exists", runtimeDir)
+		}
+		return fmt.Errorf("verify runtime directory %s absent: %w", runtimeDir, err)
+	}
+	return nil
+}
+
+// disableLinger disables systemd linger and proves that PID 1 no longer has a
+// persistent-login marker which could recreate the user runtime during UID
+// cleanup.
+func disableLinger(username string) error {
+	if out, err := defaultExecutor.Run("loginctl", "disable-linger", username); err != nil {
+		return fmt.Errorf("loginctl disable-linger %s: %w: %s", username, err, strings.TrimSpace(string(out)))
+	}
+	lingerPath := filepath.Join(userLingerRoot, username)
+	if _, err := os.Stat(lingerPath); !errors.Is(err, os.ErrNotExist) {
+		if err == nil {
+			return fmt.Errorf("linger marker %s still exists", lingerPath)
+		}
+		return fmt.Errorf("verify linger marker %s absent: %w", lingerPath, err)
+	}
+	return nil
 }

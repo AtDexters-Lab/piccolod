@@ -4,6 +4,11 @@
 **Status:** Draft
 **Depends on:** RFC 20260206 (Rootless Podman Execution and Capability Hardening)
 
+> **Session/OOM amendment (2026-07-18):** PID 1, not the runtime socket path,
+> is the liveness authority for each app user manager. The recovery contract
+> and the user-manager/workload OOM ordering are defined by
+> [20260718-per-app-runtime-oom-session-recovery-amendment.md](20260718-per-app-runtime-oom-session-recovery-amendment.md).
+
 ## 1. Problem Statement
 
 The current rootless Podman implementation (RFC 20260206) runs ALL app containers as a single shared `piccolo-runtime` user. After a container escape (CVE-2024-21626, CVE-2019-5736, CVE-2022-0185), the attacker lands as `piccolo-runtime` on the host and can read/write every other app's Podman storage, runtime state, and data. Since apps are untrusted, per-app user isolation is needed so that an escape from app A (UID X) cannot access app B's data (owned by UID Y).

@@ -1,6 +1,8 @@
 package app
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -99,4 +101,66 @@ func TestStoreAppMetadata(t *testing.T) {
 			t.Errorf("cached NetworkAnchorID mismatch: got %q, want %q", cached.NetworkAnchorID, "anchor789")
 		}
 	})
+}
+
+func TestUpdateAppEnabledCommitsDiskBeforeCache(t *testing.T) {
+	tmpDir := t.TempDir()
+	fsm, err := NewFilesystemStateManager(tmpDir)
+	if err != nil {
+		t.Fatalf("NewFilesystemStateManager: %v", err)
+	}
+	instanceID := "enabled-commit"
+	appDir := filepath.Join(tmpDir, "apps", instanceID)
+	if err := os.MkdirAll(appDir, 0o755); err != nil {
+		t.Fatalf("mkdir app: %v", err)
+	}
+	app := &AppInstance{
+		InstanceID: instanceID,
+		Enabled:    false,
+		CreatedAt:  time.Now(),
+		UpdatedAt:  time.Now(),
+	}
+	if err := fsm.StoreAppMetadata(app); err != nil {
+		t.Fatalf("StoreAppMetadata: %v", err)
+	}
+
+	fsm.storeAppMetadataHook = func(string, *AppInstance) error {
+		return errors.New("injected write failure")
+	}
+	if err := fsm.UpdateAppEnabled(instanceID, true); err == nil {
+		t.Fatal("expected enabled-state write failure")
+	}
+	if cached, ok := fsm.GetApp(instanceID); !ok || cached.Enabled {
+		t.Fatalf("cache changed after failed commit: ok=%v app=%+v", ok, cached)
+	}
+	data, err := os.ReadFile(filepath.Join(appDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read metadata: %v", err)
+	}
+	var metadata AppMetadata
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("unmarshal metadata: %v", err)
+	}
+	if metadata.Enabled == nil || *metadata.Enabled {
+		t.Fatalf("disk changed after failed commit: enabled=%v", metadata.Enabled)
+	}
+
+	fsm.storeAppMetadataHook = nil
+	if err := fsm.UpdateAppEnabled(instanceID, true); err != nil {
+		t.Fatalf("UpdateAppEnabled success: %v", err)
+	}
+	if cached, ok := fsm.GetApp(instanceID); !ok || !cached.Enabled {
+		t.Fatalf("cache did not publish successful commit: ok=%v app=%+v", ok, cached)
+	}
+	data, err = os.ReadFile(filepath.Join(appDir, "metadata.json"))
+	if err != nil {
+		t.Fatalf("read committed metadata: %v", err)
+	}
+	metadata = AppMetadata{}
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		t.Fatalf("unmarshal committed metadata: %v", err)
+	}
+	if metadata.Enabled == nil || !*metadata.Enabled {
+		t.Fatalf("disk did not commit enabled=true: enabled=%v", metadata.Enabled)
+	}
 }

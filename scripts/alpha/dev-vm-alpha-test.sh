@@ -21,6 +21,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> oom-recovery     # stage 21: destructive OOM hierarchy/session recovery (~15 min)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> connection-auth  # stage 12: ConnectionAuth L4 deny/allow rules (RFC 20260505)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> tcp-raw          # stage 13: tcp+raw + __primary listener (RFC 20260505)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> cookie-isolation # stage 14: cross-app cookie injection regression (f1a24d8)
@@ -30,6 +31,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> network-transition # stage 18: multi-interface WAN/LAN transition validation (requires dev-vm-alpha.sh netlab)
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> logs             # download piccolod journal
 set -euo pipefail
+umask 077
 
 IP="${1:?Usage: $0 <VM_IP> [stage]}"
 STAGE="${2:-all}"
@@ -40,10 +42,18 @@ elif [[ -n "${PICCOLO_TEST_PASS:-}" ]]; then
 else
   PASS='PiccoloE2E-Test-2026!'
 fi
-COOKIE_JAR="/tmp/claude/piccolo-alpha/cookies.txt"
+ALPHA_STATE_DIR="${TMPDIR:-/tmp}/piccolo-alpha-${UID}"
+COOKIE_JAR="$ALPHA_STATE_DIR/cookies.txt"
+LEGACY_COOKIE_JAR="/tmp/claude/piccolo-alpha/cookies.txt"
 PASS_COUNT=0
 FAIL_COUNT=0
 SKIP_COUNT=0
+OOM_STAGE_RECOVERY_APP=""
+OOM_STAGE_PROBATION_APP=""
+OOM_STAGE_RECOVERY_CREATED=0
+OOM_STAGE_PROBATION_CREATED=0
+OOM_STAGE_RECOVERY_UID=""
+OOM_STAGE_PROBATION_UID=""
 
 # Colors
 GREEN='\033[0;32m'
@@ -52,18 +62,18 @@ YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-LOG_DIR="/tmp/claude/piccolo-alpha/logs"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+LOG_DIR="$ALPHA_STATE_DIR/logs"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
 # SSH into the VM.
-vssh() { ssh $SSH_OPTS "root@$IP" "$@"; }
+vssh() { ssh "${SSH_OPTS[@]}" "root@$IP" "$@"; }
 
 # HTTP helpers (same as production test script).
 api()  { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" "http://$IP$1" 2>/dev/null; }
 apij() { api "$1" | python3 -m json.tool 2>/dev/null; }
 csrf() { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/auth/csrf" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null; }
 post() {
-  local _body_file; _body_file=$(mktemp /tmp/claude-1000/post-body-XXXXXX)
+  local _body_file; _body_file=$(mktemp "$ALPHA_STATE_DIR/post-body-XXXXXX")
   printf '%s' "$2" > "$_body_file"
   curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -X POST -H "Content-Type: application/json" -d @"$_body_file" "http://$IP$1" 2>/dev/null
@@ -72,7 +82,7 @@ post() {
 post_csrf() {
   local token; token=$(csrf)
   if [[ -n "${2:-}" ]]; then
-    local _body; _body=$(mktemp /tmp/claude-1000/csrf-body-XXXXXX)
+    local _body; _body=$(mktemp "$ALPHA_STATE_DIR/csrf-body-XXXXXX")
     printf '%s' "$2" > "$_body"
     curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
       -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
@@ -86,21 +96,35 @@ post_csrf() {
 }
 
 ensure_session() {
-  local authed
+  local authed login_code
   authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
     "http://$IP/api/v1/auth/session" 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
   [[ "$authed" == "True" ]] && return 0
-  local _body; _body=$(mktemp /tmp/claude-1000/session-body-XXXXXX)
-  printf '{"username":"admin","password":"%s"}' "$PASS" > "$_body"
-  curl -sf --connect-timeout 10 -c "$COOKIE_JAR" \
-    -X POST -H "Content-Type: application/json" \
-    -d @"$_body" "http://$IP/api/v1/auth/login" >/dev/null 2>&1 || true
-  printf '{"password":"%s"}' "$PASS" > "$_body"
-  curl -sf --connect-timeout 10 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-    -X POST -H "Content-Type: application/json" \
-    -d @"$_body" "http://$IP/api/v1/crypto/unlock" >/dev/null 2>&1 || true
+  local _body; _body=$(mktemp "$ALPHA_STATE_DIR/session-body-XXXXXX")
+  rm -f "$COOKIE_JAR"
+  for _ in $(seq 1 10); do
+    printf '{"username":"admin","password":"%s"}' "$PASS" > "$_body"
+    login_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+      -c "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
+      -d @"$_body" "http://$IP/api/v1/auth/login" 2>/dev/null || true)
+    if [[ "$login_code" == "200" ]]; then
+      printf '{"password":"%s"}' "$PASS" > "$_body"
+      curl -sf --connect-timeout 10 --max-time 30 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+        -X POST -H "Content-Type: application/json" \
+        -d @"$_body" "http://$IP/api/v1/crypto/unlock" >/dev/null 2>&1 || true
+      authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
+        "http://$IP/api/v1/auth/session" 2>/dev/null \
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
+      if [[ "$authed" == "True" ]]; then
+        rm -f "$_body"
+        return 0
+      fi
+    fi
+    sleep 1
+  done
   rm -f "$_body"
+  return 1
 }
 
 check() {
@@ -395,7 +419,7 @@ stage_system_update() {
   ensure_session
 
   local status_file status_code start_ns end_ns elapsed_ms
-  status_file=$(mktemp /tmp/claude-1000/os-update-status-XXXXXX)
+  status_file=$(mktemp "$ALPHA_STATE_DIR/os-update-status-XXXXXX")
   start_ns=$(date +%s%N)
   status_code=$(curl -s -o "$status_file" -w '%{http_code}' \
     --connect-timeout 5 --max-time 12 \
@@ -440,7 +464,7 @@ PY
   fi
 
   local log_file log_code log_bytes
-  log_file=$(mktemp /tmp/claude-1000/diagnostic-log-XXXXXX)
+  log_file=$(mktemp "$ALPHA_STATE_DIR/diagnostic-log-XXXXXX")
   log_code=$(curl -s -o "$log_file" -w '%{http_code}' \
     --connect-timeout 10 --max-time 75 \
     -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
@@ -893,8 +917,8 @@ except: print('')" 2>/dev/null)
   fi
 
   local body_file resp_file resize_code resize_resp
-  body_file=$(mktemp /tmp/claude-1000/resize-body-XXXXXX)
-  resp_file=$(mktemp /tmp/claude-1000/resize-resp-XXXXXX)
+  body_file=$(mktemp "$ALPHA_STATE_DIR/resize-body-XXXXXX")
+  resp_file=$(mktemp "$ALPHA_STATE_DIR/resize-resp-XXXXXX")
   printf '{"size_bytes":%d}' "$target_bytes" > "$body_file"
   token=$(csrf)
   resize_code=$(curl -s -o "$resp_file" -w '%{http_code}' --connect-timeout 30 --max-time 180 \
@@ -1100,7 +1124,7 @@ except: print('')" 2>/dev/null)
   active_rootfs_before=$(vssh "python3 -c 'import json; d=json.load(open(\"$METADATA_PATH\")); print((d.get(\"active_rootfs\") or {}).get(\"main\", \"\"))'" 2>/dev/null || true)
 
   local resp_file update_code update_resp
-  resp_file=$(mktemp /tmp/claude-1000/image-update-resp-XXXXXX)
+  resp_file=$(mktemp "$ALPHA_STATE_DIR/image-update-resp-XXXXXX")
   token=$(csrf)
   update_code=$(curl -s -o "$resp_file" -w '%{http_code}' --connect-timeout 30 --max-time 300 \
     -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
@@ -1240,7 +1264,7 @@ stage_reboot() {
 
   # Unlock
   rm -f "$COOKIE_JAR"
-  local _body; _body=$(mktemp /tmp/claude-1000/unlock-body-XXXXXX)
+  local _body; _body=$(mktemp "$ALPHA_STATE_DIR/unlock-body-XXXXXX")
   printf '{"password":"%s"}' "$PASS" > "$_body"
   local unlock_code
   unlock_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
@@ -1648,6 +1672,409 @@ print(json.dumps({
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 21: OOM hierarchy and per-app session recovery
+#
+# This is an explicit destructive qualification stage and is deliberately not
+# part of `all`. It uses deterministic SIGKILL loss injection while separately
+# proving the live OOM score hierarchy. The runtime recovery owner remains the
+# ordinary 30-second app reconciler; this harness does not trigger a private
+# recovery path.
+# ─────────────────────────────────────────────────────────
+stage_oom_recovery() {
+  echo -e "\n${CYAN}═══ Stage 21: OOM Hierarchy + Session Recovery (~15 min) ═══${NC}"
+  ensure_session
+
+  local run_token
+  run_token=$(date +%s%N)
+  run_token="${run_token: -10}"
+  OOM_STAGE_RECOVERY_APP="oomr${run_token}"
+  OOM_STAGE_PROBATION_APP="oomp${run_token}"
+  OOM_STAGE_RECOVERY_CREATED=0
+  OOM_STAGE_PROBATION_CREATED=0
+  OOM_STAGE_RECOVERY_UID=""
+  OOM_STAGE_PROBATION_UID=""
+  local recovery_app="$OOM_STAGE_RECOVERY_APP"
+  local probation_app="$OOM_STAGE_PROBATION_APP"
+  local fixture_yaml
+  fixture_yaml=$(cat <<'EOF'
+services:
+  main:
+    image: docker.io/traefik/whoami:latest
+    bind_ports: [80]
+
+listeners:
+  - name: __primary
+    guest_port: 80
+    flow: tcp
+    protocol: http
+
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+
+x-piccolo:
+  mode: service
+EOF
+)
+
+  _oom_app_field() {
+    local app_name="$1" field="$2"
+    api "/api/v1/apps/$app_name" | FIELD="$field" python3 -c '
+import json, os, sys
+try:
+    app = json.load(sys.stdin).get("data", {}).get("app")
+    if not isinstance(app, dict) or not app:
+        raise ValueError("missing app payload")
+    field = os.environ["FIELD"]
+    # StartupAttempts is encoded with omitempty, so a valid app payload omits
+    # the field when the recovery history has been reset to zero.
+    value = app.get(field, 0 if field == "startup_attempts" else "")
+    print(str(value).lower() if isinstance(value, bool) else value)
+except Exception:
+    print("")
+' 2>/dev/null
+  }
+
+  _oom_wait_running() {
+    local app_name="$1" status=""
+    for _ in $(seq 1 90); do
+      status=$(_oom_app_field "$app_name" status)
+      [[ "$status" == "running" ]] && return 0
+      sleep 2
+    done
+    return 1
+  }
+
+  _oom_install_fixture() {
+    local app_name="$1" created_var="$2" uid_var="$3" payload token install_http fixture_uid
+
+    payload=$(YAML="$fixture_yaml" NAME="$app_name" python3 -c '
+import json, os
+print(json.dumps({
+    "app_definition": os.environ["YAML"],
+    "inputs": {"__app_address__": os.environ["NAME"]},
+    "catalog_source": "none",
+}))
+')
+    token=$(csrf)
+    install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 300 \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+    check "21.install.$app_name" "$app_name fixture installed" "$install_http" "201"
+    [[ "$install_http" == "201" ]] || return 1
+    printf -v "$created_var" '%d' 1
+    fixture_uid=$(vssh "id -u pa-$app_name 2>/dev/null" | tail -1 | tr -d '[:space:]')
+    [[ "$fixture_uid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf -v "$uid_var" '%s' "$fixture_uid"
+    _oom_wait_running "$app_name"
+  }
+
+  _oom_fixture_absent() {
+    local app_name="$1" uid="$2" username="pa-$1"
+    [[ "$app_name" =~ ^[a-z0-9]+$ && "$uid" =~ ^[1-9][0-9]*$ ]] || return 1
+    vssh "set -euo pipefail
+      if getent passwd $username >/dev/null; then exit 1; fi
+      if getent group $username >/dev/null; then exit 1; fi
+      if grep -q '^$username:' /etc/subuid /etc/subgid 2>/dev/null; then exit 1; fi
+      if test -e /home/$username || test -e /var/lib/systemd/linger/$username || test -e /run/user/$uid; then exit 1; fi
+      if test -e /piccolo-core/apps/$app_name || test -e /run/piccolo/podman/apps/$app_name || test -e /run/piccolo/podman/app-$app_name || test -e /piccolo-core/mounts/app-$app_name; then exit 1; fi
+      if ps -eo ruid=,euid=,suid=,fuid= | awk -v uid=$uid '{ for (i = 1; i <= 4; i++) if (\$i == uid) found = 1 } END { exit found ? 0 : 1 }'; then exit 1; fi
+      exit 0" >/dev/null
+  }
+
+  _oom_cleanup() {
+    local cleanup_code
+    if [[ "${OOM_STAGE_RECOVERY_CREATED:-0}" == "1" ]]; then
+      cleanup_code=$(delete_app_if_present "$OOM_STAGE_RECOVERY_APP")
+      if [[ "$cleanup_code" == "200" || "$cleanup_code" == "404" ]]; then
+        sleep 2
+        if _oom_fixture_absent "$OOM_STAGE_RECOVERY_APP" "$OOM_STAGE_RECOVERY_UID"; then
+          OOM_STAGE_RECOVERY_CREATED=0
+        fi
+      fi
+    fi
+    if [[ "${OOM_STAGE_PROBATION_CREATED:-0}" == "1" ]]; then
+      cleanup_code=$(delete_app_if_present "$OOM_STAGE_PROBATION_APP")
+      if [[ "$cleanup_code" == "200" || "$cleanup_code" == "404" ]]; then
+        sleep 2
+        if _oom_fixture_absent "$OOM_STAGE_PROBATION_APP" "$OOM_STAGE_PROBATION_UID"; then
+          OOM_STAGE_PROBATION_CREATED=0
+        fi
+      fi
+    fi
+  }
+  # The IDs are unique to this invocation and only become cleanup-eligible
+  # after a successful create response. An interrupted destructive stage can
+  # therefore remove its own fixtures without uninstalling a pre-existing app.
+  trap _oom_cleanup EXIT
+  echo -e "  ${CYAN}INFO${NC} Run-scoped fixtures: $recovery_app, $probation_app"
+
+  _oom_runtime_context() {
+    local app_name="$1"
+    local username="pa-$app_name" uid home
+    uid=$(vssh "id -u $username 2>/dev/null" | tail -1 | tr -d '[:space:]')
+    home=$(vssh "getent passwd $username | cut -d: -f6" | tail -1 | tr -d '[:space:]')
+    [[ "$uid" =~ ^[0-9]+$ && -n "$home" ]] || return 1
+    printf '%s|%s|%s\n' "$username" "$uid" "$home"
+  }
+
+  _oom_podman_prefix() {
+    local app_name="$1" runtime_context username uid home
+    runtime_context=$(_oom_runtime_context "$app_name") || return 1
+    IFS='|' read -r username uid home <<< "$runtime_context"
+    # runuser preserves the caller's working directory. The harness connects as
+    # root, whose home is not traversable by the rootless app user, so enter a
+    # neutral directory before invoking the app's Podman storage context.
+    printf 'cd /tmp && /usr/sbin/runuser --user %s -- /usr/bin/env HOME=%s XDG_RUNTIME_DIR=/run/user/%s LANG=C.UTF-8 LC_ALL=C /usr/bin/podman --root /run/piccolo/podman/apps/%s --runroot /run/piccolo/podman/app-%s --storage-driver overlay' \
+      "$username" "$home" "$uid" "$app_name" "$app_name"
+  }
+
+  _oom_workload_identity() {
+    local app_name="$1" prefix cid pid
+    prefix=$(_oom_podman_prefix "$app_name") || return 1
+    cid=$(vssh "$prefix ps --no-trunc --filter 'label=io.piccolo.instance=$app_name' --filter 'label=io.piccolo.role=service' --format '{{.ID}}' 2>/dev/null | head -1" \
+      | tail -1 | tr -d '[:space:]')
+    [[ "$cid" =~ ^[0-9a-f]{64}$ ]] || return 1
+    pid=$(vssh "$prefix inspect --format '{{.State.Pid}}' $cid 2>/dev/null" | tail -1 | tr -d '[:space:]')
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    printf '%s|%s\n' "$cid" "$pid"
+  }
+
+  _oom_workload_pid() {
+    local identity cid pid
+    identity=$(_oom_workload_identity "$1") || return 1
+    IFS='|' read -r cid pid <<< "$identity"
+    printf '%s\n' "$pid"
+  }
+
+  _oom_kill_workload() {
+    local app_name="$1" identity cid pid runtime_context username uid home
+    identity=$(_oom_workload_identity "$app_name") || return 1
+    IFS='|' read -r cid pid <<< "$identity"
+    runtime_context=$(_oom_runtime_context "$app_name") || return 1
+    IFS='|' read -r username uid home <<< "$runtime_context"
+
+    # Fail closed unless the inspected PID still belongs to the exact full
+    # container ID. Target the transient container scope rather than the PID,
+    # so PID exit/reuse between inspection and the destructive action cannot
+    # kill an unrelated VM process.
+    vssh "set -eu; test -r /proc/$pid/cgroup; grep -Eq '(^|/)libpod-$cid\\.scope($|/)' /proc/$pid/cgroup; /usr/sbin/runuser --user $username -- /usr/bin/env XDG_RUNTIME_DIR=/run/user/$uid DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus /usr/bin/systemctl --user kill --kill-who=all --signal=KILL libpod-$cid.scope" >/dev/null || return 1
+    printf '%s\n' "$pid"
+  }
+
+  _oom_wait_recovered() {
+    local app_name="$1" old_pid="$2" expected_attempts="$3"
+    local status attempts new_pid=""
+    for _ in $(seq 1 75); do
+      status=$(_oom_app_field "$app_name" status)
+      attempts=$(_oom_app_field "$app_name" startup_attempts)
+      new_pid=$(_oom_workload_pid "$app_name" 2>/dev/null || true)
+      if [[ "$status" == "running" && "$attempts" == "$expected_attempts" &&
+            "$new_pid" =~ ^[1-9][0-9]*$ && "$new_pid" != "$old_pid" ]]; then
+        return 0
+      fi
+      sleep 2
+    done
+    return 1
+  }
+
+  _oom_kill_and_wait() {
+    local app_name="$1" expected_attempt="$2" old_pid
+    old_pid=$(_oom_kill_workload "$app_name") || return 1
+    _oom_wait_recovered "$app_name" "$old_pid" "$expected_attempt"
+  }
+
+  check_ssh_ok "21.1" "choom helper is executable" "test -x /usr/bin/choom"
+  check_ssh_ok "21.2" "runuser helper is executable" "test -x /usr/sbin/runuser"
+  check_ssh "21.3" "Effective piccolod OOMScoreAdjust" \
+    "systemctl show piccolod.service -p OOMScoreAdjust" "OOMScoreAdjust=-500"
+  check_ssh "21.4" "Global user@ template drop-in is installed" \
+    "systemd-analyze cat-config systemd/system/user@.service 2>/dev/null" "OOMScoreAdjust=-250"
+
+  if ! _oom_install_fixture "$recovery_app" OOM_STAGE_RECOVERY_CREATED OOM_STAGE_RECOVERY_UID; then
+    echo -e "  ${RED}FAIL${NC} [21.5] Recovery fixture did not reach running"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage21-install-fail"
+    return
+  fi
+  echo -e "  ${GREEN}PASS${NC} [21.5] Recovery fixture reaches running"
+  ((PASS_COUNT++)) || true
+
+  local runtime_context username uid home workload_pid piccolod_pid user_pid
+  runtime_context=$(_oom_runtime_context "$recovery_app")
+  IFS='|' read -r username uid home <<< "$runtime_context"
+  workload_pid=$(_oom_workload_pid "$recovery_app")
+  piccolod_pid=$(vssh "systemctl show piccolod.service -p MainPID --value" | tail -1 | tr -d '[:space:]')
+  user_pid=$(vssh "systemctl show user@${uid}.service -p MainPID --value" | tail -1 | tr -d '[:space:]')
+
+  check_ssh "21.6" "Live piccolod process score" "printf 'score='; cat /proc/$piccolod_pid/oom_score_adj" "score=-500"
+  check_ssh "21.7" "Live per-app user manager score" "printf 'score='; cat /proc/$user_pid/oom_score_adj" "score=-250"
+  check_ssh "21.8" "Live rootless workload score" "printf 'score='; cat /proc/$workload_pid/oom_score_adj" "score=0"
+  check_ssh_ok "21.9" "Real per-app user bus transaction succeeds" \
+    "/usr/sbin/runuser --user $username -- /usr/bin/env XDG_RUNTIME_DIR=/run/user/$uid DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus /usr/bin/busctl --user --no-pager --quiet list"
+  local workload_identity workload_cid
+  workload_identity=$(_oom_workload_identity "$recovery_app")
+  IFS='|' read -r workload_cid workload_pid <<< "$workload_identity"
+  check_ssh_fail "21.9a" "Workload identity proof rejects a mismatched container ID" \
+    "test -r /proc/$workload_pid/cgroup && grep -Eq '(^|/)libpod-0000000000000000000000000000000000000000000000000000000000000000\\.scope($|/)' /proc/$workload_pid/cgroup"
+  check_ssh_fail "21.9b" "Workload identity proof rejects a missing proc entry" \
+    "test -r /proc/999999999/cgroup && grep -Eq '(^|/)libpod-$workload_cid\\.scope($|/)' /proc/999999999/cgroup"
+
+  if _oom_kill_and_wait "$recovery_app" 1; then
+    echo -e "  ${GREEN}PASS${NC} [21.10] Workload-only loss recovered through ordinary reconcile (attempt 1)"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.10] Workload-only loss did not recover"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage21-workload-recovery-fail"
+    return
+  fi
+
+  local old_user_pid old_workload unit_observation new_user_pid session_log
+  old_user_pid=$(vssh "systemctl show user@${uid}.service -p MainPID --value" | tail -1 | tr -d '[:space:]')
+  old_workload=$(_oom_workload_pid "$recovery_app")
+  # Target the dedicated user slice so delegated Podman scopes are killed with
+  # the manager, matching the kernel/systemd whole-cgroup OOM sequence.
+  unit_observation=$(vssh "systemctl kill --kill-who=all --signal=KILL user-${uid}.slice; sleep 0.2; systemctl show user@${uid}.service -p ActiveState -p SubState -p Result --no-pager; if test -S /run/user/$uid/bus; then echo bus_socket=present; else echo bus_socket=absent; fi" 2>&1 || true)
+  echo -e "  ${CYAN}INFO${NC} Immediate whole-unit loss observation:"
+  echo "$unit_observation" | sed 's/^/       /'
+  if echo "$unit_observation" | grep -q 'bus_socket=present'; then
+    echo -e "  ${GREEN}PASS${NC} [21.11] Stale user-bus socket residue observed after unit loss"
+    ((PASS_COUNT++)) || true
+  else
+    skip "21.11" "Stale bus residue coverage" "this alpha system removed the socket during unit loss"
+  fi
+
+  if _oom_wait_recovered "$recovery_app" "$old_workload" 2; then
+    new_user_pid=$(vssh "systemctl show user@${uid}.service -p MainPID --value" | tail -1 | tr -d '[:space:]')
+    if [[ "$new_user_pid" =~ ^[1-9][0-9]*$ && "$new_user_pid" != "$old_user_pid" ]]; then
+      echo -e "  ${GREEN}PASS${NC} [21.12] Whole user unit and workload recovered with a new manager PID (attempt 2)"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [21.12] Workload recovered without proving a replacement user manager"
+      ((FAIL_COUNT++)) || true
+    fi
+  else
+    echo -e "  ${RED}FAIL${NC} [21.12] Whole user-unit loss did not recover"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage21-user-unit-recovery-fail"
+    return
+  fi
+  session_log=$(vssh "journalctl -u piccolod --since '5 minutes ago' --no-pager 2>/dev/null | grep 'user session ready instance=$recovery_app' | grep -E 'repair_action=(start|restart)' | tail -1" 2>/dev/null || true)
+  if echo "$session_log" | grep -Eq 'repair_action=(start|restart)'; then
+    echo -e "  ${GREEN}PASS${NC} [21.13] Structured session diagnostic records the owned repair action"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.13] Structured session diagnostic lacks start/restart evidence"
+    echo -e "       actual: ${session_log:-<empty>}"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local attempt
+  for attempt in 3 4 5; do
+    if _oom_kill_and_wait "$recovery_app" "$attempt"; then
+      echo -e "  ${GREEN}PASS${NC} [21.14.$attempt] Rapid loss recovered and retained attempt $attempt"
+      ((PASS_COUNT++)) || true
+    else
+      echo -e "  ${RED}FAIL${NC} [21.14.$attempt] Rapid loss failed before owned attempt $attempt completed"
+      ((FAIL_COUNT++)) || true
+      dump_logs "stage21-attempt-$attempt-fail"
+      return
+    fi
+  done
+
+  local sixth_old sixth_status="" sixth_attempts="" sixth_pid=""
+  sixth_old=$(_oom_kill_workload "$recovery_app")
+  for _ in $(seq 1 45); do
+    sixth_status=$(_oom_app_field "$recovery_app" status)
+    sixth_attempts=$(_oom_app_field "$recovery_app" startup_attempts)
+    sixth_pid=$(_oom_workload_pid "$recovery_app" 2>/dev/null || true)
+    [[ "$sixth_status" == "error" && "$sixth_attempts" == "5" && -z "$sixth_pid" ]] && break
+    sleep 2
+  done
+  if [[ "$sixth_status" == "error" && "$sixth_attempts" == "5" && -z "$sixth_pid" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [21.15] Sixth rapid recovery is blocked at the existing five-attempt budget"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.15] Sixth-attempt guard mismatch (status=$sixth_status attempts=$sixth_attempts pid=${sixth_pid:-none})"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  local cleanup_code
+  cleanup_code=$(delete_app_if_present "$recovery_app")
+  check "21.16" "Budget fixture uninstall API accepted after blocked recovery" "$cleanup_code" "200"
+  sleep 4
+  if [[ "$cleanup_code" == "200" ]] && _oom_fixture_absent "$recovery_app" "$OOM_STAGE_RECOVERY_UID"; then
+    echo -e "  ${GREEN}PASS${NC} [21.16a] Budget fixture user, UID processes, linger, roots, and app paths are absent"
+    ((PASS_COUNT++)) || true
+    OOM_STAGE_RECOVERY_CREATED=0
+  else
+    echo -e "  ${RED}FAIL${NC} [21.16a] Budget fixture cleanup did not prove complete absence"
+    ((FAIL_COUNT++)) || true
+  fi
+
+  if ! _oom_install_fixture "$probation_app" OOM_STAGE_PROBATION_CREATED OOM_STAGE_PROBATION_UID; then
+    echo -e "  ${RED}FAIL${NC} [21.17] Probation fixture did not reach running"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage21-probation-install-fail"
+    return
+  fi
+  if _oom_kill_and_wait "$probation_app" 1; then
+    echo -e "  ${GREEN}PASS${NC} [21.17] Probation fixture begins with one owned recovery attempt"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.17] Probation fixture did not recover"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  echo -e "  ${CYAN}WAIT${NC} Observing ten continuous running minutes plus one reconcile tick..."
+  local probation_attempts=""
+  for _ in $(seq 1 140); do
+    probation_attempts=$(_oom_app_field "$probation_app" startup_attempts)
+    [[ "$probation_attempts" == "0" ]] && break
+    sleep 5
+  done
+  if [[ "$probation_attempts" == "0" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [21.18] Ten-minute continuous-running probation clears recovery history"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.18] Recovery history did not clear after probation (attempts=$probation_attempts)"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage21-probation-reset-fail"
+  fi
+
+  if _oom_kill_and_wait "$probation_app" 1; then
+    echo -e "  ${GREEN}PASS${NC} [21.19] Post-probation loss starts a fresh recovery budget"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [21.19] Post-probation recovery did not start a fresh budget"
+    ((FAIL_COUNT++)) || true
+  fi
+  cleanup_code=$(delete_app_if_present "$probation_app")
+  check "21.20" "Probation fixture uninstall API accepted" "$cleanup_code" "200"
+  sleep 4
+  if [[ "$cleanup_code" == "200" ]] && _oom_fixture_absent "$probation_app" "$OOM_STAGE_PROBATION_UID"; then
+    echo -e "  ${GREEN}PASS${NC} [21.20a] Probation fixture user, UID processes, linger, roots, and app paths are absent"
+    ((PASS_COUNT++)) || true
+    OOM_STAGE_PROBATION_CREATED=0
+  else
+    echo -e "  ${RED}FAIL${NC} [21.20a] Probation fixture cleanup did not prove complete absence"
+    ((FAIL_COUNT++)) || true
+  fi
+  dump_logs "stage21-oom-recovery"
+  # Retry any failed explicit delete before exit. Keep the EXIT retry armed if
+  # cleanup still fails; only disarm it after both owned fixtures are absent.
+  _oom_cleanup
+  if [[ "$OOM_STAGE_RECOVERY_CREATED" == "0" && "$OOM_STAGE_PROBATION_CREATED" == "0" ]]; then
+    trap - EXIT
+  fi
+}
+
+# ─────────────────────────────────────────────────────────
 # Stage 12: ConnectionAuth (L4 IP allow/deny — listener-pipeline RFC 20260505)
 #
 # Verifies the new ConnectionAuth field on AppListener composes through the
@@ -1970,7 +2397,7 @@ for l in ls:
   # is byte-oriented (curl over plain TCP is equivalent to "raw HTTP bytes"
   # from the listener's perspective). Backend takes 20-40s past health=ok on
   # first install due to pasta/podman wiring; retry up to 60s.
-  local raw_body; raw_body=$(mktemp /tmp/claude-1000/raw-body-XXXXXX)
+  local raw_body; raw_body=$(mktemp "$ALPHA_STATE_DIR/raw-body-XXXXXX")
   local body="" attempt code=""
   for attempt in $(seq 1 20); do
     code=$(curl -s -o "$raw_body" -w '%{http_code}' --max-time 4 "http://$IP:$pub_port/" 2>/dev/null || true)
@@ -3111,7 +3538,27 @@ except: print('||0|0|False')" 2>/dev/null)
 # ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
-mkdir -p "$(dirname "$COOKIE_JAR")" /tmp/claude-1000
+if [[ -L "$ALPHA_STATE_DIR" ]] || { [[ -e "$ALPHA_STATE_DIR" ]] && [[ ! -d "$ALPHA_STATE_DIR" ]]; }; then
+  echo "Refusing unsafe alpha state path: $ALPHA_STATE_DIR" >&2
+  exit 1
+fi
+if [[ -d "$ALPHA_STATE_DIR" ]] && [[ "$(stat -c '%u' "$ALPHA_STATE_DIR")" != "$UID" ]]; then
+  echo "Refusing alpha state directory owned by another UID: $ALPHA_STATE_DIR" >&2
+  exit 1
+fi
+mkdir -p "$ALPHA_STATE_DIR"
+chmod 0700 "$ALPHA_STATE_DIR"
+if [[ -e "$COOKIE_JAR" ]]; then
+  if [[ -L "$COOKIE_JAR" ]] || [[ "$(stat -c '%u' "$COOKIE_JAR")" != "$UID" ]]; then
+    echo "Refusing unsafe alpha cookie jar: $COOKIE_JAR" >&2
+    exit 1
+  fi
+  chmod 0600 "$COOKIE_JAR"
+fi
+if [[ -e "$LEGACY_COOKIE_JAR" ]] && [[ ! -L "$LEGACY_COOKIE_JAR" ]] \
+    && [[ -f "$LEGACY_COOKIE_JAR" ]] && [[ "$(stat -c '%u' "$LEGACY_COOKIE_JAR")" == "$UID" ]]; then
+  rm -f "$LEGACY_COOKIE_JAR"
+fi
 
 case "$STAGE" in
   prereq)            stage_prereq ;;
@@ -3129,6 +3576,7 @@ case "$STAGE" in
   reboot)            stage_reboot ;;
   storage-post)      stage_storage_post ;;
   stewardship)       stage_stewardship ;;
+  oom-recovery)      stage_oom_recovery ;;
   auto-unlock)       stage_auto_unlock ;;
   connection-auth)   stage_connection_auth ;;
   tcp-raw)           stage_tcp_raw ;;
@@ -3167,7 +3615,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac

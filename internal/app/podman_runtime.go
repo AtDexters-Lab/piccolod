@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -10,6 +12,13 @@ import (
 
 	"piccolod/internal/container"
 	"piccolod/internal/state/paths"
+)
+
+type appRuntimeIntent uint8
+
+const (
+	appRuntimeObserve appRuntimeIntent = iota
+	appRuntimeEnsureReady
 )
 
 const (
@@ -48,15 +57,26 @@ func podmanRunRootBase() string {
 
 // resolveAppCredential provisions a per-app Linux user and sets up the
 // environment (XDG_RUNTIME_DIR, cgroup delegation, directory ownership).
-func (m *AppManager) resolveAppCredential(instanceID string, layout appVolumeLayout, runRoot string) (*syscall.Credential, string, error) {
+func (m *AppManager) resolveAppCredential(ctx context.Context, instanceID string, layout appVolumeLayout, runRoot string, intent appRuntimeIntent) (*syscall.Credential, string, error) {
 	// Test hook: use injected resolver instead of real user provisioning.
 	if m.credentialResolver != nil {
 		return m.credentialResolver(instanceID)
 	}
 
-	appUser, err := container.ProvisionAppUser(instanceID)
+	var (
+		appUser *container.AppUser
+		err     error
+	)
+	switch intent {
+	case appRuntimeObserve:
+		appUser, err = container.ResolveReadyAppUser(ctx, instanceID)
+	case appRuntimeEnsureReady:
+		appUser, err = container.ProvisionAppUserContext(ctx, instanceID)
+	default:
+		return nil, "", fmt.Errorf("unsupported runtime intent %d", intent)
+	}
 	if err != nil {
-		return nil, "", fmt.Errorf("provision per-app user for %s: %w", instanceID, err)
+		return nil, "", fmt.Errorf("acquire per-app user for %s: %w", instanceID, err)
 	}
 
 	cred := appUser.Credential
@@ -110,7 +130,7 @@ func (m *AppManager) ensureServiceRoot(instanceID string, cred *syscall.Credenti
 // podmanRuntimeForApp returns a runtime configured for a specific app instance.
 // Each app instance has an isolated podman Root (container metadata, RW layers).
 // Service containers use --rootfs from golden LV snapshots, bypassing podman image storage.
-func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayout, mode PiccoloMode) (container.PodmanRuntime, error) {
+func (m *AppManager) podmanRuntimeForApp(ctx context.Context, instanceID string, layout appVolumeLayout, mode PiccoloMode, intent appRuntimeIntent) (container.PodmanRuntime, error) {
 	volID := layout.VolumeID
 	if volID == "" {
 		volID = appVolumeID(instanceID)
@@ -125,7 +145,7 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", instanceID)
 	}
 
-	cred, homeDir, err := m.resolveAppCredential(instanceID, layout, runRoot)
+	cred, homeDir, err := m.resolveAppCredential(ctx, instanceID, layout, runRoot, intent)
 	if err != nil {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
 	}
@@ -149,6 +169,31 @@ func (m *AppManager) podmanRuntimeForApp(instanceID string, layout appVolumeLayo
 		Credential:    cred,
 		HomeDir:       homeDir,
 	}, nil
+}
+
+// quiesceRuntimeForApp returns a usable runtime for graceful Podman teardown.
+// If any rootless runtime prerequisite is unavailable, PID 1 stops the
+// dedicated user unit and the second return value reports that no rootless
+// command is required.
+func (m *AppManager) quiesceRuntimeForApp(ctx context.Context, instanceID string, layout appVolumeLayout, mode PiccoloMode) (container.PodmanRuntime, bool, error) {
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeObserve)
+	if err == nil {
+		return runtime, false, nil
+	}
+	if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+		return container.PodmanRuntime{}, false, errors.Join(
+			fmt.Errorf("rootless runtime unavailable for %s: %w", instanceID, err),
+			fmt.Errorf("PID 1 quiesce failed for %s: %w", instanceID, quiesceErr),
+		)
+	}
+	return container.PodmanRuntime{}, true, nil
+}
+
+func (m *AppManager) quiesceAppUserSession(ctx context.Context, instanceID string) error {
+	if m.userSessionQuiescer != nil {
+		return m.userSessionQuiescer(ctx, instanceID)
+	}
+	return container.QuiesceAppUserSession(ctx, instanceID)
 }
 
 // newEphemeralFlattenRuntime creates a temporary podman root for a single

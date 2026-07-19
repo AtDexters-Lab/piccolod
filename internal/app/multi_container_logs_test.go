@@ -44,7 +44,7 @@ func TestAppManager_LogsForService_MultiContainer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ensureAppVolumeLayout: %v", err)
 	}
-	runtime, err := mgr.podmanRuntimeForApp("demo", layout, ModeService)
+	runtime, err := mgr.podmanRuntimeForApp(context.Background(), "demo", layout, ModeService, appRuntimeEnsureReady)
 	if err != nil {
 		t.Fatalf("podmanRuntimeForApp: %v", err)
 	}

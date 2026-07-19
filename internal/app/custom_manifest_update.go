@@ -996,7 +996,7 @@ func (m *AppManager) restoreManifestUpdateAccessFromRuntime(ctx context.Context,
 	if err != nil {
 		return fmt.Errorf("ensure layout: %w", err)
 	}
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, piccoloModeFromExtensions(def.Extensions))
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeEnsureReady)
 	if err != nil {
 		return fmt.Errorf("podman runtime: %w", err)
 	}
@@ -1248,15 +1248,10 @@ func (m *AppManager) restorePrecommitDataSnapshot(ctx context.Context, state *Fi
 	if failedDef != nil {
 		layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 		if err != nil {
-			log.Printf("WARN: manifest update %s: ensure layout before data snapshot restore: %v", instanceID, err)
-		} else {
-			mode := piccoloModeFromExtensions(failedDef.Extensions)
-			runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
-			if err != nil {
-				log.Printf("WARN: manifest update %s: resolve runtime before data snapshot restore: %v", instanceID, err)
-			} else if err := m.stopContainersForMultiApp(ctx, appInst, failedDef, runtime); err != nil {
-				log.Printf("WARN: manifest update %s: stop containers before data snapshot restore: %v", instanceID, err)
-			}
+			return fmt.Errorf("ensure layout before data snapshot restore: %w", err)
+		}
+		if err := m.quiesceContainerGroup(ctx, state, appInst, failedDef, layout); err != nil {
+			return fmt.Errorf("quiesce runtime before data snapshot restore: %w", err)
 		}
 	}
 	renamesCommitted, snapshotPromoted, err := rollbacker.RollbackDataVolume(ctx, instanceID, snapshotID, failedLVName)
@@ -3189,7 +3184,7 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 		return nil, fmt.Errorf("ensure layout: %w", err)
 	}
 	mode := piccoloModeFromExtensions(candidateDef.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return nil, fmt.Errorf("podman runtime: %w", err)
 	}
@@ -3498,7 +3493,7 @@ func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx c
 		return fmt.Errorf("ensure layout: %w", err)
 	}
 	mode := piccoloModeFromExtensions(candidateDef.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return fmt.Errorf("podman runtime: %w", err)
 	}
@@ -3560,7 +3555,7 @@ func (m *AppManager) recreateContainersFromStagedRootfsWithHook(ctx context.Cont
 		return fmt.Errorf("ensure layout: %w", err)
 	}
 	mode := piccoloModeFromExtensions(candidateDef.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
 	if err != nil {
 		return fmt.Errorf("podman runtime: %w", err)
 	}

@@ -1,12 +1,19 @@
 package container
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // mockResolver implements CredentialResolver for testing.
@@ -40,6 +47,8 @@ type mockExecutor struct {
 	// onRun is an optional callback invoked before returning from Run.
 	// Tests use this to simulate side effects (e.g., useradd making a user visible).
 	onRun func(name string, args ...string)
+	// blockUntilContext maps commands that should simulate a hung subprocess.
+	blockUntilContext map[string]bool
 }
 
 type mockResult struct {
@@ -58,6 +67,629 @@ func (m *mockExecutor) Run(name string, args ...string) ([]byte, error) {
 		return r.output, r.err
 	}
 	return m.defaultResult.output, m.defaultResult.err
+}
+
+func (m *mockExecutor) RunContext(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	default:
+	}
+	call := append([]string{name}, args...)
+	key := strings.Join(call, " ")
+	if m.blockUntilContext[key] {
+		m.calls = append(m.calls, call)
+		if m.onRun != nil {
+			m.onRun(name, args...)
+		}
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	return m.Run(name, args...)
+}
+
+func systemUnitShowKey(unit string) string {
+	return fmt.Sprintf("systemctl show %s --property=ActiveState --property=SubState --property=Result --property=ControlGroup --no-pager", unit)
+}
+
+func userSessionShowKey(uid uint32) string {
+	return systemUnitShowKey(fmt.Sprintf("user@%d.service", uid))
+}
+
+func userBusProbeKey(username string, uid uint32) string {
+	return fmt.Sprintf("/usr/sbin/runuser --user %s -- /usr/bin/env XDG_RUNTIME_DIR=/run/user/%d DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%d/bus /usr/bin/busctl --user --no-pager --quiet list", username, uid, uid)
+}
+
+func hasExecutorCall(calls [][]string, want ...string) bool {
+	for _, call := range calls {
+		if strings.Join(call, "\x00") == strings.Join(want, "\x00") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEnsureUserSessionRepairsFailedUnitDespiteStaleBusPath(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+
+	const uid = uint32(475)
+	const username = "pa-namek"
+	exec := &mockExecutor{results: map[string]mockResult{}}
+	exec.results[userSessionShowKey(uid)] = mockResult{output: []byte("ActiveState=failed\nSubState=failed\nResult=signal\nControlGroup=/user.slice/user-475.slice/user@475.service\n")}
+	exec.onRun = func(name string, args ...string) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "start" {
+			exec.results[userSessionShowKey(uid)] = mockResult{output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")}
+			exec.results[userBusProbeKey(username, uid)] = mockResult{}
+		}
+	}
+	defaultExecutor = exec
+
+	if err := ensureUserSession(context.Background(), "namek", username, uid); err != nil {
+		t.Fatalf("ensureUserSession: %v", err)
+	}
+	if !hasExecutorCall(exec.calls, "systemctl", "start", "user@475.service") {
+		t.Fatalf("expected failed unit to be started, calls=%v", exec.calls)
+	}
+	if !hasExecutorCall(exec.calls, "/usr/sbin/runuser", "--user", username, "--", "/usr/bin/env",
+		"XDG_RUNTIME_DIR=/run/user/475", "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/475/bus",
+		"/usr/bin/busctl", "--user", "--no-pager", "--quiet", "list") {
+		t.Fatalf("expected real user-bus probe, calls=%v", exec.calls)
+	}
+}
+
+func TestObserveUserSessionDoesNotRepairActiveButUnusableBus(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+
+	const uid = uint32(475)
+	const username = "pa-namek"
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid):        {output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+		userBusProbeKey(username, uid): {output: []byte("connection refused"), err: errors.New("exit status 1")},
+	}}
+	defaultExecutor = exec
+
+	err := waitForUserSession(context.Background(), "namek", username, uid, false)
+	if !errors.Is(err, ErrUserSessionUnavailable) {
+		t.Fatalf("expected ErrUserSessionUnavailable, got %v", err)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("observe-only bus failure waited for the repair deadline: %v", err)
+	}
+	if hasExecutorCall(exec.calls, "systemctl", "restart", "user@475.service") {
+		t.Fatalf("observe-only path restarted the unit, calls=%v", exec.calls)
+	}
+}
+
+func TestEnsureUserSessionRestartsActiveButUnusableBus(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+
+	const uid = uint32(475)
+	const username = "pa-namek"
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid):        {output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+		userBusProbeKey(username, uid): {output: []byte("connection refused"), err: errors.New("exit status 1")},
+	}}
+	exec.onRun = func(name string, args ...string) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "restart" {
+			exec.results[userBusProbeKey(username, uid)] = mockResult{}
+		}
+	}
+	defaultExecutor = exec
+
+	if err := ensureUserSession(context.Background(), "namek", username, uid); err != nil {
+		t.Fatalf("ensureUserSession: %v", err)
+	}
+	if !hasExecutorCall(exec.calls, "systemctl", "restart", "user@475.service") {
+		t.Fatalf("expected active unusable unit to be restarted, calls=%v", exec.calls)
+	}
+}
+
+func TestEnsureUserSessionStartsInactiveUnit(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+
+	const uid = uint32(475)
+	const username = "pa-namek"
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid): {output: []byte("ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n")},
+	}}
+	exec.onRun = func(name string, args ...string) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "start" {
+			exec.results[userSessionShowKey(uid)] = mockResult{output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")}
+			exec.results[userBusProbeKey(username, uid)] = mockResult{}
+		}
+	}
+	defaultExecutor = exec
+
+	if err := ensureUserSession(context.Background(), "namek", username, uid); err != nil {
+		t.Fatalf("ensureUserSession: %v", err)
+	}
+	if !hasExecutorCall(exec.calls, "systemctl", "start", "user@475.service") {
+		t.Fatalf("inactive unit was not started, calls=%v", exec.calls)
+	}
+}
+
+func TestUserSessionStateAndRepairFailuresAreContextual(t *testing.T) {
+	const uid = uint32(475)
+	const username = "pa-namek"
+	tests := []struct {
+		name           string
+		show           mockResult
+		bus            mockResult
+		action         string
+		actionResult   mockResult
+		wantPreActive  string
+		wantPostActive string
+		wantAction     string
+		wantResult     string
+		wantText       string
+	}{
+		{
+			name:       "query failure",
+			show:       mockResult{output: []byte("pid1 unavailable"), err: errors.New("query failed")},
+			wantAction: "none", wantResult: "not-attempted", wantText: "query failed",
+		},
+		{
+			name:          "maintenance state",
+			show:          mockResult{output: []byte("ActiveState=maintenance\nSubState=maintenance\nResult=signal\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+			wantPreActive: "maintenance", wantPostActive: "maintenance",
+			wantAction: "none", wantResult: "not-attempted", wantText: "unsupported unit state",
+		},
+		{
+			name:   "start failure",
+			show:   mockResult{output: []byte("ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n")},
+			action: "start", actionResult: mockResult{output: []byte("authorization failed"), err: errors.New("start failed")},
+			wantPreActive: "inactive", wantPostActive: "inactive",
+			wantAction: "start", wantResult: "failed", wantText: "start failed",
+		},
+		{
+			name:   "restart failure",
+			show:   mockResult{output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+			bus:    mockResult{output: []byte("connection refused"), err: errors.New("dead bus")},
+			action: "restart", actionResult: mockResult{output: []byte("restart rejected"), err: errors.New("restart failed")},
+			wantPreActive: "active", wantPostActive: "active",
+			wantAction: "restart", wantResult: "failed", wantText: "restart failed",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			oldExecutor := defaultExecutor
+			defer func() { defaultExecutor = oldExecutor }()
+			exec := &mockExecutor{results: map[string]mockResult{
+				userSessionShowKey(uid):        tc.show,
+				userBusProbeKey(username, uid): tc.bus,
+			}}
+			if tc.action != "" {
+				exec.results[fmt.Sprintf("systemctl %s user@475.service", tc.action)] = tc.actionResult
+			}
+			defaultExecutor = exec
+
+			err := ensureUserSession(context.Background(), "namek", username, uid)
+			if err == nil || !strings.Contains(err.Error(), tc.wantText) {
+				t.Fatalf("ensureUserSession error = %v, want %q", err, tc.wantText)
+			}
+			var unavailable *userSessionUnavailableError
+			if !errors.As(err, &unavailable) {
+				t.Fatalf("error type = %T, want userSessionUnavailableError", err)
+			}
+			if unavailable.InstanceID != "namek" || unavailable.UID != uid || unavailable.Unit != "user@475.service" ||
+				unavailable.PreActionState.ActiveState != tc.wantPreActive || unavailable.PostActionState.ActiveState != tc.wantPostActive ||
+				unavailable.RepairAction != tc.wantAction || unavailable.RepairResult != tc.wantResult {
+				t.Fatalf("readiness context = %+v", unavailable)
+			}
+		})
+	}
+}
+
+func TestUserSessionTransitionalStatesRespectDeadline(t *testing.T) {
+	const uid = uint32(475)
+	const username = "pa-namek"
+	for _, activeState := range []string{"activating", "deactivating", "reloading"} {
+		t.Run(activeState, func(t *testing.T) {
+			oldExecutor := defaultExecutor
+			defer func() { defaultExecutor = oldExecutor }()
+			exec := &mockExecutor{results: map[string]mockResult{
+				userSessionShowKey(uid): {output: []byte(fmt.Sprintf("ActiveState=%s\nSubState=waiting\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n", activeState))},
+			}}
+			defaultExecutor = exec
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			started := time.Now()
+			err := waitForUserSession(ctx, "namek", username, uid, true)
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("waitForUserSession error = %v, want deadline", err)
+			}
+			if elapsed := time.Since(started); elapsed > time.Second {
+				t.Fatalf("transitional wait exceeded bound: %v", elapsed)
+			}
+		})
+	}
+}
+
+func TestPostRepairDeadlinePreservesPreAndPostState(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+	const uid = uint32(475)
+	const username = "pa-namek"
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid): {output: []byte("ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n")},
+	}}
+	exec.onRun = func(name string, args ...string) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "start" {
+			exec.results[userSessionShowKey(uid)] = mockResult{output: []byte("ActiveState=activating\nSubState=start\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")}
+		}
+	}
+	defaultExecutor = exec
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := ensureUserSession(ctx, "namek", username, uid)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("ensureUserSession error = %v, want deadline", err)
+	}
+	var unavailable *userSessionUnavailableError
+	if !errors.As(err, &unavailable) {
+		t.Fatalf("error type = %T", err)
+	}
+	if unavailable.PreActionState.ActiveState != "inactive" || unavailable.PostActionState.ActiveState != "activating" ||
+		unavailable.RepairAction != "start" || unavailable.RepairResult != "success" {
+		t.Fatalf("post-repair readiness context = %+v", unavailable)
+	}
+}
+
+func TestUserBusProbeHonorsCancellation(t *testing.T) {
+	oldExecutor := defaultExecutor
+	defer func() { defaultExecutor = oldExecutor }()
+	const uid = uint32(475)
+	const username = "pa-namek"
+	ctx, cancel := context.WithCancel(context.Background())
+	exec := &mockExecutor{
+		results: map[string]mockResult{
+			userSessionShowKey(uid): {output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+		},
+		blockUntilContext: map[string]bool{userBusProbeKey(username, uid): true},
+	}
+	exec.onRun = func(name string, args ...string) {
+		if name == "/usr/sbin/runuser" {
+			cancel()
+		}
+	}
+	defaultExecutor = exec
+	err := waitForUserSession(ctx, "namek", username, uid, false)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitForUserSession error = %v, want cancellation", err)
+	}
+}
+
+func TestQuiesceAppUserSessionStopsUnitAndRequiresEmptyState(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	oldCgroupRoot := userSessionCgroupRoot
+	oldProcessRoot := userProcessRoot
+	oldOpen := openProcessPIDFD
+	oldSignal := signalProcessPIDFD
+	oldClose := closeProcessPIDFD
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+		userSessionCgroupRoot = oldCgroupRoot
+		userProcessRoot = oldProcessRoot
+		openProcessPIDFD = oldOpen
+		signalProcessPIDFD = oldSignal
+		closeProcessPIDFD = oldClose
+	}()
+
+	const uid = uint32(475)
+	const username = "pa-namek"
+	defaultResolver = &mockResolver{users: map[string]*user.User{
+		username: {Uid: "475", Gid: "475", Username: username, HomeDir: "/home/" + username},
+	}}
+	userSessionCgroupRoot = t.TempDir()
+	userProcessRoot = t.TempDir()
+	eventsPath := filepath.Join(userSessionCgroupRoot, "user.slice/user-475.slice/user@475.service/cgroup.events")
+	if err := os.MkdirAll(filepath.Dir(eventsPath), 0o755); err != nil {
+		t.Fatalf("create cgroup fixture: %v", err)
+	}
+	if err := os.WriteFile(eventsPath, []byte("populated 0\n"), 0o644); err != nil {
+		t.Fatalf("write cgroup fixture: %v", err)
+	}
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid): {output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user@475.service\n")},
+	}}
+	exec.onRun = func(name string, args ...string) {
+		if name == "systemctl" && len(args) >= 2 && args[0] == "stop" {
+			exec.results[userSessionShowKey(uid)] = mockResult{output: []byte("ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n")}
+		}
+	}
+	defaultExecutor = exec
+	escapedProc := filepath.Join(userProcessRoot, "4242")
+	if err := os.MkdirAll(escapedProc, 0o755); err != nil {
+		t.Fatalf("create escaped process fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(escapedProc, "status"), []byte("Name:\tcatatonit\nUid:\t475\t475\t475\t475\n"), 0o644); err != nil {
+		t.Fatalf("write escaped process fixture: %v", err)
+	}
+	openProcessPIDFD = func(pid int, _ int) (int, error) { return pid, nil }
+	escapedSignaled := false
+	signalProcessPIDFD = func(_ int, signal unix.Signal) error {
+		if signal != unix.SIGKILL {
+			t.Fatalf("escaped process signal = %v, want SIGKILL", signal)
+		}
+		escapedSignaled = true
+		return os.RemoveAll(escapedProc)
+	}
+	closeProcessPIDFD = func(int) error { return nil }
+
+	if err := QuiesceAppUserSession(context.Background(), "namek"); err != nil {
+		t.Fatalf("QuiesceAppUserSession: %v", err)
+	}
+	if !hasExecutorCall(exec.calls, "systemctl", "stop", "user@475.service") {
+		t.Fatalf("expected PID 1 stop, calls=%v", exec.calls)
+	}
+	if !escapedSignaled {
+		t.Fatal("quiescence did not terminate the UID-owned process outside the user cgroup")
+	}
+}
+
+func TestProcessStatusHasUIDMatchesAnyCredentialUID(t *testing.T) {
+	data := []byte("Name:\tcatatonit\nUid:\t1000\t475\t1000\t1000\n")
+	owned, err := processStatusHasUID(data, 475)
+	if err != nil {
+		t.Fatalf("processStatusHasUID: %v", err)
+	}
+	if !owned {
+		t.Fatal("effective UID match was not recognized")
+	}
+	owned, err = processStatusHasUID(data, 476)
+	if err != nil {
+		t.Fatalf("processStatusHasUID non-match: %v", err)
+	}
+	if owned {
+		t.Fatal("unrelated UID was classified as process owner")
+	}
+}
+
+func TestTerminateUserProcessesKillsEscapedUIDAndProvesAbsence(t *testing.T) {
+	oldProcessRoot := userProcessRoot
+	oldOpen := openProcessPIDFD
+	oldSignal := signalProcessPIDFD
+	oldClose := closeProcessPIDFD
+	defer func() {
+		userProcessRoot = oldProcessRoot
+		openProcessPIDFD = oldOpen
+		signalProcessPIDFD = oldSignal
+		closeProcessPIDFD = oldClose
+	}()
+
+	const (
+		uid = uint32(475)
+		pid = 4242
+	)
+	userProcessRoot = t.TempDir()
+	procDir := filepath.Join(userProcessRoot, strconv.Itoa(pid))
+	if err := os.MkdirAll(procDir, 0o755); err != nil {
+		t.Fatalf("create process fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(procDir, "status"), []byte("Name:\tcatatonit\nUid:\t475\t475\t475\t475\n"), 0o644); err != nil {
+		t.Fatalf("write process fixture: %v", err)
+	}
+
+	openProcessPIDFD = func(gotPID int, flags int) (int, error) {
+		if gotPID != pid || flags != 0 {
+			t.Fatalf("pidfd open = (%d, %d), want (%d, 0)", gotPID, flags, pid)
+		}
+		return gotPID, nil
+	}
+	signaled := false
+	signalProcessPIDFD = func(fd int, signal unix.Signal) error {
+		if fd != pid || signal != unix.SIGKILL {
+			t.Fatalf("pidfd signal = (%d, %v), want (%d, SIGKILL)", fd, signal, pid)
+		}
+		signaled = true
+		return os.RemoveAll(procDir)
+	}
+	closeProcessPIDFD = func(int) error { return nil }
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := terminateUserProcesses(ctx, uid); err != nil {
+		t.Fatalf("terminateUserProcesses: %v", err)
+	}
+	if !signaled {
+		t.Fatal("UID-owned process was not signaled")
+	}
+}
+
+func TestTerminateUserProcessesRechecksOwnershipAfterPidfdOpen(t *testing.T) {
+	oldProcessRoot := userProcessRoot
+	oldOpen := openProcessPIDFD
+	oldSignal := signalProcessPIDFD
+	oldClose := closeProcessPIDFD
+	defer func() {
+		userProcessRoot = oldProcessRoot
+		openProcessPIDFD = oldOpen
+		signalProcessPIDFD = oldSignal
+		closeProcessPIDFD = oldClose
+	}()
+
+	const pid = 4343
+	userProcessRoot = t.TempDir()
+	procDir := filepath.Join(userProcessRoot, strconv.Itoa(pid))
+	statusPath := filepath.Join(procDir, "status")
+	if err := os.MkdirAll(procDir, 0o755); err != nil {
+		t.Fatalf("create process fixture: %v", err)
+	}
+	if err := os.WriteFile(statusPath, []byte("Name:\told\nUid:\t475\t475\t475\t475\n"), 0o644); err != nil {
+		t.Fatalf("write process fixture: %v", err)
+	}
+
+	openProcessPIDFD = func(gotPID int, _ int) (int, error) {
+		if err := os.WriteFile(statusPath, []byte("Name:\treused\nUid:\t0\t0\t0\t0\n"), 0o644); err != nil {
+			t.Fatalf("replace process owner: %v", err)
+		}
+		return gotPID, nil
+	}
+	signalProcessPIDFD = func(int, unix.Signal) error {
+		t.Fatal("ownership mismatch must not be signaled")
+		return nil
+	}
+	closeProcessPIDFD = func(int) error { return nil }
+
+	if err := terminateUserProcesses(context.Background(), 475); err != nil {
+		t.Fatalf("terminateUserProcesses: %v", err)
+	}
+}
+
+func TestReleaseUserRuntimeStopsOwnerAndRemovesFallbackDirectory(t *testing.T) {
+	oldExecutor := defaultExecutor
+	oldRuntimeRoot := userRuntimeRoot
+	defer func() {
+		defaultExecutor = oldExecutor
+		userRuntimeRoot = oldRuntimeRoot
+	}()
+
+	userRuntimeRoot = t.TempDir()
+	runtimeDir := filepath.Join(userRuntimeRoot, "475", "libpod", "tmp")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatalf("create runtime fixture: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runtimeDir, "alive"), []byte("stale"), 0o600); err != nil {
+		t.Fatalf("write runtime fixture: %v", err)
+	}
+	exec := &mockExecutor{results: map[string]mockResult{
+		systemUnitShowKey("user-runtime-dir@475.service"): {
+			output: []byte("ActiveState=inactive\nSubState=dead\nResult=success\nControlGroup=\n"),
+		},
+	}}
+	defaultExecutor = exec
+
+	if err := releaseUserRuntime(475); err != nil {
+		t.Fatalf("releaseUserRuntime: %v", err)
+	}
+	if !hasExecutorCall(exec.calls, "systemctl", "stop", "user-runtime-dir@475.service") {
+		t.Fatalf("runtime-dir owner was not stopped, calls=%v", exec.calls)
+	}
+	if _, err := os.Stat(filepath.Join(userRuntimeRoot, "475")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime directory still exists: %v", err)
+	}
+}
+
+func TestReleaseUserRuntimeFailsClosedWhenOwnerRemainsActive(t *testing.T) {
+	oldExecutor := defaultExecutor
+	oldRuntimeRoot := userRuntimeRoot
+	defer func() {
+		defaultExecutor = oldExecutor
+		userRuntimeRoot = oldRuntimeRoot
+	}()
+
+	userRuntimeRoot = t.TempDir()
+	runtimeDir := filepath.Join(userRuntimeRoot, "475")
+	if err := os.MkdirAll(runtimeDir, 0o700); err != nil {
+		t.Fatalf("create runtime fixture: %v", err)
+	}
+	exec := &mockExecutor{results: map[string]mockResult{
+		"systemctl stop user-runtime-dir@475.service": {
+			output: []byte("job failed"), err: errors.New("exit status 1"),
+		},
+		systemUnitShowKey("user-runtime-dir@475.service"): {
+			output: []byte("ActiveState=active\nSubState=running\nResult=success\nControlGroup=/user.slice/user-475.slice/user-runtime-dir@475.service\n"),
+		},
+	}}
+	defaultExecutor = exec
+
+	err := releaseUserRuntime(475)
+	if err == nil || !strings.Contains(err.Error(), "remains active/running") {
+		t.Fatalf("active runtime-dir owner authorized cleanup: %v", err)
+	}
+	if _, err := os.Stat(runtimeDir); err != nil {
+		t.Fatalf("runtime directory was removed without owner quiescence: %v", err)
+	}
+}
+
+func TestReleaseUserRuntimeRefusesUIDZero(t *testing.T) {
+	if err := releaseUserRuntime(0); err == nil {
+		t.Fatal("releaseUserRuntime accepted UID 0")
+	}
+}
+
+func TestDisableLingerRequiresMarkerAbsence(t *testing.T) {
+	oldExecutor := defaultExecutor
+	oldLingerRoot := userLingerRoot
+	defer func() {
+		defaultExecutor = oldExecutor
+		userLingerRoot = oldLingerRoot
+	}()
+
+	userLingerRoot = t.TempDir()
+	marker := filepath.Join(userLingerRoot, "pa-namek")
+	if err := os.WriteFile(marker, []byte{}, 0o644); err != nil {
+		t.Fatalf("create linger marker: %v", err)
+	}
+	exec := &mockExecutor{results: map[string]mockResult{}}
+	defaultExecutor = exec
+	if err := disableLinger("pa-namek"); err == nil || !strings.Contains(err.Error(), "still exists") {
+		t.Fatalf("persistent linger marker authorized user cleanup: %v", err)
+	}
+
+	exec.onRun = func(name string, args ...string) {
+		if name == "loginctl" && len(args) == 2 && args[0] == "disable-linger" {
+			if err := os.Remove(marker); err != nil {
+				t.Fatalf("remove linger marker: %v", err)
+			}
+		}
+	}
+	if err := disableLinger("pa-namek"); err != nil {
+		t.Fatalf("disableLinger after marker removal: %v", err)
+	}
+}
+
+func TestQuiesceAppUserSessionMissingUserFailsClosed(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	defaultResolver = &mockResolver{users: map[string]*user.User{}}
+	exec := &mockExecutor{}
+	defaultExecutor = exec
+
+	err := QuiesceAppUserSession(context.Background(), "namek")
+	if err == nil || !strings.Contains(err.Error(), "cannot prove cgroup empty") {
+		t.Fatalf("missing runtime user authorized quiescence: %v", err)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("unexpected systemd calls without a numeric UID: %v", exec.calls)
+	}
+}
+
+func TestQuiesceAppUserSessionRefusesUIDZeroBeforeSystemdAction(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	defaultResolver = &mockResolver{users: map[string]*user.User{
+		"pa-namek": {Uid: "0", Gid: "0", Username: "root", HomeDir: "/root"},
+	}}
+	exec := &mockExecutor{}
+	defaultExecutor = exec
+
+	err := QuiesceAppUserSession(context.Background(), "namek")
+	if err == nil || !strings.Contains(err.Error(), "UID is 0") {
+		t.Fatalf("UID 0 app user authorized quiescence: %v", err)
+	}
+	if len(exec.calls) != 0 {
+		t.Fatalf("systemd action occurred before UID 0 rejection: %v", exec.calls)
+	}
 }
 
 func TestAppUsername_short_name(t *testing.T) {

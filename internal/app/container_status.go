@@ -38,7 +38,7 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	runtime, err := m.podmanRuntimeForApp(instanceID, layout, mode)
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeObserve)
 	if err != nil {
 		return nil, err
 	}

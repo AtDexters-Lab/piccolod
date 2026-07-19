@@ -94,7 +94,6 @@ type PodmanCLI struct{}
 // will be stored under that directory.
 //
 // RunRoot configures where Podman stores runtime state (typically under /run or XDG_RUNTIME_DIR).
-//
 type PodmanRuntime struct {
 	Root          string
 	RunRoot       string
@@ -129,6 +128,7 @@ func (rt PodmanRuntime) Validate() error {
 type ContainerState struct {
 	Exists  bool
 	Running bool
+	Stale   bool
 }
 
 // ContainerListItem captures minimal container identity information from `podman ps`.
@@ -278,6 +278,16 @@ func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 	if rt.Credential == nil {
 		return
 	}
+	// Without an explicit reset, rootless Podman helpers and the workloads they
+	// launch inherit piccolod's OOMScoreAdjust=-500. The user command first
+	// resets its score to neutral; choom then execs the original command,
+	// preserving signals, PTYs, stdin/stdout, and cancellation.
+	if cmd.Path != "" && len(cmd.Args) > 0 {
+		originalPath := cmd.Path
+		originalArgs := append([]string(nil), cmd.Args[1:]...)
+		cmd.Path = "/usr/bin/choom"
+		cmd.Args = append([]string{"/usr/bin/choom", "-n", "0", "--", originalPath}, originalArgs...)
+	}
 	cmd.Env = append(minimalRootlessEnv(rt.HomeDir, rt.Credential.Uid), extraEnv...)
 	cmd.Env = append(cmd.Env, ProxyEnvVars()...)
 
@@ -285,6 +295,22 @@ func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 		cmd.SysProcAttr = &syscall.SysProcAttr{}
 	}
 	cmd.SysProcAttr.Credential = rt.Credential
+}
+
+// podmanExitOneMeansAbsent distinguishes Podman's documented exists(1)
+// result from a pre-exec choom failure. Rootless commands force LC_ALL=C, so
+// util-linux's stable program diagnostic is safe to recognize. False
+// negatives fail closed: an ambiguous exit is an operational error, not
+// fabricated absence.
+func podmanExitOneMeansAbsent(rt PodmanRuntime, output []byte, err error) bool {
+	code, ok := exitCode(err)
+	if !ok || code != 1 {
+		return false
+	}
+	if rt.Credential == nil {
+		return true
+	}
+	return !strings.HasPrefix(strings.TrimSpace(string(output)), "choom:")
 }
 
 func exitCode(err error) (int, bool) {
@@ -827,15 +853,15 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 		return false, err
 	}
 	cmd := podmanCmd(ctx, runtime, args...)
-	err = cmd.Run()
+	output, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, nil
 	}
 	// Exit code 1 means image doesn't exist
-	if code, ok := exitCode(err); ok && code == 1 {
+	if podmanExitOneMeansAbsent(runtime, output, err) {
 		return false, nil
 	}
-	return false, fmt.Errorf("podman image exists failed: %w", err)
+	return false, fmt.Errorf("podman image exists failed: %w, output: %s", err, string(output))
 }
 
 // RemoveImage removes an image from local storage.
@@ -974,7 +1000,7 @@ func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, 
 	if err == nil {
 		return true, nil
 	}
-	if code, ok := exitCode(err); ok && code == 1 {
+	if podmanExitOneMeansAbsent(runtime, out, err) {
 		return false, nil
 	}
 	return false, fmt.Errorf("podman container exists failed: %w, output: %s", err, string(out))
@@ -1094,17 +1120,36 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	running := parts[0] == "true"
 	pid := strings.TrimSpace(parts[1])
 
-	// If podman reports running but PID doesn't exist, the container is stale
-	// This happens after system reboot when podman DB has stale state
-	if running && pid != "" && pid != "0" {
-		procPath := fmt.Sprintf("/proc/%s", pid)
-		if _, err := os.Stat(procPath); os.IsNotExist(err) {
-			// PID doesn't exist - container is stale, treat as not running
-			return ContainerState{Exists: true, Running: false}, nil
+	// Podman can retain running=true after its conmon and payload were killed.
+	// PID existence alone is insufficient because Linux may already have reused
+	// the number. Prove that the process still belongs to this container's
+	// libpod cgroup before reporting it as running.
+	if running {
+		live, err := containerPIDIsLive("/proc", containerID, pid)
+		if err != nil {
+			return ContainerState{}, err
+		}
+		if !live {
+			return ContainerState{Exists: true, Running: false, Stale: true}, nil
 		}
 	}
 
 	return ContainerState{Exists: true, Running: running}, nil
+}
+
+func containerPIDIsLive(procRoot, containerID, pid string) (bool, error) {
+	if pid == "" || pid == "0" {
+		return false, nil
+	}
+	cgroupPath := filepath.Join(procRoot, pid, "cgroup")
+	cgroup, err := os.ReadFile(cgroupPath)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("read container process cgroup %s: %w", cgroupPath, err)
+	}
+	return strings.Contains(string(cgroup), "libpod-"+containerID), nil
 }
 
 // InspectPublishedPorts returns a map of "guest_port/proto" -> host_port for a container.
@@ -1690,7 +1735,6 @@ var (
 
 	// Matches: "Copying blob sha256:abc123 skipped: already exists"
 	pullExistsRe = regexp.MustCompile(`Copying blob ([a-zA-Z0-9:]+)\s+skipped.*exists`)
-
 )
 
 // parseLine processes a single line of podman pull output.

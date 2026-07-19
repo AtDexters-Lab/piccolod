@@ -20,11 +20,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
+USER_OOM_POLICY="$PROJECT_DIR/../piccolo-os/packages/piccolo-os-support/piccolo-user-session-oom.conf"
 WORK_DIR="/tmp/claude/piccolo-alpha"
 VM_STATE_FILE="$WORK_DIR/alpha-vm-name"
 VM_IP_FILE="$WORK_DIR/alpha-vm-ip"
 TEMPLATE="piccolod-dev-alpha-template"
-SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
 CMD="${1:-help}"
 VM_NAME="${2:-}"
@@ -63,7 +64,7 @@ wait_ssh() {
   local ip="$1"
   echo "==> Waiting for SSH on $ip..."
   for i in $(seq 1 30); do
-    if ssh $SSH_OPTS -o ConnectTimeout=2 "root@$ip" true 2>/dev/null; then
+    if ssh "${SSH_OPTS[@]}" -o ConnectTimeout=2 "root@$ip" true 2>/dev/null; then
       echo "  SSH ready after ~$((i*2))s"
       return 0
     fi
@@ -121,7 +122,7 @@ cmd_start() {
   echo "============================================"
   echo "  VM ready: $vm"
   echo "  IP:       $ip"
-  echo "  SSH:      ssh $SSH_OPTS root@$ip"
+  echo "  SSH:      ssh ${SSH_OPTS[*]} root@$ip"
   echo "============================================"
 }
 
@@ -132,7 +133,7 @@ cmd_ssh() {
   local ip
   ip=$(get_ip "$vm")
   [[ -n "$ip" ]] || die "No IP for VM $vm"
-  exec ssh $SSH_OPTS "root@$ip"
+  exec ssh "${SSH_OPTS[@]}" "root@$ip"
 }
 
 cmd_deploy() {
@@ -147,8 +148,17 @@ cmd_deploy() {
   cd "$PROJECT_DIR"
   make build
 
+  [[ -f "$USER_OOM_POLICY" ]] || die "Piccolo OS user-session OOM policy not found: $USER_OOM_POLICY"
+  echo "==> Installing alpha host OOM policy"
+  scp "${SSH_OPTS[@]}" "$USER_OOM_POLICY" "root@$ip:/tmp/piccolo-user-session-oom.conf"
+  ssh "${SSH_OPTS[@]}" "root@$ip" \
+    "install -d -m 0755 /etc/systemd/system/user@.service.d && \
+     install -m 0644 /tmp/piccolo-user-session-oom.conf /etc/systemd/system/user@.service.d/90-piccolo-oom.conf && \
+     rm -f /tmp/piccolo-user-session-oom.conf && \
+     systemctl daemon-reload"
+
   echo "==> Deploying to VM ($ip)"
-  ssh $SSH_OPTS "root@$ip" "cd /piccolod && sudo RUN_PORT=80 make service"
+  ssh "${SSH_OPTS[@]}" "root@$ip" "cd /piccolod && sudo RUN_PORT=80 make service"
 
   echo "==> Waiting for HTTP..."
   for i in $(seq 1 30); do
@@ -225,7 +235,7 @@ cmd_logs() {
   ip=$(get_ip "$vm")
   [[ -n "$ip" ]] || die "No IP for VM $vm"
   # Filter mDNS noise
-  ssh $SSH_OPTS "root@$ip" \
+  ssh "${SSH_OPTS[@]}" "root@$ip" \
     "journalctl -u piccolod -f --no-pager" \
     | grep -v -e "Announced" -e "PTR record" -e "peer discovery" -e "non-local query" -e "query from" -e "self-response"
 }

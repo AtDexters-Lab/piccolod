@@ -168,14 +168,36 @@ All events land on `TopicResourcePressure` with unified payload
 (`ResourcePressureEvent`). `TopicStorageAlert` is dual-published by
 the pool guard during the transition window; deprecated.
 
-## Protecting piccolod itself
+## OOM recovery hierarchy
 
-`piccolod.service` runs with `OOMScoreAdjust=-500`. Without this, under
-pathological misdeclaration the kernel's system-wide OOM scorer might
-pick piccolod as the victim — taking down the pressure monitor, slice
-reconciler, and UI all at once, leaving the user with no recovery path.
-Per-app-user slices keep the default `oom_score_adj=0`; they are the
-correct victims when an app misbehaves.
+The appliance uses one existing systemd hierarchy with three explicit
+OOM priorities:
+
+1. `piccolod.service` runs at `OOMScoreAdjust=-500`. It owns pressure
+   attribution, desired-state reconciliation, the UI, and app recovery.
+2. The global `user@.service` template runs user managers at `-250`.
+   This makes the rootless control boundary less attractive than app
+   workloads without equating it to piccolod.
+3. Every rootless Podman command passes through
+   `/usr/bin/choom -n 0 -- ...` at the existing runtime-credential
+   boundary. Podman helpers and container workloads therefore run at the
+   neutral value instead of inheriting either protected control plane.
+
+Under pathological misdeclaration, the kernel can kill a workload while
+leaving both recovery layers available. If host-scope OOM still kills an
+app's user manager, ordinary app reconciliation repairs the same
+`user@UID.service` and then reuses the existing container-group recovery.
+Status and read-only paths only observe session readiness; automatic or
+manual start paths may ensure it; stop, shutdown, uninstall, and storage
+transitions quiesce it.
+
+Automatic repair remains inside the existing five-attempt/ten-minute
+startup budget. A successful repair begins a ten-minute process-local
+probation window rather than resetting history immediately, so rapid
+running-then-OOM churn cannot open a fresh retry budget every reconcile
+tick. See
+[`20260718-per-app-runtime-oom-session-recovery-amendment.md`](../rfc/20260718-per-app-runtime-oom-session-recovery-amendment.md)
+for the lifecycle contract and release requirements.
 
 ## Catalog-author guide: picking priority + profile
 

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1614,6 +1615,7 @@ func generateMockContainerID(id int) string {
 
 // GinMockContainerManager implements the ContainerManager interface for Gin testing
 type GinMockContainerManager struct {
+	mu          sync.RWMutex
 	containers  map[string]*MockContainer
 	images      map[string]struct{}
 	nextID      int
@@ -1625,6 +1627,8 @@ type GinMockContainerManager struct {
 
 func (m *GinMockContainerManager) CreateContainer(ctx context.Context, runtime container.PodmanRuntime, spec container.ContainerCreateSpec) (string, error) {
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.createError != nil {
 		return "", m.createError
 	}
@@ -1650,6 +1654,8 @@ func (m *GinMockContainerManager) CreateContainer(ctx context.Context, runtime c
 
 func (m *GinMockContainerManager) StartContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.startError != nil {
 		return m.startError
 	}
@@ -1663,6 +1669,8 @@ func (m *GinMockContainerManager) StartContainer(ctx context.Context, runtime co
 
 func (m *GinMockContainerManager) StopContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.stopError != nil {
 		return m.stopError
 	}
@@ -1676,6 +1684,8 @@ func (m *GinMockContainerManager) StopContainer(ctx context.Context, runtime con
 
 func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime container.PodmanRuntime, containerID string) error {
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.removeError != nil {
 		return m.removeError
 	}
@@ -1690,6 +1700,8 @@ func (m *GinMockContainerManager) RemoveContainer(ctx context.Context, runtime c
 func (m *GinMockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
 	_ = ctx
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	out := []container.ContainerListItem{}
 	for id, c := range m.containers {
 		if c == nil || c.Spec.Labels == nil {
@@ -1724,6 +1736,8 @@ func (m *GinMockContainerManager) PullImageWithProgress(ctx context.Context, run
 func (m *GinMockContainerManager) ResetStorage(ctx context.Context, runtime container.PodmanRuntime) error {
 	_ = ctx
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.containers = make(map[string]*MockContainer)
 	m.images = make(map[string]struct{})
 	return nil
@@ -1738,6 +1752,8 @@ func (m *GinMockContainerManager) ValidateAndRepairStorage(ctx context.Context, 
 func (m *GinMockContainerManager) CommitContainer(ctx context.Context, runtime container.PodmanRuntime, containerID, imageName string) error {
 	_ = ctx
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if _, ok := m.containers[containerID]; !ok {
 		return container.ErrContainerNotFound(containerID)
 	}
@@ -1751,6 +1767,8 @@ func (m *GinMockContainerManager) CommitContainer(ctx context.Context, runtime c
 func (m *GinMockContainerManager) ImageExists(ctx context.Context, runtime container.PodmanRuntime, imageName string) (bool, error) {
 	_ = ctx
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.images == nil {
 		return false, nil
 	}
@@ -1761,6 +1779,8 @@ func (m *GinMockContainerManager) ImageExists(ctx context.Context, runtime conta
 func (m *GinMockContainerManager) RemoveImage(ctx context.Context, runtime container.PodmanRuntime, imageName string) error {
 	_ = ctx
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	if m.images == nil {
 		return nil
 	}
@@ -1770,6 +1790,8 @@ func (m *GinMockContainerManager) RemoveImage(ctx context.Context, runtime conta
 
 func (m *GinMockContainerManager) Logs(ctx context.Context, runtime container.PodmanRuntime, containerID string, lines int) ([]string, error) {
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if _, ok := m.containers[containerID]; !ok {
 		return nil, container.ErrContainerNotFound(containerID)
 	}
@@ -1787,6 +1809,8 @@ func (m *GinMockContainerManager) LogsStream(ctx context.Context, runtime contai
 	_ = ctx
 	_ = runtime
 	_ = timestamps
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if _, ok := m.containers[containerID]; !ok {
 		return nil, container.ErrContainerNotFound(containerID)
 	}
@@ -1803,6 +1827,8 @@ func (m *GinMockContainerManager) LogsStream(ctx context.Context, runtime contai
 func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, runtime container.PodmanRuntime, name string) (string, error) {
 	_ = ctx
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for id, c := range m.containers {
 		if c.Name == name {
 			return id, nil
@@ -1814,6 +1840,8 @@ func (m *GinMockContainerManager) ResolveContainerIDByName(ctx context.Context, 
 func (m *GinMockContainerManager) InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error) {
 	_ = ctx
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	c, ok := m.containers[containerID]
 	if !ok {
 		return container.ContainerState{Exists: false, Running: false}, nil
@@ -1825,6 +1853,8 @@ func (m *GinMockContainerManager) InspectContainerState(ctx context.Context, run
 func (m *GinMockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error) {
 	_ = ctx
 	_ = runtime
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	c, ok := m.containers[containerID]
 	if !ok {
 		return nil, container.ErrContainerNotFound(containerID)
@@ -1844,6 +1874,8 @@ func (m *GinMockContainerManager) InspectPublishedPorts(ctx context.Context, run
 func (m *GinMockContainerManager) UpdatePublishAdd(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
 	_ = ctx
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c, ok := m.containers[containerID]
 	if !ok {
 		return container.ErrContainerNotFound(containerID)
@@ -1855,6 +1887,8 @@ func (m *GinMockContainerManager) UpdatePublishAdd(ctx context.Context, runtime 
 func (m *GinMockContainerManager) UpdatePublishRemove(ctx context.Context, runtime container.PodmanRuntime, containerID string, hostBind, guestPort int) error {
 	_ = ctx
 	_ = runtime
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	c, ok := m.containers[containerID]
 	if !ok {
 		return container.ErrContainerNotFound(containerID)

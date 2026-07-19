@@ -71,6 +71,9 @@ for inspecting block devices, mount tables, kernel modules, and DRBD/NBD state.
 ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-inspect
 ./scripts/alpha/dev-vm-alpha-test.sh <IP> overlay-verify
 
+# Destructive OOM hierarchy/session recovery qualification (~15 minutes)
+./scripts/alpha/dev-vm-alpha-test.sh <IP> oom-recovery
+
 # View logs
 ./scripts/alpha/dev-vm-alpha.sh logs
 
@@ -138,3 +141,10 @@ drbdadm status
 ./scripts/alpha/dev-vm-alpha.sh deploy
 ./scripts/alpha/dev-vm-alpha-test.sh $IP all
 ```
+
+`oom-recovery` is intentionally excluded from `all`: it kills a disposable
+fixture workload and its complete `user@UID.service`, exercises the existing
+five-attempt recovery budget, and waits through the ten-minute continuous
+running probation window. The alpha deploy installs the Piccolo OS global
+user-manager OOM policy and the dev service uses the production piccolod OOM
+score so this stage can verify the live hierarchy.

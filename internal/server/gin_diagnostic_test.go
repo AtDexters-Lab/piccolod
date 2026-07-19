@@ -1,8 +1,13 @@
 package server
 
 import (
+	"context"
+	"reflect"
+	"syscall"
 	"testing"
 	"time"
+
+	"piccolod/internal/container"
 )
 
 func TestParseDiagnosticRange(t *testing.T) {
@@ -114,5 +119,28 @@ func TestParseDiagnosticRange(t *testing.T) {
 				t.Errorf("until = %v, want %v", until, tt.wantUntil)
 			}
 		})
+	}
+}
+
+func TestNewDiagnosticPodmanImagesCommandAppliesRootlessWrapper(t *testing.T) {
+	rt := container.PodmanRuntime{
+		Credential: &syscall.Credential{Uid: 475, Gid: 475},
+		HomeDir:    "/var/lib/piccolo/apps/namek/home",
+	}
+	cmd := newDiagnosticPodmanImagesCommand(
+		context.Background(),
+		rt,
+		[]string{"--root", "/apps/namek/podman", "images", "--format", "{{.Repository}}:{{.Tag}}"},
+	)
+
+	wantArgs := []string{
+		"/usr/bin/choom", "-n", "0", "--", "/usr/bin/podman",
+		"--root", "/apps/namek/podman", "images", "--format", "{{.Repository}}:{{.Tag}}",
+	}
+	if cmd.Path != "/usr/bin/choom" || !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("diagnostic command = path %q args %v, want %q %v", cmd.Path, cmd.Args, "/usr/bin/choom", wantArgs)
+	}
+	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential != rt.Credential {
+		t.Fatal("diagnostic command did not receive the ephemeral runtime credential")
 	}
 }

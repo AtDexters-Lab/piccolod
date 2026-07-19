@@ -19,12 +19,6 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		return fmt.Errorf("start: app definition required")
 	}
 
-	// Set Enabled=true and persist
-	appInst.Enabled = true
-	if err := state.UpdateAppEnabled(appInst.InstanceID, true); err != nil {
-		log.Printf("WARN: start %s: failed to persist enabled state: %v", appInst.InstanceID, err)
-	}
-
 	// Update status to starting immediately so UI reflects progress
 	m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusStarting, "Starting containers")
 
@@ -79,6 +73,21 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		}
 	}
 
+	// Podman may retain running metadata after the container PID has died or
+	// been reused. In that state `podman start` is a successful no-op, so manual
+	// Start must use the same strict whole-group recovery as reconciliation.
+	if anchorState, inspectErr := m.containerManager.InspectContainerState(ctx, runtime, anchorID); inspectErr != nil {
+		log.Printf("WARN: start %s: inspect anchor state failed: %v", appInst.InstanceID, inspectErr)
+	} else if anchorState.Stale {
+		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+			"anchor process no longer belongs to its libpod cgroup during manual start", blockNativeRootfsMap); recoverErr != nil {
+			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+			return recoverErr
+		}
+		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+		return nil
+	}
+
 	// Start anchor first, then services in order.
 	if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
 		// Start failed — attempt recreation of the entire container group.
@@ -97,6 +106,17 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		if cid == "" {
 			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 			return fmt.Errorf("missing container ID for service '%s'", svcName)
+		}
+		if serviceState, inspectErr := m.containerManager.InspectContainerState(ctx, runtime, cid); inspectErr != nil {
+			log.Printf("WARN: start %s: inspect service %q state failed: %v", appInst.InstanceID, svcName, inspectErr)
+		} else if serviceState.Stale {
+			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+				fmt.Sprintf("service %q process no longer belongs to its libpod cgroup during manual start", svcName), blockNativeRootfsMap); recoverErr != nil {
+				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+				return recoverErr
+			}
+			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+			return nil
 		}
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 			log.Printf("INFO: start %s: service '%s' start failed (%v), recreating",
@@ -123,8 +143,6 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		}
 	}
 
-	// Reset startup failure tracking and persist.
-	resetStartupTracking(appInst)
 	appInst.UpdatedAt = time.Now()
 	if err := state.StoreAppMetadata(appInst); err != nil {
 		return fmt.Errorf("failed to update app metadata: %w", err)
@@ -153,102 +171,79 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	return nil
 }
 
-// stopContainerGroupOpts contains options for stopping a container group.
-type stopContainerGroupOpts struct {
-	// ShutdownMode indicates this is a graceful shutdown operation.
-	// When true, status update failures are logged but don't cause the stop to fail,
-	// since the control volume may become unavailable during shutdown.
-	ShutdownMode bool
-}
-
 // stopContainerGroup stops a container group (network anchor + service containers).
 // This is the unified stop path for both service and workspace modes.
 func (m *AppManager) stopContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
-	return m.stopContainerGroupWithOpts(ctx, state, appInst, def, layout, runtime, stopContainerGroupOpts{})
-}
-
-// stopContainerGroupWithOpts stops a container group with configurable options.
-func (m *AppManager) stopContainerGroupWithOpts(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, opts stopContainerGroupOpts) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("stop: app definition required")
 	}
+	_ = state // Desired-state persistence is owned by the lifecycle caller.
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	primary := primaryServiceFor(def, appInst)
-
-	startOrder, err := serviceStartOrder(def.Services)
-	if err != nil {
+	// Strictly check both recorded IDs and deterministic names. A container may
+	// have been recreated just before a crash persisted its new ID; only a
+	// typed not-found for the deterministic name proves that replacement absent.
+	if err := m.stopContainersForMultiApp(ctx, appInst, def, runtime); err != nil {
 		return err
 	}
 
-	// Stop services in reverse order, then anchor.
-	for i := len(startOrder) - 1; i >= 0; i-- {
-		// Check for context cancellation to avoid wasting time if shutdown is timing out
-		if ctx.Err() != nil {
-			log.Printf("WARN: stop %s: context cancelled, %d service containers not stopped", appInst.InstanceID, i+1)
-			break
-		}
-		svcName := startOrder[i]
-		cid := strings.TrimSpace(appInst.Containers[svcName])
-		if cid == "" {
-			// Best-effort resolve by name.
-			name := containerNameForService(appInst.InstanceID, svcName, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-				cid = id
-			}
-		}
-		if strings.TrimSpace(cid) == "" {
-			continue
-		}
-		if err := m.containerManager.StopContainer(ctx, runtime, cid); err != nil {
-			log.Printf("WARN: stop %s: failed to stop container %s (%s): %v", appInst.InstanceID, svcName, cid, err)
-		}
-	}
+	m.finalizeQuiescedContainerGroup(ctx, appInst, def, mode)
+	return nil
+}
 
-	// Check context before stopping anchor
-	if ctx.Err() != nil {
-		log.Printf("WARN: stop %s: context cancelled, network anchor not stopped", appInst.InstanceID)
-		return ctx.Err()
-	}
-
-	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
-	if anchorID == "" {
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil {
-			anchorID = id
-		}
-	}
-	if strings.TrimSpace(anchorID) != "" {
-		if err := m.containerManager.StopContainer(ctx, runtime, anchorID); err != nil {
-			log.Printf("WARN: stop %s: failed to stop network anchor %s: %v", appInst.InstanceID, anchorID, err)
-		}
-	}
-
-	// Detach rootfs on clean stop.
+func (m *AppManager) finalizeQuiescedContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, mode PiccoloMode) {
+	// StopAllApps can quiesce several independent Podman groups in parallel,
+	// but rootfs-manager detach bookkeeping is a shared lifecycle surface.
+	m.quiesceFinalizeMu.Lock()
+	defer m.quiesceFinalizeMu.Unlock()
+	// Detach rootfs only after graceful stop or PID 1 empty-cgroup proof.
 	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def, appInst) {
 		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def, appInst)
-	}
-
-	// For explicit user-initiated stops, set Enabled=false and persist.
-	// During graceful shutdown, keep Enabled unchanged so apps auto-start on service restart.
-	if !opts.ShutdownMode {
-		appInst.Enabled = false
-		if err := state.UpdateAppEnabled(appInst.InstanceID, false); err != nil {
-			return fmt.Errorf("failed to persist disabled state: %w", err)
-		}
-	} else {
-		log.Printf("DEBUG: stop %s: preserving enabled state for auto-restart on service resume", appInst.InstanceID)
 	}
 	m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 	if m.serviceManager != nil {
 		m.serviceManager.DeactivateApp(appInst.InstanceID)
 	}
-	return nil
+	m.interruptStartupProbation(appInst.InstanceID)
 }
 
-// uninstallContainerGroup removes a container group (network anchor + service containers).
+// quiesceContainerGroupRuntime prefers graceful Podman stop. Its boolean
+// result says whether the returned runtime remains usable for post-quiescence
+// metadata cleanup. PID 1 fallback proves process absence but stops the user
+// manager, so callers must skip Podman cleanup or explicitly reacquire later.
+func (m *AppManager) quiesceContainerGroupRuntime(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout) (container.PodmanRuntime, bool, error) {
+	mode := piccoloModeFromExtensions(def.Extensions)
+	runtime, sessionQuiesced, err := m.quiesceRuntimeForApp(ctx, appInst.InstanceID, layout, mode)
+	if err != nil {
+		return container.PodmanRuntime{}, false, err
+	}
+	if sessionQuiesced {
+		m.finalizeQuiescedContainerGroup(ctx, appInst, def, mode)
+		return container.PodmanRuntime{}, false, nil
+	}
+	if err := m.stopContainerGroup(ctx, state, appInst, def, layout, runtime); err == nil {
+		return runtime, true, nil
+	} else {
+		log.Printf("WARN: graceful Podman stop failed for %s, quiescing dedicated user unit: %v", appInst.InstanceID, err)
+		if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr != nil {
+			return container.PodmanRuntime{}, false, errors.Join(err, quiesceErr)
+		}
+	}
+	m.finalizeQuiescedContainerGroup(ctx, appInst, def, mode)
+	return container.PodmanRuntime{}, false, nil
+}
+
+// quiesceContainerGroup is the common lifecycle boundary for callers that do
+// not need to issue further Podman commands after process-absence proof.
+func (m *AppManager) quiesceContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout) error {
+	_, _, err := m.quiesceContainerGroupRuntime(ctx, state, appInst, def, layout)
+	return err
+}
+
+// uninstallContainerGroup removes an already-quiesced container group.
 // This is the unified uninstall path for both service and workspace modes.
 // Note: This does not handle volume destruction or state removal - those are handled by the caller.
-func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime) error {
+func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, runtime container.PodmanRuntime) error {
 	if appInst == nil || def == nil {
 		return fmt.Errorf("uninstall: app definition required")
 	}
@@ -258,32 +253,14 @@ func (m *AppManager) uninstallContainerGroup(ctx context.Context, appInst *AppIn
 
 	order, _ := serviceStartOrder(def.Services)
 
-	// Stop containers in reverse order (best-effort).
-	for i := len(order) - 1; i >= 0; i-- {
-		svcName := order[i]
-		cid := strings.TrimSpace(appInst.Containers[svcName])
-		if cid == "" {
-			name := containerNameForService(appInst.InstanceID, svcName, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil {
-				cid = id
-			}
-		}
-		if cid != "" {
-			_ = m.containerManager.StopContainer(ctx, runtime, cid)
-		}
-	}
-
 	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
 	if anchorID == "" {
 		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil {
 			anchorID = id
 		}
 	}
-	if anchorID != "" {
-		_ = m.containerManager.StopContainer(ctx, runtime, anchorID)
-	}
-
-	// Detach rootfs before container removal.
+	// Rootfs is normally detached by the quiescence proof. Keep this
+	// idempotent detach for uninstall retries that resume after partial cleanup.
 	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def, appInst) {
 		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def, appInst)
 	}

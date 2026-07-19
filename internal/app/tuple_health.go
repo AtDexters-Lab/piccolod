@@ -2,7 +2,9 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"log"
+	"strings"
 	"time"
 )
 
@@ -11,6 +13,39 @@ const (
 	// before the previous snapshot is deprecated (RFC 20260302 Phase 4).
 	healthVerificationDuration = 24 * time.Hour
 )
+
+// recordFailedRollbackLV gives tuple GC durable ownership of the displaced
+// data LV. The synthetic path covers first-update failures where no active
+// generation was recorded before rollback began.
+func recordFailedRollbackLV(ts *TupleState, trackingGen *TupleGeneration, failedLVName string, failedGenNumber int) *TupleGeneration {
+	if trackingGen == nil {
+		for i := range ts.Generations {
+			gen := &ts.Generations[i]
+			if gen.Status == TupleStatusFailed && strings.TrimSpace(gen.FailedLVName) == failedLVName {
+				trackingGen = gen
+				break
+			}
+		}
+	}
+	if trackingGen == nil {
+		failedNow := time.Now()
+		ts.Generations = append(ts.Generations, TupleGeneration{
+			ID:           fmt.Sprintf("gen-failed-%d", failedGenNumber),
+			Status:       TupleStatusFailed,
+			FailedLVName: failedLVName,
+			FailedAt:     &failedNow,
+			CreatedAt:    failedNow,
+		})
+		return &ts.Generations[len(ts.Generations)-1]
+	}
+	trackingGen.Status = TupleStatusFailed
+	trackingGen.FailedLVName = failedLVName
+	if trackingGen.FailedAt == nil {
+		failedNow := time.Now()
+		trackingGen.FailedAt = &failedNow
+	}
+	return trackingGen
+}
 
 // checkTupleHealth checks tuple generation health during reconciliation.
 // - Auto-deprecation: active generation healthy for 24h → deprecate previous snapshot.
@@ -87,32 +122,132 @@ func (m *AppManager) markTupleHealthy(state *FilesystemStateManager, instanceID 
 	}
 }
 
-// reconcilePartialRollback detects and recovers from partially-completed LV renames.
-// Called during reconciliation startup. Handles crash recovery between LV rename steps.
-// TODO: Implement actual LV state recovery. Currently only logs inconsistencies for GC.
-func (m *AppManager) reconcilePartialRollback(ctx context.Context, state *FilesystemStateManager, instanceID string) error {
-	ts, err := state.LoadTupleState(instanceID)
-	if ts == nil || err != nil {
+// commitRollbackAppState copies tuple-authoritative rollback state into the
+// split app.yaml/metadata.json representation, then records that both files
+// are durable. Runtime reacquisition is forbidden until the final tuple write.
+func (m *AppManager) commitRollbackAppState(state *FilesystemStateManager, appInst *AppInstance, ts *TupleState, active *TupleGeneration) error {
+	if active == nil || active.RollbackAppStateCommitted == nil || *active.RollbackAppStateCommitted {
 		return nil
 	}
 
-	// Check for "failed" generations that might indicate an incomplete rollback.
-	// If a generation is marked "failed" but the snapshot LV still exists,
-	// the rollback was interrupted between steps.
-	rollbacker, ok := m.currentVolumeManager().(dataVolumeRollbacker)
-	if !ok {
-		return nil // no LV operations possible
+	prevDef, err := state.GetPreviousAppDefinition(appInst.InstanceID)
+	if err != nil {
+		return fmt.Errorf("load previous definition for rollback generation %s: %w", active.ID, err)
 	}
-	_ = rollbacker // recovery uses lower-level LV operations if needed
+	appInst.ActiveRootfs = make(map[string]string, len(active.RootfsVolIDs))
+	for serviceName, volumeID := range active.RootfsVolIDs {
+		appInst.ActiveRootfs[serviceName] = volumeID
+	}
+	appInst.Definition = prevDef
+	appInst.UpdatedAt = time.Now()
+	if err := state.StoreApp(appInst); err != nil {
+		return fmt.Errorf("store tuple-authoritative rollback app state: %w", err)
+	}
 
-	// For now, log any inconsistencies. The existing Attach/Detach methods
-	// handle LV state recovery during normal volume mount operations.
-	for _, gen := range ts.Generations {
-		if gen.Status == TupleStatusFailed && gen.FailedLVName != "" {
-			log.Printf("INFO: %s: found failed generation %s (LV: %s) — will be cleaned by GC",
-				instanceID, gen.ID, gen.FailedLVName)
+	committed := true
+	active.RollbackAppStateCommitted = &committed
+	if err := state.StoreTupleState(appInst.InstanceID, ts); err != nil {
+		return fmt.Errorf("persist rollback app-state commit marker: %w", err)
+	}
+	return nil
+}
+
+// reconcilePartialRollback runs before volume-layout or runtime acquisition.
+// It resumes an interrupted active->failed, snapshot->active LV swap and then
+// completes the tuple-authoritative app.yaml/metadata.json commit protocol.
+// The boolean result reports that a pending rollback was completed.
+func (m *AppManager) reconcilePartialRollback(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) (bool, error) {
+	instanceID := appInst.InstanceID
+	ts, err := state.LoadTupleState(instanceID)
+	if err != nil {
+		return false, fmt.Errorf("load tuple state for rollback recovery: %w", err)
+	}
+	if ts == nil {
+		return false, nil
+	}
+
+	current := ts.GenerationByID(ts.CurrentGeneration)
+	snapshot := ts.LatestSnapshot()
+	failedLVName := ""
+	pendingLVSwap := false
+	if snapshot != nil && strings.TrimSpace(snapshot.DataSnapshot) != "" {
+		failedLVName = strings.TrimSpace(snapshot.RollbackFailedLVName)
+		pendingLVSwap = snapshot.RollbackPending && failedLVName != ""
+		// Compatibility with a partial swap recorded before the explicit
+		// pre-LV intent fields were introduced.
+		if !pendingLVSwap && current != nil && current.Status == TupleStatusFailed {
+			failedLVName = strings.TrimSpace(current.FailedLVName)
+			pendingLVSwap = failedLVName != ""
 		}
 	}
+	active := ts.ActiveGeneration()
+	pendingAppCommit := active != nil && active.RollbackAppStateCommitted != nil && !*active.RollbackAppStateCommitted
+	if !pendingLVSwap && !pendingAppCommit {
+		return false, nil
+	}
 
-	return nil
+	// Do not consult the possibly-missing app LV or rootless Podman store: PID 1
+	// owns the authoritative process-absence proof at this recovery boundary.
+	if err := m.quiesceAppUserSession(ctx, instanceID); err != nil {
+		return false, fmt.Errorf("quiesce user session before rollback recovery: %w", err)
+	}
+
+	if pendingLVSwap {
+		rollbacker, ok := m.currentVolumeManager().(dataVolumeRollbacker)
+		if !ok {
+			return false, fmt.Errorf("volume manager does not support rollback recovery")
+		}
+		renamed, promoted, rollbackErr := rollbacker.RollbackDataVolume(ctx, instanceID, snapshot.DataSnapshot, failedLVName)
+		if rollbackErr != nil && !renamed {
+			return false, fmt.Errorf("resume partial data-volume rollback: %w", rollbackErr)
+		}
+		trackingGen := current
+		if trackingGen == nil {
+			trackingGen = active
+		}
+		if renamed {
+			failedGenNumber := ts.NextGenNumber - 1
+			if failedGenNumber < 1 {
+				failedGenNumber = 1
+			}
+			recordFailedRollbackLV(ts, trackingGen, failedLVName, failedGenNumber)
+			// The synthetic append can reallocate the generation slice.
+			snapshot = ts.LatestSnapshot()
+			if snapshot == nil {
+				return false, fmt.Errorf("rollback snapshot lost while tracking failed LV")
+			}
+		}
+		if !promoted {
+			if storeErr := state.StoreTupleState(instanceID, ts); storeErr != nil {
+				return false, fmt.Errorf("persist still-partial rollback state: %w", storeErr)
+			}
+			if rollbackErr == nil {
+				rollbackErr = fmt.Errorf("snapshot promotion did not commit")
+			}
+			return false, fmt.Errorf("resume partial data-volume rollback: %w", rollbackErr)
+		}
+		if rollbackErr != nil {
+			// Both renames are durable. A following ensureAppVolumeLayout call is
+			// the authoritative retry for an attach-only failure.
+			log.Printf("WARN: rollback %s: promotion recovered with attach error; retrying layout: %v", instanceID, rollbackErr)
+		}
+
+		snapshot.Status = TupleStatusActive
+		snapshot.DataSnapshot = ""
+		snapshot.RollbackAttempted = true
+		snapshot.RollbackPending = false
+		snapshot.RollbackFailedLVName = ""
+		appStateCommitted := false
+		snapshot.RollbackAppStateCommitted = &appStateCommitted
+		ts.CurrentGeneration = snapshot.ID
+		if err := state.StoreTupleState(instanceID, ts); err != nil {
+			return false, fmt.Errorf("persist promoted rollback tuple during recovery: %w", err)
+		}
+		active = snapshot
+	}
+
+	if err := m.commitRollbackAppState(state, appInst, ts, active); err != nil {
+		return false, err
+	}
+	return true, nil
 }
