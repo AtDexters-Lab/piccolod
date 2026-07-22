@@ -30,15 +30,15 @@ manual unlock path, and is measured separately rather than counted as
 successful unattended service recovery. Extending escrow exposure across all
 unlocked uptime requires a separate explicit security/product decision.
 
-Status: The main local implementation, local OBS package integration, Piccolo
-OS image-validator integration, and compatible local validation are complete.
-The exact local candidate RPM passed install-from-start-limit recovery, both
-terminal boot-health branches with real reboots, and unattended locked-to-
-unlocked recovery. This source tree is not release-qualified: the authoritative
-0.2.40 OBS build/publication, mounted final image, direct final-package
-task-exhaustion interruption, clean-cohort app/owner matrix, 4 GiB profile,
-installed-record capacity baseline, repeated p95, soak, and canary gates remain
-pending.
+Status: The main implementation, GitHub v0.2.40 release, authoritative OBS
+`0.2.40-1.1` package, corrected Piccolo OS revision-21 image matrix, and
+compatible local validation are complete. The exact local candidate RPM passed
+install-from-start-limit recovery, both terminal boot-health branches with real
+reboots, and unattended locked-to-unlocked recovery. Release qualification is
+not closed: strict mounted-root validation of the corrected final image,
+direct final-package task-exhaustion interruption, the clean-cohort app/owner
+matrix, 4 GiB profile, installed-record capacity baseline, repeated p95, soak,
+and canary gates remain pending.
 Date: 2026-07-19
 Related:
 
@@ -2254,19 +2254,20 @@ counter or rollback authority. Adversarial verification finds no remaining
 terminal combination in which pending boot-health is pre-empted or accepted
 boot-health leaves Piccolod permanently start-limited. Minimality verification
 retains the companion because a static unconditional start-limit action cannot
-satisfy both obligations. Plan verdict: **GREEN**. Remote artifact/image
-integration and the remaining release-qualification proof remain blockers.
+satisfy both obligations. Plan verdict: **GREEN**. Strict mounted-image and the
+remaining live release-qualification proof remain blockers.
 
 ## Implementation Notes & Status
 
 The original RFC was implemented on 2026-07-19 across the Piccolod tree and its
-local package/alpha seams and is recorded in local commit `49ee693`. The latest
-unlock-before-enumeration correction remains a two-file working-tree amendment.
-The authoritative OBS checkout and Piccolo OS mounted-image policy validator
-now contain the coordinated post-stop helper and repeated-start/boot-health
-composition described below, but those sibling changes are still local and
-unpublished. No remote OBS or final-image qualification is implied by this
-section.
+local package/alpha seams in commit `49ee693`; the unlock-before-enumeration
+correction is commit `12b85d3`. The authoritative package integration was
+published as OBS source revision 78 and built as `piccolod-0.2.40-1.1` for both
+architectures. Piccolo OS commit `965711b8` enforces the mounted-image policy,
+and OBS image revision 21 synchronizes the already-committed final bootstrap-
+DNS seed before rebuilding all image profiles. Strict mounted-root validation
+and the remaining live qualification are not implied by these publication
+facts.
 
 Post-alpha review on 2026-07-21 found two incomplete effect boundaries. The
 self-hosted Nexus adapter derived aliases directly from persisted desired
@@ -2333,7 +2334,7 @@ locked recovery starts; all other core owners remain Ready-gated.
 | D7 — event and dock treatment | Authenticated initial task snapshot; per-topic barrier; connected pending Checking versus disconnected Offline; Warning/Unavailable degraded and Critical recovering; no per-app false status or new workflow; neutral expectation-setting copy | `internal/events/bus.go`; `internal/server/gin_event_stream.go`; `gin_event_stream_pressure_test.go`; Dart resource model/client/dock; `ui/test/resource_pressure_test.dart`; `ui/test/terminal_task_pressure_test.dart` | satisfied | Mounted reconnect/hydration transitions, exact neutral copy, and forbidden internal terminology are covered. `EventStreamClient` is the single pressure-state owner. |
 | D8 — fixed overhead and capacity floor | No per-app guard workers; 16 terminal cap; qualify 2/4 GiB, the canonical constant-overhead installed-record baseline, and 72-hour stability | Single-loop guard unit test, terminal cap/soak unit test, and 2 GiB alpha profile (2,044,694,528 bytes RAM, one CPU, no swap) | partial | The 4 GiB profile, D8 constant-overhead baseline, and 72-hour mixed-operation soak remain pending. |
 | D9 — measured reliability target | Treat five-nines as a target; capture stage timing; prove 30-second p95 unlocked route recovery for the healthy deterministic lowest-id Enabled route-bearing candidate with its reserved five-second slice; skip that qualification cohort for listenerless-only fleets while continuing their ordinary recovery; continue ordinary convergence with fresh bounds; measure recurrence and unexpected-no-handoff cohorts separately | `cmd/piccolod/task_recovery.go`, `task_fatal_owner.go`, `task_recovery_controller.go`, `task_recovery_runner.go`, and `internal/server/task_recovery_capabilities.go` preserve exact detection separately from marker time, keep failed qualification separate from the ordinary pass, carry fresh route/publication truth out of each app attempt, and emit correlated core-Ready, truthful unlock pickup/skip, lifecycle-Ready, qualification, per-route, and eventual-convergence stages with continuity/task/cohort labels; repeated 2/4 GiB derivation remains pending | partial | Local source telemetry is sufficient for the canary harness to derive stage durations without stale high-water or route-shape carry-over. Earlier sub-30-second core Ready runs are not unlocked-service evidence, and prepared/unknown handoffs, backoff, or manual unlock cannot enter the unexpected-no-handoff/healthy denominator. |
-| Production unit and validators | Finite 15% task limit, 60-second service watchdog, always/5-second restart, control-group kill, bounded `ExecStopPost` recurrence marker, three-start/fifteen-minute limit, conditional PID-1 reboot composition, and upgrade-time stop/reset/start recovery in authoritative package, mounted image, and live boot | Local OBS `home:atdexterslab/piccolod/piccolod.service`, companion recovery unit/helper/test, and spec; `Makefile`; `scripts/systemd/piccolod-start-limit-recovery-test.sh`; `scripts/alpha/dev-vm-alpha-test.sh`; local Piccolo OS `scripts/validate-image-policy.sh`; local RPM `%check`; exact candidate-RPM alpha lifecycle and real reboot logs | partial | Local OBS/package and image-validator integration are implemented. The exact local RPM proved the effective policy, install-from-start-limit reset/restart, completed-success and failed boot-health branches with automatic real reboots, and unattended unlocked Ready afterward. Remote OBS build/publication and validation against its mounted final image remain pending. |
+| Production unit and validators | Finite 15% task limit, 60-second service watchdog, always/5-second restart, control-group kill, bounded `ExecStopPost` recurrence marker, three-start/fifteen-minute limit, conditional PID-1 reboot composition, and upgrade-time stop/reset/start recovery in authoritative package, mounted image, and live boot | Published OBS `home:atdexterslab/piccolod` revision 78, companion recovery unit/helper/test, spec, and `0.2.40-1.1` binaries; `Makefile`; `scripts/systemd/piccolod-start-limit-recovery-test.sh`; `scripts/alpha/dev-vm-alpha-test.sh`; Piccolo OS `scripts/validate-image-policy.sh` at commit `965711b8`; corrected OBS image revision 21 and Build21.1 evidence; local RPM `%check`; exact candidate-RPM alpha lifecycle and real reboot logs | partial | The authoritative package builds and all corrected image profiles are green. The exact local RPM proved the effective policy, install-from-start-limit reset/restart, both boot-health branches with automatic real reboots, and unattended unlocked Ready. Strict mounted-root validation of Build21.1 and direct authoritative-package fault injection remain pending. |
 | Local validation acceptance | Repository Go tests/races/vet, focused Flutter validation, shell syntax, policy diffs, and diff hygiene | `go test ./...`, scoped `go test -race`, `go vet ./...`, compatible native/browser Flutter test partitions, `flutter analyze --no-fatal-infos`, `bash -n`, `osc diff`, and `git diff --check` | satisfied | All compatible test partitions are green. A single all-platform Flutter invocation remains impossible because the existing native suite includes a web-only test and the browser suite includes a `dart:io` source-reading test; analyze reports nine pre-existing info-only lints. |
 | Out-of-scope memory/capacity work | Do not reopen 0.2.39 OOM hierarchy, memory limits, inactive-app offloading, Snapper/Btrfs, or hardware-watchdog policy | No changes to those owners; resource documentation preserves the separate OOM contract and distinguishes service from hardware watchdog | satisfied | Existing 0.2.39 Go tests remain green. |
 | Out-of-scope rescue/product surfaces | Do not add SSH/serial/rescue daemon, Piccolod-owned snapshot/rollback selection, per-app health screen, or operator recovery workflow | No such API, process, service, UI screen, or rollback path in the diff | satisfied | The bounded start-limit companion only composes with existing PID-1/MicroOS owners; safe-start and manual Start semantics are unchanged. |
@@ -2410,11 +2411,43 @@ with `ready:true`, control storage unlocked, and `NRestarts=0`. The temporary
 fixture and runtime override were removed after qualification.
 
 These runs prove the exact local package lifecycle, both terminal boot-health
-classifiers, automatic real reboot, and unattended unlock continuity. They do
-not prove the remote OBS artifact, mounted final image, a clean-image app
+classifiers, automatic real reboot, and unattended unlock continuity. The
+subsequent publication evidence below proves the remote artifact identity but
+not its direct fault injection, strict mounted image, a clean-image app
 lifecycle, the named interruption matrix, 4 GiB/installed-record baselines,
 repeated p95, soak, or canary gates. Earlier app-install observations on this
 reused VM remain excluded because prior test state contaminated the cohort.
+
+### Published package and corrected image evidence — 2026-07-22
+
+Tag `v0.2.40` points at commit `12b85d3`. GitHub Actions run `29902274844`
+completed its UI, x86_64, aarch64, and release jobs successfully. The published
+server assets report SHA-256
+`a5348d382b13e2d5125a3d90ce6f718cab10a140b2c75a5e2555a827d910181b`
+for x86_64 and
+`2772049feb53cb328c725ab9c81b1a74d2ad89539dd1a2f237d9c37e5c4b8715`
+for aarch64.
+
+OBS package source revision 78 consumes those assets and produced
+`piccolod-0.2.40-1.1` successfully for x86_64 and aarch64. The downloaded
+x86_64 RPM has SHA-256
+`adfd196d3766bc3c2a5ff501cf3c0bdc6a13ea2e62e222597df37ead9c6e35d1`;
+its header and payload digests and RSA/SHA256 signatures verify after importing
+the repository's public key into an isolated temporary RPM database.
+
+The first dependent image rebuild, VirtualBox Build20.25, was excluded after
+release-path review found authoritative image source revision 20 missing the
+already-committed late bootstrap-DNS seed from `disk.sh`. Publishing only the
+byte-identical Git file as OBS image revision 21 rebuilt all five x86_64 and
+aarch64 profiles successfully. Corrected VirtualBox Build21.1 has official and
+downloaded SHA-256
+`275dfc2c63019469c128061965611b6cff29b7f30e87396c74dfb53827cece4a`.
+Its CycloneDX SBOM records `piccolod-0.2.40-1.1`,
+`piccolo-os-support-0.3.14-1.1`, and health-checker; the authoritative build log
+records the late `bootstrap-dns.sh apply /etc/resolv.conf` execution. These are
+artifact identity and build-composition proofs. The strict read-only mounted-
+root validator still requires an operator-authorized local mount and remains a
+release gate.
 
 ### Closure result
 
@@ -2424,31 +2457,31 @@ The local code obligations have no known open blocking requirement. Release
 closure remains blocked because the accepted RFC deliberately makes coordinated
 package/image/device and sustained-runtime evidence part of the contract.
 
-- **blocking × in-scope — authoritative package publication and image integration**
+- **blocking × in-scope — strict mounted-image integration**
   - **Location:** Production unit and validators.
-  - **Statement:** the local OBS unit/spec/helper/test and local Piccolo OS
-    validator implement the coordinated policy, and the exact local RPM passed
-    its lifecycle gates. The source identity still targets 0.2.39 while the
-    validator requires 0.2.40, no authoritative remote OBS build has completed,
-    and no final mounted image has been validated. The current checkouts cannot
-    yet produce and prove the release artifact as one composition.
-  - **Suggested resolution:** release/tag the reviewed Piccolod 0.2.40 source,
-    advance the OBS spec/service source identity to that artifact, publish and
-    wait for a green remote build, then build/mount the corresponding Piccolo OS
-    image and run its policy validator.
+  - **Statement:** GitHub v0.2.40, OBS package revision 78, both authoritative
+    package architectures, corrected OBS image revision 21, and all image
+    profiles are published and green. Build21.1's checksum, SBOM, and build log
+    prove the intended source/package composition, but the strict validator has
+    not yet inspected its mounted root and effective systemd configuration.
+  - **Suggested resolution:** from the Piccolo OS repository, run
+    `./scripts/validate-obs-image.sh --profile VirtualBox --arch x86_64
+    /tmp/piccolo-os.x86_64-0.2.0-VirtualBox-Build21.1.vdi.xz` and append the
+    exact result here.
 - **blocking × in-scope — release qualification evidence**
   - **Location:** D6/D8/D9, Acceptance criteria, and Rollout and observability.
   - **Statement:** live 2 GiB unit policy, watchdog/task-critical recovery,
     old-process cleanup, exact local RPM lifecycle, both terminal boot-health
     branches with real reboots, and unattended unlock recovery are proven.
-    Release still lacks the authoritative OBS build/mounted-image result, a
-    clean-cohort app lifecycle, the named owner/transition interruption matrix,
-    repeated 2 GiB and 4 GiB p95
+    Release still lacks the mounted-image result, direct task-exhaustion
+    interruption of the authoritative `0.2.40-1.1` package, a clean-cohort app
+    lifecycle, the named owner/transition interruption matrix, repeated 2 GiB
+    and 4 GiB p95
     timing, the D8 constant-overhead baseline, 72-hour mixed-operation soak, and
     canary telemetry. The monolithic Flutter gate remains unavailable because
     of pre-existing cross-platform harness incompatibility, although every
     compatible partition is green.
-  - **Suggested resolution:** build the coordinated OBS/image artifact; run the
-    mounted and remaining live fault matrix on clean 2 GiB and 4 GiB canaries;
+  - **Suggested resolution:** validate the coordinated mounted image; run the
+    remaining live fault matrix on clean 2 GiB and 4 GiB canaries;
     capture the installed-record, soak, and canary evidence; append exact
     commands/results here; then repeat RFC implementation closure.
