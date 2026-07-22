@@ -210,7 +210,16 @@ func (r *taskRecoveryRunner) Run(ctx context.Context) {
 		}
 		scheduleActions := actions
 		if enumerationRequired {
-			scheduleActions = map[string]taskRecoveryOwner{taskRecoveryEnumerationOwner: enumerationOwner}
+			if ready {
+				scheduleActions = map[string]taskRecoveryOwner{taskRecoveryEnumerationOwner: enumerationOwner}
+			} else if unlockOwner, ok := actions[taskRecoveryUnlockChainOwner]; ok {
+				// Desired-owner enumeration requires decrypted lifecycle state.
+				// On a locked recovery boot, unattended unlock must therefore run
+				// before enumeration; all other core owners remain Ready-gated.
+				scheduleActions = map[string]taskRecoveryOwner{taskRecoveryUnlockChainOwner: unlockOwner}
+			} else {
+				scheduleActions = nil
+			}
 			qualification = nil
 		}
 		schedule := r.config.controller.Schedule()

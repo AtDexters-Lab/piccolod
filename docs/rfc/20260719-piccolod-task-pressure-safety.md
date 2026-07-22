@@ -30,12 +30,14 @@ manual unlock path, and is measured separately rather than counted as
 successful unattended service recovery. Extending escrow exposure across all
 unlocked uptime requires a separate explicit security/product decision.
 
-Status: The main local implementation and compatible local validation are
-complete. The repeated-start/boot-health composition amendment is implemented
-in the development unit but not yet in the authoritative package or image
-validator. This source tree is not release-qualified: a coordinated package and
-mounted image, unattended locked-to-unlocked fault qualification, the 4 GiB
-profile, installed-record capacity baseline, soak, and canary gates remain
+Status: The main local implementation, local OBS package integration, Piccolo
+OS image-validator integration, and compatible local validation are complete.
+The exact local candidate RPM passed install-from-start-limit recovery, both
+terminal boot-health branches with real reboots, and unattended locked-to-
+unlocked recovery. This source tree is not release-qualified: the authoritative
+0.2.40 OBS build/publication, mounted final image, direct final-package
+task-exhaustion interruption, clean-cohort app/owner matrix, 4 GiB profile,
+installed-record capacity baseline, repeated p95, soak, and canary gates remain
 pending.
 Date: 2026-07-19
 Related:
@@ -2252,17 +2254,19 @@ counter or rollback authority. Adversarial verification finds no remaining
 terminal combination in which pending boot-health is pre-empted or accepted
 boot-health leaves Piccolod permanently start-limited. Minimality verification
 retains the companion because a static unconditional start-limit action cannot
-satisfy both obligations. Plan verdict: **GREEN**. Implementation and live
-composition proof remain release blockers.
+satisfy both obligations. Plan verdict: **GREEN**. Remote artifact/image
+integration and the remaining release-qualification proof remain blockers.
 
 ## Implementation Notes & Status
 
 The original RFC was implemented on 2026-07-19 across the Piccolod tree and its
-local package/alpha seams. The authoritative OBS `piccolod.service` and Piccolo
-OS mounted-image policy validator still require the amended post-stop helper
-and repeated-start/boot-health composition described below. The implementation
-is still an uncommitted working-tree change; no release artifact or device
-qualification is implied by this section.
+local package/alpha seams and is recorded in local commit `49ee693`. The latest
+unlock-before-enumeration correction remains a two-file working-tree amendment.
+The authoritative OBS checkout and Piccolo OS mounted-image policy validator
+now contain the coordinated post-stop helper and repeated-start/boot-health
+composition described below, but those sibling changes are still local and
+unpublished. No remote OBS or final-image qualification is implied by this
+section.
 
 Post-alpha review on 2026-07-21 found two incomplete effect boundaries. The
 self-hosted Nexus adapter derived aliases directly from persisted desired
@@ -2272,8 +2276,9 @@ masked a locked replacement. The local implementation now closes both: alias
 publication is derived from active runtime projection with apply-generation
 ordering and fail-closed withdrawal, while deliberate restart paths use the
 provider-neutral bounded handoff and replacement pickup flow. The prior alpha
-run remains insufficient evidence for unattended unlocked service recovery and
-must not be counted as the renewed live gate.
+run by itself remained insufficient evidence for unattended unlocked service
+recovery; the exact candidate-RPM qualification recorded below later closed
+that live gate.
 
 Code, security, and UX review were repeated after implementation. Their local
 blocking/significant findings were resolved: live runtime-pressure events now
@@ -2298,9 +2303,18 @@ keeps failed qualification accounting separate from ordinary recovery, and
 emits exact detection, continuity/task, unlock, per-route, and terminal stages;
 route completion comes only from the fresh attempt's route-bearing plus active
 publication result.
+Exact package qualification then exposed one more temporal dependency: desired
+owner enumeration requires decrypted lifecycle state, but the recovery runner
+had selected enumeration before the unlock owner on a locked replacement. The
+runner now exposes only the existing unlock owner until Ready, then exposes
+only enumeration before the remaining owners. Focused/race tests and repeated
+exact-RPM boots prove the corrected order without adding a second unlock or
+enumeration authority.
 Code, security, UX, minimality, and temporal-convergence roles were exercised by
-independent local reviewer agents. No external review CLI was used. Accepted
-product or scope deviations: `none`.
+independent local reviewer agents. No external review CLI was used. There are
+no product or scope deviations. The accepted correctness fix schedules the
+provider-neutral `unlock-chain` before decrypted desired-owner enumeration on
+locked recovery starts; all other core owners remain Ready-gated.
 
 ### RFC-to-code trace
 
@@ -2312,14 +2326,14 @@ product or scope deviations: `none`.
 | D3 — persistent app-scoped recovery | Three/60-second isolated failure window; Normal/session/dependency/transition/shared-sentinel proofs; retain publication until PID 1 empty-cgroup proof, then fail closed for the absent backend; single crash-replayable transition; at most one quarantine; persistent data retained | `internal/app/runtime_unknown_recovery.go`; runtime-recovery additions in `internal/app/installed_app_transition.go`; quiescence/publication, follower fallback, and durable-phase fault tests | satisfied | Live phase-interruption fault injection remains a release gate below. |
 | D4 and invariant 5 — child lifecycle | Remove legacy direct PTY endpoints; supported sessions retain caps/reaper and exactly one `Wait` owner | Deleted `gin_terminal.go`, `gin_workspace_terminal.go`, and `pty_session.go`; `internal/terminal/session.go`; `internal/terminal/manager.go`; `TestManager_RepeatedCreateDeleteReapsChildren`; child-start audit in touched seams | satisfied | The 72-hour task/goroutine/zombie soak remains pending. |
 | D5 — task guard and Warning admission | One constant-size direct cgroup-v2 sampler; exact thresholds/hysteresis; no-fork bounded census; shared child admission; retryable 503; sustained Warning becomes Critical; Warning prepare and Normal cancel callbacks never block sampling | `internal/resources/pressure/task_guard.go`; `internal/resources/pressure/admission.go`; `internal/autounlock/task_pressure.go`; `cmd/piccolod/task_fatal_owner.go`; guard/admission/callback/first-fatal/race tests | satisfied | Sampler pressure, monitor health, startup admission, and process-fatal admission have separate release authority. Critical commits its exact snapshot to the shared producer-side first-fatal latch before callbacks or census. Live renewed qualification remains a release gate. |
-| D6 — emergency restart marker | Three-second outer deadline, at-most-two-second last-chance continuity, final one-second exit; invocation-idempotent atomic marker; PCV pre-freeze intent and independent post-stop/earliest-startup thaw recovery; acknowledged active progress with exit-76 global fallback; bounded suspect/global schedules; prompt non-suspect restore and automatic retry/clear proof | `cmd/piccolod/task_recovery.go`; `task_fatal_owner.go`; `internal/pcv/control_plane_thaw.go`; recovery controller/runner/server and PCV freeze-interruption tests; marker, backoff, continuity, and timing tests | partial | Local process-exit and cross-systemd thaw ownership are implemented. A real-filesystem/systemd interruption run remains required; permanently uninterruptible filesystem ioctls are outside the process-recovery fault model. The old alpha run proved fast replacement only and did not prove unattended unlock. |
-| D6 — restart unlock continuity | Provider-neutral prepare/recover/cancel; compatible raw v1 blob plus ordered digest/format reconciliation; singleton-handoff exclusivity; Namek v1 expiry cleanup; joinable unlock chain and Ready barrier; caller timeout retains execution ownership; atomic completion-versus-fatal liveness bound and reserved-suspect retry; no plaintext secret persistence; 20-second pickup failure cap and manual fallback | `internal/autounlock/`; `internal/server/gin_crypto_handlers.go`; `internal/server/recovery_execution.go`; `internal/app/app_manager.go`; `internal/server/gin_server.go`; `cmd/piccolod`; unit and race matrices | partial | Local implementation, legacy compatibility, exact volatile ownership, and temporal race proofs are green. A renewed live locked-to-unlocked run without automatic password input remains required. Standing all-uptime escrow, Linux keyring, keyed revocation, and provider registry/UI remain out of scope. |
+| D6 — emergency restart marker | Three-second outer deadline, at-most-two-second last-chance continuity, final one-second exit; invocation-idempotent atomic marker; PCV pre-freeze intent and independent post-stop/earliest-startup thaw recovery; acknowledged active progress with exit-76 global fallback; bounded suspect/global schedules; prompt non-suspect restore and automatic retry/clear proof | `cmd/piccolod/task_recovery.go`; `task_fatal_owner.go`; `internal/pcv/control_plane_thaw.go`; recovery controller/runner/server and PCV freeze-interruption tests; marker, backoff, continuity, and timing tests | partial | Local process-exit and cross-systemd thaw ownership are implemented. A direct real-filesystem/systemd task-exhaustion interruption on the final package remains required; the package start-limit reboots below prove the outer replacement boundary but not this exact fault. Permanently uninterruptible filesystem ioctls remain outside the process-recovery fault model. |
+| D6 — restart unlock continuity | Provider-neutral prepare/recover/cancel; compatible raw v1 blob plus ordered digest/format reconciliation; singleton-handoff exclusivity; Namek v1 expiry cleanup; joinable unlock chain and Ready barrier; caller timeout retains execution ownership; atomic completion-versus-fatal liveness bound and reserved-suspect retry; no plaintext secret persistence; 20-second pickup failure cap and manual fallback | `internal/autounlock/`; `internal/server/gin_crypto_handlers.go`; `internal/server/recovery_execution.go`; `internal/app/app_manager.go`; `internal/server/gin_server.go`; `cmd/piccolod`; `TestTaskRecoveryRunnerUnlocksBeforeDesiredOwnerEnumeration`; unit and race matrices; exact 0.2.40 candidate-RPM alpha boots | satisfied | The exact candidate RPM moved locked-to-unlocked without password input in two seconds, repeated after install-from-start-limit recovery, and reached unlocked Ready after both real-reboot branches. Standing all-uptime escrow, Linux keyring, keyed revocation, and provider registry/UI remain out of scope. |
 | D6 — core-before-optional startup and alias authority | Bind listener before `READY=1`; portal bootstrap first; reach lifecycle Ready before decrypted owners; publish app aliases only after active-publication proof; deny local acceptance and attempt bounded adapter withdrawal before closure; stale upstream fails closed; apply-time projection generation prevents stale snapshot replay | `internal/server/gin_server.go`; `internal/remote/manager.go`; `internal/services/publication_state.go`; startup, publication, suspension, withdrawal, projection-generation, and stale-apply tests | satisfied | Local acceptance and relay projection use the same active-publication authority; delayed and stale applies cannot republish a withdrawn alias. Live package/canary validation remains pending. |
 | D6 — interrupted-owner matrix | Durable transitions replay; storage/onboarding/update suppress premature success; ephemeral streams/probes are discarded; bounded per-suspect/global recurrence automatically retries while non-suspects recover independently | Existing transition tests plus admission/lifecycle ownership in app, persistence, onboarding, storage, update, terminal, network, and firewall owners; bounded desired-owner enumeration lock-stall/fatal tests | partial | Local enumeration and owner execution share the finite deadline, cancellation grace, and first-fatal boundary. The amended live interruption matrix remains a release gate. |
 | D7 — event and dock treatment | Authenticated initial task snapshot; per-topic barrier; connected pending Checking versus disconnected Offline; Warning/Unavailable degraded and Critical recovering; no per-app false status or new workflow; neutral expectation-setting copy | `internal/events/bus.go`; `internal/server/gin_event_stream.go`; `gin_event_stream_pressure_test.go`; Dart resource model/client/dock; `ui/test/resource_pressure_test.dart`; `ui/test/terminal_task_pressure_test.dart` | satisfied | Mounted reconnect/hydration transitions, exact neutral copy, and forbidden internal terminology are covered. `EventStreamClient` is the single pressure-state owner. |
 | D8 — fixed overhead and capacity floor | No per-app guard workers; 16 terminal cap; qualify 2/4 GiB, the canonical constant-overhead installed-record baseline, and 72-hour stability | Single-loop guard unit test, terminal cap/soak unit test, and 2 GiB alpha profile (2,044,694,528 bytes RAM, one CPU, no swap) | partial | The 4 GiB profile, D8 constant-overhead baseline, and 72-hour mixed-operation soak remain pending. |
 | D9 — measured reliability target | Treat five-nines as a target; capture stage timing; prove 30-second p95 unlocked route recovery for the healthy deterministic lowest-id Enabled route-bearing candidate with its reserved five-second slice; skip that qualification cohort for listenerless-only fleets while continuing their ordinary recovery; continue ordinary convergence with fresh bounds; measure recurrence and unexpected-no-handoff cohorts separately | `cmd/piccolod/task_recovery.go`, `task_fatal_owner.go`, `task_recovery_controller.go`, `task_recovery_runner.go`, and `internal/server/task_recovery_capabilities.go` preserve exact detection separately from marker time, keep failed qualification separate from the ordinary pass, carry fresh route/publication truth out of each app attempt, and emit correlated core-Ready, truthful unlock pickup/skip, lifecycle-Ready, qualification, per-route, and eventual-convergence stages with continuity/task/cohort labels; repeated 2/4 GiB derivation remains pending | partial | Local source telemetry is sufficient for the canary harness to derive stage durations without stale high-water or route-shape carry-over. Earlier sub-30-second core Ready runs are not unlocked-service evidence, and prepared/unknown handoffs, backoff, or manual unlock cannot enter the unexpected-no-handoff/healthy denominator. |
-| Production unit and validators | Finite 15% task limit, 60-second service watchdog, always/5-second restart, control-group kill, bounded `ExecStopPost` recurrence marker, three-start/fifteen-minute limit, conditional PID-1 reboot composition, and upgrade-time stop/reset/start recovery in authoritative package, mounted image, and live boot | OBS `home:atdexterslab/piccolod/piccolod.service`, companion recovery unit, and spec; `Makefile`; `scripts/systemd/piccolod-start-limit-recovery-test.sh`; `scripts/alpha/dev-vm-alpha-test.sh`; Piccolo OS `scripts/validate-image-policy.sh`; exact file diffs, shell syntax, and live alpha values | partial | The local development unit, companion, service-result gate, health-check ordering, install-time reset, and focused helper tests are implemented. The amended alpha run proved the effective finite policy, transient-failure no-reboot branch, and exhausted-restart mocked-reboot branch. OBS still disables start limiting and installs no companion; package build, mounted-image validation, install-from-start-limit proof, a real reboot request, and both production terminal boot-health branches remain pending. |
+| Production unit and validators | Finite 15% task limit, 60-second service watchdog, always/5-second restart, control-group kill, bounded `ExecStopPost` recurrence marker, three-start/fifteen-minute limit, conditional PID-1 reboot composition, and upgrade-time stop/reset/start recovery in authoritative package, mounted image, and live boot | Local OBS `home:atdexterslab/piccolod/piccolod.service`, companion recovery unit/helper/test, and spec; `Makefile`; `scripts/systemd/piccolod-start-limit-recovery-test.sh`; `scripts/alpha/dev-vm-alpha-test.sh`; local Piccolo OS `scripts/validate-image-policy.sh`; local RPM `%check`; exact candidate-RPM alpha lifecycle and real reboot logs | partial | Local OBS/package and image-validator integration are implemented. The exact local RPM proved the effective policy, install-from-start-limit reset/restart, completed-success and failed boot-health branches with automatic real reboots, and unattended unlocked Ready afterward. Remote OBS build/publication and validation against its mounted final image remain pending. |
 | Local validation acceptance | Repository Go tests/races/vet, focused Flutter validation, shell syntax, policy diffs, and diff hygiene | `go test ./...`, scoped `go test -race`, `go vet ./...`, compatible native/browser Flutter test partitions, `flutter analyze --no-fatal-infos`, `bash -n`, `osc diff`, and `git diff --check` | satisfied | All compatible test partitions are green. A single all-platform Flutter invocation remains impossible because the existing native suite includes a web-only test and the browser suite includes a `dart:io` source-reading test; analyze reports nine pre-existing info-only lints. |
 | Out-of-scope memory/capacity work | Do not reopen 0.2.39 OOM hierarchy, memory limits, inactive-app offloading, Snapper/Btrfs, or hardware-watchdog policy | No changes to those owners; resource documentation preserves the separate OOM contract and distinguishes service from hardware watchdog | satisfied | Existing 0.2.39 Go tests remain green. |
 | Out-of-scope rescue/product surfaces | Do not add SSH/serial/rescue daemon, Piccolod-owned snapshot/rollback selection, per-app health screen, or operator recovery workflow | No such API, process, service, UI screen, or rollback path in the diff | satisfied | The bounded start-limit companion only composes with existing PID-1/MicroOS owners; safe-start and manual Start semantics are unchanged. |
@@ -2359,42 +2373,48 @@ mounted-image, or canary-telemetry gates.
 
 ### Amended start-limit alpha evidence — 2026-07-22
 
-The current source candidate (`v0.2.40-rc.local`, binary `sha256
-dcd0faac876044f00c64fd56641dd80c3c1e9231843ccba86a9483b46e760fb1`)
-was deployed to the same 2 GiB, one-vCPU, no-swap alpha profile. Effective
+The final source candidate (`v0.2.40-rc.local`, binary `sha256
+6f9bd4840ff4afaa1951364c5c96193176a78f84c2ba76e17ded0a1ec6d00488`)
+was packaged as the exact local RPM used for qualification (`sha256
+6833865b437677467cb02ef9ec50b995a5df6bef3fe30a51c5c77494b82d1495`)
+and installed on the same 2 GiB, one-vCPU, no-swap alpha profile. Effective
 systemd state reported `StartLimitIntervalUSec=15min`, `StartLimitBurst=3`,
 `RestartUSec=5s`, `WatchdogUSec=1min`, `TasksMax=2294`,
 `KillMode=control-group`, the companion `OnFailure`, and the no-secret
-`ExecStopPost`. `/api/v1/health/ready` returned HTTP 200 with task pressure
-Normal, the device remained unlocked across the planned daemon replacement,
-and the post-setup smoke passed 6/6.
+`ExecStopPost`. The RPM was built locally with real Tumbleweed RPM macros and
+passed `%check`; the unavailable privileged OBS chroot means this is not an
+authoritative remote OBS build.
 
-The development VM has no production `health-checker.service`, so the
-start-limit integration was exercised with an isolated systemd fixture and a
-mocked final reboot command. One unexpected ABRT moved Piccolod through
-`activating` to `active`; the companion queried effective state and made no
-reboot request. An explicit failing `ExecStart` then exhausted the finite
-counter (`NRestarts=3`, final `ActiveState=failed`) and the final companion run
-observed fixture boot health and issued exactly one mocked
-`systemctl --no-block reboot`. This run discovered and corrected the invalid
-assumption that systemd would supply `MONITOR_SERVICE_RESULT=start-limit-hit`;
-the real final value remained the process result `exit-code`.
+The first exact-RPM start exposed the locked-enumeration ordering defect above.
+After the two-file correction and RPM rebuild, an existing volatile handoff
+moved the device from locked to unlocked in two seconds without a password,
+emitting `unlock_pickup_started`, `unlock_pickup_complete outcome=active`, and
+`lifecycle_ready`. The same RPM was then installed while Piccolod was terminally
+start-limited: its package lifecycle cleared the failed/rate-limit state,
+restarted the daemon, and again reached unlocked Ready in two seconds.
 
-The final helper was also run against an actual completed alpha
-`Type=oneshot` fixture. systemd reported `ActiveState=inactive`, a non-empty
-`InvocationID`, and `Result=success`; the helper obtained all three properties
-in one `systemctl show` snapshot and issued the mocked normal-reboot request.
-This proves the completed-oneshot classifier without claiming the production
-checker package or a real reboot.
+The terminal boot-health branches used an isolated `Type=oneshot`
+`health-checker.service` fixture while retaining the packaged companion and
+real `/usr/bin/systemctl --no-block reboot` effect. For completed successful
+health, systemd reported `ActiveState=inactive`, a non-empty `InvocationID`, and
+`Result=success`; repeated Piccolod failure caused the companion to request a
+normal reboot, after which the boot ID changed and Piccolod reached unattended
+unlocked Ready. For failed health, systemd reported `ActiveState=failed`, a
+non-empty `InvocationID`, and `Result=exit-code`; four automatic companion
+invocations observed Piccolod's restart transition, and the terminal invocation
+logged `preserving its recovery decision and requesting normal reboot`.
+systemd-logind recorded `System is rebooting`; the boot ID changed from
+`0b031a0e-bb8a-47f5-a55a-3c6020e2bfc4` to
+`a6c039e0-466f-4ce7-8e41-486c99dd3e5e`, and the replacement reached HTTP 200
+with `ready:true`, control storage unlocked, and `NRestarts=0`. The temporary
+fixture and runtime override were removed after qualification.
 
-The ABRT intentionally lacked a fresh continuity handoff and, after prior
-injection strikes had enlarged the test-only recovery backoff, left this reused
-VM locked. The final smoke used the harness password to restore test state; it
-is not unattended-unlock evidence. A stewardship app-install check also hit a
-pre-existing foreign `scratch-flatten` mount on this reused VM and is not
-counted as candidate evidence. Production health-checker ordering, the exact
-packaged pending/failed/successful checker branches, the real normal reboot,
-renewed unattended unlock, and clean-image app lifecycle remain release gates.
+These runs prove the exact local package lifecycle, both terminal boot-health
+classifiers, automatic real reboot, and unattended unlock continuity. They do
+not prove the remote OBS artifact, mounted final image, a clean-image app
+lifecycle, the named interruption matrix, 4 GiB/installed-record baselines,
+repeated p95, soak, or canary gates. Earlier app-install observations on this
+reused VM remain excluded because prior test state contaminated the cohort.
 
 ### Closure result
 
@@ -2404,36 +2424,31 @@ The local code obligations have no known open blocking requirement. Release
 closure remains blocked because the accepted RFC deliberately makes coordinated
 package/image/device and sustained-runtime evidence part of the contract.
 
-- **blocking × in-scope — authoritative package integration**
+- **blocking × in-scope — authoritative package publication and image integration**
   - **Location:** Production unit and validators.
-  - **Statement:** the authoritative OBS unit still lacks
-    `ExecStopPost=/usr/bin/piccolod --record-service-exit`, and the Piccolo OS
-    image validator does not yet require it. The development unit now has the
-    bounded start policy and conditional companion, but the OBS unit still
-    disables start limiting and installs no companion. Unexpected production exits therefore cannot invoke the
-    implemented recurrence-marker/thaw helper, and repeated activation failure
-    has no bounded handoff to the existing PID-1/MicroOS recovery boundary.
-  - **Suggested resolution:** add the post-stop hook, bounded start policy,
-    conditional companion, spec lifecycle (including upgrade-time reset), and
-    validator assertions; build the coordinated package/image; prove exact-once
-    exit recording, install-from-start-limit recovery, ordering behind pending
-    boot health, and both failed/successful terminal start-limit branches.
+  - **Statement:** the local OBS unit/spec/helper/test and local Piccolo OS
+    validator implement the coordinated policy, and the exact local RPM passed
+    its lifecycle gates. The source identity still targets 0.2.39 while the
+    validator requires 0.2.40, no authoritative remote OBS build has completed,
+    and no final mounted image has been validated. The current checkouts cannot
+    yet produce and prove the release artifact as one composition.
+  - **Suggested resolution:** release/tag the reviewed Piccolod 0.2.40 source,
+    advance the OBS spec/service source identity to that artifact, publish and
+    wait for a green remote build, then build/mount the corresponding Piccolo OS
+    image and run its policy validator.
 - **blocking × in-scope — release qualification evidence**
   - **Location:** D6/D8/D9, Acceptance criteria, and Rollout and observability.
   - **Statement:** live 2 GiB unit policy, watchdog/task-critical recovery,
-    old-process cleanup, and amended source-level start-limit dispatch are
-    proven. The start-limit reboot itself used a mock because the development
-    VM lacks production health-checker. Release still lacks the coordinated
-    package build/mounted-image result, both terminal boot-health branches with
-    a real reboot, a
-    renewed locked-to-unlocked fault run without automatic password input, the
-    named owner/transition interruption matrix, repeated 2 GiB and 4 GiB p95
+    old-process cleanup, exact local RPM lifecycle, both terminal boot-health
+    branches with real reboots, and unattended unlock recovery are proven.
+    Release still lacks the authoritative OBS build/mounted-image result, a
+    clean-cohort app lifecycle, the named owner/transition interruption matrix,
+    repeated 2 GiB and 4 GiB p95
     timing, the D8 constant-overhead baseline, 72-hour mixed-operation soak, and
     canary telemetry. The monolithic Flutter gate remains unavailable because
     of pre-existing cross-platform harness incompatibility, although every
     compatible partition is green.
   - **Suggested resolution:** build the coordinated OBS/image artifact; run the
-    mounted and live fault matrix on 2 GiB and 4 GiB canaries without harness
-    password submission; capture the installed-record, soak, and canary
-    evidence; append exact commands/results here; then repeat RFC implementation
-    closure.
+    mounted and remaining live fault matrix on clean 2 GiB and 4 GiB canaries;
+    capture the installed-record, soak, and canary evidence; append exact
+    commands/results here; then repeat RFC implementation closure.

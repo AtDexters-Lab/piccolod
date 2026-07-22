@@ -68,6 +68,54 @@ func TestTaskRecoveryScheduleGlobalSuppressionBeforeEnumeration(t *testing.T) {
 	}
 }
 
+func TestTaskRecoveryRunnerUnlocksBeforeDesiredOwnerEnumeration(t *testing.T) {
+	controller := newTaskRecoveryControllerWithDeps(
+		validTaskRecoveryControllerMarker(),
+		"locked-recovery",
+		&fakeTaskRecoveryControllerMarkerIO{},
+		&fakeTaskRecoveryControllerClock{now: time.Unix(25, 0)},
+	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	order := make([]string, 0, 2)
+	var runtime *fakeTaskRecoveryRuntime
+	runtime = &fakeTaskRecoveryRuntime{
+		snapshot: pressure.TaskSnapshot{State: pressure.TaskPressureNormal},
+		core: []taskRecoveryOwner{{
+			Name:    taskRecoveryUnlockChainOwner,
+			Timeout: time.Second,
+			Attempt: func(context.Context) (bool, error) {
+				order = append(order, taskRecoveryUnlockChainOwner)
+				runtime.ready = true
+				return true, nil
+			},
+		}},
+	}
+	runtime.enumerate = func(int) []taskRecoveryOwner {
+		order = append(order, taskRecoveryEnumerationOwner)
+		cancel()
+		return nil
+	}
+	runner := newTaskRecoveryRunner(taskRecoveryRunnerConfig{
+		controller:   controller,
+		runtime:      runtime,
+		pollInterval: time.Millisecond,
+		requestFatal: func(string) bool {
+			t.Fatal("unexpected fatal request")
+			return false
+		},
+		requestUncertain: func() bool {
+			t.Fatal("unexpected uncertain request")
+			return false
+		},
+		logf: func(string, ...any) {},
+	})
+	runTaskRecoveryRunnerTest(t, runner, ctx)
+	if want := []string{taskRecoveryUnlockChainOwner, taskRecoveryEnumerationOwner}; !reflect.DeepEqual(order, want) {
+		t.Fatalf("recovery order=%v, want %v", order, want)
+	}
+}
+
 func TestExecuteBoundedTaskRecoveryOwnerCompletionAndFatalArbitration(t *testing.T) {
 	t.Run("return during grace wins", func(t *testing.T) {
 		release := make(chan struct{})
