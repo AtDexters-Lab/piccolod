@@ -16,6 +16,7 @@ import (
 	"piccolod/internal/events"
 	"piccolod/internal/network/ap"
 	"piccolod/internal/network/nmclient"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/runner"
 )
 
@@ -96,6 +97,18 @@ func (s *Supervisor) Name() string { return "network-supervisor" }
 // Start implements supervisor.Component. Loads the ledger, starts the
 // signal-subscription goroutines, and launches the tick loop.
 func (s *Supervisor) Start(ctx context.Context) error {
+	return s.start(ctx, true)
+}
+
+// StartRecovery runs and joins the first probe/decision pass before launching
+// the steady-state loop. This keeps task-recovery owner reacquisition serial
+// and prevents the server from declaring its bounded recovery pass complete
+// while the initial network probe is still pending.
+func (s *Supervisor) StartRecovery(ctx context.Context) error {
+	return s.start(ctx, false)
+}
+
+func (s *Supervisor) start(ctx context.Context, runInitialInLoop bool) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -108,11 +121,14 @@ func (s *Supervisor) Start(ctx context.Context) error {
 	log.Printf("INFO: net-supervisor: ledger loaded — reboots=%d bounces=%v actuation=%v",
 		len(led.Reboots), summarizeBounces(led.Bounces), s.enableActuation)
 
-	runCtx, cancel := context.WithCancel(ctx)
+	runCtx, cancel := context.WithCancel(pressure.WithWorkClass(ctx, pressure.WorkNetworkProbe))
 	s.cancelCtx = cancel
 	s.prober.Run(runCtx)
 
-	go s.tickLoop(runCtx)
+	if !runInitialInLoop {
+		s.runTick(runCtx)
+	}
+	go s.tickLoop(runCtx, runInitialInLoop)
 	return nil
 }
 
@@ -204,11 +220,13 @@ func (s *Supervisor) RequestProbeAndDecide() {
 
 // tickLoop runs the main tick loop. Tick at 30s steady, plus opportunistic
 // early ticks via RequestProbeAndDecide.
-func (s *Supervisor) tickLoop(ctx context.Context) {
+func (s *Supervisor) tickLoop(ctx context.Context, runInitial bool) {
 	defer close(s.doneCh)
 
 	// First tick fires immediately so we have a snapshot before 30s elapses.
-	s.runTick(ctx)
+	if runInitial {
+		s.runTick(ctx)
+	}
 
 	tk := time.NewTicker(TickInterval)
 	defer tk.Stop()

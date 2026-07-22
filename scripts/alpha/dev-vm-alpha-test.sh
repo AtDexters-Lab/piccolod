@@ -96,7 +96,7 @@ post_csrf() {
 }
 
 ensure_session() {
-  local authed login_code
+  local authed locked login_code unlock_code
   authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
     "http://$IP/api/v1/auth/session" 2>/dev/null \
     | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
@@ -104,15 +104,25 @@ ensure_session() {
   local _body; _body=$(mktemp "$ALPHA_STATE_DIR/session-body-XXXXXX")
   rm -f "$COOKIE_JAR"
   for _ in $(seq 1 10); do
+    locked=$(curl -s --connect-timeout 5 \
+      "http://$IP/api/v1/crypto/status" 2>/dev/null \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('locked',False))" 2>/dev/null)
+    if [[ "$locked" == "True" ]]; then
+      printf '{"password":"%s"}' "$PASS" > "$_body"
+      unlock_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
+        -c "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
+        -d @"$_body" "http://$IP/api/v1/crypto/unlock" 2>/dev/null || true)
+      if [[ "$unlock_code" != "200" ]]; then
+        sleep 1
+        continue
+      fi
+    fi
+
     printf '{"username":"admin","password":"%s"}' "$PASS" > "$_body"
     login_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
       -c "$COOKIE_JAR" -X POST -H "Content-Type: application/json" \
       -d @"$_body" "http://$IP/api/v1/auth/login" 2>/dev/null || true)
     if [[ "$login_code" == "200" ]]; then
-      printf '{"password":"%s"}' "$PASS" > "$_body"
-      curl -sf --connect-timeout 10 --max-time 30 -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
-        -X POST -H "Content-Type: application/json" \
-        -d @"$_body" "http://$IP/api/v1/crypto/unlock" >/dev/null 2>&1 || true
       authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
         "http://$IP/api/v1/auth/session" 2>/dev/null \
         | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
@@ -1891,6 +1901,46 @@ print(json.dumps({
   check_ssh_ok "21.2" "runuser helper is executable" "test -x /usr/sbin/runuser"
   check_ssh "21.3" "Effective piccolod OOMScoreAdjust" \
     "systemctl show piccolod.service -p OOMScoreAdjust" "OOMScoreAdjust=-500"
+  check_ssh "21.3a" "Piccolod task budget is explicit" \
+    "systemctl cat piccolod.service --no-pager" "TasksMax=15%"
+  check_ssh_ok "21.3a1" "Effective piccolod task budget is finite" \
+    "systemctl show piccolod.service -p TasksMax | grep -Eq '^TasksMax=[0-9]+$'"
+  check_ssh "21.3b" "Piccolod service watchdog is enabled" \
+    "systemctl cat piccolod.service --no-pager" "WatchdogSec=60"
+  check_ssh_ok "21.3b1" "Effective piccolod service watchdog is enabled" \
+    "systemctl show piccolod.service -p WatchdogUSec | grep -Eq '^WatchdogUSec=(1min|60000000us)$'"
+  check_ssh "21.3c" "Piccolod restart delay is bounded" \
+    "systemctl cat piccolod.service --no-pager" "RestartSec=5"
+  check_ssh "21.3c1" "Effective piccolod restart delay is bounded" \
+    "systemctl show piccolod.service -p RestartUSec" "RestartUSec=5s"
+  check_ssh "21.3d" "Piccolod restart empties its helper cgroup" \
+    "systemctl show piccolod.service -p KillMode" "KillMode=control-group"
+  check_ssh "21.3e" "Piccolod repeated-start window is bounded" \
+    "systemctl cat piccolod.service --no-pager" "StartLimitIntervalSec=900"
+  check_ssh_ok "21.3e1" "Effective Piccolod repeated-start window is fifteen minutes" \
+    "systemctl show piccolod.service -p StartLimitIntervalUSec --value | grep -Eq '^(15min|900s|900000000us)$'"
+  check_ssh "21.3e2" "Piccolod allows three starts per recovery window" \
+    "systemctl cat piccolod.service --no-pager" "StartLimitBurst=3"
+  check_ssh "21.3e2a" "Effective Piccolod start budget allows three starts" \
+    "systemctl show piccolod.service -p StartLimitBurst" "StartLimitBurst=3"
+  check_ssh "21.3e3" "Piccolod start-limit delegates to the conditional recovery companion" \
+    "systemctl cat piccolod.service --no-pager" "OnFailure=piccolod-start-limit-recovery.service"
+  check_ssh_ok "21.3e3a" "Effective Piccolod failure handler includes start-limit recovery" \
+    "systemctl show piccolod.service -p OnFailure --value | tr ' ' '\n' | grep -Fxq 'piccolod-start-limit-recovery.service'"
+  check_ssh "21.3e4" "Start-limit recovery is restricted to images with boot health" \
+    "systemctl cat piccolod-start-limit-recovery.service --no-pager" "ConditionPathExists=/usr/lib/systemd/system/health-checker.service"
+  check_ssh "21.3e4a" "Start-limit recovery cannot pre-empt boot health" \
+    "systemctl cat piccolod-start-limit-recovery.service --no-pager" "After=health-checker.service"
+  check_ssh_ok "21.3e4b" "Effective start-limit recovery ordering follows boot health" \
+    "systemctl show piccolod-start-limit-recovery.service -p After --value | tr ' ' '\n' | grep -Fxq 'health-checker.service'"
+  check_ssh "21.3e5" "Start-limit recovery has a bounded PID-1 reboot fallback" \
+    "systemctl cat piccolod-start-limit-recovery.service --no-pager" "FailureAction=reboot"
+  check_ssh "21.3e5a" "Effective start-limit recovery fallback is PID-1 reboot" \
+    "systemctl show piccolod-start-limit-recovery.service -p FailureAction" "FailureAction=reboot"
+  check_ssh_ok "21.3e6" "Start-limit recovery helper is executable" \
+    "test -x /usr/local/libexec/piccolod-start-limit-recovery"
+  check_ssh "21.3f" "Piccolod records unexpected service exits" \
+    "systemctl cat piccolod.service --no-pager" "ExecStopPost=/usr/local/bin/piccolod --record-service-exit"
   check_ssh "21.4" "Global user@ template drop-in is installed" \
     "systemd-analyze cat-config systemd/system/user@.service 2>/dev/null" "OOMScoreAdjust=-250"
 

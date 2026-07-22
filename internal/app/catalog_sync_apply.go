@@ -13,6 +13,7 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/cluster"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 )
 
@@ -890,12 +891,9 @@ func (m *AppManager) rollbackManifestOnly(
 // rollback, removeDef is the failed-apply def. Passing newDef here would
 // orphan any service that the catalog removed.
 //
-// Listener reconciliation: when newDef.Listeners differs from removeDef
-// (port adds/removes, auth rule changes, middleware changes), the service
-// registry must be reconciled before container recreate so the proxy stops
-// emitting old endpoints and starts emitting new ones. We mirror the
-// UpdateListeners pattern at app_manager.go:3151 by calling
-// serviceManager.Reconcile when the listener slices differ.
+// Listener reconciliation is prepared before destructive runtime work so
+// container port bindings are stable, but proxy/firewall/registry publication
+// is deferred until the replacement container IDs have been persisted.
 func (m *AppManager) recreateContainersInPlace(
 	ctx context.Context,
 	instanceID string,
@@ -903,7 +901,7 @@ func (m *AppManager) recreateContainersInPlace(
 	removeDef *api.AppDefinition,
 	appInst *AppInstance,
 ) error {
-	return m.recreateContainersInPlaceWithHook(ctx, instanceID, newDef, removeDef, appInst, nil)
+	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, nil, services.PublicationResumeToken{})
 }
 
 func (m *AppManager) recreateContainersInPlaceWithHook(
@@ -913,6 +911,18 @@ func (m *AppManager) recreateContainersInPlaceWithHook(
 	removeDef *api.AppDefinition,
 	appInst *AppInstance,
 	beforeInstall func() error,
+) error {
+	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, beforeInstall, services.PublicationResumeToken{})
+}
+
+func (m *AppManager) recreateContainersInPlaceWithHookAndPublicationResumeToken(
+	ctx context.Context,
+	instanceID string,
+	newDef *api.AppDefinition,
+	removeDef *api.AppDefinition,
+	appInst *AppInstance,
+	beforeInstall func() error,
+	publicationResumeToken services.PublicationResumeToken,
 ) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -928,31 +938,22 @@ func (m *AppManager) recreateContainersInPlaceWithHook(
 		return fmt.Errorf("podman runtime: %w", err)
 	}
 
-	if err := m.removeContainersForMultiApp(ctx, appInst, removeDef, runtime); err != nil {
-		return fmt.Errorf("remove previous containers: %w", err)
+	// Reserve the complete replacement endpoint set before removing the
+	// current runtime. Preparation does not alter registry/proxy/firewall state,
+	// so a suspended app remains suspended until the replacement runtime and
+	// its durable container IDs are ready.
+	listenerPlan, err := m.serviceManager.PrepareReconcile(instanceID, newDef.Listeners)
+	if err != nil {
+		return fmt.Errorf("prepare listeners: %w", err)
+	}
+	defer listenerPlan.Release()
+	endpoints := listenerPlan.Endpoints()
+	if len(endpoints) == 0 && len(newDef.Listeners) > 0 && !allowMissingListenerEndpointsForTest() {
+		return fmt.Errorf("prepare listeners: no endpoints for %d listeners", len(newDef.Listeners))
 	}
 
-	// Compute endpoints. If the listener set changed between removeDef and
-	// newDef, call Reconcile to update the service registry. Otherwise reuse
-	// the existing registry entries.
-	var endpoints []services.ServiceEndpoint
-	if removeDef != nil && reflect.DeepEqual(removeDef.Listeners, newDef.Listeners) {
-		endpoints, _ = m.serviceManager.GetByApp(instanceID)
-		if len(endpoints) == 0 {
-			if !allowMissingListenerEndpointsForTest() {
-				var allocErr error
-				endpoints, allocErr = m.serviceManager.AllocateForApp(instanceID, newDef.Listeners)
-				if allocErr != nil {
-					return fmt.Errorf("allocate endpoints: %w", allocErr)
-				}
-			}
-		}
-	} else {
-		result, _, recErr := m.serviceManager.Reconcile(instanceID, newDef.Listeners)
-		if recErr != nil {
-			return fmt.Errorf("reconcile listeners: %w", recErr)
-		}
-		endpoints = result.Endpoints
+	if err := m.removeContainersForMultiApp(ctx, appInst, removeDef, runtime); err != nil {
+		return fmt.Errorf("remove previous containers: %w", err)
 	}
 	m.configureOIDCAuthorizePaths(instanceID, newDef)
 	if beforeInstall != nil {
@@ -978,6 +979,10 @@ func (m *AppManager) recreateContainersInPlaceWithHook(
 	appInst.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, newDef)
 	if err := state.StoreApp(appInst); err != nil {
 		return fmt.Errorf("persist container ids: %w", err)
+	}
+	publicationCtx := pressure.WithTransitionContinuation(ctx)
+	if _, _, err := listenerPlan.PublishWithResumeTokenContext(publicationCtx, publicationResumeToken); err != nil {
+		return fmt.Errorf("publish listeners: %w", err)
 	}
 	if appInst.Enabled {
 		m.setObservedStatus(instanceID, StatusRunning)

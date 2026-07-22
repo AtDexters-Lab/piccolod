@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"piccolod/internal/api"
+	"piccolod/internal/resources/pressure"
 )
 
 func TestTransitionPlanHashCanonicalizesOrderingAndEmptyValues(t *testing.T) {
@@ -608,6 +609,45 @@ func TestRecoverPendingTransitionRecordsClearsPreparedWithoutLegacyJournal(t *te
 	}
 	if _, err := state.LoadTransitionRecord("piclu"); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("transition record err = %v, want cleared", err)
+	}
+}
+
+func TestRecoverPendingTransitionRecordsWarningAdvancesOnlyOneDurableRecord(t *testing.T) {
+	mgr, err := NewAppManagerForTest(nil, t.TempDir())
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	for _, instanceID := range []string{"alpha", "beta"} {
+		if err := state.StoreApp(transitionTestAppInstance(instanceID)); err != nil {
+			t.Fatalf("store app %s: %v", instanceID, err)
+		}
+		if err := state.StoreTransitionRecord(instanceID, transitionTestRecord(instanceID, TransitionPhasePrepared)); err != nil {
+			t.Fatalf("store transition %s: %v", instanceID, err)
+		}
+	}
+
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+	ctx := withTransitionRecoveryAdmission(context.Background())
+	blocked := mgr.recoverPendingTransitionRecords(ctx, state)
+	if len(blocked) != 0 {
+		t.Fatalf("prepared transition recovery blocked: %v", blocked)
+	}
+
+	remaining := 0
+	for _, instanceID := range []string{"alpha", "beta"} {
+		if _, err := state.LoadTransitionRecord(instanceID); err == nil {
+			remaining++
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("load transition %s: %v", instanceID, err)
+		}
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining transitions = %d, want exactly one after one Warning continuation", remaining)
 	}
 }
 

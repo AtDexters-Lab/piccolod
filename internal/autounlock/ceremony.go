@@ -2,13 +2,9 @@ package autounlock
 
 import (
 	"context"
-	"crypto/rand"
 	"errors"
-	"io"
 	"log"
 	"time"
-
-	"piccolod/internal/cryptoutil"
 
 	"github.com/AtDexters-Lab/namek-server/pkg/namekclient"
 )
@@ -31,106 +27,17 @@ const fSize = 32
 // at namek. Bails (no-op) when auto-unlock is disabled or identity is not in a state
 // to deposit. Failure does NOT block shutdown — caller logs and proceeds.
 func (o *Orchestrator) RunCeremony(ctx context.Context) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	state, err := LoadState()
-	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
-		log.Printf("WARN: autounlock: ceremony load state: %v", err)
-		return err
-	}
-	if !state.Enabled {
-		return nil
-	}
-	if !o.deps.IsIdentityReady() {
-		log.Printf("WARN: autounlock: ceremony skipped — identity not ready")
-		return nil
-	}
-	if !o.deps.Manager.SDEKLoaded() {
-		// Defense-in-depth: shutdown without an unlocked manager has no SDEK
-		// to wrap. Should not happen in normal operation.
-		log.Printf("WARN: autounlock: ceremony skipped — manager locked")
-		return nil
-	}
-	client := o.deps.NamekClient()
-	if client == nil {
-		log.Printf("WARN: autounlock: ceremony skipped — namek client unavailable")
-		return nil
-	}
-
 	cctx, cancel := context.WithTimeout(ctx, ceremonyTimeoutBudget)
 	defer cancel()
-
-	F := make([]byte, fSize)
-	defer cryptoutil.SecureZero(F)
-	if _, err := io.ReadFull(rand.Reader, F); err != nil {
-		log.Printf("ERROR: autounlock: rand F: %v", err)
-		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
-		return err
-	}
-
-	aad, err := o.aad()
+	result, err := o.Prepare(cctx, PrepareTriggerGracefulShutdown, configuredWindowSeconds*time.Second)
 	if err != nil {
-		log.Printf("ERROR: autounlock: aad: %v", err)
-		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
+		log.Printf("ERROR: autounlock: ceremony prepare failed: %v", err)
 		return err
 	}
-	blob, err := o.deps.Manager.WrapSDEKForEscrow(F, aad)
-	if err != nil {
-		log.Printf("ERROR: autounlock: wrap SDEK: %v", err)
-		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
-		return err
+	if result.Disposition == PrepareDispositionUnavailable {
+		log.Printf("WARN: autounlock: ceremony skipped — recovery provider unavailable")
 	}
-	if err := WriteBlob(blob); err != nil {
-		log.Printf("ERROR: autounlock: write blob: %v", err)
-		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonBlobWriteFailed)
-		return err
-	}
-
-	resp, err := o.deposit(cctx, client, F)
-	if err != nil {
-		// Clean up: blob wrapped to F that's not at namek is unrecoverable.
-		// Deleting prevents a stale-blob pickup on next boot.
-		_ = DeleteBlob()
-		log.Printf("ERROR: autounlock: deposit failed: %v", err)
-		// All deposit-side failures (including the 25s ceremony-budget
-		// timeout) collapse to deposit_failed. The pickup goroutine's
-		// service_unreachable is for the *next boot's* read — they're not
-		// the same failure class.
-		o.recordFailure(&state, AuditCycleFailedDeposit, ReasonDepositFailed)
-		return err
-	}
-
-	now := o.deps.Now()
-	state.LastDepositAt = &now
-	if err := SaveState(state); err != nil {
-		log.Printf("WARN: autounlock: persist post-deposit state: %v", err)
-	}
-	o.emitAudit(AuditCycleDeposited, map[string]any{
-		"effective_window":  resp.EffectiveWindowSeconds,
-		"requested_clamped": resp.RequestedClamped,
-		"expires_at":        resp.ExpiresAt,
-	})
 	return nil
-}
-
-// deposit attempts the deposit RPC with a single retry on transient errors.
-// F is captured once at ceremony start — the retry reuses the same bytes,
-// never regenerates. Regenerating mid-retry would race the wrap/blob already
-// committed to the same F, leaving an unrecoverable blob on disk.
-func (o *Orchestrator) deposit(ctx context.Context, client NamekEscrowClient, F []byte) (*namekclient.DepositUnlockEscrowResponse, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		resp, err := client.DepositUnlockEscrow(ctx, F, configuredWindowSeconds)
-		if err == nil {
-			return resp, nil
-		}
-		if attempt == 0 && isTransientNamekErr(err) {
-			log.Printf("WARN: autounlock: deposit transient error, retrying: %v", err)
-			continue
-		}
-		return nil, err
-	}
-	return nil, errors.New("deposit retries exhausted")
 }
 
 // recordFailure persists last_failure_* and emits the supplied audit kind.
@@ -162,6 +69,9 @@ func isTransientNamekErr(err error) bool {
 	}
 	// Permanent sentinels — retrying just burns cycles.
 	if errors.Is(err, namekclient.ErrEscrowNotFound) {
+		return false
+	}
+	if errors.Is(err, ErrRecoveryFactorInvalid) {
 		return false
 	}
 	var apiErr *namekclient.APIError

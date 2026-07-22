@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/runner"
 )
 
@@ -48,6 +49,9 @@ func NewInstaller(run runner.CommandRunner, reporter events.ProgressReporter, mg
 // Install starts the Install to Disk pipeline. It runs in a goroutine and reports
 // progress via the event bus. Returns an error immediately if already running.
 func (inst *Installer) Install(ctx context.Context, targetDisk, imageURL, taskID string) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkOnboarding); err != nil {
+		return err
+	}
 	inst.mu.Lock()
 	if inst.running {
 		inst.mu.Unlock()
@@ -57,7 +61,10 @@ func (inst *Installer) Install(ctx context.Context, targetDisk, imageURL, taskID
 	inst.activeTaskID = taskID
 	inst.mu.Unlock()
 
+	ctx = pressure.WithTransitionContinuation(pressure.WithWorkClass(ctx, pressure.WorkOnboarding))
 	go func() {
+		releaseOwner := pressure.BeginLifecycleOwner("onboarding")
+		defer releaseOwner()
 		defer func() {
 			inst.mu.Lock()
 			inst.running = false
@@ -172,6 +179,9 @@ func (inst *Installer) runPipeline(ctx context.Context, targetDisk, imageURL, ta
 // streamInstall streams the compressed image directly from HTTP to disk:
 // HTTP GET → tee(sha256) → xzcat → dd. Zero staging space required.
 func (inst *Installer) streamInstall(ctx context.Context, imageURL, targetDisk, taskID string) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkOnboarding); err != nil {
+		return err
+	}
 	// 1. Download .sha256 checksum file (small, quick).
 	expectedHash, checksumErr := inst.fetchChecksum(ctx, imageURL)
 
@@ -232,11 +242,13 @@ func (inst *Installer) streamInstall(ctx context.Context, imageURL, targetDisk, 
 	if err := ddCmd.Start(); err != nil {
 		resp.Body.Close()
 		xzCmd.Process.Kill()
-		xzCmd.Wait()
+		// streamInstall remains the sole Wait owner after the sibling start fails.
+		_ = xzCmd.Wait()
 		return fmt.Errorf("start dd: %w", err)
 	}
 
 	// 8. Wait for dd (downstream consumer) first, then xzcat (upstream producer).
+	// streamInstall is the sole Wait owner for both pipeline children.
 	ddErr := ddCmd.Wait()
 	// Close HTTP body to unblock any pending teeReader.Read() — prevents
 	// xzCmd.Wait() from hanging if dd exits before all bytes are consumed.

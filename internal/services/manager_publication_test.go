@@ -1,14 +1,125 @@
 package services
 
 import (
+	"context"
 	"errors"
 	"net"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/firewall"
+	"piccolod/internal/resources/pressure"
 )
+
+func TestSuspendAppPublicationWithdrawsBeforeRouteTeardown(t *testing.T) {
+	mgr := NewServiceManager()
+	useFakeProxyListeners(mgr)
+	ep := ServiceEndpoint{
+		App:              "piclu",
+		Name:             "web",
+		GuestPort:        8080,
+		HostBind:         15080,
+		PublicPort:       35080,
+		Flow:             api.FlowTCP,
+		Protocol:         api.ListenerProtocolHTTP,
+		DerivedHostLabel: "piclu",
+		RemotePorts:      []int{80, 443},
+	}
+	mgr.registry["piclu"] = map[string]ServiceEndpoint{"web": ep}
+	if err := mgr.proxyManager.StartListenerChecked(ep); err != nil {
+		t.Fatalf("start route: %v", err)
+	}
+	if _, ok := mgr.ResolveByHostLabel("piclu", 443); !ok {
+		t.Fatal("route was not active before suspension")
+	}
+	tlsMux := NewTlsMux(mgr)
+	tlsMux.UpdateAliases(map[string]string{"piclu.example.net": "piclu"})
+	if upstream := tlsMux.resolveUpstream("piclu.example.net", 443); upstream != ep.PublicPort {
+		t.Fatalf("TLS mux upstream before suspension = %d, want %d", upstream, ep.PublicPort)
+	}
+
+	withdrawCalled := false
+	mgr.SetRuntimePublicationCallbacks(func(ctx context.Context) error {
+		withdrawCalled = true
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("withdrawal callback was not bounded")
+		}
+		if _, ok := mgr.ResolveByHostLabelAnyPort("piclu"); ok {
+			t.Fatal("inactive registry endpoint remained resolvable during withdrawal")
+		}
+		if upstream := tlsMux.resolveUpstream("piclu.example.net", 443); upstream != 0 {
+			t.Fatalf("TLS mux retained suspended alias upstream %d", upstream)
+		}
+		mgr.proxyManager.mu.Lock()
+		_, stillRunning := mgr.proxyManager.listeners[ep.PublicPort]
+		mgr.proxyManager.mu.Unlock()
+		if !stillRunning {
+			t.Fatal("route was torn down before runtime withdrawal")
+		}
+		return nil
+	}, nil)
+
+	mgr.SuspendAppPublication("piclu")
+	if !withdrawCalled {
+		t.Fatal("runtime withdrawal was not invoked")
+	}
+	if _, ok := mgr.ResolveByHostLabel("piclu", 443); ok {
+		t.Fatal("suspended endpoint remained resolvable")
+	}
+	mgr.proxyManager.mu.Lock()
+	_, stillRunning := mgr.proxyManager.listeners[ep.PublicPort]
+	mgr.proxyManager.mu.Unlock()
+	if stillRunning {
+		t.Fatal("route remained running after suspension")
+	}
+}
+
+func TestFailedResumeStaysWithdrawnAndDoesNotAdvertise(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	ep := ServiceEndpoint{
+		App:              "piclu",
+		Name:             "web",
+		GuestPort:        8080,
+		HostBind:         15080,
+		PublicPort:       35080,
+		Flow:             api.FlowTCP,
+		Protocol:         api.ListenerProtocolHTTP,
+		DerivedHostLabel: "piclu",
+		RemotePorts:      []int{80, 443},
+	}
+	mgr.registry["piclu"] = map[string]ServiceEndpoint{"web": ep}
+	mgr.deactivated["piclu"] = &publicationInactiveRecord{
+		kind:      publicationInactiveStopped,
+		endpoints: endpointInfoSlice([]ServiceEndpoint{ep}),
+	}
+	mgr.proxyManager.listenTCP = func(string, string) (net.Listener, error) {
+		return nil, errors.New("forced resume bind failure")
+	}
+	advertised := false
+	mgr.SetRuntimePublicationCallbacks(nil, func() { advertised = true })
+	recorder := &recordingPublication{}
+	mgr.SetRemotePublisher(recorder)
+
+	if err := mgr.ResumeAppPublicationChecked("piclu"); err == nil {
+		t.Fatal("resume error = nil, want bind failure")
+	}
+	if advertised {
+		t.Fatal("failed resume advertised runtime projection")
+	}
+	if len(recorder.published) != 0 {
+		t.Fatalf("failed resume published ports = %v", recorder.published)
+	}
+	if _, inactive := mgr.deactivated["piclu"]; !inactive {
+		t.Fatal("failed resume committed active publication state")
+	}
+	if _, ok := mgr.ResolveByHostLabelAnyPort("piclu"); ok {
+		t.Fatal("failed resume made endpoint resolvable")
+	}
+}
 
 func TestSuspendAppPublicationPreservesRegistryAndAllocations(t *testing.T) {
 	mgr := NewServiceManager()
@@ -30,7 +141,7 @@ func TestSuspendAppPublicationPreservesRegistryAndAllocations(t *testing.T) {
 	mgr.allocator.usedHost[ep.HostBind] = struct{}{}
 	mgr.allocator.usedPublic[publicKey(ep.PublicPort, ep.Flow.TransportProtocol())] = struct{}{}
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 
 	if _, ok := mgr.registry["piclu"]["web"]; !ok {
 		t.Fatalf("suspend removed endpoint registry")
@@ -45,7 +156,9 @@ func TestSuspendAppPublicationPreservesRegistryAndAllocations(t *testing.T) {
 		t.Fatalf("unpublished ports = %v, want [%d]", recorder.unpublished, ep.PublicPort)
 	}
 
-	mgr.ResumeAppPublication("piclu")
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), resumeToken, "piclu"); err != nil {
+		t.Fatalf("resume publication: %v", err)
+	}
 
 	if _, ok := mgr.registry["piclu"]["web"]; !ok {
 		t.Fatalf("resume removed endpoint registry")
@@ -104,12 +217,14 @@ func TestActivePortClaimsExcludeSuspendedApps(t *testing.T) {
 		t.Fatalf("active claims before suspend = %+v, want one claim %d", claims, claim)
 	}
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 	if claims := mgr.ActivePortClaims(); len(claims) != 0 {
 		t.Fatalf("active claims while suspended = %+v, want none", claims)
 	}
 
-	mgr.ResumeAppPublication("piclu")
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), resumeToken, "piclu"); err != nil {
+		t.Fatalf("resume publication: %v", err)
+	}
 	if claims := mgr.ActivePortClaims(); len(claims) != 1 || claims[0].Port != claim {
 		t.Fatalf("active claims after resume = %+v, want one claim %d", claims, claim)
 	}
@@ -370,7 +485,7 @@ func TestPreparedReconcileRestartsClaimUpdateAfterSuspendedPublication(t *testin
 	}
 	defer prepared.Release()
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 	mgr.proxyManager.mu.Lock()
 	_, runningBefore := mgr.proxyManager.listeners[old.PublicPort]
 	mgr.proxyManager.mu.Unlock()
@@ -378,7 +493,7 @@ func TestPreparedReconcileRestartsClaimUpdateAfterSuspendedPublication(t *testin
 		t.Fatalf("listener still running after suspended publication")
 	}
 
-	if _, _, err := prepared.Publish(); err != nil {
+	if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), resumeToken); err != nil {
 		t.Fatalf("publish after suspended publication: %v", err)
 	}
 	mgr.proxyManager.mu.Lock()
@@ -433,9 +548,9 @@ func TestPreparedReconcileDoesNotDoubleStartSamePortClaimProxyRestartAfterSuspen
 		t.Fatalf("prepared restart/claim counts = %d/%d, want overlapping endpoint in both buckets", len(prepared.proxyRestart), len(prepared.claimUpdate))
 	}
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 	startsBeforePublish := starts
-	if _, _, err := prepared.Publish(); err != nil {
+	if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), resumeToken); err != nil {
 		t.Fatalf("publish after suspended publication: %v", err)
 	}
 	if got := starts - startsBeforePublish; got != 1 {
@@ -478,8 +593,8 @@ func TestPreparedReconcileRestartsUnchangedListenersAfterSuspendedPublication(t 
 	}
 	defer prepared.Release()
 
-	mgr.SuspendAppPublication("piclu")
-	if _, _, err := prepared.Publish(); err != nil {
+	resumeToken := mgr.SuspendAppPublication("piclu")
+	if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), resumeToken); err != nil {
 		t.Fatalf("publish after suspended publication: %v", err)
 	}
 	mgr.proxyManager.mu.Lock()
@@ -621,7 +736,7 @@ func TestPrepareReconcileMigratesAutoUDPToSamePortClaim(t *testing.T) {
 		t.Fatalf("auto udp public port not tracked under tcp key before claim update")
 	}
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 	prepared, err := mgr.PrepareReconcile("piclu", []api.AppListener{{
 		Name:      "dns",
 		GuestPort: 5353,
@@ -668,7 +783,7 @@ func TestPrepareReconcileMigratesAutoUDPToSamePortClaim(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepare same-port udp claim for publish: %v", err)
 	}
-	if _, _, err := prepared.Publish(); err != nil {
+	if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), resumeToken); err != nil {
 		t.Fatalf("publish same-port udp claim: %v", err)
 	}
 	if _, ok := mgr.allocator.usedPublic[publicKey(claim, "tcp")]; ok {
@@ -782,7 +897,7 @@ func TestPrepareReconcileRestoresAutoUDPKeysAfterPartialClaimPublishFailure(t *t
 	firstClaim := first.PublicPort
 	secondClaim := second.PublicPort
 
-	mgr.SuspendAppPublication("piclu")
+	resumeToken := mgr.SuspendAppPublication("piclu")
 	prepared, err := mgr.PrepareReconcile("piclu", []api.AppListener{
 		{Name: "dns-a", GuestPort: 5353, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: &firstClaim},
 		{Name: "dns-b", GuestPort: 5354, Flow: api.FlowUDP, Protocol: api.ListenerProtocolRaw, PortClaim: &secondClaim},
@@ -799,7 +914,7 @@ func TestPrepareReconcileRestoresAutoUDPKeysAfterPartialClaimPublishFailure(t *t
 		return inMemoryTestUDPConn{}, nil
 	}
 
-	if _, _, err := prepared.Publish(); err == nil {
+	if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), resumeToken); err == nil {
 		t.Fatalf("publish same-port udp claims err = nil, want second bind failure")
 	}
 	prepared.Release()
@@ -883,6 +998,395 @@ func TestRestoreFromPodmanAutoUDPSkipsUDPUnavailablePublicPort(t *testing.T) {
 	}
 	if _, ok := mgr.allocator.usedPublic[publicKey(35001, "tcp")]; !ok {
 		t.Fatalf("restored UDP auto port not tracked under auto key")
+	}
+}
+
+func TestRestoreFromPodmanRejectsPartialBindingsBeforeWithdrawingRoutes(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	listeners := []api.AppListener{
+		{Name: "web", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		{Name: "admin", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+	}
+	before, err := mgr.AllocateForApp("piclu", listeners)
+	if err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+
+	_, err = mgr.RestoreFromPodman("piclu", listeners, map[string]int{"8080/tcp": before[0].HostBind})
+	if !errors.Is(err, ErrPublicationRestoreIncomplete) {
+		t.Fatalf("partial restore error = %v, want %v", err, ErrPublicationRestoreIncomplete)
+	}
+	after, err := mgr.GetByApp("piclu")
+	if err != nil || len(after) != len(before) {
+		t.Fatalf("last-known routes after rejected restore = %v, err=%v; want %d routes", after, err, len(before))
+	}
+	if !mgr.AppPublicationActive("piclu") {
+		t.Fatal("partial restore withdrew the complete last-known publication")
+	}
+}
+
+func TestRestoreFromPodmanReservationFailureRollsBackWholeRestore(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	listeners := []api.AppListener{
+		{Name: "web", GuestPort: 8080, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP, Primary: true},
+		{Name: "admin", GuestPort: 9090, Flow: api.FlowTCP, Protocol: api.ListenerProtocolHTTP},
+	}
+
+	_, err := mgr.RestoreFromPodman("piclu", listeners, map[string]int{
+		"8080/tcp": 15080,
+		"9090/tcp": 15080,
+	})
+	if !errors.Is(err, ErrPublicationRestoreIncomplete) {
+		t.Fatalf("duplicate host restore error = %v, want %v", err, ErrPublicationRestoreIncomplete)
+	}
+	if _, err := mgr.GetByApp("piclu"); err == nil {
+		t.Fatal("failed restore retained a partial registry")
+	}
+	if len(mgr.allocator.usedHost) != 0 || len(mgr.allocator.usedPublic) != 0 {
+		t.Fatalf("failed restore leaked allocations: host=%v public=%v", mgr.allocator.usedHost, mgr.allocator.usedPublic)
+	}
+}
+
+func TestSuspendWaitsForRestoreFromPodmanRouteReplacement(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	claim := 18080
+	listeners := []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}}
+	eps, err := mgr.AllocateForApp("piclu", listeners)
+	if err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	fw := newBlockingLifecycleFirewall(mgr)
+	mgr.SetFirewallManager(fw)
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		_, restoreErr := mgr.RestoreFromPodmanContext(context.Background(), "piclu", listeners, map[string]int{"8080/tcp": eps[0].HostBind})
+		restoreDone <- restoreErr
+	}()
+	fw.waitForOpen(t)
+	if !fw.lifecycleHeld() {
+		t.Fatal("RestoreFromPodman released publication lifecycle authority before replacement activation")
+	}
+
+	suspendStarted := make(chan struct{})
+	suspendDone := make(chan struct{})
+	go func() {
+		close(suspendStarted)
+		mgr.SuspendAppPublication("piclu")
+		close(suspendDone)
+	}()
+	<-suspendStarted
+	select {
+	case <-suspendDone:
+		t.Fatal("suspend completed before in-flight route replacement released lifecycle authority")
+	case <-time.After(20 * time.Millisecond):
+	}
+	fw.releaseOpen()
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore from podman: %v", err)
+	}
+	<-suspendDone
+	assertAppPublicationSuspended(t, mgr, "piclu")
+}
+
+func TestSuspendWaitsForRestorePreparedRouteReplacement(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	claim := 18081
+	eps, err := mgr.AllocateForApp("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}})
+	if err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	restored := eps[0]
+	mgr.RemoveApp("piclu")
+	fw := newBlockingLifecycleFirewall(mgr)
+	mgr.SetFirewallManager(fw)
+
+	restoreDone := make(chan error, 1)
+	go func() {
+		restoreDone <- mgr.RestorePreparedPublicationContext(context.Background(), "piclu", []ServiceEndpoint{restored})
+	}()
+	fw.waitForOpen(t)
+	if !fw.lifecycleHeld() {
+		t.Fatal("RestorePreparedPublication replaced routes outside publication lifecycle authority")
+	}
+
+	suspendStarted := make(chan struct{})
+	suspendDone := make(chan struct{})
+	go func() {
+		close(suspendStarted)
+		mgr.SuspendAppPublication("piclu")
+		close(suspendDone)
+	}()
+	<-suspendStarted
+	select {
+	case <-suspendDone:
+		t.Fatal("suspend completed before prepared route replacement released lifecycle authority")
+	case <-time.After(20 * time.Millisecond):
+	}
+	fw.releaseOpen()
+	if err := <-restoreDone; err != nil {
+		t.Fatalf("restore prepared publication: %v", err)
+	}
+	<-suspendDone
+	assertAppPublicationSuspended(t, mgr, "piclu")
+}
+
+func TestSuspensionAuthorityGatesDelayedActivators(t *testing.T) {
+	listeners := []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+	}}
+
+	t.Run("restore from podman", func(t *testing.T) {
+		mgr := NewServiceManager()
+		mgr.UseInMemoryNetworkForTest()
+		eps, err := mgr.AllocateForApp("piclu", listeners)
+		if err != nil {
+			t.Fatalf("allocate app: %v", err)
+		}
+		token := mgr.SuspendAppPublication("piclu")
+		inactive := mgr.deactivated["piclu"]
+
+		_, err = mgr.RestoreFromPodmanContext(context.Background(), "piclu", listeners, map[string]int{"8080/tcp": eps[0].HostBind})
+		if !errors.Is(err, ErrPublicationSuspended) {
+			t.Fatalf("passive restore error = %v, want publication suspended", err)
+		}
+		if mgr.deactivated["piclu"] != inactive || mgr.AppPublicationActive("piclu") {
+			t.Fatal("denied restore changed the suspended publication")
+		}
+
+		if _, err := mgr.RestoreFromPodmanWithResumeTokenContext(context.Background(), token, "piclu", listeners, map[string]int{"8080/tcp": eps[0].HostBind}); err != nil {
+			t.Fatalf("authorized restore: %v", err)
+		}
+		if !mgr.AppPublicationActive("piclu") {
+			t.Fatal("authorized restore did not reactivate publication")
+		}
+	})
+
+	t.Run("restore prepared", func(t *testing.T) {
+		mgr := NewServiceManager()
+		mgr.UseInMemoryNetworkForTest()
+		eps, err := mgr.AllocateForApp("piclu", listeners)
+		if err != nil {
+			t.Fatalf("allocate app: %v", err)
+		}
+		token := mgr.SuspendAppPublication("piclu")
+		inactive := mgr.deactivated["piclu"]
+
+		err = mgr.RestorePreparedPublicationContext(context.Background(), "piclu", eps)
+		if !errors.Is(err, ErrPublicationSuspended) {
+			t.Fatalf("passive prepared restore error = %v, want publication suspended", err)
+		}
+		if mgr.deactivated["piclu"] != inactive || mgr.AppPublicationActive("piclu") {
+			t.Fatal("denied prepared restore changed the suspended publication")
+		}
+
+		if err := mgr.RestorePreparedPublicationWithResumeTokenContext(context.Background(), token, "piclu", eps); err != nil {
+			t.Fatalf("authorized prepared restore: %v", err)
+		}
+		if !mgr.AppPublicationActive("piclu") {
+			t.Fatal("authorized prepared restore did not reactivate publication")
+		}
+	})
+
+	t.Run("prepared publish", func(t *testing.T) {
+		mgr := NewServiceManager()
+		mgr.UseInMemoryNetworkForTest()
+		if _, err := mgr.AllocateForApp("piclu", listeners); err != nil {
+			t.Fatalf("allocate app: %v", err)
+		}
+		prepared, err := mgr.PrepareReconcile("piclu", listeners)
+		if err != nil {
+			t.Fatalf("prepare reconcile: %v", err)
+		}
+		defer prepared.Release()
+		token := mgr.SuspendAppPublication("piclu")
+		inactive := mgr.deactivated["piclu"]
+
+		if _, _, err := prepared.PublishContext(context.Background()); !errors.Is(err, ErrPublicationSuspended) {
+			t.Fatalf("passive prepared publish error = %v, want publication suspended", err)
+		}
+		if prepared.published || mgr.deactivated["piclu"] != inactive || mgr.AppPublicationActive("piclu") {
+			t.Fatal("denied prepared publish changed the suspended publication")
+		}
+
+		if _, _, err := prepared.PublishWithResumeTokenContext(context.Background(), token); err != nil {
+			t.Fatalf("authorized prepared publish: %v", err)
+		}
+		if !mgr.AppPublicationActive("piclu") {
+			t.Fatal("authorized prepared publish did not reactivate publication")
+		}
+	})
+}
+
+func TestDeniedPreparedPublishReleaseFreesCandidateReservations(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	prepared, err := mgr.PrepareReconcile("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+	}})
+	if err != nil {
+		t.Fatalf("prepare reconcile: %v", err)
+	}
+	endpoints := prepared.Endpoints()
+	if len(endpoints) != 1 {
+		t.Fatalf("prepared endpoints = %+v, want one", endpoints)
+	}
+	token := mgr.SuspendAppPublication("piclu")
+	if _, _, err := prepared.PublishContext(context.Background()); !errors.Is(err, ErrPublicationSuspended) {
+		t.Fatalf("passive publish error = %v, want publication suspended", err)
+	}
+	prepared.Release()
+	if _, used := mgr.allocator.usedHost[endpoints[0].HostBind]; used {
+		t.Fatalf("denied prepared host reservation %d survived release", endpoints[0].HostBind)
+	}
+	if _, used := mgr.allocator.usedPublic[endpointPublicAllocationKey(endpoints[0])]; used {
+		t.Fatalf("denied prepared public reservation %s survived release", endpointPublicAllocationKey(endpoints[0]))
+	}
+	if mgr.deactivated["piclu"] != token.record {
+		t.Fatal("release invalidated the owning suspension")
+	}
+}
+
+func TestRepeatedSuspensionInvalidatesOlderResumeToken(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	if _, err := mgr.AllocateForApp("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+	}}); err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	oldToken := mgr.SuspendAppPublication("piclu")
+	currentToken := mgr.SuspendAppPublication("piclu")
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), oldToken, "piclu"); !errors.Is(err, ErrPublicationSuspended) {
+		t.Fatalf("stale resume error = %v, want publication suspended", err)
+	}
+	if mgr.deactivated["piclu"] != currentToken.record || mgr.AppPublicationActive("piclu") {
+		t.Fatal("stale token changed the current suspension")
+	}
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), currentToken, "piclu"); err != nil {
+		t.Fatalf("current token resume: %v", err)
+	}
+}
+
+func TestStoppedPublicationAllowsPassiveRestore(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	listeners := []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+	}}
+	eps, err := mgr.AllocateForApp("piclu", listeners)
+	if err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	mgr.DeactivateApp("piclu")
+	if inactive := mgr.deactivated["piclu"]; inactive == nil || inactive.kind != publicationInactiveStopped {
+		t.Fatalf("inactive record = %+v, want ordinary stopped publication", inactive)
+	}
+	if _, err := mgr.RestoreFromPodmanContext(context.Background(), "piclu", listeners, map[string]int{"8080/tcp": eps[0].HostBind}); err != nil {
+		t.Fatalf("passive stopped restore: %v", err)
+	}
+	if !mgr.AppPublicationActive("piclu") {
+		t.Fatal("passive stopped restore did not reactivate publication")
+	}
+}
+
+func TestSuspendedPublicationRejectsPassiveAllocateAndResume(t *testing.T) {
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	listeners := []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+	}}
+	if _, err := mgr.AllocateForApp("piclu", listeners); err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	token := mgr.SuspendAppPublication("piclu")
+	if _, err := mgr.AllocateForApp("piclu", listeners); !errors.Is(err, ErrPublicationSuspended) {
+		t.Fatalf("passive allocate error = %v, want publication suspended", err)
+	}
+	if err := mgr.ResumeAppPublicationCheckedContext(context.Background(), "piclu"); !errors.Is(err, ErrPublicationSuspended) {
+		t.Fatalf("passive resume error = %v, want publication suspended", err)
+	}
+	if mgr.deactivated["piclu"] != token.record || mgr.AppPublicationActive("piclu") {
+		t.Fatal("passive activation changed the suspension")
+	}
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), token, "piclu"); err != nil {
+		t.Fatalf("authorized resume: %v", err)
+	}
+}
+
+func TestClaimedPortResumeCarriesWarningContinuationAndRetainsPendingOnFailure(t *testing.T) {
+	pressure.DefaultAdmission.ResetForTest()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+	mgr := NewServiceManager()
+	mgr.UseInMemoryNetworkForTest()
+	claim := 18082
+	if _, err := mgr.AllocateForApp("piclu", []api.AppListener{{
+		Name:      "web",
+		GuestPort: 8080,
+		Flow:      api.FlowTCP,
+		Protocol:  api.ListenerProtocolHTTP,
+		PortClaim: &claim,
+	}}); err != nil {
+		t.Fatalf("allocate app: %v", err)
+	}
+	fw := &admissionCheckingFirewall{}
+	mgr.SetFirewallManager(fw)
+	resumeToken := mgr.SuspendAppPublication("piclu")
+	pressure.DefaultAdmission.Fence()
+	closedBeforeFailedResume := len(fw.closed)
+
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(context.Background(), resumeToken, "piclu"); !pressure.IsAdmissionError(err) {
+		t.Fatalf("resume without continuation err = %v, want task-pressure admission error", err)
+	}
+	assertAppPublicationSuspended(t, mgr, "piclu")
+	if got := len(fw.opened); got != 0 {
+		t.Fatalf("failed resume opened %d firewall rules, want none", got)
+	}
+	if got := len(fw.closed); got != closedBeforeFailedResume+1 {
+		t.Fatalf("failed resume cleanup closes = %d, want %d", got, closedBeforeFailedResume+1)
+	}
+
+	continuationCtx := pressure.WithTransitionContinuation(context.Background())
+	if err := mgr.ResumeAppPublicationWithResumeTokenContext(continuationCtx, resumeToken, "piclu"); err != nil {
+		t.Fatalf("resume with durable transition continuation: %v", err)
+	}
+	if got := len(fw.opened); got != 1 {
+		t.Fatalf("continued resume opened %d firewall rules, want one", got)
+	}
+	if !mgr.AppPublicationActive("piclu") {
+		t.Fatal("continued resume did not commit active publication")
 	}
 }
 
@@ -1159,12 +1663,95 @@ type recordingFirewall struct {
 	closed []firewall.Rule
 }
 
-func (r *recordingFirewall) OpenPort(rule firewall.Rule) error {
+func (r *recordingFirewall) OpenPort(_ context.Context, rule firewall.Rule) error {
 	r.opened = append(r.opened, rule)
 	return nil
 }
 
-func (r *recordingFirewall) ClosePort(rule firewall.Rule) error {
+func (r *recordingFirewall) ClosePort(_ context.Context, rule firewall.Rule) error {
 	r.closed = append(r.closed, rule)
 	return nil
+}
+
+type blockingLifecycleFirewall struct {
+	manager       *ServiceManager
+	openStarted   chan struct{}
+	openRelease   chan struct{}
+	openOnce      sync.Once
+	releaseOnce   sync.Once
+	heldLifecycle bool
+}
+
+func newBlockingLifecycleFirewall(manager *ServiceManager) *blockingLifecycleFirewall {
+	return &blockingLifecycleFirewall{
+		manager:     manager,
+		openStarted: make(chan struct{}),
+		openRelease: make(chan struct{}),
+	}
+}
+
+func (f *blockingLifecycleFirewall) OpenPort(_ context.Context, _ firewall.Rule) error {
+	f.openOnce.Do(func() {
+		if f.manager.publicationLifecycleMu.TryLock() {
+			f.manager.publicationLifecycleMu.Unlock()
+			f.heldLifecycle = false
+		} else {
+			f.heldLifecycle = true
+		}
+		close(f.openStarted)
+		<-f.openRelease
+	})
+	return nil
+}
+
+func (f *blockingLifecycleFirewall) ClosePort(_ context.Context, _ firewall.Rule) error {
+	return nil
+}
+
+func (f *blockingLifecycleFirewall) waitForOpen(t *testing.T) {
+	t.Helper()
+	select {
+	case <-f.openStarted:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for firewall publication")
+	}
+}
+
+func (f *blockingLifecycleFirewall) lifecycleHeld() bool {
+	return f.heldLifecycle
+}
+
+func (f *blockingLifecycleFirewall) releaseOpen() {
+	f.releaseOnce.Do(func() { close(f.openRelease) })
+}
+
+type admissionCheckingFirewall struct {
+	opened []firewall.Rule
+	closed []firewall.Rule
+}
+
+func (f *admissionCheckingFirewall) OpenPort(ctx context.Context, rule firewall.Rule) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkNetworkProbe); err != nil {
+		return err
+	}
+	f.opened = append(f.opened, rule)
+	return nil
+}
+
+func (f *admissionCheckingFirewall) ClosePort(ctx context.Context, rule firewall.Rule) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkNetworkProbe); err != nil {
+		return err
+	}
+	f.closed = append(f.closed, rule)
+	return nil
+}
+
+func assertAppPublicationSuspended(t *testing.T, mgr *ServiceManager, appName string) {
+	t.Helper()
+	if _, inactive := mgr.deactivated[appName]; !inactive {
+		t.Fatalf("app %s has no suspended publication marker", appName)
+	}
+	if mgr.AppPublicationActive(appName) {
+		t.Fatalf("app %s publication is active, want suspended", appName)
+	}
 }

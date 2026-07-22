@@ -23,6 +23,7 @@ import (
 	"piccolod/internal/container"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/router"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
@@ -60,12 +61,19 @@ type AppManager struct {
 
 	// In-memory observed status: derived from container state during reconciliation.
 	// Published via event bus and returned in API responses. Never persisted.
-	observedStatus        map[string]string
-	observedStatusMessage map[string]string // transient status message for UI context
-	observedStatusMu      sync.RWMutex
-	startupRecoveryMu     sync.Mutex
-	startupRecovery       map[string]startupRecoveryWindow
-	quiesceFinalizeMu     sync.Mutex
+	observedStatus         map[string]string
+	observedStatusMessage  map[string]string // transient status message for UI context
+	observedStatusMu       sync.RWMutex
+	startupRecoveryMu      sync.Mutex
+	startupRecovery        map[string]startupRecoveryWindow
+	unknownObservationMu   sync.Mutex
+	unknownObservations    map[string]unknownObservationWindow
+	observationGeneration  uint64
+	runtimeSentinel        func(context.Context) error
+	taskPressureNormal     func() bool
+	automaticSuppressionMu sync.RWMutex
+	automaticSuppression   map[string]string
+	quiesceFinalizeMu      sync.Mutex
 
 	// Internal CA path for OIDC trust
 	internalCAPath string
@@ -214,6 +222,8 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		observedStatus:           make(map[string]string),
 		observedStatusMessage:    make(map[string]string),
 		startupRecovery:          make(map[string]startupRecoveryWindow),
+		unknownObservations:      make(map[string]unknownObservationWindow),
+		automaticSuppression:     make(map[string]string),
 		oidcHostname:             "piccolo.local",
 		runtimeUser:              *runtimeUser,
 		syncInFlight:             make(map[string]bool),
@@ -222,6 +232,15 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 	}
 
 	return mgr, nil
+}
+
+// SetTaskPressureNormal supplies the production task-guard authority used by
+// destructive persistent-unknown recovery. Tests may leave it nil, in which
+// case an open admission gate is treated as Normal.
+func (m *AppManager) SetTaskPressureNormal(fn func() bool) {
+	m.stateMu.Lock()
+	m.taskPressureNormal = fn
+	m.stateMu.Unlock()
 }
 
 // SetRouter wires the router registrar for leadership-based routing decisions.
@@ -686,6 +705,17 @@ func (m *AppManager) StopRuntimeEvents() {
 }
 
 func (m *AppManager) StartBackground() {
+	m.startBackground(true)
+}
+
+// StartBackgroundAfterInitial starts only periodic work. It is used after a
+// serialized task-recovery pass so immediate reconcile work is not duplicated
+// in detached goroutines.
+func (m *AppManager) StartBackgroundAfterInitial() {
+	m.startBackground(false)
+}
+
+func (m *AppManager) startBackground(runInitial bool) {
 	m.stateMu.Lock()
 	if m.reconcileCancel != nil {
 		m.stateMu.Unlock()
@@ -702,7 +732,9 @@ func (m *AppManager) StartBackground() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		m.ReconcileOnce(ctx)
+		if runInitial {
+			m.ReconcileOnce(ctx)
+		}
 		for {
 			select {
 			case <-ctx.Done():
@@ -722,7 +754,9 @@ func (m *AppManager) StartBackground() {
 	go func() {
 		defer m.reconcileWG.Done()
 		const slicePolicyInterval = 5 * time.Minute
-		m.ReconcileAllSlicePolicies()
+		if runInitial {
+			m.ReconcileAllSlicePolicies()
+		}
 		ticker := time.NewTicker(slicePolicyInterval)
 		defer ticker.Stop()
 		for {
@@ -735,7 +769,7 @@ func (m *AppManager) StartBackground() {
 		}
 	}()
 
-	m.startCatalogSyncLoop(ctx)
+	m.startCatalogSyncLoop(ctx, runInitial)
 }
 
 func (m *AppManager) StopBackground() {
@@ -850,6 +884,11 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 // stopAppForShutdown stops an app's containers without updating state or
 // emitting progress events. This is a simplified path for graceful shutdown.
 func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) error {
+	// Graceful shutdown already owns this quiescence boundary. Allow the
+	// existing PID 1/Podman cleanup path to finish through a Warning fence;
+	// the Critical hard fence still rejects every child-producing command.
+	ctx = pressure.WithTransitionContinuation(ctx)
+
 	m.stateInitMu.Lock()
 	stateMgr := m.stateManager
 	m.stateInitMu.Unlock()
@@ -861,6 +900,9 @@ func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) 
 	app, exists := stateMgr.GetApp(instanceID)
 	if !exists {
 		return nil
+	}
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(instanceID)
 	}
 
 	def, err := stateMgr.GetAppDefinition(instanceID)
@@ -1203,6 +1245,8 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		startupRecovery:       make(map[string]startupRecoveryWindow),
+		unknownObservations:   make(map[string]unknownObservationWindow),
+		automaticSuppression:  make(map[string]string),
 		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
@@ -1240,6 +1284,8 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		observedStatus:        make(map[string]string),
 		observedStatusMessage: make(map[string]string),
 		startupRecovery:       make(map[string]startupRecoveryWindow),
+		unknownObservations:   make(map[string]unknownObservationWindow),
+		automaticSuppression:  make(map[string]string),
 		oidcHostname:          "piccolo.local",
 		runtimeUser: container.RuntimeUser{
 			Credential: testCred,
@@ -1256,6 +1302,9 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 
 // RestoreServices rebuilds service proxies for running apps based on current container port bindings.
 func (m *AppManager) RestoreServices(ctx context.Context) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return
+	}
 	state, err := m.ensureStateManager()
 	if err != nil {
 		if errors.Is(err, ErrLocked) {
@@ -1268,75 +1317,96 @@ func (m *AppManager) RestoreServices(ctx context.Context) {
 	m.clearPendingRestore()
 	apps := state.ListApps()
 	for _, app := range apps {
-		publishCID := strings.TrimSpace(app.PublishContainerID())
-		if publishCID == "" {
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(app.InstanceID)
-			}
+		if app == nil || m.automaticRecoverySuppressed(app.InstanceID) {
 			continue
 		}
-		if m.manifestUpdateServiceRestoreBlocked(state, app.InstanceID) {
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(app.InstanceID)
-			}
-			continue
-		}
-		if m.imageUpdateServiceRestoreBlocked(state, app.InstanceID) {
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(app.InstanceID)
-			}
-			continue
-		}
-		// Respect desired state: disabled apps should not have proxies restored.
-		if !app.Enabled {
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(app.InstanceID)
-			}
-			continue
-		}
-		// Followers should not restore proxies for apps they don't lead.
-		if m.LastObservedRole(cluster.ResourceForApp(app.InstanceID)) == cluster.RoleFollower {
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(app.InstanceID)
-			}
-			continue
-		}
-		def, err := state.GetAppDefinition(app.InstanceID)
-		if err != nil {
-			log.Printf("WARN: restore services: failed to read app definition for %s: %v", app.InstanceID, err)
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		layout, err := m.ensureAppVolumeLayout(ctx, app.InstanceID)
-		if err != nil {
-			log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.InstanceID, err)
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		runtime, err := m.podmanRuntimeForApp(ctx, app.InstanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeObserve)
-		if err != nil {
-			log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.InstanceID, err)
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		ports, err := m.containerManager.InspectPublishedPorts(ctx, runtime, publishCID)
-		if err != nil {
-			log.Printf("WARN: restore services: podman port inspect failed for %s: %v", app.InstanceID, err)
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		if len(ports) == 0 {
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		if _, err := m.serviceManager.RestoreFromPodman(app.InstanceID, def.Listeners, ports); err != nil {
-			log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.InstanceID, err)
-			m.serviceManager.DeactivateApp(app.InstanceID)
-			continue
-		}
-		m.configureOIDCAuthorizePaths(app.InstanceID, def)
-		m.serviceManager.SetAppContainerID(app.InstanceID, publishCID)
+		m.restoreServiceForApp(ctx, state, app)
 	}
+}
+
+func (m *AppManager) restoreServiceForApp(ctx context.Context, state *FilesystemStateManager, app *AppInstance) {
+	releaseOwner := pressure.BeginLifecycleOwner("app:" + app.InstanceID)
+	defer releaseOwner()
+	if m.manifestUpdateServiceRestoreBlocked(state, app.InstanceID) {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(app.InstanceID)
+		}
+		return
+	}
+	if m.imageUpdateServiceRestoreBlocked(state, app.InstanceID) {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(app.InstanceID)
+		}
+		return
+	}
+	// Respect desired state: disabled apps should not have proxies restored.
+	if !app.Enabled {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(app.InstanceID)
+		}
+		return
+	}
+	// Followers should not restore proxies for apps they don't lead.
+	if m.LastObservedRole(cluster.ResourceForApp(app.InstanceID)) == cluster.RoleFollower {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(app.InstanceID)
+		}
+		return
+	}
+	def, err := state.GetAppDefinition(app.InstanceID)
+	if err != nil {
+		log.Printf("WARN: restore services: failed to read app definition for %s: %v", app.InstanceID, err)
+		return
+	}
+	layout, err := m.observeAppVolumeLayout(ctx, app.InstanceID)
+	if err != nil {
+		log.Printf("WARN: restore services: app volume unavailable for %s: %v", app.InstanceID, err)
+		m.recordUnknownObservation(app.InstanceID, err)
+		return
+	}
+	runtime, err := m.podmanRuntimeForApp(ctx, app.InstanceID, layout, piccoloModeFromExtensions(def.Extensions), appRuntimeObserve)
+	if err != nil {
+		log.Printf("WARN: restore services: podman runtime unavailable for %s: %v", app.InstanceID, err)
+		m.recordUnknownObservation(app.InstanceID, err)
+		return
+	}
+	observed := m.observeContainerGroup(ctx, runtime, app, def)
+	if !observed.known() {
+		log.Printf("WARN: restore services: container group observation unknown for %s: %v", app.InstanceID, observed.Err)
+		m.recordUnknownObservation(app.InstanceID, observed.Err)
+		return
+	}
+	if observed.Outcome != containerGroupRunning {
+		m.serviceManager.DeactivateApp(app.InstanceID)
+		return
+	}
+	if err := m.applyContainerGroupObservation(state, app, observed); err != nil {
+		log.Printf("WARN: restore services: persist observed IDs for %s: %v", app.InstanceID, err)
+		return
+	}
+	publishCID := strings.TrimSpace(observed.Anchor.ID)
+	if publishCID == "" {
+		m.serviceManager.DeactivateApp(app.InstanceID)
+		return
+	}
+	ports, err := m.containerManager.InspectPublishedPorts(ctx, runtime, publishCID)
+	if err != nil {
+		log.Printf("WARN: restore services: podman port inspect failed for %s: %v", app.InstanceID, err)
+		m.recordUnknownObservation(app.InstanceID, err)
+		return
+	}
+	if len(ports) == 0 {
+		m.serviceManager.DeactivateApp(app.InstanceID)
+		return
+	}
+	if _, err := m.serviceManager.RestoreFromPodmanContext(ctx, app.InstanceID, def.Listeners, ports); err != nil {
+		log.Printf("WARN: restore services: failed to restore proxies for %s: %v", app.InstanceID, err)
+		m.serviceManager.DeactivateApp(app.InstanceID)
+		return
+	}
+	m.configureOIDCAuthorizePaths(app.InstanceID, def)
+	m.serviceManager.SetAppContainerID(app.InstanceID, publishCID)
+	m.clearUnknownObservation(app.InstanceID)
 }
 
 func (m *AppManager) imageUpdateServiceRestoreBlocked(state *FilesystemStateManager, instanceID string) bool {
@@ -1382,7 +1452,6 @@ func (m *AppManager) manifestUpdateServiceRestoreBlocked(state *FilesystemStateM
 }
 
 func (m *AppManager) recoverPendingTransitionRecords(ctx context.Context, state *FilesystemStateManager) map[string]bool {
-	_ = ctx
 	blocked := map[string]bool{}
 	for _, appInst := range state.ListApps() {
 		if appInst == nil || strings.TrimSpace(appInst.InstanceID) == "" {
@@ -1399,51 +1468,75 @@ func (m *AppManager) recoverPendingTransitionRecords(ctx context.Context, state 
 			blocked[instanceID] = true
 			continue
 		}
-		if record.Phase == TransitionPhaseCommitted {
-			if err := state.ClearTransitionRecord(instanceID); err != nil {
-				log.Printf("ERROR: transition recovery %s: clear committed transition record: %v", instanceID, err)
-				m.setObservedStatus(instanceID, StatusError)
-				blocked[instanceID] = true
-			}
-			continue
+		recoveryCtx, admitted := admitPendingTransitionRecovery(ctx)
+		if !admitted {
+			return blocked
 		}
-		legacy, legacyErr := loadTransitionLegacyJournals(state, instanceID)
-		if legacyErr != nil {
-			log.Printf("ERROR: transition recovery %s: inspect legacy journals: %v", instanceID, legacyErr)
-			m.setObservedStatus(instanceID, StatusError)
+		if m.recoverPendingTransitionRecord(recoveryCtx, state, appInst, record) {
 			blocked[instanceID] = true
-			continue
 		}
-		if legacy.hasAny() {
-			if err := m.recoverTransitionWithLegacyJournal(ctx, state, appInst, record, legacy); err != nil {
-				log.Printf("ERROR: transition recovery %s: recover legacy-backed v2 transition: %v", instanceID, err)
-				m.setObservedStatus(instanceID, StatusError)
-				blocked[instanceID] = true
-			}
-			continue
+		if transitionRecoveryMustYield(recoveryCtx) {
+			return blocked
 		}
-		if record.Plan.OperationKind == TransitionOperationUpdateImage && record.Plan.SourceKind == TransitionSourceCurrentCommitted {
-			if err := m.recoverV2OnlyImageUpdateTransition(ctx, state, appInst, record); err != nil {
-				log.Printf("ERROR: transition recovery %s: recover v2-only image update: %v", instanceID, err)
-				m.setObservedStatus(instanceID, StatusError)
-				blocked[instanceID] = true
-			}
-			continue
-		}
-		if record.Phase == TransitionPhasePrepared {
-			log.Printf("INFO: transition recovery %s: clearing prepared transition with no legacy journal", instanceID)
-			if err := state.ClearTransitionRecord(instanceID); err != nil {
-				log.Printf("ERROR: transition recovery %s: clear prepared transition: %v", instanceID, err)
-				m.setObservedStatus(instanceID, StatusError)
-				blocked[instanceID] = true
-			}
-			continue
-		}
-		log.Printf("ERROR: transition recovery %s: v2 transition %s has no legacy journal; manual repair required", instanceID, record.Phase)
-		m.setObservedStatus(instanceID, StatusError)
-		blocked[instanceID] = true
 	}
 	return blocked
+}
+
+func (m *AppManager) recoverPendingTransitionRecord(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, record *TransitionRecord) bool {
+	instanceID := appInst.InstanceID
+	if record.Plan.OperationKind == TransitionOperationRuntimeRecovery {
+		if err := m.recoverRuntimeRecoveryTransition(ctx, state, appInst, record); err != nil {
+			log.Printf("ERROR: transition recovery %s: recover dedicated runtime quarantine: %v", instanceID, err)
+			m.recordUnknownObservation(instanceID, errAppRuntimeObservationUnavailable)
+			return true
+		}
+		if _, err := state.LoadTransitionRecord(instanceID); errors.Is(err, os.ErrNotExist) {
+			m.clearUnknownObservation(instanceID)
+		}
+		return false
+	}
+	if record.Phase == TransitionPhaseCommitted {
+		if err := state.ClearTransitionRecord(instanceID); err != nil {
+			log.Printf("ERROR: transition recovery %s: clear committed transition record: %v", instanceID, err)
+			m.setObservedStatus(instanceID, StatusError)
+			return true
+		}
+		return false
+	}
+	legacy, legacyErr := loadTransitionLegacyJournals(state, instanceID)
+	if legacyErr != nil {
+		log.Printf("ERROR: transition recovery %s: inspect legacy journals: %v", instanceID, legacyErr)
+		m.setObservedStatus(instanceID, StatusError)
+		return true
+	}
+	if legacy.hasAny() {
+		if err := m.recoverTransitionWithLegacyJournal(ctx, state, appInst, record, legacy); err != nil {
+			log.Printf("ERROR: transition recovery %s: recover legacy-backed v2 transition: %v", instanceID, err)
+			m.setObservedStatus(instanceID, StatusError)
+			return true
+		}
+		return false
+	}
+	if record.Plan.OperationKind == TransitionOperationUpdateImage && record.Plan.SourceKind == TransitionSourceCurrentCommitted {
+		if err := m.recoverV2OnlyImageUpdateTransition(ctx, state, appInst, record); err != nil {
+			log.Printf("ERROR: transition recovery %s: recover v2-only image update: %v", instanceID, err)
+			m.setObservedStatus(instanceID, StatusError)
+			return true
+		}
+		return false
+	}
+	if record.Phase == TransitionPhasePrepared {
+		log.Printf("INFO: transition recovery %s: clearing prepared transition with no legacy journal", instanceID)
+		if err := state.ClearTransitionRecord(instanceID); err != nil {
+			log.Printf("ERROR: transition recovery %s: clear prepared transition: %v", instanceID, err)
+			m.setObservedStatus(instanceID, StatusError)
+			return true
+		}
+		return false
+	}
+	log.Printf("ERROR: transition recovery %s: v2 transition %s has no legacy journal; manual repair required", instanceID, record.Phase)
+	m.setObservedStatus(instanceID, StatusError)
+	return true
 }
 
 type transitionLegacyJournals struct {
@@ -1505,6 +1598,7 @@ func (m *AppManager) recoverTransitionWithLegacyJournal(ctx context.Context, sta
 }
 
 func (m *AppManager) RetryTransitionFollowUp(ctx context.Context, instanceID string, action TransitionActionKind) (err error) {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	if err := m.ensureUnlocked(); err != nil {
@@ -1553,13 +1647,15 @@ func (m *AppManager) retryTransitionFollowUpLocked(ctx context.Context, state *F
 		return err
 	}
 	if legacy.hasAny() {
-		if err := m.recoverTransitionWithLegacyJournal(ctx, state, appInst, record, legacy); err != nil {
+		transitionCtx := pressure.WithTransitionContinuation(ctx)
+		if err := m.recoverTransitionWithLegacyJournal(transitionCtx, state, appInst, record, legacy); err != nil {
 			return err
 		}
 		return ensureTransitionFollowUpCompleted(state, instanceID, action)
 	}
 	if action == TransitionActionFinishCleanup && record.Plan.OperationKind == TransitionOperationUpdateImage && record.Plan.SourceKind == TransitionSourceCurrentCommitted {
-		if err := m.recoverV2OnlyImageUpdateTransition(ctx, state, appInst, record); err != nil {
+		transitionCtx := pressure.WithTransitionContinuation(ctx)
+		if err := m.recoverV2OnlyImageUpdateTransition(transitionCtx, state, appInst, record); err != nil {
 			return err
 		}
 		return ensureTransitionFollowUpCompleted(state, instanceID, action)
@@ -1574,13 +1670,15 @@ func (m *AppManager) retryLegacyTransitionFollowUp(ctx context.Context, state *F
 		return err
 	}
 	if legacy.manifest != nil && manifestFollowUpActionMatchesPhase(action, legacy.manifest) {
-		if err := m.recoverOneManifestUpdate(ctx, state, appInst, legacy.manifest); err != nil {
+		transitionCtx := pressure.WithTransitionContinuation(ctx)
+		if err := m.recoverOneManifestUpdate(transitionCtx, state, appInst, legacy.manifest); err != nil {
 			return err
 		}
 		return ensureTransitionFollowUpCompleted(state, instanceID, action)
 	}
 	if action == TransitionActionFinishCleanup && legacy.image != nil && imageFollowUpActionMatchesCleanup(legacy.image) {
-		if err := m.recoverOneImageUpdate(ctx, state, appInst, legacy.image); err != nil {
+		transitionCtx := pressure.WithTransitionContinuation(ctx)
+		if err := m.recoverOneImageUpdate(transitionCtx, state, appInst, legacy.image); err != nil {
 			return err
 		}
 		return ensureTransitionFollowUpCompleted(state, instanceID, action)
@@ -1692,6 +1790,52 @@ func transitionLegacyJournalExists(state *FilesystemStateManager, instanceID str
 	return legacy.hasAny(), nil
 }
 
+type transitionRecoveryAdmissionKey struct{}
+
+// transitionRecoveryAdmission owns the single Warning-pressure continuation
+// available to one reconciliation pass. Normal pressure can recover every
+// pending record. Under Warning, exactly one already-durable transition may
+// execute its current phase; the next app/phase must wait for ordinary
+// admission to reopen.
+type transitionRecoveryAdmission struct {
+	continuationUsed bool
+}
+
+func withTransitionRecoveryAdmission(ctx context.Context) context.Context {
+	return context.WithValue(ctx, transitionRecoveryAdmissionKey{}, &transitionRecoveryAdmission{})
+}
+
+func transitionRecoveryAdmissionFrom(ctx context.Context) *transitionRecoveryAdmission {
+	if ctx == nil {
+		return nil
+	}
+	admission, _ := ctx.Value(transitionRecoveryAdmissionKey{}).(*transitionRecoveryAdmission)
+	return admission
+}
+
+func admitPendingTransitionRecovery(ctx context.Context) (context.Context, bool) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err == nil {
+		return ctx, true
+	}
+	admission := transitionRecoveryAdmissionFrom(ctx)
+	if admission == nil || admission.continuationUsed {
+		return nil, false
+	}
+	continuationCtx := pressure.WithTransitionContinuation(ctx)
+	// A continuation bypasses Warning only. Startup and Critical fences remain
+	// authoritative and must not consume the one-transition allowance.
+	if err := pressure.DefaultAdmission.Check(continuationCtx, pressure.WorkLifecycle); err != nil {
+		return nil, false
+	}
+	admission.continuationUsed = true
+	return continuationCtx, true
+}
+
+func transitionRecoveryMustYield(ctx context.Context) bool {
+	admission := transitionRecoveryAdmissionFrom(ctx)
+	return admission != nil && admission.continuationUsed && pressure.IsTransitionContinuation(ctx)
+}
+
 // ReconcileOnce ensures Podman observed state converges to Piccolo desired state.
 //
 // Desired state is derived from the persisted Enabled flag:
@@ -1715,9 +1859,14 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if err != nil {
 		return
 	}
-	transitionBlocked := m.recoverPendingTransitionRecords(ctx, state)
-	imageUpdateBlocked := m.recoverPendingImageUpdates(ctx, state, transitionBlocked)
-	manifestUpdateBlocked := m.recoverPendingManifestUpdates(ctx, state, transitionBlocked)
+	transitionCtx := withTransitionRecoveryAdmission(ctx)
+	transitionBlocked := m.recoverPendingTransitionRecords(transitionCtx, state)
+	imageUpdateBlocked := m.recoverPendingImageUpdates(transitionCtx, state, transitionBlocked)
+	manifestUpdateBlocked := m.recoverPendingManifestUpdates(transitionCtx, state, transitionBlocked)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return
+	}
+	m.beginObservationPass()
 
 	// Clean up orphaned per-app users on first reconciliation.
 	m.orphanCleanupOnce.Do(func() {
@@ -1746,37 +1895,48 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 		if transitionBlocked[appInst.InstanceID] {
 			continue
 		}
+		if m.automaticRecoverySuppressed(appInst.InstanceID) {
+			continue
+		}
 		if err := m.rejectIfTransitionInProgress(state, appInst.InstanceID, TransitionFenceNormalReconcile); err != nil {
 			if !errors.Is(err, ErrTransitionInProgress) {
 				log.Printf("ERROR: reconcile app %s: %v", appInst.InstanceID, err)
 			}
 			continue
 		}
-		if err := m.reconcileApp(ctx, state, appInst); err != nil {
+		releaseOwner := pressure.BeginLifecycleOwner("app:" + appInst.InstanceID)
+		err := m.reconcileApp(ctx, state, appInst)
+		releaseOwner()
+		if err != nil {
 			log.Printf("ERROR: reconcile app %s: %v", appInst.InstanceID, err)
 		}
 	}
 }
 
 func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) error {
+	previousStatus, previousMessage := m.getObservedStatusAndMessage(appInst.InstanceID)
 	if _, err := m.reconcilePartialRollback(ctx, state, appInst); err != nil {
 		m.setObservedStatus(appInst.InstanceID, StatusError)
 		return fmt.Errorf("recover pending rollback before runtime: %w", err)
 	}
 
+	follower := m.LastObservedRole(cluster.ResourceForApp(appInst.InstanceID)) == cluster.RoleFollower
 	desiredRunning := appInst.Enabled
-	if m.LastObservedRole(cluster.ResourceForApp(appInst.InstanceID)) == cluster.RoleFollower {
+	if follower {
 		desiredRunning = false
 	}
 
 	def, err := state.GetAppDefinition(appInst.InstanceID)
 	if err != nil {
 		if !desiredRunning {
+			if !appInst.Enabled && m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(appInst.InstanceID)
+			}
 			if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr == nil {
-				m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
-				if m.serviceManager != nil {
+				if follower && m.serviceManager != nil {
 					m.serviceManager.DeactivateApp(appInst.InstanceID)
 				}
+				m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 				m.interruptStartupProbation(appInst.InstanceID)
 				if !appInst.Enabled {
 					m.clearStartupRecovery(appInst)
@@ -1789,22 +1949,28 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 		return err
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
-	if err != nil {
-		if !desiredRunning {
+	if !desiredRunning {
+		layout, layoutErr := m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
+		if layoutErr != nil {
+			if !appInst.Enabled && m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(appInst.InstanceID)
+			}
 			if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr != nil {
-				return errors.Join(err, quiesceErr)
+				return errors.Join(layoutErr, quiesceErr)
+			}
+			if follower && m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(appInst.InstanceID)
 			}
 			m.finalizeQuiescedContainerGroup(ctx, appInst, def, piccoloModeFromExtensions(def.Extensions))
 			if !appInst.Enabled {
 				m.clearStartupRecovery(appInst)
 			}
+			m.clearUnknownObservation(appInst.InstanceID)
 			return nil
 		}
-		return err
-	}
-
-	if !desiredRunning {
+		if !appInst.Enabled && m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(appInst.InstanceID)
+		}
 		if err := m.quiesceContainerGroup(ctx, state, appInst, def, layout); err != nil {
 			return err
 		}
@@ -1815,35 +1981,98 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 		if !appInst.Enabled {
 			m.clearStartupRecovery(appInst)
 		}
+		m.clearUnknownObservation(appInst.InstanceID)
 		return nil
 	}
 
 	mode := piccoloModeFromExtensions(def.Extensions)
-	if runtime, observeErr := m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeObserve); observeErr == nil &&
-		m.containerGroupObservedRunning(ctx, runtime, appInst, def) {
-		err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true)
+	layout, layoutObserveErr := m.observeAppVolumeLayout(ctx, appInst.InstanceID)
+	if layoutObserveErr != nil && !errors.Is(layoutObserveErr, errAppVolumeObservationUnavailable) {
+		log.Printf("WARN: reconcile app %s: volume observation unknown: %v", appInst.InstanceID, layoutObserveErr)
+		m.recordUnknownObservation(appInst.InstanceID, layoutObserveErr)
+		return nil
+	}
+	var runtime container.PodmanRuntime
+	var runtimeObserveErr error
+	if layoutObserveErr == nil {
+		runtime, runtimeObserveErr = m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeObserve)
+	} else {
+		runtimeObserveErr = layoutObserveErr
+	}
+	var observed containerGroupObservation
+	if runtimeObserveErr == nil {
+		observed = m.observeContainerGroup(ctx, runtime, appInst, def)
+		if !observed.known() {
+			log.Printf("WARN: reconcile app %s: container group observation unknown: %v", appInst.InstanceID, observed.Err)
+			return m.handleUnknownContainerGroup(ctx, state, appInst, def, layout, mode, observed.Err)
+		}
+		m.clearUnknownObservation(appInst.InstanceID)
+		if observed.Outcome == containerGroupRunning {
+			err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true, observed)
+			if err != nil {
+				if pressure.IsAdmissionError(err) {
+					m.pauseStartupAttemptForAdmission(state, appInst, previousStatus, previousMessage)
+				} else if m.startupAttemptActive(appInst.InstanceID) {
+					m.handleStartupFailure(state, appInst)
+				}
+				return err
+			}
+			m.markStartupRecoverySucceeded(state, appInst)
+			return nil
+		}
+	} else if !errors.Is(runtimeObserveErr, container.ErrUserSessionUnavailable) &&
+		!errors.Is(runtimeObserveErr, errAppRuntimeObservationUnavailable) &&
+		!errors.Is(runtimeObserveErr, errAppVolumeObservationUnavailable) {
+		log.Printf("WARN: reconcile app %s: runtime observation unknown: %v", appInst.InstanceID, runtimeObserveErr)
+		return m.handleUnknownContainerGroup(ctx, state, appInst, def, layout, mode, runtimeObserveErr)
+	}
+
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil
+	}
+	projectStarting := previousStatus != StatusRunning
+	if !m.beginAutomaticStartupAttemptWithProjection(state, appInst, projectStarting) {
+		return nil
+	}
+	if runtimeObserveErr != nil {
+		if layoutObserveErr != nil {
+			layout, err = m.ensureAppVolumeLayout(ctx, appInst.InstanceID)
+			if err != nil {
+				if pressure.IsAdmissionError(err) {
+					m.pauseStartupAttemptForAdmission(state, appInst, previousStatus, previousMessage)
+				} else if projectStarting {
+					m.handleStartupFailure(state, appInst)
+				} else {
+					m.finishUnknownObservation(state, appInst)
+				}
+				return err
+			}
+		}
+		runtime, err = m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeEnsureReady)
 		if err != nil {
-			if m.startupAttemptActive(appInst.InstanceID) {
+			if pressure.IsAdmissionError(err) {
+				m.pauseStartupAttemptForAdmission(state, appInst, previousStatus, previousMessage)
+			} else if projectStarting {
 				m.handleStartupFailure(state, appInst)
+			} else {
+				m.finishUnknownObservation(state, appInst)
 			}
 			return err
 		}
-		m.markStartupRecoverySucceeded(state, appInst)
-		return nil
+		observed = m.observeContainerGroup(ctx, runtime, appInst, def)
+		if !observed.known() {
+			log.Printf("WARN: reconcile app %s: container group observation remains unknown after runtime repair: %v", appInst.InstanceID, observed.Err)
+			return m.handleUnknownContainerGroup(ctx, state, appInst, def, layout, mode, observed.Err)
+		}
+		m.clearUnknownObservation(appInst.InstanceID)
 	}
 
-	if !m.beginAutomaticStartupAttempt(state, appInst) {
-		return nil
-	}
-	runtime, err := m.podmanRuntimeForApp(ctx, appInst.InstanceID, layout, mode, appRuntimeEnsureReady)
-	if err != nil {
-		m.handleStartupFailure(state, appInst)
-		return err
-	}
-
-	// Unified reconcile path: all apps (service and workspace) use container groups.
-	if err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true); err != nil {
-		if m.startupAttemptActive(appInst.InstanceID) {
+	// Unified reconcile path: all apps (service and workspace) use one complete
+	// observation snapshot. Unknown never reaches this effect boundary.
+	if err := m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true, observed); err != nil {
+		if pressure.IsAdmissionError(err) {
+			m.pauseStartupAttemptForAdmission(state, appInst, previousStatus, previousMessage)
+		} else if m.startupAttemptActive(appInst.InstanceID) {
 			m.handleStartupFailure(state, appInst)
 		}
 		return err
@@ -1877,7 +2106,10 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 		return nil
 	}
 
-	if _, err := m.serviceManager.RestoreFromPodman(instanceID, def.Listeners, ports); err != nil {
+	if _, err := m.serviceManager.RestoreFromPodmanContext(ctx, instanceID, def.Listeners, ports); err != nil {
+		if errors.Is(err, services.ErrPublicationRestoreIncomplete) {
+			return fmt.Errorf("%w: %v", container.ErrPortReconciliationRequired, err)
+		}
 		return err
 	}
 	m.configureOIDCAuthorizePaths(instanceID, def)
@@ -1932,6 +2164,10 @@ func (m *AppManager) ensurePodmanPublishes(ctx context.Context, def *api.AppDefi
 // - The primary listener name (for apps with listeners)
 // - The workspace_name (for workspace apps without listeners)
 func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*AppInstance, error) {
+	defer pressure.BeginLifecycleOwner("app:install")()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	m.reconcileMu.Lock()
 	inst, err := m.installLocked(ctx, appDef)
 	m.reconcileMu.Unlock()
@@ -2219,6 +2455,9 @@ func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*Ap
 // The origin must be a workspace-mode app and must be stopped.
 // After cloning, both origin and clone are (re-)started automatically.
 func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	return m.cloneWorkspaceLocked(ctx, originID, cloneID)
@@ -2609,6 +2848,10 @@ func (m *AppManager) GetAppDefinition(ctx context.Context, instanceID string) (*
 
 // Start starts an application instance by instanceID.
 func (m *AppManager) Start(ctx context.Context, instanceID string) error {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	state, err := m.ensureStateManager()
@@ -2627,6 +2870,13 @@ func (m *AppManager) Start(ctx context.Context, instanceID string) error {
 	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceStart); err != nil {
 		return err
 	}
+	if _, exists := state.GetApp(instanceID); !exists {
+		return fmt.Errorf("app instance not found: %s", instanceID)
+	}
+	// A validated manual Start is the explicit retry authority for an app whose
+	// automatic recovery was circuit-broken. Storage/leadership/transition or
+	// not-found failures above must not silently re-enable the culprit.
+	m.clearAutomaticRecoverySuppression(instanceID)
 	return m.startLocked(ctx, instanceID)
 }
 
@@ -2652,6 +2902,7 @@ func (m *AppManager) recoverPendingImageUpdateBeforeTransitionFence(ctx context.
 }
 
 func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err error) {
+	previousStatus, previousMessage := m.getObservedStatusAndMessage(instanceID)
 	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 0, "Starting app", false, nil)
 	defer func() {
 		if err != nil {
@@ -2700,7 +2951,9 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	m.interruptStartupProbation(instanceID)
 	defer func() {
 		if err != nil {
-			if !m.startupAttemptActive(instanceID) {
+			if pressure.IsAdmissionError(err) {
+				m.pauseStartupAttemptForAdmission(state, app, previousStatus, previousMessage)
+			} else if !m.startupAttemptActive(instanceID) {
 				m.handleStartupFailure(state, app)
 			}
 			return
@@ -2730,6 +2983,9 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 		if rootfsErr != nil {
 			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 		}
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
 		if stopErr := m.stopContainersForMultiApp(ctx, app, def, runtime); stopErr != nil {
 			log.Printf("WARN: start %s: pre-recreate stop failed: %v", instanceID, stopErr)
 		}
@@ -2746,6 +3002,7 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 
 // Stop stops an application instance by instanceID.
 func (m *AppManager) Stop(ctx context.Context, instanceID string) error {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 
@@ -2766,6 +3023,11 @@ func (m *AppManager) Stop(ctx context.Context, instanceID string) error {
 }
 
 func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID string) error {
+	// The observed follower role is the authority for this quiescence. It must
+	// be able to stop the local app through Warning, while Critical continues
+	// to take precedence through the admission gate's hard fence.
+	ctx = pressure.WithTransitionContinuation(ctx)
+
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -2781,6 +3043,7 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 		}
 		m.updateStatusWithEvent(instanceID, StatusStopped)
 		m.interruptStartupProbation(instanceID)
+		m.clearUnknownObservation(instanceID)
 	}
 
 	// Follower demotion is a transition-boundary quiesce exception: it may stop
@@ -2810,6 +3073,13 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 	}
 	if !sessionQuiesced {
 		if stopErr := m.stopContainersForMultiApp(ctx, app, def, runtime); stopErr != nil {
+			// A grouped graceful stop is not atomic: one container may already
+			// be down when another stop reports an error. From this point the
+			// old publication can no longer truthfully represent a complete
+			// backend, even if PID 1 cannot subsequently prove full quiescence.
+			if m.serviceManager != nil {
+				m.serviceManager.DeactivateApp(instanceID)
+			}
 			log.Printf("WARN: follower demotion graceful stop failed for %s, quiescing dedicated user unit: %v", instanceID, stopErr)
 			if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
 				return errors.Join(stopErr, quiesceErr)
@@ -2822,6 +3092,11 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 
 func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err error) {
 	m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseStopping, 0, "Stopping app", false, nil)
+	defer func() {
+		if err == nil {
+			m.clearUnknownObservation(instanceID)
+		}
+	}()
 	defer func() {
 		if err != nil {
 			m.emitProgress(ctx, taskTypeStopApp, instanceID, taskPhaseComplete, 100, "Stop failed", true, err)
@@ -2841,9 +3116,19 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 	if err := state.UpdateAppEnabled(instanceID, false); err != nil {
 		return fmt.Errorf("failed to persist disabled state: %w", err)
 	}
+	// Enabled=false is now durable, so this manual lifecycle owner must be able
+	// to reach the quiescence boundary even if task pressure entered Warning
+	// between the request and the cleanup commands.
+	ctx = pressure.WithTransitionContinuation(ctx)
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(instanceID)
+	}
 
 	def, defErr := state.GetAppDefinition(instanceID)
 	if defErr != nil {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
 		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
 			return errors.Join(fmt.Errorf("failed to load app definition: %w", defErr), quiesceErr)
 		}
@@ -2858,6 +3143,9 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
+		if m.serviceManager != nil {
+			m.serviceManager.DeactivateApp(instanceID)
+		}
 		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
 			return errors.Join(fmt.Errorf("resolve volume layout before stop: %w", err), quiesceErr)
 		}
@@ -2878,6 +3166,10 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 // Uninstall removes an application instance completely by instanceID,
 // including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return err
+	}
 	m.reconcileMu.Lock()
 	state, stateErr := m.ensureStateManager()
 	if stateErr != nil {
@@ -2962,6 +3254,9 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 			m.updateStatusWithEvent(instanceID, rollback)
 		}
 	}()
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(instanceID)
+	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
 	if err != nil {
@@ -3048,6 +3343,7 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return fmt.Errorf("failed to remove app from storage: %w", err)
 	}
 	m.clearStartupRecovery(app)
+	m.retireRuntimeObservation(instanceID)
 
 	// Clean up observed status and emit "uninstalled" event.
 	// Status is deterministically StatusUninstalling here (set at entry, no rollback on success).
@@ -3062,6 +3358,10 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 // manifest digest has drifted. The app manifest is not modified — tag refs
 // stay the same; only the underlying rootfs LV gets refreshed.
 func (m *AppManager) UpdateImage(ctx context.Context, instanceID string) error {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	state, err := m.ensureStateManager()
@@ -4132,6 +4432,10 @@ func mapsEqual(a, b map[string]string) bool {
 // RollbackToSnapshot rolls back an app to its latest snapshot generation (RFC 20260302 Phase 3).
 // This is the exported entry point — acquires reconcileMu.
 func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) error {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	state, err := m.ensureStateManager()
@@ -4419,6 +4723,10 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 // ctx must NOT be derived from an HTTP request context — callers must use a server-scoped
 // context so that the internal rollback closure (which captures ctx) survives connection drops.
 func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, listeners []api.AppListener) (*api.AppDefinition, error) {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 	state, err := m.ensureStateManager()
@@ -4860,6 +5168,9 @@ func (m *AppManager) ExecShellCmd(ctx context.Context, instanceID string) (*exec
 // ExecShellCmdForService returns an exec.Cmd for running a shell inside a specific service container.
 // If service is empty, defaults to the primary service.
 func (m *AppManager) ExecShellCmdForService(ctx context.Context, instanceID, service string) (*exec.Cmd, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkTerminal); err != nil {
+		return nil, err
+	}
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err

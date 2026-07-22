@@ -459,8 +459,9 @@ class _AppDetailViewState extends State<AppDetailView>
       );
       final hasProgress =
           operation.taskId == _activeOperation?.taskId && operation.hasProgress;
-      final settlement = type.policy.settle(
-        _classifySubmitFailure(actionError),
+      final settlement = settleAppOperationSubmitFailure(
+        type,
+        actionError,
         hasProgress: hasProgress,
       );
       if (settlement.closeProgressDialog) {
@@ -477,9 +478,11 @@ class _AppDetailViewState extends State<AppDetailView>
         }
       }
       if (!mounted) return const _OperationSubmitResult(accepted: false);
-      final message = trackingAvailable
-          ? 'Request status is unclear; continuing to track ${operation.label.toLowerCase()}.'
-          : 'Action failed: $actionError';
+      final message =
+          appOperationSubmitFailureMessage(type, actionError) ??
+          (trackingAvailable
+              ? 'Request status is unclear; continuing to track ${operation.label.toLowerCase()}.'
+              : 'Action failed: $actionError');
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(message)));
@@ -511,14 +514,6 @@ class _AppDetailViewState extends State<AppDetailView>
       _scheduleNoProgressTimeout(operation);
     }
     return const _OperationSubmitResult(accepted: true);
-  }
-
-  static AppOperationOutcome _classifySubmitFailure(Object error) {
-    if (error is ApiException &&
-        isDeterministicAppOperationSubmitRejectionStatus(error.statusCode)) {
-      return AppOperationOutcome.submitRejected;
-    }
-    return AppOperationOutcome.submitUnclear;
   }
 
   Future<void> _syncActiveOperationFromServer() async {

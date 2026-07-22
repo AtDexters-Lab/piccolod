@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"time"
+
+	"piccolod/internal/resources/pressure"
 )
 
 // CommandRunner abstracts external command execution for testability.
@@ -26,6 +28,10 @@ type CommandRunner interface {
 type ExecRunner struct{}
 
 func (ExecRunner) Run(ctx context.Context, name string, args ...string) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkClassFromContext(ctx, pressure.WorkNetworkProbe)); err != nil {
+		return err
+	}
+	defer beginLifecycleOwner(ctx)()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 5 * time.Second
 	cmd.Stdout = os.Stdout
@@ -34,6 +40,10 @@ func (ExecRunner) Run(ctx context.Context, name string, args ...string) error {
 }
 
 func (ExecRunner) RunWithOutput(ctx context.Context, name string, args ...string) ([]byte, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkClassFromContext(ctx, pressure.WorkNetworkProbe)); err != nil {
+		return nil, err
+	}
+	defer beginLifecycleOwner(ctx)()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 5 * time.Second
 	var stderr bytes.Buffer
@@ -46,6 +56,10 @@ func (ExecRunner) RunWithOutput(ctx context.Context, name string, args ...string
 }
 
 func (ExecRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, args ...string) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkClassFromContext(ctx, pressure.WorkNetworkProbe)); err != nil {
+		return err
+	}
+	defer beginLifecycleOwner(ctx)()
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.WaitDelay = 5 * time.Second
 	if stdin != nil {
@@ -54,4 +68,13 @@ func (ExecRunner) RunWithStdin(ctx context.Context, stdin []byte, name string, a
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
+}
+
+func beginLifecycleOwner(ctx context.Context) func() {
+	class := pressure.WorkClassFromContext(ctx, "")
+	owner := string(class)
+	if class == pressure.WorkNetworkProbe {
+		owner = "network"
+	}
+	return pressure.BeginLifecycleOwner(owner)
 }

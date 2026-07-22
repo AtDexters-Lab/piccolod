@@ -3,6 +3,8 @@ package container
 import (
 	"context"
 	"os/exec"
+
+	"piccolod/internal/resources/pressure"
 )
 
 // SystemExecutor abstracts OS command execution for testability.
@@ -17,10 +19,17 @@ type SystemExecutor interface {
 type osExecutor struct{}
 
 func (osExecutor) Run(name string, args ...string) ([]byte, error) {
+	if err := pressure.DefaultAdmission.Check(context.Background(), pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	return exec.Command(name, args...).CombinedOutput()
 }
 
 func (osExecutor) RunContext(ctx context.Context, name string, args ...string) ([]byte, error) {
+	class := pressure.WorkClassFromContext(ctx, pressure.WorkLifecycle)
+	if err := pressure.DefaultAdmission.Check(ctx, class); err != nil {
+		return nil, err
+	}
 	return exec.CommandContext(ctx, name, args...).CombinedOutput()
 }
 

@@ -104,22 +104,24 @@ func (m *AppManager) currentSyncHost() SyncHost {
 	return m.syncHost
 }
 
-// startCatalogSyncLoop is invoked from StartBackground to start the dedicated
-// 15-minute catalog manifest sync ticker. The first pass is deferred by
-// catalogSyncStartupDelay so it does not collide with the reconcile ticker's
-// initial pass and the post-unlock warmup work.
-func (m *AppManager) startCatalogSyncLoop(ctx context.Context) {
+// startCatalogSyncLoop starts the dedicated 15-minute catalog manifest sync
+// ticker. Normal startup defers its first pass so it does not collide with the
+// other eager owners. Task recovery supplies runInitial=false after joining a
+// serialized initial pass, so the loop waits for its first steady-state tick.
+func (m *AppManager) startCatalogSyncLoop(ctx context.Context, runInitial bool) {
 	m.reconcileWG.Add(1)
 	go func() {
 		defer m.reconcileWG.Done()
 
-		select {
-		case <-time.After(catalogSyncStartupDelay):
-		case <-ctx.Done():
-			return
-		}
+		if runInitial {
+			select {
+			case <-time.After(catalogSyncStartupDelay):
+			case <-ctx.Done():
+				return
+			}
 
-		m.runCatalogSyncPass(ctx)
+			m.runCatalogSyncPass(ctx)
+		}
 
 		ticker := time.NewTicker(catalogSyncInterval)
 		defer ticker.Stop()

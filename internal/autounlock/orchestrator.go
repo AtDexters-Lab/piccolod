@@ -3,7 +3,6 @@ package autounlock
 import (
 	"context"
 	"errors"
-	"sync"
 	"sync/atomic"
 	"time"
 
@@ -24,7 +23,6 @@ type ManagerOps interface {
 type NamekEscrowClient interface {
 	DepositUnlockEscrow(ctx context.Context, secret []byte, windowSeconds int) (*namekclient.DepositUnlockEscrowResponse, error)
 	PickupUnlockEscrow(ctx context.Context) (*namekclient.PickupUnlockEscrowResponse, error)
-	RevokeUnlockEscrow(ctx context.Context) error
 }
 
 // AuditEmitter is the audit-event publication callback. Wraps the server's
@@ -45,6 +43,12 @@ type Deps struct {
 	// methods bail with service_not_ready when that happens.
 	NamekClient func() NamekEscrowClient
 
+	// RecoveryProvider and RecoveryProviderID are the provider-neutral
+	// injection point. Existing production wiring may leave them nil; New then
+	// adapts NamekClient as the v1 provider without changing its wire format.
+	RecoveryProvider   func() RecoveryFactorProvider
+	RecoveryProviderID string
+
 	// GetDeviceID returns the persisted device.id. Used as part of the AAD
 	// passed to Wrap/Unwrap to bind the blob to this device.
 	GetDeviceID func() string
@@ -63,6 +67,12 @@ type Deps struct {
 	// IsIdentityReady. Tests inject a fake.
 	WaitForIdentityReady func(ctx context.Context, timeout time.Duration) bool
 
+	// Provider readiness defaults to the identity callbacks above for the
+	// Namek v1 adapter. A future provider can supply independent readiness
+	// callbacks without leaking its transport into the continuity core.
+	IsRecoveryProviderReady      func() bool
+	WaitForRecoveryProviderReady func(ctx context.Context, timeout time.Duration) bool
+
 	// PublishAudit emits an audit event. Best-effort.
 	PublishAudit AuditEmitter
 
@@ -76,26 +86,37 @@ type Deps struct {
 }
 
 // Orchestrator owns the autounlock package's mutating operations. A single
-// instance per piccolod process. The internal mutex serializes ceremony /
-// test / state-change / pickup against each other. Pickup typically runs
-// at startup and completes before Stop fires, but a fast Stop catching pickup
-// mid-namek-call requires the wiring layer to cancel pickup's context first
-// so pickup releases the mutex promptly.
+// instance per piccolod process. A context-aware token gate serializes
+// ceremony / prepare / pickup / test / settings / cleanup against each other.
+// Critical recovery callers can therefore honor their absolute deadline while
+// waiting instead of blocking indefinitely behind provider I/O.
 type Orchestrator struct {
 	deps Deps
-	mu   sync.Mutex
+	gate chan struct{}
+
+	// restartHandoffClaimDigest is volatile ownership of the exact encrypted
+	// handoff committed by a successful graceful or fatal restart prepare. It
+	// is read and written only while holding gate. Binding the claim to the raw
+	// blob digest prevents a later replacement from inheriting stale ownership.
+	restartHandoffClaimDigest string
+
+	// taskWarningHandoffClaimDigest is volatile ownership of the exact blob
+	// created by task-Warning preparation. Normal pressure may clean up only
+	// when the current raw blob still matches this digest. Pre-existing or
+	// later replacement handoffs therefore cannot inherit Warning cleanup.
+	taskWarningHandoffClaimDigest string
 
 	// inFlight reports whether a pickup attempt is currently running. Read
-	// (without taking o.mu) by handleCryptoStatus so the locked-screen UI
+	// (without taking the operation gate) by handleCryptoStatus so the locked-screen UI
 	// can show the transient "Auto-unlocking…" state. Set true at RunPickup
 	// entry, cleared via defer.
 	inFlight atomic.Bool
 
-	// lastTestAt timestamps the most recent RunTest invocation. Read under
-	// o.mu inside RunTest to enforce the plan-mandated ≥5s gap between
+	// lastTestAt timestamps the most recent RunTest invocation. Read while the
+	// operation gate is held to enforce the plan-mandated ≥5s gap between
 	// successive Test calls per device. Closes the "admin script clicks
 	// Test in a loop" surface that bombards namek and starves the
-	// orchestrator mutex.
+	// continuity operation gate.
 	lastTestAt time.Time
 }
 
@@ -107,8 +128,11 @@ func (o *Orchestrator) InFlight() bool {
 }
 
 // New constructs an Orchestrator and ensures the on-disk state directory
-// exists. Returns an error only on filesystem failure.
+// exists. Custom recovery providers must use their own non-empty protocol ID.
 func New(deps Deps) (*Orchestrator, error) {
+	if deps.RecoveryProvider != nil && (deps.RecoveryProviderID == "" || deps.RecoveryProviderID == namekV1ProviderID) {
+		return nil, ErrInvalidRecoveryProviderID
+	}
 	if deps.Now == nil {
 		deps.Now = time.Now
 	}
@@ -118,7 +142,32 @@ func New(deps Deps) (*Orchestrator, error) {
 	if err := EnsureStateDir(); err != nil {
 		return nil, err
 	}
-	return &Orchestrator{deps: deps}, nil
+	o := &Orchestrator{
+		deps: deps,
+		gate: make(chan struct{}, 1),
+	}
+	o.gate <- struct{}{}
+	return o, nil
+}
+
+func (o *Orchestrator) acquire(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-o.gate:
+		if err := ctx.Err(); err != nil {
+			o.release()
+			return err
+		}
+		return nil
+	}
+}
+
+func (o *Orchestrator) release() {
+	o.gate <- struct{}{}
 }
 
 // aad assembles the AEAD additional-authenticated-data for wrap/unwrap. Binds

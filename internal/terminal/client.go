@@ -38,7 +38,11 @@ func (c *Client) Run(session *Session) {
 	})
 
 	pingDone := make(chan struct{})
-	go c.pingLoop(pingDone)
+	pingExited := make(chan struct{})
+	go func() {
+		defer close(pingExited)
+		c.pingLoop(pingDone)
+	}()
 
 	// Read loop
 	for {
@@ -62,6 +66,7 @@ func (c *Client) Run(session *Session) {
 	}
 
 	close(pingDone)
+	<-pingExited
 	session.DetachClient(c)
 }
 

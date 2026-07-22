@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 )
 
@@ -47,14 +48,15 @@ type installedAppApplyTransactionSpec struct {
 }
 
 type installedAppApplyTransaction struct {
-	manager      *AppManager
-	ctx          context.Context
-	state        *FilesystemStateManager
-	spec         installedAppApplyTransactionSpec
-	txn          *ManifestUpdateTransaction
-	transition   *TransitionRecord
-	runtimeStage *manifestUpdateRuntimeStage
-	listenerPlan *services.PreparedReconcile
+	manager                *AppManager
+	ctx                    context.Context
+	state                  *FilesystemStateManager
+	spec                   installedAppApplyTransactionSpec
+	txn                    *ManifestUpdateTransaction
+	transition             *TransitionRecord
+	runtimeStage           *manifestUpdateRuntimeStage
+	listenerPlan           *services.PreparedReconcile
+	publicationResumeToken services.PublicationResumeToken
 }
 
 func (m *AppManager) beginInstalledAppApplyTransaction(ctx context.Context, state *FilesystemStateManager, spec installedAppApplyTransactionSpec) (*installedAppApplyTransaction, error) {
@@ -307,7 +309,7 @@ func (t *installedAppApplyTransaction) recreateRuntimeIfNeeded() error {
 		}
 	} else {
 		recreate = func(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance) error {
-			return t.manager.recreateContainersInPlaceWithHook(ctx, instanceID, candidateDef, removeDef, appInst, beforeInstall)
+			return t.manager.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, candidateDef, removeDef, appInst, beforeInstall, t.publicationResumeToken)
 		}
 	}
 	if err := recreate(t.ctx, t.spec.InstanceID, t.spec.CandidateDefinition, t.spec.PreviousDefinition, t.spec.AppInst); err != nil {
@@ -595,7 +597,7 @@ func (t *installedAppApplyTransaction) suspendAccessForRuntimeSwitch() error {
 		return fmt.Errorf("persist access suspend transaction marker: %w", err)
 	}
 	if t.manager.serviceManager != nil {
-		t.manager.serviceManager.SuspendAppPublication(t.spec.InstanceID)
+		t.publicationResumeToken = t.manager.serviceManager.SuspendAppPublication(t.spec.InstanceID)
 	}
 	if err := t.storePhase("access_suspended"); err != nil {
 		return fmt.Errorf("persist access suspended transaction marker: %w", err)
@@ -613,7 +615,8 @@ func (t *installedAppApplyTransaction) publishAccess() error {
 	}
 	if t.listenerPlan != nil {
 		t.manager.emitProgress(t.ctx, t.spec.TaskType, t.spec.InstanceID, taskPhasePublishingAccess, 90, "Publishing access", false, nil)
-		if _, _, err := t.listenerPlan.Publish(); err != nil {
+		continuationCtx := pressure.WithTransitionContinuation(t.ctx)
+		if _, _, err := t.listenerPlan.PublishWithResumeTokenContext(continuationCtx, t.publicationResumeToken); err != nil {
 			t.listenerPlan.RetainReservationsForRepair()
 			t.listenerPlan = nil
 			return fmt.Errorf("publish prepared listeners: %w", err)
@@ -621,7 +624,8 @@ func (t *installedAppApplyTransaction) publishAccess() error {
 		t.listenerPlan = nil
 	} else if t.txn.AccessSuspended && t.manager.serviceManager != nil {
 		t.manager.emitProgress(t.ctx, t.spec.TaskType, t.spec.InstanceID, taskPhasePublishingAccess, 90, "Publishing access", false, nil)
-		if err := t.manager.serviceManager.ResumeAppPublicationChecked(t.spec.InstanceID); err != nil {
+		continuationCtx := pressure.WithTransitionContinuation(t.ctx)
+		if err := t.manager.serviceManager.ResumeAppPublicationWithResumeTokenContext(continuationCtx, t.publicationResumeToken, t.spec.InstanceID); err != nil {
 			return fmt.Errorf("resume app publication: %w", err)
 		}
 	}
@@ -817,6 +821,7 @@ func (t *installedAppApplyTransaction) rollback(cause error) error {
 		t.txn,
 		t.spec.TaskType,
 		t.spec.OperationKind,
+		t.publicationResumeToken,
 		cause,
 	)
 }

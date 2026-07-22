@@ -3,9 +3,7 @@ package app
 import (
 	"context"
 	"fmt"
-	"log"
 	"sort"
-	"strings"
 )
 
 // ServiceContainerStatus captures per-service container identity and observed running state.
@@ -27,7 +25,7 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	layout, err := m.observeAppVolumeLayout(ctx, instanceID)
 	if err != nil {
 		return nil, err
 	}
@@ -43,8 +41,15 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 		return nil, err
 	}
 
-	primary := primaryServiceFor(def, appInst)
+	observed := m.observeContainerGroup(ctx, runtime, appInst, def)
+	if !observed.known() {
+		return nil, fmt.Errorf("container status observation unknown for %s: %w", instanceID, observed.Err)
+	}
+	if err := m.applyContainerGroupObservation(state, appInst, observed); err != nil {
+		return nil, err
+	}
 
+	primary := primaryServiceFor(def, appInst)
 	names := make([]string, 0, len(def.Services))
 	for name := range def.Services {
 		names = append(names, name)
@@ -59,40 +64,15 @@ func (m *AppManager) ContainerStatuses(ctx context.Context, instanceID string) (
 		}
 	}
 
-	changed := false
 	out := make([]ServiceContainerStatus, 0, len(names))
 	for _, svcName := range names {
-		cid := strings.TrimSpace(appInst.Containers[svcName])
-		if cid == "" {
-			name := containerNameForService(instanceID, svcName, primary)
-			if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
-				cid = id
-				if appInst.Containers == nil {
-					appInst.Containers = make(map[string]string)
-				}
-				appInst.Containers[svcName] = id
-				changed = true
-			}
-		}
-
-		running := false
-		if cid != "" {
-			if st, err := m.containerManager.InspectContainerState(ctx, runtime, cid); err == nil && st.Exists {
-				running = st.Running
-			}
-		}
+		service := observed.Services[svcName]
 
 		out = append(out, ServiceContainerStatus{
 			Service:     svcName,
-			ContainerID: cid,
-			Running:     running,
+			ContainerID: service.ID,
+			Running:     service.State.Exists && service.State.Running,
 		})
-	}
-
-	if changed {
-		if err := state.StoreAppMetadata(appInst); err != nil {
-			log.Printf("WARN: ContainerStatuses %s: failed to persist repaired container IDs: %v", instanceID, err)
-		}
 	}
 
 	return out, nil

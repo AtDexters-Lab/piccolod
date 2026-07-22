@@ -75,6 +75,7 @@ type fakeNamek struct {
 	revokeCount    int
 	lastDepositF   []byte
 	lastDepositWin int
+	onDeposit      func()
 }
 
 func (f *fakeNamek) popErr(slice *[]error) error {
@@ -95,11 +96,14 @@ func (f *fakeNamek) DepositUnlockEscrow(ctx context.Context, secret []byte, wind
 	if err := f.popErr(&f.depositErrs); err != nil {
 		return nil, err
 	}
+	if f.onDeposit != nil {
+		f.onDeposit()
+	}
 	if f.depositResp != nil {
 		return f.depositResp, nil
 	}
 	return &namekclient.DepositUnlockEscrowResponse{
-		ExpiresAt:              "2026-05-02T00:00:00Z",
+		ExpiresAt:              "2026-05-02T12:10:00Z",
 		EffectiveWindowSeconds: windowSeconds,
 		RequestedClamped:       false,
 	}, nil
@@ -158,6 +162,28 @@ func newOrchestrator(t *testing.T) (*Orchestrator, *fakeManager, *fakeNamek, *[]
 		t.Fatalf("New: %v", err)
 	}
 	return o, mgr, nc, audits
+}
+
+func TestNewRejectsInvalidCustomRecoveryProviderIDs(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	provider := &observingProvider{}
+	for _, tc := range []struct {
+		name       string
+		providerID string
+	}{
+		{name: "empty", providerID: ""},
+		{name: "reserved namek v1", providerID: namekV1ProviderID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := New(Deps{
+				RecoveryProvider:   func() RecoveryFactorProvider { return provider },
+				RecoveryProviderID: tc.providerID,
+			})
+			if !errors.Is(err, ErrInvalidRecoveryProviderID) {
+				t.Fatalf("New error = %v; want ErrInvalidRecoveryProviderID", err)
+			}
+		})
+	}
 }
 
 // --- ceremony ---
@@ -379,8 +405,8 @@ func TestRunPickup_HappyPath(t *testing.T) {
 	if mgr.unwrapCallCount != 1 {
 		t.Errorf("unwrap call count = %d; want 1", mgr.unwrapCallCount)
 	}
-	if nc.revokeCount != 1 {
-		t.Errorf("revoke count = %d; want 1", nc.revokeCount)
+	if nc.revokeCount != 0 {
+		t.Errorf("revoke count = %d; want 0", nc.revokeCount)
 	}
 	if BlobExists() {
 		t.Errorf("blob retained after successful pickup")
@@ -452,12 +478,19 @@ func TestRunPickup_ManualUnlockFirst(t *testing.T) {
 		Secret: base64.RawURLEncoding.EncodeToString(F),
 	}
 	mgr.unwrapErr = crypt.ErrAutoUnlockAlreadyUnlocked
-	out := o.RunPickup(context.Background(), neverCalledChain(t))
+	chainCalled := false
+	out := o.RunPickup(context.Background(), func(context.Context) error {
+		chainCalled = true
+		return nil
+	})
 	if out != PickupOutcomeManualUnlockFirst {
 		t.Errorf("outcome = %v; want ManualUnlockFirst", out)
 	}
-	if nc.revokeCount != 1 {
-		t.Errorf("revoke not called on manual_unlock_first race")
+	if !chainCalled {
+		t.Errorf("manual-first path did not join complete unlock chain")
+	}
+	if nc.revokeCount != 0 {
+		t.Errorf("revoke called on manual_unlock_first race")
 	}
 	if BlobExists() {
 		t.Errorf("blob retained after manual_unlock_first")
@@ -535,8 +568,8 @@ func TestRunTest_HappyPath(t *testing.T) {
 	if !res.Success {
 		t.Errorf("Success = false; ErrorKind = %q", res.ErrorKind)
 	}
-	if nc.depositCount != 1 || nc.pickupCount != 1 || nc.revokeCount != 1 {
-		t.Errorf("deposit/pickup/revoke counts = %d/%d/%d; want 1/1/1",
+	if nc.depositCount != 1 || nc.pickupCount != 1 || nc.revokeCount != 0 {
+		t.Errorf("deposit/pickup/revoke counts = %d/%d/%d; want 1/1/0",
 			nc.depositCount, nc.pickupCount, nc.revokeCount)
 	}
 	// Window passed to deposit should be the small test window.
@@ -566,8 +599,8 @@ func TestRunTest_RateLimited(t *testing.T) {
 	}
 	// Sanity: the rate-limit check fires BEFORE namek interaction; the
 	// second call should NOT have reached deposit/pickup/revoke.
-	if nc.depositCount != 1 || nc.pickupCount != 1 || nc.revokeCount != 1 {
-		t.Errorf("rate-limited call still hit namek: deposit/pickup/revoke = %d/%d/%d; want 1/1/1",
+	if nc.depositCount != 1 || nc.pickupCount != 1 || nc.revokeCount != 0 {
+		t.Errorf("rate-limited call still hit namek: deposit/pickup/revoke = %d/%d/%d; want 1/1/0",
 			nc.depositCount, nc.pickupCount, nc.revokeCount)
 	}
 }
@@ -657,7 +690,7 @@ func TestRunPickup_IdentityNotReady_RecordsServiceNotReady(t *testing.T) {
 	}
 }
 
-func TestRunTest_RevokeFails(t *testing.T) {
+func TestRunTest_DoesNotCallLegacyRevoke(t *testing.T) {
 	o, _, nc, audits := newOrchestrator(t)
 	if err := SaveState(State{Enabled: true}); err != nil {
 		t.Fatalf("SaveState: %v", err)
@@ -668,14 +701,17 @@ func TestRunTest_RevokeFails(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RunTest: %v", err)
 	}
-	if res.Success {
-		t.Errorf("expected test failure when revoke fails")
+	if !res.Success {
+		t.Errorf("test failed because unused legacy revoke was configured to fail")
 	}
-	if res.ErrorKind != ReasonServiceUnreachable {
-		t.Errorf("ErrorKind = %q; want %q", res.ErrorKind, ReasonServiceUnreachable)
+	if res.ErrorKind != "" {
+		t.Errorf("ErrorKind = %q; want empty", res.ErrorKind)
 	}
-	if (*audits)[0].details["error_kind"] != ReasonServiceUnreachable {
-		t.Errorf("audit error_kind = %v; want %s", (*audits)[0].details["error_kind"], ReasonServiceUnreachable)
+	if nc.revokeCount != 0 {
+		t.Errorf("legacy revoke called %d times; want 0", nc.revokeCount)
+	}
+	if (*audits)[0].details["success"] != true {
+		t.Errorf("audit success = %v; want true", (*audits)[0].details["success"])
 	}
 }
 

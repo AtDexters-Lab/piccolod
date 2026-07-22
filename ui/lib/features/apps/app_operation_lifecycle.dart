@@ -1,4 +1,5 @@
 import 'package:piccolo_os/core/models/task_progress.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 
 const _legacyUpdateManifestTaskType = 'update_manifest';
 
@@ -32,11 +33,47 @@ enum AppOperationDetailAction {
   verifyDeletedApp,
 }
 
+const manualAppStartTaskPressureMessage =
+    'Piccolo is under heavy load. Start was not attempted. Try again shortly.';
+
 bool isDeterministicAppOperationSubmitRejectionStatus(int statusCode) {
   return switch (statusCode) {
     400 || 401 || 403 || 404 || 409 || 422 || 423 => true,
     _ => false,
   };
+}
+
+bool isManualAppStartTaskPressureRejection(
+  AppOperationType type,
+  Object error,
+) {
+  return type == AppOperationType.start &&
+      error is ApiException &&
+      error.statusCode == 503 &&
+      error.code == 'task_pressure';
+}
+
+AppOperationOutcome classifyAppOperationSubmitFailure(
+  AppOperationType type,
+  Object error,
+) {
+  if (isManualAppStartTaskPressureRejection(type, error)) {
+    return AppOperationOutcome.submitRejected;
+  }
+  if (error is ApiException &&
+      isDeterministicAppOperationSubmitRejectionStatus(error.statusCode)) {
+    return AppOperationOutcome.submitRejected;
+  }
+  return AppOperationOutcome.submitUnclear;
+}
+
+String? appOperationSubmitFailureMessage(
+  AppOperationType type,
+  Object error,
+) {
+  return isManualAppStartTaskPressureRejection(type, error)
+      ? manualAppStartTaskPressureMessage
+      : null;
 }
 
 class AppReadinessObservationRequest {
@@ -178,6 +215,20 @@ class AppOperationPolicy {
         );
     }
   }
+}
+
+AppOperationSettlement settleAppOperationSubmitFailure(
+  AppOperationType type,
+  Object error, {
+  required bool hasProgress,
+}) {
+  return type.policy.settle(
+    classifyAppOperationSubmitFailure(type, error),
+    // task_pressure is an explicit no-effect response for manual Start. A
+    // stray/stale progress event must not keep that rejected request alive.
+    hasProgress:
+        hasProgress && !isManualAppStartTaskPressureRejection(type, error),
+  );
 }
 
 class TrackedAppOperation {

@@ -222,11 +222,25 @@ type Manager struct {
 	scheduleWakeCh chan struct{}
 
 	// Self-hosted adapter (existing behavior)
-	adapterMu      sync.Mutex // protects both self-hosted and namek adapter fields
-	adapterApplyMu sync.Mutex
-	adapter        nexusclient.Adapter
-	adapterCancel  context.CancelFunc
-	lastAdapterKey string
+	adapterMu          sync.Mutex // protects both self-hosted and namek adapter fields
+	adapterStopTimeout time.Duration
+	adapter            nexusclient.Adapter
+	adapterCancel      context.CancelFunc
+	lastAdapterKey     string
+	// adapterProjectionGeneration makes runtime publication updates monotonic.
+	// Requests advance it before waiting for apply ownership, so a blocked
+	// Configure call can detect and repair a newer withdrawal before releasing
+	// ownership or committing its fingerprint.
+	adapterProjectionGeneration uint64
+	adapterAppliedGeneration    uint64
+	adapterForceGeneration      uint64
+	adapterApplyRunning         bool
+	adapterApplyDone            chan struct{}
+	// aliasPublicationFilter is a process-local projection over persisted
+	// desired aliases. GinServer uses it to keep app aliases out of relay
+	// registration until their local route is proven; nil preserves the legacy
+	// behavior for callers that do not install a publication policy.
+	aliasPublicationFilter func(nexusclient.AliasEntry) bool
 
 	// Source-agnostic orchestrator client registry (RFC 20260312)
 	orchClients map[string]acme.OrchestratorClient // source → orchClient
@@ -274,13 +288,14 @@ func newManagerWithDeps(storage Storage, baseDir string, d dialer, r resolver, n
 		baseDir = paths.CoreRoot()
 	}
 	m := &Manager{
-		storage:        storage,
-		dialer:         d,
-		resolver:       r,
-		now:            now,
-		baseDir:        baseDir,
-		scheduleWakeCh: make(chan struct{}, 1), // Buffered to avoid blocking
-		relayStates:    make(map[string]relayState),
+		storage:            storage,
+		dialer:             d,
+		resolver:           r,
+		now:                now,
+		baseDir:            baseDir,
+		adapterStopTimeout: 5 * time.Second,
+		scheduleWakeCh:     make(chan struct{}, 1), // Buffered to avoid blocking
+		relayStates:        make(map[string]relayState),
 	}
 	m.challenges = NewChallengeManager()
 	// ACME manager (wire later on configure)
@@ -325,11 +340,18 @@ func (m *Manager) SetNexusAdapter(adapter nexusclient.Adapter) {
 	m.adapter = adapter
 	m.adapterMu.Unlock()
 	m.ensureConfigHydrated()
-	m.cfgMu.RLock()
-	snap := extractAdapterSnapshot(m.cfg)
-	m.cfgMu.RUnlock()
-	snap = m.snapshotWithClaims(snap)
-	m.applyAdapterStateSerialized(snap)
+	_, _ = m.requestAdapterProjection(context.Background(), false)
+}
+
+// SetAliasPublicationFilter installs a process-local filter for aliases sent
+// to the Nexus adapter. Persisted aliases and ListAliases remain unchanged.
+// Callers should install the filter before SetNexusAdapter; subsequent adapter
+// refreshes re-evaluate it against current runtime route state.
+func (m *Manager) SetAliasPublicationFilter(filter func(nexusclient.AliasEntry) bool) {
+	m.adapterMu.Lock()
+	m.aliasPublicationFilter = filter
+	m.adapterMu.Unlock()
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 }
 
 // RestartAdapterForNetworkTransition forces the self-hosted Nexus adapter
@@ -341,28 +363,9 @@ func (m *Manager) RestartAdapterForNetworkTransition(reasons []network.NetworkTr
 		return false
 	}
 	m.ensureConfigHydrated()
-	m.adapterApplyMu.Lock()
-	defer m.adapterApplyMu.Unlock()
-
-	m.cfgMu.RLock()
-	snap := extractAdapterSnapshot(m.cfg)
-	m.cfgMu.RUnlock()
-	snap = m.snapshotWithClaims(snap)
-	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
-		return false
-	}
-
-	m.adapterMu.Lock()
-	if m.adapter == nil {
-		m.adapterMu.Unlock()
-		return false
-	}
-	m.lastAdapterKey = ""
-	m.adapterMu.Unlock()
-
 	log.Printf("INFO: remote: restarting nexus adapter (network transition: %s)", networkTransitionReasonString(reasons))
-	m.applyAdapterState(snap)
-	return true
+	active, _ := m.requestAdapterProjection(context.Background(), true)
+	return active
 }
 
 func networkTransitionReasonString(reasons []network.NetworkTransitionReason) string {
@@ -392,20 +395,27 @@ func (m *Manager) SetPortClaimProvider(p PortClaimProvider) {
 	m.adapterMu.Lock()
 	m.portClaimProvider = p
 	m.adapterMu.Unlock()
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 }
 
-// RefreshPortClaims re-evaluates active port claims and applies them to the
-// adapter. Called when service endpoints change (app install/start/stop or
-// post-unlock service restore) so that claim mappings propagate to the relay.
+// RefreshPortClaims re-evaluates runtime-filtered aliases and active port claims
+// and applies them to the adapter. Called when service endpoints change (app
+// install/start/stop or post-unlock service restore) so that relay registration
+// follows current route proof.
 func (m *Manager) RefreshPortClaims() {
-	if m == nil || m.closed.Load() {
-		return
+	_ = m.RefreshPortClaimsContext(context.Background())
+}
+
+// RefreshPortClaimsContext advances the publication generation before waiting
+// for apply ownership. If ctx expires, the apply continues under ownership so
+// a blocking adapter cannot strand an older projection; the caller is free to
+// proceed once its local fail-closed work has completed.
+func (m *Manager) RefreshPortClaimsContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
 	}
-	m.cfgMu.RLock()
-	snap := extractAdapterSnapshot(m.cfg)
-	m.cfgMu.RUnlock()
-	snap = m.snapshotWithClaims(snap)
-	m.applyAdapterStateSerialized(snap)
+	_, err := m.requestAdapterProjection(ctx, false)
+	return err
 }
 
 // RegisterOrchClient registers an orchestrator client for a source tag.
@@ -605,12 +615,10 @@ func (m *Manager) saveNexus(cfg *Config) error {
 		}
 	}
 	m.cfg = cfg
-	snap := extractAdapterSnapshot(cfg)
 	m.cfgMu.Unlock()
 
-	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterStateSerialized(snap)
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -684,12 +692,10 @@ func (m *Manager) saveNexusAndEvents(cfg *Config) error {
 		}
 	}
 	m.cfg = cfg
-	snap := extractAdapterSnapshot(cfg)
 	m.cfgMu.Unlock()
 
-	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterStateSerialized(snap)
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -794,12 +800,10 @@ func (m *Manager) saveAll(cfg *Config) error {
 		}
 	}
 	m.cfg = cfg
-	snap := extractAdapterSnapshot(cfg)
 	m.cfgMu.Unlock()
 
-	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
-	m.applyAdapterStateSerialized(snap)
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 	m.updateACMEConfig(cfg)
 	m.publishConfigChanged()
 	return nil
@@ -821,7 +825,6 @@ func (m *Manager) reloadFromStorage() error {
 	m.cfgMu.Lock()
 	m.cfg = &cfg
 	m.validateCertFiles(m.cfg)
-	snap := extractAdapterSnapshot(m.cfg)
 	m.cfgMu.Unlock()
 
 	// Best-effort repo sync — closes the gap where filesystem was written
@@ -833,13 +836,12 @@ func (m *Manager) reloadFromStorage() error {
 		log.Printf("WARN: post-unlock cert repo sync failed: %v", err)
 	}
 
-	snap = m.snapshotWithClaims(snap)
 	m.needsReload.Store(false)
 	if cfg.Enabled {
 		log.Printf("remote: reloaded config (solver=%s, managed=%v, portal=%s, certs=%d)",
 			cfg.Solver, cfg.Managed, cfg.PortalHostname, len(cfg.Certificates))
 	}
-	m.applyAdapterStateSerialized(snap)
+	_, _ = m.requestAdapterProjection(context.Background(), false)
 	m.updateACMEConfig(&cfg)
 	m.publishConfigChanged()
 	m.requeueOutstandingIssuances()
@@ -1452,12 +1454,28 @@ func extractAdapterSnapshot(cfg *Config) adapterStateSnapshot {
 	}
 }
 
-// snapshotWithClaims enriches a config snapshot with active port claims
-// from the service manager. Safe to call without holding any lock.
-func (m *Manager) snapshotWithClaims(snap adapterStateSnapshot) adapterStateSnapshot {
+// prepareCurrentAdapterSnapshot projects durable desired config through the
+// current runtime publication policy. The single coalescing worker owns apply
+// ordering, but no ServiceManager lock: filters may safely re-enter lookups.
+func (m *Manager) prepareCurrentAdapterSnapshot() (adapterStateSnapshot, uint64) {
+	m.cfgMu.RLock()
+	snap := extractAdapterSnapshot(m.cfg)
+	m.cfgMu.RUnlock()
+
 	m.adapterMu.Lock()
+	filter := m.aliasPublicationFilter
 	provider := m.portClaimProvider
+	generation := m.adapterProjectionGeneration
 	m.adapterMu.Unlock()
+	if filter != nil {
+		aliases := make([]nexusclient.AliasEntry, 0, len(snap.Aliases))
+		for _, alias := range snap.Aliases {
+			if filter(alias) {
+				aliases = append(aliases, alias)
+			}
+		}
+		snap.Aliases = aliases
+	}
 	if provider != nil {
 		claims := provider.ActivePortClaims()
 		// Sort for stable fingerprinting
@@ -1469,20 +1487,102 @@ func (m *Manager) snapshotWithClaims(snap adapterStateSnapshot) adapterStateSnap
 		})
 		snap.PortClaims = claims
 	}
-	return snap
+	return snap, generation
 }
 
-func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
-	if m.closed.Load() {
+func (m *Manager) requestAdapterProjection(ctx context.Context, force bool) (bool, error) {
+	if m == nil || m.closed.Load() {
+		return false, nil
+	}
+	m.adapterMu.Lock()
+	m.adapterProjectionGeneration++
+	generation := m.adapterProjectionGeneration
+	if force {
+		m.adapterForceGeneration = generation
+	}
+	done := m.adapterApplyDone
+	if !m.adapterApplyRunning {
+		m.adapterApplyRunning = true
+		done = make(chan struct{})
+		m.adapterApplyDone = done
+		go m.runAdapterProjectionWorker(done)
+	}
+	m.adapterMu.Unlock()
+
+	// Configure has no context parameter and third-party adapters may block.
+	// Keep one coalescing owner alive after the caller's bound expires so the
+	// final generation is still repaired before another apply owner proceeds.
+	select {
+	case <-done:
+		m.cfgMu.RLock()
+		snap := extractAdapterSnapshot(m.cfg)
+		m.cfgMu.RUnlock()
+		active := snap.Enabled && snap.Endpoint != "" && snap.DeviceSecret != "" && snap.PortalHostname != ""
+		return active, nil
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
+}
+
+func (m *Manager) runAdapterProjectionWorker(done chan struct{}) {
+	for {
+		_, _ = m.applyCurrentAdapterProjection()
+		m.adapterMu.Lock()
+		if m.closed.Load() {
+			m.adapterApplyRunning = false
+			close(done)
+			m.adapterMu.Unlock()
+			return
+		}
+		if m.adapterAppliedGeneration != m.adapterProjectionGeneration || m.adapterForceGeneration != 0 {
+			m.adapterMu.Unlock()
+			continue
+		}
+		m.adapterApplyRunning = false
+		close(done)
+		m.adapterMu.Unlock()
 		return
+	}
+}
+
+func (m *Manager) projectionGenerationCurrent(generation uint64) bool {
+	m.adapterMu.Lock()
+	current := generation == m.adapterProjectionGeneration
+	m.adapterMu.Unlock()
+	return current
+}
+
+func (m *Manager) commitAdapterProjection(generation uint64, key string) bool {
+	m.adapterMu.Lock()
+	defer m.adapterMu.Unlock()
+	if generation != m.adapterProjectionGeneration {
+		return false
+	}
+	m.lastAdapterKey = key
+	m.adapterAppliedGeneration = generation
+	if m.adapterForceGeneration <= generation {
+		m.adapterForceGeneration = 0
+	}
+	return true
+}
+
+func (m *Manager) applyAdapterProjection(snap adapterStateSnapshot, generation uint64, force bool) (bool, bool) {
+	if m.closed.Load() {
+		return true, false
 	}
 	m.adapterMu.Lock()
 	adapter := m.adapter
 	cancel := m.adapterCancel
+	lastKey := m.lastAdapterKey
+	current := generation == m.adapterProjectionGeneration
 	m.adapterMu.Unlock()
 
+	active := snap.Enabled && snap.Endpoint != "" && snap.DeviceSecret != "" && snap.PortalHostname != ""
+	if !current {
+		return false, active
+	}
 	if adapter == nil {
-		return
+		return m.commitAdapterProjection(generation, ""), false
 	}
 
 	adapterCfg := nexusclient.Config{
@@ -1492,40 +1592,49 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 		Aliases:        snap.Aliases,
 		ClaimMappings:  snap.PortClaims,
 	}
+	// This is the last generation check before the potentially blocking call.
+	// A request that arrived while the snapshot was being prepared prevents the
+	// stale snapshot from reaching Configure at all.
+	if !m.projectionGenerationCurrent(generation) {
+		return false, active
+	}
 	if err := adapter.Configure(adapterCfg); err != nil {
 		log.Printf("WARN: remote: configure nexus adapter failed: %v", err)
 	}
+	if m.closed.Load() {
+		return true, false
+	}
+	if !m.projectionGenerationCurrent(generation) {
+		return false, active
+	}
 
-	if !snap.Enabled || snap.Endpoint == "" || snap.DeviceSecret == "" || snap.PortalHostname == "" {
-		m.stopAdapter()
+	if !active {
+		m.stopAdapterForProjection()
+		if !m.projectionGenerationCurrent(generation) {
+			return false, false
+		}
 		// Reset lastAdapterKey so a subsequent enable always restarts the adapter.
 		// Only stop the renew scheduler if no external source has registered an orchClient.
 		// External sources (e.g., namek) share the same scheduler for cert renewals.
 		m.adapterMu.Lock()
-		m.lastAdapterKey = ""
 		hasExternalSources := len(m.orchClients) > 0
 		m.adapterMu.Unlock()
 		if !hasExternalSources {
 			m.stopRenewScheduler()
 		}
-		return
+		return m.commitAdapterProjection(generation, ""), false
 	}
 
 	// Only restart the adapter when config that affects the relay registration
 	// (endpoint, secret, portal, aliases) actually changed. Cert-only saves
 	// skip the restart to avoid flapping the relay connection.
 	key := adapterConfigKey(snap)
-	m.adapterMu.Lock()
-	changed := key != m.lastAdapterKey
-	if changed {
-		m.lastAdapterKey = key
-	}
-	m.adapterMu.Unlock()
+	changed := force || key != lastKey
 
 	if !changed && cancel != nil {
 		// Adapter running with identical config — nothing to do.
 		m.startRenewScheduler()
-		return
+		return m.commitAdapterProjection(generation, key), true
 	}
 
 	if changed {
@@ -1533,17 +1642,31 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	}
 
 	if cancel != nil {
-		m.stopAdapter()
+		m.stopAdapterForProjection()
+		if m.closed.Load() {
+			return true, false
+		}
+		if !m.projectionGenerationCurrent(generation) {
+			return false, true
+		}
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	m.adapterMu.Lock()
+	if m.closed.Load() {
+		m.adapterMu.Unlock()
+		cancel()
+		return true, false
+	}
 	m.adapterCancel = cancel
-	adapterRun := m.adapter
 	m.adapterMu.Unlock()
+	if !m.projectionGenerationCurrent(generation) {
+		cancel()
+		return false, true
+	}
 
 	go func() {
-		err := adapterRun.Start(ctx)
+		err := adapter.Start(ctx)
 		if err != nil {
 			if !errors.Is(err, context.Canceled) {
 				log.Printf("WARN: remote: nexus adapter exited: %v", err)
@@ -1562,12 +1685,33 @@ func (m *Manager) applyAdapterState(snap adapterStateSnapshot) {
 	}()
 	// Ensure renew scheduler is running when remote is active
 	m.startRenewScheduler()
+	return m.commitAdapterProjection(generation, key), true
 }
 
-func (m *Manager) applyAdapterStateSerialized(snap adapterStateSnapshot) {
-	m.adapterApplyMu.Lock()
-	defer m.adapterApplyMu.Unlock()
-	m.applyAdapterState(snap)
+func (m *Manager) applyCurrentAdapterProjection() (bool, error) {
+	for {
+		m.adapterMu.Lock()
+		generation := m.adapterProjectionGeneration
+		applied := m.adapterAppliedGeneration
+		forceGeneration := m.adapterForceGeneration
+		m.adapterMu.Unlock()
+		if generation == applied && forceGeneration == 0 {
+			m.cfgMu.RLock()
+			snap := extractAdapterSnapshot(m.cfg)
+			m.cfgMu.RUnlock()
+			active := snap.Enabled && snap.Endpoint != "" && snap.DeviceSecret != "" && snap.PortalHostname != ""
+			return active, nil
+		}
+
+		snap, snapshotGeneration := m.prepareCurrentAdapterSnapshot()
+		force := forceGeneration != 0 && forceGeneration <= snapshotGeneration
+		stable, active := m.applyAdapterProjection(snap, snapshotGeneration, force)
+		if stable {
+			return active, nil
+		}
+		// The projection advanced during preparation or a blocking adapter call.
+		// Recompute and apply the newest state before releasing ownership.
+	}
 }
 
 func (m *Manager) publishConfigChanged() {
@@ -1605,7 +1749,10 @@ func (m *Manager) HTTPChallengeHandler() http.Handler {
 	return m.challenges.Handler()
 }
 
-func (m *Manager) stopAdapter() {
+func (m *Manager) stopAdapter(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.adapterMu.Lock()
 	cancel := m.adapterCancel
 	adapter := m.adapter
@@ -1616,8 +1763,19 @@ func (m *Manager) stopAdapter() {
 		cancel()
 	}
 	if adapter != nil {
-		if err := adapter.Stop(context.Background()); err != nil {
-			log.Printf("WARN: remote: stopping nexus adapter: %v", err)
+		// Adapter implementations are expected to honor ctx, but the manager's
+		// publication owner cannot trust that boundary: a stale relay stop must
+		// not permanently occupy the sole projection worker. The buffered result
+		// lets a late return finish without regaining publication authority.
+		stopped := make(chan error, 1)
+		go func() { stopped <- adapter.Stop(ctx) }()
+		select {
+		case err := <-stopped:
+			if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				log.Printf("WARN: remote: stopping nexus adapter: %v", err)
+			}
+		case <-ctx.Done():
+			log.Printf("WARN: remote: nexus adapter stop acknowledgement timed out: %v", ctx.Err())
 		}
 	}
 
@@ -1626,6 +1784,16 @@ func (m *Manager) stopAdapter() {
 	// ClearRelayState also publishes config change and requeues if this removal
 	// unblocks httpChallengeReachable (e.g., removing a disconnected relay).
 	m.ClearRelayState("piccolo-portal")
+}
+
+func (m *Manager) stopAdapterForProjection() {
+	timeout := m.adapterStopTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	m.stopAdapter(ctx)
 }
 
 // RelayEventHandler returns a callback suitable for nexusclient.WithAdapterEventHandler.
@@ -2298,7 +2466,7 @@ func (m *Manager) Close() error {
 	}
 	m.closeOnce.Do(func() {
 		m.closed.Store(true)
-		m.stopAdapter()
+		m.stopAdapter(context.Background())
 		m.stopRenewScheduler()
 		if m.issueCancel != nil {
 			m.issueCancel()

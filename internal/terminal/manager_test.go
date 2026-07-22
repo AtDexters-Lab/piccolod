@@ -4,8 +4,11 @@ import (
 	"context"
 	"os"
 	"os/exec"
+	"runtime"
 	"testing"
 	"time"
+
+	"piccolod/internal/resources/pressure"
 )
 
 func testShell() string {
@@ -14,6 +17,26 @@ func testShell() string {
 		shell = "/bin/sh"
 	}
 	return shell
+}
+
+func TestManager_TaskPressureRejectsCreateButKeepsDelete(t *testing.T) {
+	gate := pressure.NewAdmissionGate()
+	m := NewManager(WithAdmissionGate(gate))
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop(context.Background())
+	session, err := m.Create(SessionKindHost, "", hostCmdFactory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate.Fence()
+	if _, err := m.Create(SessionKindHost, "", hostCmdFactory); !pressure.IsAdmissionError(err) {
+		t.Fatalf("fenced create error = %v", err)
+	}
+	if !m.Delete(session.ID) {
+		t.Fatal("delete was unavailable while admission fenced")
+	}
 }
 
 func hostCmdFactory() (*exec.Cmd, error) {
@@ -178,5 +201,74 @@ func TestManager_AutoRemoveOnShellExit(t *testing.T) {
 	_, ok := m.Get(id)
 	if ok {
 		t.Fatal("session should be auto-removed after shell exit")
+	}
+}
+
+func TestManager_CreateFailureReleasesReservedSlot(t *testing.T) {
+	m := NewManager(WithMaxSessions(1))
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop(context.Background())
+
+	if _, err := m.Create(SessionKindHost, "", func() (*exec.Cmd, error) {
+		return exec.Command("/definitely/missing/piccolo-shell"), nil
+	}); err == nil {
+		t.Fatal("expected PTY start failure")
+	}
+	if _, err := m.Create(SessionKindHost, "", hostCmdFactory); err != nil {
+		t.Fatalf("reserved slot survived failed start: %v", err)
+	}
+}
+
+func TestManagerRechecksAdmissionAfterCommandFactory(t *testing.T) {
+	gate := pressure.NewAdmissionGate()
+	m := NewManager(WithAdmissionGate(gate))
+	t.Cleanup(gate.ResetForTest)
+
+	_, err := m.CreateContext(context.Background(), SessionKindHost, "", func() (*exec.Cmd, error) {
+		gate.FenceCritical()
+		return exec.Command(testShell()), nil
+	})
+	if !pressure.IsAdmissionError(err) {
+		t.Fatalf("CreateContext error = %v, want task-pressure admission error", err)
+	}
+	if got := m.Count(); got != 0 {
+		t.Fatalf("session count = %d after rejected factory", got)
+	}
+}
+
+func TestManager_RepeatedCreateDeleteReapsChildren(t *testing.T) {
+	m := NewManager(WithMaxSessions(2))
+	if err := m.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer m.Stop(context.Background())
+	baselineGoroutines := runtime.NumGoroutine()
+
+	for i := 0; i < 32; i++ {
+		sess, err := m.Create(SessionKindHost, "", hostCmdFactory)
+		if err != nil {
+			t.Fatalf("create session %d: %v", i, err)
+		}
+		if !m.Delete(sess.ID) {
+			t.Fatalf("delete session %d", i)
+		}
+		// ProcessState is populated only by Wait/Run. A PTY child cancelled by
+		// Delete is commonly signalled, so Exited() itself need not be true.
+		if sess.cmd.ProcessState == nil {
+			t.Fatalf("session %d child was not waited", i)
+		}
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baselineGoroutines+2 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baselineGoroutines+2 {
+		t.Fatalf("terminal goroutines did not return near baseline: before=%d after=%d", baselineGoroutines, got)
+	}
+	if got := len(m.List(SessionKindHost, "")); got != 0 {
+		t.Fatalf("host sessions after soak = %d, want 0", got)
 	}
 }

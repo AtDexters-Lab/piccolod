@@ -2,8 +2,8 @@ package autounlock
 
 import (
 	"context"
-	"encoding/base64"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"time"
@@ -21,6 +21,7 @@ import (
 // locked-screen UI responsive — after that the operator can password-unlock.
 const pickupIdentityWaitTimeout = 60 * time.Second
 const pickupIdentityWaitInterval = 1 * time.Second
+const minimumRecoveryAttemptLifetime = 30 * time.Second
 
 // PickupOutcome reports what happened in the post-boot pickup attempt. The
 // caller (gin_server.Start integration) uses this to drive UI status (the
@@ -36,7 +37,7 @@ const (
 	PickupOutcomeUnlocked
 	// PickupOutcomeManualUnlockFirst: pickup retrieved a valid F but the
 	// password handler had already unlocked the manager. Cleanup ran
-	// (revoke + delete blob); caller treats as success.
+	// (local blob + metadata only); caller treats as success.
 	PickupOutcomeManualUnlockFirst
 	// PickupOutcomeFailed: pickup couldn't unlock the device. Caller leaves
 	// the device locked + surfaces the failure banner. State file's
@@ -57,22 +58,43 @@ type CompleteUnlockChain func(ctx context.Context) error
 // on any failure — the locked HTTP server stays up the whole time so the
 // password path is always available in parallel.
 //
-// Takes o.mu to serialize against ceremony. If a fast Stop catches pickup
-// mid-namek-call, the wiring layer cancels pickup's context first → pickup's
-// HTTP call returns ctx.Canceled → pickup releases the mutex → ceremony
-// proceeds. Without this lock, pickup's tail (state-file save, blob delete,
-// revoke) could race ceremony's wrap+deposit on the same files.
+// The shared operation gate serializes this path with prepare, Test, settings,
+// and local cleanup. Gate acquisition itself is context-aware so an emergency
+// owner can abandon continuity at its hard deadline.
 func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlockChain) PickupOutcome {
-	o.mu.Lock()
-	defer o.mu.Unlock()
-
-	state, err := LoadState()
-	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
-		log.Printf("WARN: autounlock: pickup load state: %v", err)
+	result, err := o.Recover(ctx, completeChain)
+	if err != nil {
+		log.Printf("WARN: autounlock: recovery failed: %v", err)
+	}
+	switch result.Disposition {
+	case RecoverDispositionUnlocked:
+		if result.Reason == ReasonManualUnlockFirst {
+			return PickupOutcomeManualUnlockFirst
+		}
+		return PickupOutcomeUnlocked
+	case RecoverDispositionNoHandoff:
 		return PickupOutcomeNoBlob
+	default:
+		return PickupOutcomeFailed
+	}
+}
+
+// Recover consumes a compatible local handoff, asks its recorded provider for
+// the random factor, unwraps the SDEK with the released v1 AAD, and runs the
+// complete unlock chain before consuming local authority.
+func (o *Orchestrator) Recover(ctx context.Context, completeChain CompleteUnlockChain) (RecoverResult, error) {
+	if err := o.acquire(ctx); err != nil {
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonServiceUnreachable}, err
+	}
+	defer o.release()
+
+	state, stateErr := LoadState()
+	if stateErr != nil && !errors.Is(stateErr, ErrInvalidStateFile) {
+		log.Printf("WARN: autounlock: pickup load state: %v", stateErr)
+		return RecoverResult{Disposition: RecoverDispositionNoHandoff}, stateErr
 	}
 	if !state.Enabled {
-		return PickupOutcomeNoBlob
+		return RecoverResult{Disposition: RecoverDispositionNoHandoff}, nil
 	}
 
 	// Marker for handleCryptoStatus's UI surface. Set after the disabled-
@@ -81,18 +103,40 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 	o.inFlight.Store(true)
 	defer o.inFlight.Store(false)
 
-	blob, err := ReadBlob()
+	handoff, err := o.reconcileHandoffLocked(&state, stateErr)
 	if err != nil {
 		if errors.Is(err, ErrBlobMissing) {
 			// Auto-unlock is enabled but ceremony didn't deposit (crash,
 			// SIGKILL, hardware-watchdog reset). Audit the silent gap so
 			// operators can see "we expected to auto-unlock and didn't."
 			o.recordFailure(&state, AuditCycleFailedPickup, ReasonNoBlob)
-			return PickupOutcomeNoBlob
+			return RecoverResult{Disposition: RecoverDispositionNoHandoff, Reason: ReasonNoBlob}, nil
 		}
-		log.Printf("ERROR: autounlock: pickup read blob: %v", err)
-		o.recordFailure(&state, AuditCycleFailedPickup, ReasonNoBlob)
-		return PickupOutcomeFailed
+		if errors.Is(err, ErrEffectiveExpiryTooShort) {
+			o.recordFailure(&state, AuditCycleFailedPickup, ReasonEscrowNotFound)
+			return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonEscrowNotFound}, err
+		}
+		log.Printf("ERROR: autounlock: reconcile handoff: %v", err)
+		if errors.Is(stateErr, ErrInvalidStateFile) {
+			// Preserve the unreadable state file. Rewriting defaults here would
+			// erase evidence of possibly matching future metadata and downgrade
+			// the same raw blob to legacy Namek on the next attempt.
+			o.emitAudit(AuditCycleFailedPickup, map[string]any{"reason": ReasonBlobCorrupt})
+		} else {
+			o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
+		}
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
+	}
+	if !handoff.expiry.IsZero() && handoff.expiry.Sub(o.deps.Now()) < minimumRecoveryAttemptLifetime {
+		// A recurrent unlock-chain backoff may outlive most of a recorded
+		// provider lease. Do not start a pickup that cannot retain the RFC's
+		// final retry margin; clear only local authority and let the remote
+		// factor expire naturally.
+		if clearErr := o.clearLocalHandoffLocked(&state); clearErr != nil {
+			return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, clearErr
+		}
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonEscrowNotFound)
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonEscrowNotFound}, ErrEffectiveExpiryTooShort
 	}
 
 	// Wait briefly for identity to come up — TPM enrollment + namek client
@@ -101,25 +145,27 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 	// record service_not_ready and require manual unlock for that boot. The
 	// wait is bounded by deps.PickupIdentityWaitTimeout AND by ctx (Stop
 	// Phase 0 cancels promptly).
-	if !o.waitForIdentity(ctx, o.deps.PickupIdentityWaitTimeout) {
-		log.Printf("WARN: autounlock: pickup — identity not ready after %s", o.deps.PickupIdentityWaitTimeout)
+	if !o.waitForProvider(ctx, o.deps.PickupIdentityWaitTimeout) {
+		log.Printf("WARN: autounlock: pickup — recovery provider not ready after %s", o.deps.PickupIdentityWaitTimeout)
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonServiceNotReady}, nil
 	}
-	client := o.deps.NamekClient()
-	if client == nil {
+	provider, ok := o.providerForID(handoff.providerID)
+	if !ok {
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonServiceNotReady}, nil
 	}
 
-	resp, err := o.pickupWithRetry(ctx, client)
+	factor, err := o.pickupWithRetry(ctx, provider)
 	if err != nil {
 		reason := ReasonServiceUnreachable
 		if errors.Is(err, namekclient.ErrEscrowNotFound) {
 			// F is gone at namek — blob is permanently inert. Delete it so
 			// the next boot doesn't show stale state.
-			_ = DeleteBlob()
+			_ = o.clearLocalHandoffLocked(&state)
 			reason = ReasonEscrowNotFound
+		} else if errors.Is(err, ErrRecoveryFactorInvalid) {
+			reason = ReasonBlobCorrupt
 		} else {
 			var apiErr *namekclient.APIError
 			if errors.As(err, &apiErr) {
@@ -130,44 +176,60 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		}
 		log.Printf("WARN: autounlock: pickup failed (%s): %v", reason, err)
 		o.recordFailure(&state, AuditCycleFailedPickup, reason)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: reason}, err
 	}
-
-	F, err := base64.RawURLEncoding.DecodeString(resp.Secret)
-	if err != nil {
-		log.Printf("ERROR: autounlock: decode F: %v", err)
+	if len(factor) != fSize {
+		cryptoutil.SecureZero(factor)
+		err := fmt.Errorf("%w: factor length %d", ErrRecoveryFactorInvalid, len(factor))
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
 	}
-	defer cryptoutil.SecureZero(F)
+	defer cryptoutil.SecureZero(factor)
 
 	aad, aadErr := o.aad()
 	if aadErr != nil {
 		log.Printf("ERROR: autounlock: aad: %v", aadErr)
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonServiceNotReady)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonServiceNotReady}, aadErr
 	}
-	unwrapErr := o.deps.Manager.UnwrapSDEKWithEscrow(blob, F, aad)
+	unwrapErr := o.deps.Manager.UnwrapSDEKWithEscrow(handoff.blob, factor, aad)
 	if errors.Is(unwrapErr, crypt.ErrAutoUnlockAlreadyUnlocked) {
-		// Manual-unlock-first race: revoke server-side state and delete the
-		// blob. From the user's perspective this is a success — the device
-		// is unlocked, just via the password path, not auto.
-		o.bestEffortRevoke(ctx, client)
-		_ = DeleteBlob()
+		// Manual-unlock-first means the password path installed the SDEK, not
+		// necessarily that its joinable post-decrypt chain has reached Ready.
+		// Join the same chain and retain the handoff on failure/timeout so the
+		// next bounded recovery attempt still has valid authority.
+		if completeChain == nil {
+			err := errors.New("autounlock: complete unlock chain unavailable")
+			o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
+			return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
+		}
+		if err := completeChain(ctx); err != nil {
+			log.Printf("ERROR: autounlock: join manual-first unlock chain: %v", err)
+			o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
+			return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
+		}
+		if err := o.clearLocalHandoffLocked(&state); err != nil {
+			return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
+		}
 		o.emitAudit(AuditCycleRevoked, map[string]any{"reason": ReasonManualUnlockFirst})
-		return PickupOutcomeManualUnlockFirst
+		return RecoverResult{Disposition: RecoverDispositionUnlocked, Reason: ReasonManualUnlockFirst}, nil
 	}
 	if errors.Is(unwrapErr, crypt.ErrAutoUnlockBlobCorrupt) {
-		_ = DeleteBlob()
+		_ = o.clearLocalHandoffLocked(&state)
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, unwrapErr
 	}
 	if unwrapErr != nil {
 		log.Printf("ERROR: autounlock: unwrap SDEK: %v", unwrapErr)
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, unwrapErr
 	}
 
+	if completeChain == nil {
+		err := errors.New("autounlock: complete unlock chain unavailable")
+		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
+	}
 	if err := completeChain(ctx); err != nil {
 		// Post-decrypt chain failure (storage volume, persistence notify, PCV,
 		// reload). Externally indistinguishable from a corrupt blob — the
@@ -175,13 +237,15 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		// ReasonBlobCorrupt to keep the failure-token vocabulary minimal.
 		log.Printf("ERROR: autounlock: post-unlock chain: %v", err)
 		o.recordFailure(&state, AuditCycleFailedPickup, ReasonBlobCorrupt)
-		return PickupOutcomeFailed
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
 	}
 
-	o.bestEffortRevoke(ctx, client)
 	if err := DeleteBlob(); err != nil {
 		log.Printf("WARN: autounlock: delete blob post-pickup: %v", err)
+		return RecoverResult{Disposition: RecoverDispositionManualUnlockRequired, Reason: ReasonBlobCorrupt}, err
 	}
+	o.clearHandoffClaimsLocked()
+	state.Handoff = nil
 	now := o.deps.Now()
 	state.LastPickupAt = &now
 	state.LastFailureAt = nil
@@ -190,17 +254,7 @@ func (o *Orchestrator) RunPickup(ctx context.Context, completeChain CompleteUnlo
 		log.Printf("WARN: autounlock: persist post-pickup state: %v", err)
 	}
 	o.emitAudit(AuditCyclePickedUp, nil)
-	return PickupOutcomeUnlocked
-}
-
-// bestEffortRevoke calls RevokeUnlockEscrow with errors swallowed. namek's
-// DELETE is idempotent and 204s even when no row exists — the call is purely
-// cleanup and a transient failure here doesn't compromise correctness (the
-// row will expire naturally).
-func (o *Orchestrator) bestEffortRevoke(ctx context.Context, client NamekEscrowClient) {
-	if err := client.RevokeUnlockEscrow(ctx); err != nil {
-		log.Printf("WARN: autounlock: revoke: %v", err)
-	}
+	return RecoverResult{Disposition: RecoverDispositionUnlocked}, nil
 }
 
 // pickupRetryAttempts bounds the number of namek PickupUnlockEscrow tries.
@@ -218,12 +272,12 @@ const pickupRetryBackoff = 2 * time.Second
 // since boot-time network ramp-up can take several seconds. Non-transient
 // errors (auth_failed, escrow_not_found) bail immediately so the caller
 // records the right failure reason on the first cycle.
-func (o *Orchestrator) pickupWithRetry(ctx context.Context, client NamekEscrowClient) (*namekclient.PickupUnlockEscrowResponse, error) {
+func (o *Orchestrator) pickupWithRetry(ctx context.Context, provider RecoveryFactorProvider) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt < pickupRetryAttempts; attempt++ {
-		resp, err := client.PickupUnlockEscrow(ctx)
+		factor, err := provider.Pickup(ctx)
 		if err == nil {
-			return resp, nil
+			return factor, nil
 		}
 		lastErr = err
 		if !isTransientNamekErr(err) {
@@ -246,6 +300,9 @@ func (o *Orchestrator) pickupWithRetry(ctx context.Context, client NamekEscrowCl
 // uses event-bus subscription for sub-1s wake on enrollment completion;
 // falls back to 1s polling when nil (tests, hand-wired callers).
 func (o *Orchestrator) waitForIdentity(ctx context.Context, timeout time.Duration) bool {
+	if o.deps.IsIdentityReady == nil {
+		return false
+	}
 	if o.deps.IsIdentityReady() {
 		return true
 	}

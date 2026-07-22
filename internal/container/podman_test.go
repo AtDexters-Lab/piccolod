@@ -10,10 +10,70 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
+
+	"piccolod/internal/resources/pressure"
 )
+
+func TestPodmanCmdRejectsBeforeConstructionWhenTaskFenced(t *testing.T) {
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+	cmd, err := podmanCmd(context.Background(), PodmanRuntime{}, "ps")
+	if cmd != nil || !pressure.IsAdmissionError(err) {
+		t.Fatalf("podmanCmd = (%v, %v), want nil typed admission error", cmd, err)
+	}
+}
+
+func TestOSExecutorRejectsBeforeConstructionWhenTaskFenced(t *testing.T) {
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+	if _, err := (osExecutor{}).Run("/definitely/missing/piccolo-command"); !pressure.IsAdmissionError(err) {
+		t.Fatalf("Run error = %v, want task-pressure admission error", err)
+	}
+	if _, err := (osExecutor{}).RunContext(context.Background(), "/definitely/missing/piccolo-command"); !pressure.IsAdmissionError(err) {
+		t.Fatalf("RunContext error = %v, want task-pressure admission error", err)
+	}
+}
+
+func TestParseContainerListOutputRejectsMalformedSuccessfulOutput(t *testing.T) {
+	validID := strings.Repeat("a", 64)
+	items, err := parseContainerListOutput([]byte(validID + "\tdemo\n"))
+	if err != nil || len(items) != 1 || items[0].Name != "demo" {
+		t.Fatalf("parse valid output = (%v, %v)", items, err)
+	}
+
+	for _, raw := range []string{"not-tab-separated\n", "invalid\tdemo\n", validID + "\t\n"} {
+		_, err := parseContainerListOutput([]byte(raw))
+		var invalid *InvalidOutputError
+		if !errors.As(err, &invalid) {
+			t.Fatalf("parse %q err = %v, want InvalidOutputError", raw, err)
+		}
+	}
+}
+
+func TestParsePublishedPortsOutputRejectsPartialSuccessfulOutput(t *testing.T) {
+	ports, err := parsePublishedPortsOutput([]byte("8080/tcp -> 127.0.0.1:15080\n53/udp -> 0.0.0.0:15053\n"))
+	if err != nil || !reflect.DeepEqual(ports, map[string]int{"8080/tcp": 15080, "53/udp": 15053}) {
+		t.Fatalf("parse valid port output = (%v, %v)", ports, err)
+	}
+
+	malformed := []string{
+		"8080/tcp -> 127.0.0.1:15080\nnot-a-binding\n",
+		"8080/tcp -> 127.0.0.1:not-a-port\n",
+		"not-a-port/tcp -> 127.0.0.1:15080\n",
+		"8080/tcp -> 127.0.0.1:15080\n8080/tcp -> 127.0.0.1:15081\n",
+	}
+	for _, raw := range malformed {
+		ports, err := parsePublishedPortsOutput([]byte(raw))
+		var invalid *InvalidOutputError
+		if ports != nil || !errors.As(err, &invalid) {
+			t.Fatalf("parse %q = (%v, %v), want nil InvalidOutputError", raw, ports, err)
+		}
+	}
+}
 
 // TestValidateContainerName tests container name validation
 func TestValidateContainerName(t *testing.T) {
@@ -609,7 +669,10 @@ func TestPodmanCmd_with_credential(t *testing.T) {
 		Credential: &syscall.Credential{Uid: 1000, Gid: 1000},
 		HomeDir:    "/home/testuser",
 	}
-	cmd := podmanCmd(context.Background(), rt, "images")
+	cmd, err := podmanCmd(context.Background(), rt, "images")
+	if err != nil {
+		t.Fatalf("podmanCmd: %v", err)
+	}
 
 	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential == nil {
 		t.Fatal("expected credential to be set on cmd from podmanCmd")

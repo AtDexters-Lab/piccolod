@@ -31,12 +31,18 @@ type AutoReboot struct {
 // abstracts whether a hardware TPM is present, so autounlock has no use for
 // identity_class or any TPM-attestation tier.
 type State struct {
-	Enabled           bool       `json:"enabled"`
-	AutoReboot        AutoReboot `json:"auto_reboot"`
-	LastDepositAt     *time.Time `json:"last_deposit_at,omitempty"`
-	LastPickupAt      *time.Time `json:"last_pickup_at,omitempty"`
-	LastFailureAt     *time.Time `json:"last_failure_at,omitempty"`
-	LastFailureReason string     `json:"last_failure_reason,omitempty"`
+	Enabled    bool       `json:"enabled"`
+	AutoReboot AutoReboot `json:"auto_reboot"`
+	// Handoff is optional, non-secret dispatch metadata for the raw
+	// auto_unlock_blob. Keep it as RawMessage so a future or malformed nested
+	// schema cannot make the rest of auto_unlock.json unreadable. The
+	// continuity reconciler validates this field only after comparing its
+	// recorded blob digest.
+	Handoff           json.RawMessage `json:"handoff,omitempty"`
+	LastDepositAt     *time.Time      `json:"last_deposit_at,omitempty"`
+	LastPickupAt      *time.Time      `json:"last_pickup_at,omitempty"`
+	LastFailureAt     *time.Time      `json:"last_failure_at,omitempty"`
+	LastFailureReason string          `json:"last_failure_reason,omitempty"`
 }
 
 // DefaultState is the implicit state when the file is missing — i.e. on a

@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/runner"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage"
@@ -29,6 +30,7 @@ func NewPreparer(run runner.CommandRunner) *Preparer {
 
 // GetPartitionState surveys the boot disk and returns partition information.
 func (p *Preparer) GetPartitionState(ctx context.Context) (*storage.PartitionState, error) {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
 	rootDev, err := p.getRootDevice(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("detect root device: %w", err)
@@ -345,6 +347,10 @@ func BuildSfdiskJSON(sectorSize int, label string, partitions []storage.SfdiskPa
 // The data partition is created BEFORE root expansion so it acts as a boundary for growpart.
 // Dispatches to GPT (sgdisk) or MBR (sfdisk) based on the partition table label.
 func (p *Preparer) CreateDataPartition(ctx context.Context, disk string) (string, int, error) {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return "", 0, err
+	}
 	sfdisk, err := p.readSfdisk(ctx, disk)
 	if err != nil {
 		return "", 0, fmt.Errorf("read partition table: %w", err)
@@ -502,6 +508,10 @@ func (p *Preparer) waitForPartition(ctx context.Context, disk string, slot int) 
 // ExpandRootPartition expands the root partition and filesystem to fill
 // available space up to the data partition boundary.
 func (p *Preparer) ExpandRootPartition(ctx context.Context, disk string, rootPartition string) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	// Extract the root partition number for growpart.
 	rootSlot := extractSlotNumber(rootPartition)
 	if rootSlot == 0 {
@@ -536,6 +546,10 @@ func (p *Preparer) ExpandRootPartition(ctx context.Context, disk string, rootPar
 // because the partition is a raw LVM PV; the LVM-level expansion (pvresize +
 // lvextend) happens separately in Phase 2.
 func (p *Preparer) ExpandDataPartition(ctx context.Context, disk string, dataPartition string) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	dataSlot := extractSlotNumber(dataPartition)
 	if dataSlot == 0 {
 		return fmt.Errorf("cannot determine data partition slot from %s", dataPartition)

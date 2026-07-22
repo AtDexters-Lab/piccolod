@@ -16,6 +16,7 @@ import (
 
 	"piccolod/internal/events"
 	"piccolod/internal/health"
+	"piccolod/internal/lifecycle"
 	"piccolod/internal/persistence"
 	"piccolod/internal/remote"
 	"piccolod/internal/remote/nexusclient"
@@ -395,6 +396,8 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 	server := &GinServer{
 		remoteManager: restartedMgr,
 		healthTracker: health.NewTracker(),
+		lifecycle:     lifecycle.New(lifecycle.StateLocked),
+		unlockReady:   make(chan struct{}),
 	}
 	server.registerUnlockReloader(restartedMgr)
 	bus := events.NewBus()
@@ -407,6 +410,27 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 			Locked: false,
 		},
 	})
+
+	// Raw persistence unlock is only an intermediate observation. Wait until
+	// the server has consumed it, then prove it did not run decrypted reloaders.
+	rawDeadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(rawDeadline) {
+		if st, ok := server.healthTracker.Status("persistence"); ok && strings.Contains(st.Message, "recovery finalizing") {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if st := restartedMgr.Status(); st.Enabled || st.PortalHostname != "" {
+		t.Fatalf("raw persistence unlock released remote reloader: %+v", st)
+	}
+	if err := server.lifecycle.BeginUnlock(); err != nil {
+		t.Fatalf("BeginUnlock: %v", err)
+	}
+	server.reloadComponentsAfterUnlock()
+	if err := server.lifecycle.MarkReady(); err != nil {
+		t.Fatalf("MarkReady: %v", err)
+	}
+	server.onUnlockChainReady()
 
 	deadline := time.Now().Add(500 * time.Millisecond)
 	for time.Now().Before(deadline) {

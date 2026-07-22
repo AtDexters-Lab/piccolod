@@ -437,11 +437,18 @@ class ApiException implements Exception {
   ApiException(this.statusCode, String body)
     : rawBody = body,
       message = _extractApiErrorMessage(statusCode, body),
-      key = _extractApiErrorKey(body);
+      key = _extractApiErrorString(body, 'key'),
+      code = _extractApiErrorString(body, 'code'),
+      retryable = _extractApiErrorRetryable(body);
   final int statusCode;
   final String message;
   final String? key;
+  final String? code;
+  final bool? retryable;
   final String rawBody;
+
+  bool get isRetryableTaskPressure =>
+      statusCode == 503 && code == 'task_pressure' && (retryable ?? false);
 
   @override
   String toString() => message;
@@ -455,7 +462,8 @@ Map<String, dynamic>? _decodeApiErrorBody(String body) {
     final map = Map<String, dynamic>.from(decoded);
     final error = map['error'];
     if (error is Map) {
-      return Map<String, dynamic>.from(error);
+      return Map<String, dynamic>.from(map)
+        ..addAll(Map<String, dynamic>.from(error));
     }
     if (error is String && error.trim().isNotEmpty) {
       final normalized = Map<String, dynamic>.from(map);
@@ -480,11 +488,16 @@ String _extractApiErrorMessage(int statusCode, String body) {
   return 'Request failed ($statusCode)';
 }
 
-String? _extractApiErrorKey(String body) {
+String? _extractApiErrorString(String body, String field) {
   final decoded = _decodeApiErrorBody(body);
-  final key = decoded?['key'];
-  if (key is String && key.trim().isNotEmpty) {
-    return key.trim();
+  final value = decoded?[field];
+  if (value is String && value.trim().isNotEmpty) {
+    return value.trim();
   }
   return null;
+}
+
+bool? _extractApiErrorRetryable(String body) {
+  final retryable = _decodeApiErrorBody(body)?['retryable'];
+  return retryable is bool ? retryable : null;
 }

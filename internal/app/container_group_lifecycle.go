@@ -19,68 +19,40 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		return fmt.Errorf("start: app definition required")
 	}
 
-	// Update status to starting immediately so UI reflects progress
+	primary := primaryServiceFor(def, appInst)
+	startOrder, err := serviceStartOrder(def.Services)
+	if err != nil {
+		return err
+	}
+
+	observed := m.observeContainerGroup(ctx, runtime, appInst, def)
+	if !observed.known() {
+		return fmt.Errorf("start: container group observation unknown: %w", observed.Err)
+	}
+	if err := m.applyContainerGroupObservation(state, appInst, observed); err != nil {
+		return err
+	}
+	anchorID := observed.Anchor.ID
+
+	// Only a complete known observation may project Starting or attach rootfs.
 	m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusStarting, "Starting containers")
-
 	mode := piccoloModeFromExtensions(def.Extensions)
-
-	// Ensure all service rootfs volumes are attached before starting containers.
 	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
 	if err != nil {
 		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 		return fmt.Errorf("failed to attach rootfs: %w", err)
 	}
 
-	primary := primaryServiceFor(def, appInst)
-
-	startOrder, err := serviceStartOrder(def.Services)
-	if err != nil {
-		return err
-	}
-
-	// Resolve missing container IDs by deterministic names (best-effort).
-	changed := false
-	anchorID := strings.TrimSpace(appInst.NetworkAnchorID)
-	if anchorID == "" {
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, networkAnchorContainerName(appInst.InstanceID)); err == nil && strings.TrimSpace(id) != "" {
-			anchorID = id
-			appInst.NetworkAnchorID = id
-			changed = true
-		}
-	}
-	if anchorID == "" {
-		return fmt.Errorf("start: network anchor container missing for %s", appInst.InstanceID)
-	}
-
-	for svcName := range def.Services {
-		if strings.TrimSpace(appInst.Containers[svcName]) != "" {
-			continue
-		}
-		name := containerNameForService(appInst.InstanceID, svcName, primary)
-		if id, err := m.containerManager.ResolveContainerIDByName(ctx, runtime, name); err == nil && strings.TrimSpace(id) != "" {
-			if appInst.Containers == nil {
-				appInst.Containers = make(map[string]string)
-			}
-			appInst.Containers[svcName] = id
-			changed = true
-		}
-	}
-
-	// Persist repaired metadata before starting.
-	if changed {
-		if err := state.StoreAppMetadata(appInst); err != nil {
-			log.Printf("WARN: start %s: failed to persist repaired container IDs: %v", appInst.InstanceID, err)
-		}
-	}
-
 	// Podman may retain running metadata after the container PID has died or
 	// been reused. In that state `podman start` is a successful no-op, so manual
 	// Start must use the same strict whole-group recovery as reconciliation.
-	if anchorState, inspectErr := m.containerManager.InspectContainerState(ctx, runtime, anchorID); inspectErr != nil {
-		log.Printf("WARN: start %s: inspect anchor state failed: %v", appInst.InstanceID, inspectErr)
-	} else if anchorState.Stale {
+	if observed.Outcome == containerGroupStale || observed.Outcome == containerGroupMissing {
+		reason := "container group is authoritatively incomplete during manual start"
+		if observed.Outcome == containerGroupStale {
+			reason = "container process no longer belongs to its libpod cgroup during manual start"
+		}
 		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-			"anchor process no longer belongs to its libpod cgroup during manual start", blockNativeRootfsMap); recoverErr != nil {
+			reason, blockNativeRootfsMap); recoverErr != nil {
 			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 			return recoverErr
 		}
@@ -102,22 +74,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	}
 
 	for _, svcName := range startOrder {
-		cid := strings.TrimSpace(appInst.Containers[svcName])
-		if cid == "" {
-			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-			return fmt.Errorf("missing container ID for service '%s'", svcName)
-		}
-		if serviceState, inspectErr := m.containerManager.InspectContainerState(ctx, runtime, cid); inspectErr != nil {
-			log.Printf("WARN: start %s: inspect service %q state failed: %v", appInst.InstanceID, svcName, inspectErr)
-		} else if serviceState.Stale {
-			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
-				fmt.Sprintf("service %q process no longer belongs to its libpod cgroup during manual start", svcName), blockNativeRootfsMap); recoverErr != nil {
-				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
-				return recoverErr
-			}
-			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
-			return nil
-		}
+		cid := observed.Services[svcName].ID
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 			log.Printf("INFO: start %s: service '%s' start failed (%v), recreating",
 				appInst.InstanceID, svcName, err)
@@ -158,7 +115,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 			} else if len(ports) == 0 {
 				log.Printf("WARN: start app %s: no published ports found during restore", appInst.InstanceID)
 			} else {
-				if _, restoreErr := m.serviceManager.RestoreFromPodman(appInst.InstanceID, def.Listeners, ports); restoreErr != nil {
+				if _, restoreErr := m.serviceManager.RestoreFromPodmanContext(ctx, appInst.InstanceID, def.Listeners, ports); restoreErr != nil {
 					log.Printf("WARN: start app %s: failed to restore services: %v", appInst.InstanceID, restoreErr)
 				} else {
 					m.configureOIDCAuthorizePaths(appInst.InstanceID, def)

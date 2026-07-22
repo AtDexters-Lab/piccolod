@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -19,18 +20,19 @@ import (
 
 	"piccolod/internal/events"
 	"piccolod/internal/fsutil"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/runner"
 	"piccolod/internal/state/paths"
 )
 
 const (
-	debounceInterval  = 30 * time.Second
-	periodicInterval  = 6 * time.Hour
-	maxPCVSize        = 100 * 1024 * 1024 // 100 MiB
-	historyLimit      = 5
-	publishTimeout    = 2 * time.Minute
-	manifestVersion   = 1
-	eventBufferSize = 16
+	debounceInterval = 30 * time.Second
+	periodicInterval = 6 * time.Hour
+	maxPCVSize       = 100 * 1024 * 1024 // 100 MiB
+	historyLimit     = 5
+	publishTimeout   = 2 * time.Minute
+	manifestVersion  = 1
+	eventBufferSize  = 16
 )
 
 // Manifest describes a published PCV archive.
@@ -48,13 +50,15 @@ type Manifest struct {
 // interface with a dormant-start model: Start() enters dormant state, Activate()
 // transitions to operational.
 type Publisher struct {
-	bus    *events.Bus
-	run    runner.CommandRunner
-	nodeID string
+	bus          *events.Bus
+	run          runner.CommandRunner
+	nodeID       string
+	thaw         *controlPlaneThawCoordinator
+	copySnapshot func(string, string) error
 
-	mu        sync.Mutex
-	active    bool
-	dirty     bool
+	mu          sync.Mutex
+	active      bool
+	dirty       bool
 	counter     uint64
 	lastGen     string
 	stopCh      chan struct{}
@@ -71,9 +75,11 @@ type Publisher struct {
 // NewPublisher creates a dormant PCV publisher.
 func NewPublisher(bus *events.Bus, run runner.CommandRunner) *Publisher {
 	return &Publisher{
-		bus:    bus,
-		run:    run,
-		stopCh: make(chan struct{}),
+		bus:          bus,
+		run:          run,
+		thaw:         processControlPlaneThaw,
+		copySnapshot: copyLoopSnapshot,
+		stopCh:       make(chan struct{}),
 	}
 }
 
@@ -466,7 +472,7 @@ func (p *Publisher) buildArchive(ctx context.Context, coreRoot, snapshotFile str
 
 	// Add essential crypto and volume metadata files.
 	essentialFiles := []struct {
-		srcRel string // relative to coreRoot
+		srcRel  string // relative to coreRoot
 		tarName string
 	}{
 		{"crypto/keyset.json", "crypto/keyset.json"},
@@ -642,23 +648,44 @@ func (p *Publisher) loadPreviousManifest() {
 
 // createLoopSnapshot copies the LUKS loop file to a staging location for
 // archiving. In production, it freezes the mounted ext4 filesystem first
-// (via fsfreeze) to ensure crash consistency. In dev/test mode, it skips
-// the freeze since there is no real mount.
-func (p *Publisher) createLoopSnapshot(ctx context.Context, loopFile, snapshotFile, mountDir string) error {
+// with an in-process FIFREEZE ioctl to ensure crash consistency. In dev/test
+// mode, it skips the freeze since there is no real mount.
+func (p *Publisher) createLoopSnapshot(ctx context.Context, loopFile, snapshotFile, mountDir string) (resultErr error) {
 	if !p.devFallback {
+		storageCtx := pressure.WithWorkClass(ctx, pressure.WorkStorage)
 		// Only freeze if the filesystem is currently mounted. During flush-on-lock,
 		// the control-plane may already be unmounted — the loop file is quiescent
 		// and safe to copy without a freeze.
-		if err := p.run.Run(ctx, "mountpoint", "-q", mountDir); err == nil {
-			if err := p.run.Run(ctx, "fsfreeze", "--freeze", mountDir); err != nil {
-				return fmt.Errorf("fsfreeze --freeze: %w", err)
+		if err := p.run.Run(storageCtx, "mountpoint", "-q", mountDir); err == nil {
+			thaw := p.thaw
+			if thaw == nil {
+				thaw = processControlPlaneThaw
 			}
-			// Use context.Background for unfreeze — if the parent context is
-			// cancelled mid-copy, the filesystem must still be unfrozen.
-			defer p.run.Run(context.Background(), "fsfreeze", "--unfreeze", mountDir)
+			obligation, err := thaw.freeze(mountDir)
+			if err != nil {
+				return err
+			}
+			// The ordinary return and the process-fatal owner share this exact
+			// in-process cleanup. A Critical fence cannot reject FITHAW because no
+			// child process is required.
+			defer func() {
+				if err := obligation.thaw(); err != nil {
+					resultErr = errors.Join(resultErr, fmt.Errorf("thaw control-plane mount: %w", err))
+				}
+			}()
+		} else if pressure.IsAdmissionError(err) {
+			return err
 		}
 	}
 
+	copySnapshot := p.copySnapshot
+	if copySnapshot == nil {
+		copySnapshot = copyLoopSnapshot
+	}
+	return copySnapshot(loopFile, snapshotFile)
+}
+
+func copyLoopSnapshot(loopFile, snapshotFile string) error {
 	in, err := os.Open(loopFile)
 	if err != nil {
 		return fmt.Errorf("open loop file: %w", err)

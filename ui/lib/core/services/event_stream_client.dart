@@ -7,6 +7,7 @@ import 'package:piccolo_os/core/config/core_config.dart';
 import 'package:piccolo_os/core/models/app_status_event.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/models/resource_pressure.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 
 /// Unified event stream client that multiplexes multiple event types
@@ -22,7 +23,14 @@ import 'package:piccolo_os/core/services/websocket_connection.dart';
 class EventStreamClient extends ChangeNotifier {
 
   /// Creates an EventStreamClient that subscribes to all event topics.
-  EventStreamClient() : _connection = WebSocketConnection(_buildUrl()) {
+  EventStreamClient() : this.withConnection(WebSocketConnection(_buildUrl()));
+
+  /// Creates a client over an injected transport.
+  ///
+  /// This keeps connection/event integration tests deterministic without
+  /// changing the production transport path.
+  @visibleForTesting
+  EventStreamClient.withConnection(this._connection) {
     _connectionListener = _onConnectionStateChanged;
     _connection.addListener(_connectionListener);
   }
@@ -45,18 +53,46 @@ class EventStreamClient extends ChangeNotifier {
       StreamController<Map<String, dynamic>>.broadcast();
   final StreamController<Map<String, dynamic>> _networkStatusController =
       StreamController<Map<String, dynamic>>.broadcast();
+  final StreamController<ResourcePressure> _resourcePressureController =
+      StreamController<ResourcePressure>.broadcast();
+  final StreamController<String> _snapshotCompleteController =
+      StreamController<String>.broadcast();
 
   /// Called when a reconnect attempt indicates an auth failure (e.g. session expired).
   /// Set by the shell to trigger the re-auth overlay for passive WebSocket-only failures.
   VoidCallback? onAuthFailure;
 
+  /// Called after several failed reconnects following a previously healthy
+  /// connection. The shell uses the public boot endpoint to distinguish a
+  /// restarting backend from a backend that restarted into a locked state.
+  Future<void> Function()? onRecoveryProbeRequired;
+
   bool _isDisposed = false;
+  bool _hasConnected = false;
+  int _consecutiveReconnectFailures = 0;
+  bool _recoveryProbeInFlight = false;
+  static const _failuresBeforeRecoveryProbe = 3;
 
   /// Last received network peers event, cached for late subscribers.
   /// Broadcast streams drop events when no one is listening; widgets that
   /// mount after the initial snapshot can read this to hydrate immediately.
   NetworkPeersEvent? _lastNetworkPeersEvent;
   NetworkPeersEvent? get lastNetworkPeersEvent => _lastNetworkPeersEvent;
+  ResourcePressure? _lastTaskPressure;
+  ResourcePressure? get lastTaskPressure => _lastTaskPressure;
+  ResourcePressure? _lastGlobalRecoverySuppression;
+  ResourcePressure? get lastGlobalRecoverySuppression =>
+      _lastGlobalRecoverySuppression;
+  final Map<String, ResourcePressure> _lastRuntimePressure = {};
+  Iterable<ResourcePressure> get lastRuntimePressure =>
+      _lastRuntimePressure.values;
+  final Map<String, ListenerHealthEvent> _lastListenerHealthEvents = {};
+  Iterable<ListenerHealthEvent> get lastListenerHealthEvents =>
+      _lastListenerHealthEvents.values;
+  Map<String, dynamic>? _lastRemoteConfig;
+  Map<String, dynamic>? get lastRemoteConfig => _lastRemoteConfig;
+  final Set<String> _completedSnapshots = {};
+  Set<String> get completedSnapshots => Set.unmodifiable(_completedSnapshots);
 
   /// Stream of app status change events.
   Stream<AppStatusEvent> get appStatusEvents => _appStatusController.stream;
@@ -83,6 +119,12 @@ class EventStreamClient extends ChangeNotifier {
   Stream<Map<String, dynamic>> get networkStatusEvents =>
       _networkStatusController.stream;
 
+  Stream<ResourcePressure> get resourcePressureEvents =>
+      _resourcePressureController.stream;
+
+  Stream<String> get snapshotCompleteEvents =>
+      _snapshotCompleteController.stream;
+
   WebSocketConnectionState get state => _connection.state;
 
   static String _buildUrl() {
@@ -108,12 +150,23 @@ class EventStreamClient extends ChangeNotifier {
   }
 
   void _onConnectionStateChanged() {
+    if (_connection.state == WebSocketConnectionState.connected) {
+      _hasConnected = true;
+      _consecutiveReconnectFailures = 0;
+    }
+
     // When disconnected/error, cancel subscription for re-subscribe on reconnect
     if (_connection.state == WebSocketConnectionState.disconnected ||
         _connection.state == WebSocketConnectionState.error) {
       unawaited(_subscription?.cancel());
       _subscription = null;
       _lastNetworkPeersEvent = null;
+      _lastTaskPressure = null;
+      _lastGlobalRecoverySuppression = null;
+      _lastRuntimePressure.clear();
+      _lastListenerHealthEvents.clear();
+      _lastRemoteConfig = null;
+      _completedSnapshots.clear();
     }
 
     // Detect auth failures on reconnect (WebSocket upgrade rejected with 401).
@@ -127,6 +180,15 @@ class EventStreamClient extends ChangeNotifier {
         // Stop reconnect attempts — session is expired, not a transient failure.
         _connection.disconnect();
         onAuthFailure!();
+        notifyListeners();
+        return;
+      }
+    }
+
+    if (_connection.state == WebSocketConnectionState.error && _hasConnected) {
+      _consecutiveReconnectFailures++;
+      if (_consecutiveReconnectFailures >= _failuresBeforeRecoveryProbe) {
+        unawaited(_requestRecoveryProbe());
       }
     }
 
@@ -137,6 +199,22 @@ class EventStreamClient extends ChangeNotifier {
       _subscription = _connection.messages.listen(_handleMessage);
     }
     notifyListeners();
+  }
+
+  Future<void> _requestRecoveryProbe() async {
+    final callback = onRecoveryProbeRequired;
+    if (_isDisposed || _recoveryProbeInFlight || callback == null) return;
+
+    _recoveryProbeInFlight = true;
+    try {
+      await callback();
+    } on Object catch (e) {
+      // The event stream owns reconnecting; a failed probe must not terminate
+      // that loop or force a pre-desktop screen without a confirmed boot state.
+      debugPrint('Event stream recovery probe failed: $e');
+    } finally {
+      _recoveryProbeInFlight = false;
+    }
   }
 
   void connect() {
@@ -169,8 +247,11 @@ class EventStreamClient extends ChangeNotifier {
         case 'app_status':
           _appStatusController.add(AppStatusEvent.fromJson(payload));
         case 'listener_health':
-          _healthController.add(ListenerHealthEvent.fromJson(payload));
+          final event = ListenerHealthEvent.fromJson(payload);
+          _lastListenerHealthEvents['${event.app}:${event.listener}'] = event;
+          _healthController.add(event);
         case 'remote_config':
+          _lastRemoteConfig = payload;
           _remoteConfigController.add(payload);
         case 'certificate':
           _certificateController.add(payload);
@@ -182,6 +263,31 @@ class EventStreamClient extends ChangeNotifier {
           _identityController.add(payload);
         case 'network_status':
           _networkStatusController.add(payload);
+        case 'resource_pressure':
+          final event = ResourcePressure.fromJson(payload);
+          if (event.isTaskPressure) _lastTaskPressure = event;
+          if (event.isRuntimeUnknown) {
+            _lastRuntimePressure[event.appInstanceId] = event;
+          } else if (event.isRecoverySuppressed) {
+            if (event.appInstanceId.isEmpty) {
+              _lastGlobalRecoverySuppression = event;
+            } else {
+              _lastRuntimePressure[event.appInstanceId] = event;
+            }
+          } else if (event.isRuntimeObservation &&
+              event.severity == 'ok' &&
+              event.appInstanceId.isEmpty) {
+            _lastGlobalRecoverySuppression = null;
+          } else if (event.isRuntimeRecovered) {
+            _lastRuntimePressure.remove(event.appInstanceId);
+          }
+          _resourcePressureController.add(event);
+        case 'snapshot_complete':
+          final topic = payload['topic'];
+          if (topic is String) {
+            _completedSnapshots.add(topic);
+            _snapshotCompleteController.add(topic);
+          }
       }
     } on Object catch (e) {
       debugPrint('Event stream decode error: $e');
@@ -191,7 +297,15 @@ class EventStreamClient extends ChangeNotifier {
   @override
   void dispose() {
     _isDisposed = true;
+    onAuthFailure = null;
+    onRecoveryProbeRequired = null;
     _lastNetworkPeersEvent = null;
+    _lastTaskPressure = null;
+    _lastGlobalRecoverySuppression = null;
+    _lastRuntimePressure.clear();
+    _lastListenerHealthEvents.clear();
+    _lastRemoteConfig = null;
+    _completedSnapshots.clear();
     unawaited(_subscription?.cancel());
     _subscription = null;
     _connection
@@ -204,6 +318,8 @@ class EventStreamClient extends ChangeNotifier {
     unawaited(_networkPeersController.close());
     unawaited(_identityController.close());
     unawaited(_networkStatusController.close());
+    unawaited(_resourcePressureController.close());
+    unawaited(_snapshotCompleteController.close());
     super.dispose();
   }
 }

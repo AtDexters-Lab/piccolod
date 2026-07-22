@@ -15,6 +15,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/state/paths"
 )
 
@@ -696,6 +697,9 @@ func (m *AppManager) MakeImageSizeFn() func(ctx context.Context, imageRef string
 
 // flattenExportToDir pipes `podman export` to `tar x` for image flattening.
 func (m *AppManager) flattenExportToDir(ctx context.Context, rt container.PodmanRuntime, cid, targetDir string) error {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return err
+	}
 	pr, pw := io.Pipe()
 
 	// Build podman args with storage flags for the export command.
@@ -727,6 +731,8 @@ func (m *AppManager) flattenExportToDir(ctx context.Context, rt container.Podman
 		pw.Close()
 	}()
 
+	// This call is the sole Wait owner for the tar child; exportCmd.Run owns
+	// the Podman child from start through wait in the sibling goroutine.
 	tarErr := tarCmd.Wait()
 	pr.Close()
 	wg.Wait()

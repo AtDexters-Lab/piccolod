@@ -32,6 +32,21 @@ func TestNewManager_DefaultPending(t *testing.T) {
 	}
 }
 
+func TestManagerSetBootModeAfterStartupObservation(t *testing.T) {
+	setupTestDir(t)
+	m := NewManager(storage.BootModeUnknown)
+	m.SetBootMode(storage.BootModeInternal)
+	if got := m.BootMode(); got != storage.BootModeInternal {
+		t.Fatalf("boot mode = %s, want internal", got)
+	}
+	if m.IsRequired() || m.IsUSBBoot() {
+		t.Fatalf("internal mode remained USB onboarding: status=%v", m.StatusResponse())
+	}
+	if got := m.StatusResponse()["boot_mode"]; got != string(storage.BootModeInternal) {
+		t.Fatalf("status boot_mode = %v", got)
+	}
+}
+
 func TestNewManager_LoadExistingState(t *testing.T) {
 	dir := setupTestDir(t)
 	cfg := OnboardingConfig{State: StateTryPiccolo, BootMode: "usb"}

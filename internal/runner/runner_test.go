@@ -4,12 +4,35 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"piccolod/internal/resources/pressure"
 )
 
 func TestExecRunner_Run(t *testing.T) {
 	r := ExecRunner{}
 	if err := r.Run(context.Background(), "true"); err != nil {
 		t.Fatalf("Run true: %v", err)
+	}
+}
+
+func TestExecRunnerRejectsBeforeCommandConstructionWhenTaskFenced(t *testing.T) {
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+	err := (ExecRunner{}).Run(context.Background(), "/definitely/missing/command")
+	if !pressure.IsAdmissionError(err) {
+		t.Fatalf("Run error = %v, want task-pressure admission error", err)
+	}
+}
+
+func TestBeginLifecycleOwnerUsesExplicitWorkClass(t *testing.T) {
+	ctx := pressure.WithWorkClass(context.Background(), pressure.WorkNetworkProbe)
+	release := beginLifecycleOwner(ctx)
+	if got := pressure.CurrentLifecycleOwner(); got != "network" {
+		t.Fatalf("owner = %q, want network", got)
+	}
+	release()
+	if got := pressure.CurrentLifecycleOwner(); got != "" {
+		t.Fatalf("owner remained after release: %q", got)
 	}
 }
 

@@ -22,11 +22,24 @@ import (
 
 	"github.com/acarl005/stripansi"
 	"github.com/creack/pty"
+
+	"piccolod/internal/resources/pressure"
 )
 
 // ContainerNotFoundError indicates Podman could not find a container by the given reference.
 type ContainerNotFoundError struct {
 	Ref string
+}
+
+// InvalidOutputError identifies a successful helper execution whose output
+// cannot be used as authoritative container state. Callers must treat it as
+// unknown, never as proof that a container is absent.
+type InvalidOutputError struct {
+	Operation string
+}
+
+func (e *InvalidOutputError) Error() string {
+	return fmt.Sprintf("podman %s returned invalid output", e.Operation)
 }
 
 func (e *ContainerNotFoundError) Error() string {
@@ -165,7 +178,10 @@ var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
 
 const podmanWaitDelay = 5 * time.Second
 
-func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) *exec.Cmd {
+func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) (*exec.Cmd, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkPodman); err != nil {
+		return nil, err
+	}
 	// Validate credential presence outside test mode to catch rootful fallback bugs.
 	// Non-fatal: logs ERROR but continues. Changing podmanCmd to return (cmd, error)
 	// would require a large refactor of all callers. The ERROR log surfaces the issue
@@ -178,7 +194,7 @@ func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) *exec.Cmd 
 	cmd := exec.CommandContext(ctx, "podman", args...)
 	cmd.WaitDelay = podmanWaitDelay
 	ApplyRuntimeCredential(cmd, rt)
-	return cmd
+	return cmd, nil
 }
 
 // runPodman builds args, runs a podman subcommand, and returns combined output.
@@ -193,7 +209,10 @@ func runPodman(ctx context.Context, rt PodmanRuntime, subcmdArgs []string) ([]by
 	if err != nil {
 		return nil, err
 	}
-	cmd := podmanCmd(ctx, rt, args...)
+	cmd, err := podmanCmd(ctx, rt, args...)
+	if err != nil {
+		return nil, err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		label := subcmdArgs[0]
@@ -759,7 +778,10 @@ func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return "", err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return "", err
+	}
 	output, err := cmd.CombinedOutput()
 
 	if err != nil {
@@ -816,7 +838,10 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return checkContainerNotFound(string(output), containerID, "podman stop failed", err)
@@ -834,7 +859,10 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return checkContainerNotFound(string(output), containerID, "podman rm failed", err)
@@ -852,7 +880,10 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 	if err != nil {
 		return false, err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return false, err
+	}
 	output, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, nil
@@ -941,7 +972,11 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 	}
 
 	runCtx, cancel := context.WithCancel(ctx)
-	cmd := podmanCmd(runCtx, runtime, cmdArgs...)
+	cmd, err := podmanCmd(runCtx, runtime, cmdArgs...)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -995,7 +1030,10 @@ func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, 
 	if err != nil {
 		return false, err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return false, err
+	}
 	out, err := cmd.CombinedOutput()
 	if err == nil {
 		return true, nil
@@ -1023,7 +1061,10 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 	if err != nil {
 		return "", err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return "", err
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return "", podmanInspectError("id", err)
@@ -1031,7 +1072,7 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 
 	id := lastNonEmptyLine(string(out))
 	if id == "" || !isValidContainerID(id) {
-		return "", fmt.Errorf("podman inspect returned invalid container id for %s: %q", name, id)
+		return "", &InvalidOutputError{Operation: "inspect container id"}
 	}
 	return id, nil
 }
@@ -1056,6 +1097,10 @@ func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRun
 		return nil, err
 	}
 
+	return parseContainerListOutput(out)
+}
+
+func parseContainerListOutput(out []byte) ([]ContainerListItem, error) {
 	lines := strings.Split(string(out), "\n")
 	items := make([]ContainerListItem, 0, len(lines))
 	for _, line := range lines {
@@ -1065,15 +1110,15 @@ func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRun
 		}
 		parts := strings.SplitN(line, "\t", 2)
 		if len(parts) != 2 {
-			continue
+			return nil, &InvalidOutputError{Operation: "ps container list"}
 		}
 		id := strings.TrimSpace(parts[0])
 		name := strings.TrimSpace(parts[1])
 		if id == "" || name == "" {
-			continue
+			return nil, &InvalidOutputError{Operation: "ps container list"}
 		}
 		if !isValidContainerID(id) {
-			continue
+			return nil, &InvalidOutputError{Operation: "ps container list"}
 		}
 		// Podman may print multiple names; keep the first.
 		if idx := strings.Index(name, ","); idx >= 0 {
@@ -1103,7 +1148,10 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	if err != nil {
 		return ContainerState{}, err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return ContainerState{}, err
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return ContainerState{}, podmanInspectError("running", err)
@@ -1114,7 +1162,10 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	// Parse "running|pid" format
 	parts := strings.SplitN(result, "|", 2)
 	if len(parts) != 2 {
-		return ContainerState{}, fmt.Errorf("podman inspect returned unexpected format: %q", result)
+		return ContainerState{}, &InvalidOutputError{Operation: "inspect container state"}
+	}
+	if parts[0] != "true" && parts[0] != "false" {
+		return ContainerState{}, &InvalidOutputError{Operation: "inspect container state"}
 	}
 
 	running := parts[0] == "true"
@@ -1164,12 +1215,18 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	if err != nil {
 		return nil, err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return nil, err
+	}
 	output, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("podman port failed: %w", err)
 	}
+	return parsePublishedPortsOutput(output)
+}
 
+func parsePublishedPortsOutput(output []byte) (map[string]int, error) {
 	result := make(map[string]int)
 	scanner := bufio.NewScanner(strings.NewReader(string(output)))
 	for scanner.Scan() {
@@ -1179,19 +1236,29 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 		}
 		parts := strings.Split(line, "->")
 		if len(parts) != 2 {
-			continue
+			return nil, &InvalidOutputError{Operation: "port bindings"}
 		}
 		left := strings.TrimSpace(parts[0])  // e.g. "80/tcp" or "53/udp"
 		right := strings.TrimSpace(parts[1]) // e.g. "127.0.0.1:15001"
 		leftParts := strings.Split(left, "/")
-		guestStr := strings.TrimSpace(leftParts[0])
-		guest, _ := strconv.Atoi(guestStr)
-		hostParts := strings.Split(right, ":")
-		hostStr := hostParts[len(hostParts)-1]
-		host, _ := strconv.Atoi(strings.TrimSpace(hostStr))
-		if guest > 0 && host > 0 {
-			result[left] = host // key is "80/tcp" or "53/udp"
+		if len(leftParts) != 2 {
+			return nil, &InvalidOutputError{Operation: "port bindings"}
 		}
+		guest, guestErr := strconv.Atoi(strings.TrimSpace(leftParts[0]))
+		protocol := strings.TrimSpace(leftParts[1])
+		hostSeparator := strings.LastIndex(right, ":")
+		if guestErr != nil || guest < 1 || guest > 65535 || (protocol != "tcp" && protocol != "udp") || hostSeparator < 0 || hostSeparator == len(right)-1 {
+			return nil, &InvalidOutputError{Operation: "port bindings"}
+		}
+		host, hostErr := strconv.Atoi(strings.TrimSpace(right[hostSeparator+1:]))
+		if hostErr != nil || host < 1 || host > 65535 {
+			return nil, &InvalidOutputError{Operation: "port bindings"}
+		}
+		key := fmt.Sprintf("%d/%s", guest, protocol)
+		if existing, ok := result[key]; ok && existing != host {
+			return nil, &InvalidOutputError{Operation: "port bindings"}
+		}
+		result[key] = host
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
@@ -1246,7 +1313,10 @@ func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) err
 	if err != nil {
 		return err
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return err
+	}
 	_ = cmd.Run() // Ignore errors - containers may already be gone
 	return nil
 }
@@ -1288,7 +1358,10 @@ func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime Podman
 	if err != nil {
 		return false, fmt.Errorf("build podman args: %w", err)
 	}
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return false, err
+	}
 	output, runErr := cmd.CombinedOutput()
 	if runErr == nil {
 		return false, nil // Storage is healthy
@@ -1485,7 +1558,10 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 		return nil, err
 	}
 
-	cmd := podmanCmd(ctx, runtime, args...)
+	cmd, err := podmanCmd(ctx, runtime, args...)
+	if err != nil {
+		return nil, err
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman image inspect failed: %w, output: %s", err, string(output))
@@ -1603,7 +1679,10 @@ func (p *PodmanCLI) ExecScript(ctx context.Context, runtime PodmanRuntime, conta
 		defer cancel()
 	}
 
-	cmd := podmanCmd(execCtx, runtime, args...)
+	cmd, err := podmanCmd(execCtx, runtime, args...)
+	if err != nil {
+		return -1, "", err
+	}
 
 	// Capture stdout+stderr with a 1MB limit to prevent OOM from misbehaving scripts.
 	var buf limitedBuffer
@@ -1921,10 +2000,16 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	if err != nil {
 		return err
 	}
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkPodman); err != nil {
+		return err
+	}
 
 	// If no callback, just use regular pull
 	if callback == nil {
-		cmd := podmanCmd(ctx, runtime, args...)
+		cmd, err := podmanCmd(ctx, runtime, args...)
+		if err != nil {
+			return err
+		}
 		output, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("podman pull failed: %w, output: %s", err, string(output))

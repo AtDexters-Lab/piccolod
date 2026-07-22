@@ -21,6 +21,8 @@ const (
 	appRuntimeEnsureReady
 )
 
+var errAppRuntimeObservationUnavailable = errors.New("app runtime observation prerequisites unavailable")
+
 const (
 	// staleDriverPrefix is the storage driver whose metadata triggers cleanup
 	// when found in a graphroot. After switching from vfs to overlay, stale
@@ -81,6 +83,9 @@ func (m *AppManager) resolveAppCredential(ctx context.Context, instanceID string
 
 	cred := appUser.Credential
 	homeDir := appUser.HomeDir
+	if intent == appRuntimeObserve {
+		return cred, homeDir, nil
+	}
 	if err := container.EnsureXDGRuntimeDir(cred.Uid, cred.Gid); err != nil {
 		log.Printf("WARN: %s: failed to ensure XDG_RUNTIME_DIR for per-app user %s (uid=%d): %v", instanceID, appUser.Username, cred.Uid, err)
 	}
@@ -106,6 +111,20 @@ func (m *AppManager) resolveAppCredential(ctx context.Context, instanceID string
 	}
 
 	return cred, homeDir, nil
+}
+
+func requireObservedRuntimeDir(label, path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("%w: %s %s does not exist", errAppRuntimeObservationUnavailable, label, path)
+		}
+		return fmt.Errorf("stat %s %s: %w", label, path, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("%w: %s %s is not a directory", errAppRuntimeObservationUnavailable, label, path)
+	}
+	return nil
 }
 
 // ensureServiceRoot creates the per-app podman service root directory,
@@ -136,13 +155,25 @@ func (m *AppManager) podmanRuntimeForApp(ctx context.Context, instanceID string,
 		volID = appVolumeID(instanceID)
 	}
 
-	runRoot, err := ensurePodmanPreamble(volID)
-	if err != nil {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
-	}
-
 	if layout.PodmanRoot == "" {
 		return container.PodmanRuntime{}, fmt.Errorf("app manager: podman root missing for %s", instanceID)
+	}
+
+	var runRoot string
+	if intent == appRuntimeObserve {
+		runRoot = filepath.Join(podmanRunRootBase(), volID)
+		if err := requireObservedRuntimeDir("app podman root", layout.PodmanRoot); err != nil {
+			return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+		}
+		if err := requireObservedRuntimeDir("podman runroot", runRoot); err != nil {
+			return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+		}
+	} else {
+		var err error
+		runRoot, err = ensurePodmanPreamble(volID)
+		if err != nil {
+			return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+		}
 	}
 
 	cred, homeDir, err := m.resolveAppCredential(ctx, instanceID, layout, runRoot, intent)
@@ -153,13 +184,20 @@ func (m *AppManager) podmanRuntimeForApp(ctx context.Context, instanceID string,
 	log.Printf("INFO: podmanRuntimeForApp %s: uid=%d gid=%d root=%s",
 		instanceID, cred.Uid, cred.Gid, layout.PodmanRoot)
 
-	// Clean stale VFS storage from previous runs.
-	cleanStaleDriverStorage(layout.PodmanRoot, staleDriverPrefix)
-	cleanStaleDriverStorage(runRoot, staleDriverPrefix)
-
-	serviceRoot, err := m.ensureServiceRoot(instanceID, cred)
-	if err != nil {
-		return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+	serviceRoot := paths.PodmanJoin("apps", instanceID)
+	if intent == appRuntimeObserve {
+		if err := requireObservedRuntimeDir("service podman root", serviceRoot); err != nil {
+			return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+		}
+	} else {
+		// Mutating readiness may repair ownership and legacy driver metadata.
+		cleanStaleDriverStorage(layout.PodmanRoot, staleDriverPrefix)
+		cleanStaleDriverStorage(runRoot, staleDriverPrefix)
+		var err error
+		serviceRoot, err = m.ensureServiceRoot(instanceID, cred)
+		if err != nil {
+			return container.PodmanRuntime{}, fmt.Errorf("app manager: %w", err)
+		}
 	}
 
 	return container.PodmanRuntime{

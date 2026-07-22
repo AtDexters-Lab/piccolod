@@ -211,14 +211,17 @@ type StorageAlertEvent struct {
 
 // Pressure-event resource kinds.
 const (
-	PressureResourceMemory = "memory"
-	PressureResourceCPU    = "cpu"
-	PressureResourceDisk   = "disk"
+	PressureResourceMemory  = "memory"
+	PressureResourceCPU     = "cpu"
+	PressureResourceDisk    = "disk"
+	PressureResourceTasks   = "tasks"
+	PressureResourceRuntime = "runtime"
 )
 
 // Pressure-event severity levels.
 const (
 	PressureSeverityInfo   = "info"   // approaching threshold; advisory
+	PressureSeverityOK     = "ok"     // explicit recovered/initial snapshot
 	PressureSeverityWarn   = "warn"   // sustained pressure; user should consider action
 	PressureSeverityUrgent = "urgent" // imminent failure / protective action taken
 )
@@ -228,7 +231,7 @@ const (
 // Published by pressure-attribution components (pool guard for disk,
 // the pressure monitor for memory/CPU). See plan D-7 and D-15.
 type ResourcePressureEvent struct {
-	Resource            string   `json:"resource"`                        // memory | cpu | disk
+	Resource            string   `json:"resource"`                        // memory | cpu | disk | tasks | runtime
 	Severity            string   `json:"severity"`                        // info | warn | urgent
 	AppInstanceID       string   `json:"app_instance_id,omitempty"`       // per-app attribution; empty for global (pool-wide disk)
 	HeaviestContributor string   `json:"heaviest_contributor,omitempty"`  // service name within app (multi-service apps)
@@ -239,6 +242,9 @@ type ResourcePressureEvent struct {
 	Message             string   `json:"message,omitempty"`
 	ActionTaken         string   `json:"action_taken,omitempty"` // e.g. "workspaces_stopped", "autogrow_refused"
 	AffectedApps        []string `json:"affected_apps,omitempty"`
+	TaskCurrent         *int64   `json:"task_current,omitempty"`
+	TaskLimit           *int64   `json:"task_limit,omitempty"`
+	ReasonCode          string   `json:"reason_code,omitempty"`
 }
 
 // AppStatusChangedEvent is emitted when an app's status changes.

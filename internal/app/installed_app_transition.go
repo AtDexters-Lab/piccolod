@@ -33,15 +33,17 @@ const (
 	TransitionOperationAccessRepair          TransitionOperationKind = "access_repair"
 	TransitionOperationCleanupRetry          TransitionOperationKind = "cleanup_retry"
 	TransitionOperationMetadataRetry         TransitionOperationKind = "metadata_retry"
+	TransitionOperationRuntimeRecovery       TransitionOperationKind = "runtime_recovery"
 )
 
 type TransitionSourceKind string
 
 const (
-	TransitionSourceCurrentCommitted TransitionSourceKind = "current_committed"
-	TransitionSourceCustomRaw        TransitionSourceKind = "custom_raw"
-	TransitionSourceCatalogPending   TransitionSourceKind = "catalog_pending"
-	TransitionSourceCatalogRendered  TransitionSourceKind = "catalog_rendered"
+	TransitionSourceCurrentCommitted  TransitionSourceKind = "current_committed"
+	TransitionSourceCustomRaw         TransitionSourceKind = "custom_raw"
+	TransitionSourceCatalogPending    TransitionSourceKind = "catalog_pending"
+	TransitionSourceCatalogRendered   TransitionSourceKind = "catalog_rendered"
+	TransitionSourceAutomaticRecovery TransitionSourceKind = "automatic_recovery"
 )
 
 type TransitionPhase string
@@ -60,6 +62,10 @@ const (
 	TransitionPhaseCommitted                TransitionPhase = "committed"
 	TransitionPhaseRestoringPrevious        TransitionPhase = "restoring_previous"
 	TransitionPhaseRestoreFailed            TransitionPhase = "restore_failed"
+	TransitionPhaseRuntimeQuarantineIntent  TransitionPhase = "runtime_quarantine_intent"
+	TransitionPhaseRuntimeQuarantined       TransitionPhase = "runtime_quarantined"
+	TransitionPhaseRuntimeCleanCreated      TransitionPhase = "runtime_clean_created"
+	TransitionPhaseRuntimeGroupCommitted    TransitionPhase = "runtime_group_committed"
 )
 
 type TransitionActionKind string
@@ -286,6 +292,10 @@ type TransitionResources struct {
 	CandidatePrimaryService  string            `json:"candidate_primary_service,omitempty"`
 	CandidateNetworkAnchorID string            `json:"candidate_network_anchor_id,omitempty"`
 	CandidateContainers      map[string]string `json:"candidate_containers,omitempty"`
+	OriginalRuntimeRoot      string            `json:"original_runtime_root,omitempty"`
+	QuarantineRuntimeRoot    string            `json:"quarantine_runtime_root,omitempty"`
+	OriginalRunRoot          string            `json:"original_run_root,omitempty"`
+	QuarantineRunRoot        string            `json:"quarantine_run_root,omitempty"`
 }
 
 func transitionImageRootfsFromManifestPlan(in []ManifestUpdateImagePlanItem) []TransitionImageRootfsDecision {
@@ -357,7 +367,28 @@ func PlanInstalledAppTransition(in TransitionPlanInput) (*TransitionPlan, error)
 	if in.Mode == "" {
 		in.Mode = ModeService
 	}
-	if in.Mode != ModeService {
+	runtimeRecovery := in.OperationKind == TransitionOperationRuntimeRecovery
+	if runtimeRecovery {
+		if in.SourceKind != TransitionSourceAutomaticRecovery {
+			return nil, fmt.Errorf("%w: runtime recovery requires automatic source", ErrTransitionPlanRejected)
+		}
+		if in.Mode != ModeService && in.Mode != ModeWorkspace {
+			return nil, fmt.Errorf("%w: runtime recovery mode %s is unsupported", ErrTransitionPlanRejected, in.Mode)
+		}
+		if !in.Enabled || !in.RuntimeChanging {
+			return nil, fmt.Errorf("%w: runtime recovery requires enabled runtime-changing app", ErrTransitionPlanRejected)
+		}
+		if len(in.ImageRootfs) != 0 || in.Data != (TransitionDataPolicy{}) ||
+			!transitionAccessPolicyEmpty(in.Access) || !transitionCleanupPolicyEmpty(in.Cleanup) ||
+			len(in.RequiredConfirmations) != 0 {
+			return nil, fmt.Errorf("%w: runtime recovery cannot change data, rootfs, access, cleanup, or review policy", ErrTransitionPlanRejected)
+		}
+		for _, key := range []string{"original_runtime_root", "quarantine_runtime_root", "original_run_root", "quarantine_run_root"} {
+			if strings.TrimSpace(in.ResourceKeys[key]) == "" {
+				return nil, fmt.Errorf("%w: runtime recovery resource %s required", ErrTransitionPlanRejected, key)
+			}
+		}
+	} else if in.Mode != ModeService {
 		return nil, fmt.Errorf("%w: %s app updates are unsupported by installed app transition v2", ErrTransitionPlanRejected, in.Mode)
 	}
 	if in.RuntimeChanging && !in.Enabled {
@@ -400,6 +431,17 @@ func PlanInstalledAppTransition(in TransitionPlanInput) (*TransitionPlan, error)
 		return nil, err
 	}
 	return &normalized, nil
+}
+
+func transitionAccessPolicyEmpty(p TransitionAccessPolicy) bool {
+	return !p.PrepareRequired && p.PublicationStrategy == "" && len(p.ReservationKeys) == 0 && p.ProxyOIDCDelta == ""
+}
+
+func transitionCleanupPolicyEmpty(p TransitionCleanupPolicy) bool {
+	return len(p.StagedRootfsKeys) == 0 && len(p.SupersededRootfsKeys) == 0 &&
+		len(p.RemovedRootfsKeys) == 0 && len(p.DataSnapshotNames) == 0 &&
+		len(p.FailedLVNames) == 0 && len(p.GeneratedOIDCClientKeys) == 0 &&
+		len(p.RetainedListenerReservations) == 0
 }
 
 func transitionActionForOperation(operation TransitionOperationKind, source TransitionSourceKind) TransitionActionKind {

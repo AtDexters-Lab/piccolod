@@ -1438,6 +1438,9 @@ func (s *GinServer) handleActiveTasks(c *gin.Context) {
 }
 
 func handleAppManagerError(c *gin.Context, err error, action string) bool {
+	if writeTaskPressureError(c, err) {
+		return true
+	}
 	if errors.Is(err, app.ErrLocked) {
 		msg := fmt.Sprintf("Unable to %s while storage is locked. Unlock Piccolo to continue.", action)
 		writeGinError(c, http.StatusLocked, msg)

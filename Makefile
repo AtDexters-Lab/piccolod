@@ -87,31 +87,41 @@ service: ## Build and install/update piccolod systemd service
 	@echo '[Unit]' > piccolod.service
 	@echo 'Description=Piccolo Daemon' >> piccolod.service
 	@echo 'After=network.target' >> piccolod.service
+	@echo 'StartLimitIntervalSec=900' >> piccolod.service
+	@echo 'StartLimitBurst=3' >> piccolod.service
+	@echo 'OnFailure=piccolod-start-limit-recovery.service' >> piccolod.service
 	@echo '' >> piccolod.service
 	@echo '[Service]' >> piccolod.service
 	@echo 'Type=notify' >> piccolod.service
 	@echo 'User=root' >> piccolod.service
 	@echo 'Group=root' >> piccolod.service
 	@echo 'ExecStart=/usr/local/bin/piccolod' >> piccolod.service
+	@echo 'ExecStopPost=/usr/local/bin/piccolod --record-service-exit' >> piccolod.service
 	@echo 'Environment="PORT=$(RUN_PORT)"' >> piccolod.service
 	@echo 'Environment="PICCOLO_CORE_ROOT=/piccolo-core"' >> piccolod.service
 	@echo 'Environment="PICCOLO_DATA_ROOT=/piccolo-data"' >> piccolod.service
 	@echo 'Restart=always' >> piccolod.service
 	@echo 'RestartSec=5' >> piccolod.service
+	@echo 'TasksMax=15%' >> piccolod.service
+	@echo 'WatchdogSec=60s' >> piccolod.service
 	@echo 'TimeoutStopSec=120' >> piccolod.service
-	@echo 'KillMode=mixed' >> piccolod.service
+	@echo 'KillMode=control-group' >> piccolod.service
 	@echo 'OOMScoreAdjust=-500' >> piccolod.service
 	@echo '' >> piccolod.service
 	@echo '[Install]' >> piccolod.service
 	@echo 'WantedBy=multi-user.target' >> piccolod.service
 	@echo "==> Installing/Updating piccolod service"
+	sudo systemctl stop piccolod-start-limit-recovery.service || true
 	@if systemctl is-active --quiet piccolod; then \
 		echo "Stopping running service to update binary..."; \
 		sudo systemctl stop piccolod; \
 	fi
 	sudo cp piccolod /usr/local/bin/piccolod
+	sudo install -Dm0755 scripts/systemd/piccolod-start-limit-recovery.sh /usr/local/libexec/piccolod-start-limit-recovery
 	sudo cp piccolod.service /etc/systemd/system/piccolod.service
+	sudo install -Dm0644 scripts/systemd/piccolod-start-limit-recovery.service /etc/systemd/system/piccolod-start-limit-recovery.service
 	sudo systemctl daemon-reload
+	sudo systemctl reset-failed piccolod.service piccolod-start-limit-recovery.service
 	sudo systemctl enable piccolod
 	sudo systemctl start piccolod
 	@echo "==> Service piccolod is now running:"
@@ -125,8 +135,11 @@ service-uninstall: ## Uninstall piccolod systemd service
 		sudo systemctl stop piccolod; \
 	fi
 	sudo systemctl disable piccolod || true
+	sudo systemctl stop piccolod-start-limit-recovery.service || true
 	sudo rm -f /etc/systemd/system/piccolod.service
+	sudo rm -f /etc/systemd/system/piccolod-start-limit-recovery.service
 	sudo rm -f /usr/local/bin/piccolod
+	sudo rm -f /usr/local/libexec/piccolod-start-limit-recovery
 	sudo systemctl daemon-reload
 	@echo "==> Service piccolod uninstalled"
 

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/runner"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/lvm"
@@ -29,7 +30,6 @@ const (
 
 	// healthMonitorInterval is the interval for thin pool health checks.
 	healthMonitorInterval = 60 * time.Second
-
 )
 
 // DiskPreparer abstracts disk probing and mutation operations.
@@ -120,23 +120,43 @@ func (m *Manager) Stop(ctx context.Context) error {
 // stale-cancel race where a second call would overwrite phase1Cancel and
 // orphan the first goroutine. The goroutine is cancelled when Stop() is called.
 func (m *Manager) StartPartitioningAsync(ctx context.Context) {
+	if err := m.startPartitioning(ctx); err != nil {
+		log.Printf("INFO: storage phase 1 deferred: %v", err)
+	}
+}
+
+func (m *Manager) startPartitioning(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	m.mu.Lock()
 	if m.phase1Started {
 		m.mu.Unlock()
-		return
+		return nil
 	}
 	m.phase1Started = true
+	ctx = pressure.WithTransitionContinuation(ctx)
 	ctx, cancel := context.WithCancel(ctx)
 	m.phase1Cancel = cancel
 	m.mu.Unlock()
 	go m.runPhase1(ctx)
+	return nil
 }
 
 // EnsurePhase1 starts Phase 1 if not already started and waits for completion.
 // Callers use this instead of raw WaitForPhase1 to handle the case where
 // Phase 1 hasn't been started yet (e.g. install_disk path skips try_piccolo).
 func (m *Manager) EnsurePhase1(ctx context.Context) error {
-	m.StartPartitioningAsync(context.Background())
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
+	// Detach the long-running phase from the request lifetime without dropping
+	// durable-transition admission carried in context values.
+	if err := m.startPartitioning(context.WithoutCancel(ctx)); err != nil {
+		return err
+	}
 	return m.WaitForPhase1(ctx)
 }
 
@@ -157,6 +177,14 @@ func (m *Manager) IsPhase1Complete() bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return m.phase1Complete
+}
+
+// IsPhase1Started reports whether the post-Ready recovery pass actually
+// launched storage preparation. USB onboarding may intentionally defer it.
+func (m *Manager) IsPhase1Started() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.phase1Started
 }
 
 // IsEmergencyMode returns whether storage is in emergency mode.
@@ -182,6 +210,8 @@ func (m *Manager) EmergencyError() error {
 
 // runPhase1 executes the Phase 1 disk preparation sequence.
 func (m *Manager) runPhase1(parentCtx context.Context) {
+	releaseOwner := pressure.BeginLifecycleOwner("storage")
+	defer releaseOwner()
 	ctx, cancel := context.WithTimeout(parentCtx, phase1Timeout)
 	defer cancel()
 
@@ -322,6 +352,7 @@ type onboardingState struct {
 // was previously set up. If EITHER signal is present, we treat the device
 // as previously set up (soft emergency on failure, not hard).
 func (m *Manager) IsPreviouslySetUp(ctx context.Context) bool {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
 	// Signal 1: onboarding.json records explicit setup completion.
 	onboardingPath := paths.CoreJoin("network-bootstrap", "onboarding.json")
 	data, err := os.ReadFile(onboardingPath)
@@ -357,6 +388,10 @@ func (m *Manager) DataDevice() string {
 // partition. No pool-level LUKS — per-volume encryption is handled by M3.
 // Also creates the ephemeral podman shared thin LV with btrfs+zstd.
 func (m *Manager) InitializeDataVolume(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	if m.lvmPool == nil {
 		return nil
 	}
@@ -395,6 +430,10 @@ func (m *Manager) InitializeDataVolume(ctx context.Context) error {
 // UnlockDataVolume activates the LVM VG and thin pool. No password needed —
 // there is no pool-level LUKS. Per-volume LUKS handled in M3.
 func (m *Manager) UnlockDataVolume(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	if m.lvmPool == nil {
 		return nil
 	}
@@ -451,6 +490,10 @@ func (m *Manager) UnlockDataVolume(ctx context.Context) error {
 
 // LockDataVolume deactivates the LVM VG.
 func (m *Manager) LockDataVolume(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkStorage)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkStorage); err != nil {
+		return err
+	}
 	if m.lvmPool == nil {
 		return nil
 	}
@@ -468,4 +511,3 @@ func (m *Manager) LockDataVolume(ctx context.Context) error {
 	log.Printf("storage: LVM VG deactivated")
 	return nil
 }
-

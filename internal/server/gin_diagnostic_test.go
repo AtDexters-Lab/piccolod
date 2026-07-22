@@ -127,11 +127,14 @@ func TestNewDiagnosticPodmanImagesCommandAppliesRootlessWrapper(t *testing.T) {
 		Credential: &syscall.Credential{Uid: 475, Gid: 475},
 		HomeDir:    "/var/lib/piccolo/apps/namek/home",
 	}
-	cmd := newDiagnosticPodmanImagesCommand(
+	cmd, err := newDiagnosticPodmanImagesCommand(
 		context.Background(),
 		rt,
 		[]string{"--root", "/apps/namek/podman", "images", "--format", "{{.Repository}}:{{.Tag}}"},
 	)
+	if err != nil {
+		t.Fatalf("newDiagnosticPodmanImagesCommand: %v", err)
+	}
 
 	wantArgs := []string{
 		"/usr/bin/choom", "-n", "0", "--", "/usr/bin/podman",

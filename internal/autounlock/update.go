@@ -6,8 +6,10 @@ import (
 )
 
 // Update applies a partial update to the on-disk state. Handles the cleanup
-// transition (revoke at namek + delete on-disk blob) when going from enabled
-// to disabled. Initializes auto_reboot defaults on the first transition from
+// transition (delete the local blob + metadata only) when going from enabled
+// to disabled. The unkeyed Namek v1 revoke is intentionally not used because
+// a late revoke could erase a newer singleton-slot deposit. Initializes
+// auto_reboot defaults on the first transition from
 // disabled to enabled.
 //
 // Validates the window-hour bounds (0..23, start != end) when either is
@@ -16,8 +18,10 @@ import (
 // Caller is the HTTP PUT handler; emits AuditEnabledChanged on enabled
 // transitions and AuditAutoRebootChanged when the auto_reboot block changes.
 func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	if err := o.acquire(ctx); err != nil {
+		return err
+	}
+	defer o.release()
 
 	state, _ := LoadState() // ErrInvalidStateFile → fall through to defaults
 	prev := state
@@ -54,21 +58,23 @@ func (o *Orchestrator) Update(ctx context.Context, in UpdateInput) error {
 		return err
 	}
 
-	// Disable transition: clean up server-side escrow and on-disk blob so
-	// the next reboot cycle doesn't try to pickup against stale state. Also
+	// Disable transition: clean up the local handoff so the next reboot cycle
+	// doesn't try to pickup against stale state. The remote factor expires. Also
 	// reset the auto_reboot block (window + last_fired/failed timestamps)
 	// so a future re-enable starts from defaults — without this, an operator
 	// who toggles off-then-on retains stale fire timestamps that could
 	// suppress the next legitimate fire via rehydrate.
 	if prev.Enabled && !state.Enabled {
-		if client := o.deps.NamekClient(); client != nil {
-			if err := client.RevokeUnlockEscrow(ctx); err != nil {
-				log.Printf("WARN: autounlock: disable-cleanup revoke: %v", err)
-			}
-		}
 		if err := DeleteBlob(); err != nil {
 			log.Printf("WARN: autounlock: disable-cleanup blob: %v", err)
+			// The first save above already committed enabled=false while
+			// retaining metadata. Do not clear metadata when the raw blob could
+			// not be removed: that would make a later re-enable reinterpret the
+			// stale bytes as a legacy handoff.
+			return err
 		}
+		o.clearHandoffClaimsLocked()
+		state.Handoff = nil
 		state.AutoReboot = AutoReboot{}
 		if err := SaveState(state); err != nil {
 			log.Printf("WARN: autounlock: persist post-disable reset: %v", err)

@@ -15,22 +15,26 @@ import (
 )
 
 type MockContainerManager struct {
-	stopMu                 sync.Mutex
-	containers             map[string]*mockContainer
-	nextID                 int
-	createError            error
-	startError             error
-	startErrorForContainer map[string]error // per-container start errors (checked before global startError)
-	stopError              error
-	resolveErrorForName    map[string]error
-	removeError            error
-	removeRunningError     bool
-	removedImages          []string
-	pulledImages           []string
-	removeImageErr         error
-	reloadedContainers     []string
-	reloadErr              error
-	inspectImageHook       func(imageName string) (*container.ImageConfig, error)
+	stopMu                   sync.Mutex
+	containers               map[string]*mockContainer
+	nextID                   int
+	createError              error
+	startError               error
+	startErrorForContainer   map[string]error // per-container start errors (checked before global startError)
+	stopError                error
+	resolveErrorForName      map[string]error
+	inspectErrorForContainer map[string]error
+	listError                error
+	inspectPortsError        error
+	removeError              error
+	removeHook               func(string)
+	removeRunningError       bool
+	removedImages            []string
+	pulledImages             []string
+	removeImageErr           error
+	reloadedContainers       []string
+	reloadErr                error
+	inspectImageHook         func(imageName string) (*container.ImageConfig, error)
 }
 
 type mockContainer struct {
@@ -97,6 +101,9 @@ func (m *MockContainerManager) RemoveContainer(ctx context.Context, runtime cont
 			return fmt.Errorf("container %s is running", containerID)
 		}
 		delete(m.containers, containerID)
+		if m.removeHook != nil {
+			m.removeHook(containerID)
+		}
 		return nil
 	}
 	return container.ErrContainerNotFound(containerID)
@@ -105,6 +112,9 @@ func (m *MockContainerManager) RemoveContainer(ctx context.Context, runtime cont
 func (m *MockContainerManager) ListContainersByLabel(ctx context.Context, runtime container.PodmanRuntime, labelKey, labelValue string) ([]container.ContainerListItem, error) {
 	_ = ctx
 	_ = runtime
+	if m.listError != nil {
+		return nil, m.listError
+	}
 	out := []container.ContainerListItem{}
 	for id, c := range m.containers {
 		if c == nil || c.Spec.Labels == nil {
@@ -191,6 +201,9 @@ func (m *MockContainerManager) ResolveContainerIDByName(ctx context.Context, run
 func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtime container.PodmanRuntime, containerID string) (container.ContainerState, error) {
 	_ = ctx
 	_ = runtime
+	if err := m.inspectErrorForContainer[containerID]; err != nil {
+		return container.ContainerState{}, err
+	}
 	c, ok := m.containers[containerID]
 	if !ok {
 		return container.ContainerState{Exists: false, Running: false}, nil
@@ -202,6 +215,9 @@ func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtim
 func (m *MockContainerManager) InspectPublishedPorts(ctx context.Context, runtime container.PodmanRuntime, containerID string) (map[string]int, error) {
 	_ = ctx
 	_ = runtime
+	if m.inspectPortsError != nil {
+		return nil, m.inspectPortsError
+	}
 	c, ok := m.containers[containerID]
 	if !ok {
 		return nil, container.ErrContainerNotFound(containerID)
@@ -351,6 +367,7 @@ type stubRootfsManager struct {
 	createServiceErr   error
 	detachErr          error
 	destroyErr         error
+	attachHook         func()
 }
 
 func newStubRootfsManager(baseDir string) *stubRootfsManager {
@@ -407,6 +424,9 @@ func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string) (pe
 	os.MkdirAll(mp, 0o755)
 	if s.exists != nil {
 		s.exists[volumeID] = true
+	}
+	if s.attachHook != nil {
+		s.attachHook()
 	}
 	return persistence.RootfsHandle{VolumeID: volumeID, MountPath: mp, ReadOnly: true}, nil
 }

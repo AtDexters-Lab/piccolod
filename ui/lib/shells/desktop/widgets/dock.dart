@@ -3,7 +3,9 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/network_models.dart';
+import 'package:piccolo_os/core/models/resource_pressure.dart';
 import 'package:piccolo_os/core/models/wifi_models.dart';
+import 'package:piccolo_os/core/services/event_stream_client.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
@@ -11,34 +13,40 @@ import 'package:piccolo_os/shared/widgets/status_dot.dart';
 import 'package:piccolo_os/shells/desktop/desktop_controller.dart';
 import 'package:piccolo_os/shells/desktop/features/terminal/terminal_view.dart';
 import 'package:piccolo_os/shells/desktop/models/desktop_window.dart';
+import 'package:piccolo_os/shells/desktop/widgets/dock_health_presentation.dart';
 import 'package:piccolo_os/theme/piccolo_icons.dart';
 import 'package:piccolo_os/theme/piccolo_theme.dart';
 import 'package:pointer_interceptor/pointer_interceptor.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 class Dock extends StatelessWidget {
-
   const Dock({required this.controller, super.key});
   final DesktopController controller;
 
   // IDs of pinned apps that shouldn't appear in running windows section
-  static const Set<String> _pinnedAppIds = {'app-store', 'settings', 'terminal'};
+  static const Set<String> _pinnedAppIds = {
+    'app-store',
+    'settings',
+    'terminal',
+  };
 
   @override
   Widget build(BuildContext context) {
     final screenSize = MediaQuery.of(context).size;
 
     // Get running windows that aren't pinned apps, sorted by ID for stable order
-    final runningWindows = controller.windows
-        .where((w) => !_pinnedAppIds.contains(w.id))
-        .toList()
-      ..sort((a, b) => a.id.compareTo(b.id));
+    final runningWindows =
+        controller.windows.where((w) => !_pinnedAppIds.contains(w.id)).toList()
+          ..sort((a, b) => a.id.compareTo(b.id));
 
     return PointerInterceptor(
       intercepting: controller.hasVisibleWebWindow,
       child: Container(
         margin: const EdgeInsets.only(bottom: Spacing.md),
-        padding: const EdgeInsets.symmetric(horizontal: Spacing.base, vertical: Spacing.md),
+        padding: const EdgeInsets.symmetric(
+          horizontal: Spacing.base,
+          vertical: Spacing.md,
+        ),
         decoration: BoxDecoration(
           color: PiccoloTheme.porcelain.withValues(alpha: 0.9),
           borderRadius: BorderRadius.circular(Radii.lg),
@@ -113,14 +121,16 @@ class Dock extends StatelessWidget {
               const SizedBox(width: Spacing.base),
               _buildSeparator(),
               const SizedBox(width: Spacing.base),
-              ...runningWindows.map((window) => Padding(
-                    padding: const EdgeInsets.only(right: Spacing.md),
-                    child: _RunningWindowItem(
-                      window: window,
-                      isActive: controller.isAppActive(window.id),
-                      onTap: () => controller.focusWindow(window.id),
-                    ),
-                  )),
+              ...runningWindows.map(
+                (window) => Padding(
+                  padding: const EdgeInsets.only(right: Spacing.md),
+                  child: _RunningWindowItem(
+                    window: window,
+                    isActive: controller.isAppActive(window.id),
+                    onTap: () => controller.focusWindow(window.id),
+                  ),
+                ),
+              ),
             ],
 
             const SizedBox(width: Spacing.base),
@@ -145,7 +155,6 @@ class Dock extends StatelessWidget {
 }
 
 class _HealthIndicator extends StatefulWidget {
-
   const _HealthIndicator({required this.controller});
   final DesktopController controller;
 
@@ -154,22 +163,10 @@ class _HealthIndicator extends StatefulWidget {
 }
 
 class _HealthIndicatorState extends State<_HealthIndicator> {
-  // Map of app:listener -> health status
-  final Map<String, ListenerHealth> _healthMap = {};
-  StreamSubscription<ListenerHealthEvent>? _subscription;
-  StreamSubscription<Map<String, dynamic>>? _remoteConfigSub;
-  // Portal state from remote_config events (null = not configured).
-  String? _portalState;
-  // True between WebSocket connect and receiving health data (or grace timeout).
-  // Prevents a brief "Healthy" flash on transient reconnects when backend is down.
-  bool _pendingSnapshot = false;
-  Timer? _snapshotGrace;
-
   @override
   void initState() {
     super.initState();
     widget.controller.addListener(_onControllerChanged);
-    _subscribeToEvents();
   }
 
   @override
@@ -178,56 +175,120 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     if (oldWidget.controller != widget.controller) {
       oldWidget.controller.removeListener(_onControllerChanged);
       widget.controller.addListener(_onControllerChanged);
-      _unsubscribeFromClient();
-      _subscribeToEvents();
     }
   }
 
   void _onControllerChanged() {
-    // Re-subscribe when eventStreamClient becomes available or changes
-    final client = widget.controller.eventStreamClient;
-    if (client != null && _subscription == null) {
-      _subscribeToEvents();
-    }
-    // Trigger rebuild to reflect connection state changes
     if (mounted) setState(() {});
   }
 
-  void _subscribeToEvents() {
+  @override
+  void dispose() {
+    widget.controller.removeListener(_onControllerChanged);
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
     final client = widget.controller.eventStreamClient;
-    if (client != null) {
-      _unsubscribeFromClient();
-      client.addListener(_onClientStateChanged);
-      _subscription = client.healthEvents.listen(_handleHealthEvent);
-      _remoteConfigSub = client.remoteConfigEvents.listen(_handleRemoteConfigEvent);
+    return DockHealthIndicator(
+      key: ValueKey(client),
+      client: client,
+    );
+  }
+}
+
+/// Dock health UI backed by the unified event stream.
+///
+/// Kept independent from [DesktopController] so its connection and snapshot
+/// lifecycle can be exercised as a mounted widget.
+class DockHealthIndicator extends StatefulWidget {
+  const DockHealthIndicator({required this.client, super.key});
+
+  final EventStreamClient? client;
+
+  @override
+  State<DockHealthIndicator> createState() => _DockHealthIndicatorState();
+}
+
+class _DockHealthIndicatorState extends State<DockHealthIndicator> {
+  // Map of app:listener -> health status
+  final Map<String, ListenerHealth> _healthMap = {};
+  StreamSubscription<ListenerHealthEvent>? _subscription;
+  StreamSubscription<Map<String, dynamic>>? _remoteConfigSub;
+  StreamSubscription<ResourcePressure>? _resourcePressureSub;
+  StreamSubscription<String>? _snapshotCompleteSub;
+  // Portal state from remote_config events (null = not configured).
+  String? _portalState;
+  // True between WebSocket connect and receiving health data (or grace timeout).
+  // Prevents a brief "Healthy" flash on transient reconnects when backend is down.
+  bool _pendingSnapshot = false;
+  final Set<String> _completedSnapshots = {};
+  static const Set<String> _requiredSnapshots = {
+    'listener_health',
+    'remote_config',
+    'resource_pressure',
+  };
+
+  @override
+  void initState() {
+    super.initState();
+    _subscribeToEvents();
+  }
+
+  @override
+  void didUpdateWidget(covariant DockHealthIndicator oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    if (oldWidget.client != widget.client) {
+      _unsubscribeFromClient(oldWidget.client);
+      _subscribeToEvents();
     }
   }
 
-  void _unsubscribeFromClient() {
+  void _subscribeToEvents() {
+    final client = widget.client;
+    if (client != null) {
+      client.addListener(_onClientStateChanged);
+      _subscription = client.healthEvents.listen(_handleHealthEvent);
+      _remoteConfigSub = client.remoteConfigEvents.listen(
+        _handleRemoteConfigEvent,
+      );
+      _resourcePressureSub = client.resourcePressureEvents.listen(
+        _handleResourcePressureEvent,
+      );
+      _snapshotCompleteSub = client.snapshotCompleteEvents.listen(
+        _handleSnapshotComplete,
+      );
+      if (client.state == WebSocketConnectionState.connected) {
+        _hydrateConnectedClient(client);
+      }
+    }
+  }
+
+  void _unsubscribeFromClient(EventStreamClient? client) {
     unawaited(_subscription?.cancel());
     _subscription = null;
     unawaited(_remoteConfigSub?.cancel());
     _remoteConfigSub = null;
-    widget.controller.eventStreamClient?.removeListener(_onClientStateChanged);
+    unawaited(_resourcePressureSub?.cancel());
+    _resourcePressureSub = null;
+    unawaited(_snapshotCompleteSub?.cancel());
+    _snapshotCompleteSub = null;
+    client?.removeListener(_onClientStateChanged);
   }
 
   void _onClientStateChanged() {
     if (!mounted) return;
-    final client = widget.controller.eventStreamClient;
+    final client = widget.client;
     if (client?.state == WebSocketConnectionState.connected) {
       _healthMap.clear();
       _portalState = null;
+      _completedSnapshots.clear();
       _pendingSnapshot = true;
-      _snapshotGrace?.cancel();
-      _snapshotGrace = Timer(const Duration(seconds: 3), () {
-        if (!mounted) return;
-        if (_healthMap.isNotEmpty) {
-          setState(() => _pendingSnapshot = false);
-        }
-      });
+      _hydrateConnectedClient(client!);
     } else {
-      _snapshotGrace?.cancel();
       _pendingSnapshot = false;
+      _completedSnapshots.clear();
     }
     setState(() {});
   }
@@ -237,40 +298,63 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     setState(() {
       final key = '${event.app}:${event.listener}';
       _healthMap[key] = event.health;
-      if (_pendingSnapshot) {
-        _pendingSnapshot = false;
-        _snapshotGrace?.cancel();
-      }
     });
   }
 
   void _handleRemoteConfigEvent(Map<String, dynamic> event) {
     if (!mounted) return;
     final state = event['state'] as String?;
-    if (state != _portalState || _pendingSnapshot) {
+    if (state != _portalState) {
       setState(() {
         _portalState = state;
-        if (_pendingSnapshot) {
-          _pendingSnapshot = false;
-          _snapshotGrace?.cancel();
-        }
       });
     }
   }
 
+  void _handleResourcePressureEvent(ResourcePressure _) {
+    if (!mounted) return;
+    setState(() {});
+  }
+
+  void _handleSnapshotComplete(String topic) {
+    if (!mounted) return;
+    setState(() {
+      _completedSnapshots.add(topic);
+      _pendingSnapshot = !_requiredSnapshots.every(
+        _completedSnapshots.contains,
+      );
+    });
+  }
+
+  void _hydrateConnectedClient(EventStreamClient client) {
+    for (final event in client.lastListenerHealthEvents) {
+      _healthMap['${event.app}:${event.listener}'] = event.health;
+    }
+    final remote = client.lastRemoteConfig;
+    _portalState = remote?['state'] as String?;
+    _completedSnapshots.addAll(client.completedSnapshots);
+    _pendingSnapshot = !_requiredSnapshots.every(_completedSnapshots.contains);
+  }
+
   @override
   void dispose() {
-    _snapshotGrace?.cancel();
-    widget.controller.removeListener(_onControllerChanged);
-    _unsubscribeFromClient();
+    _unsubscribeFromClient(widget.client);
     super.dispose();
   }
 
   bool get _isConnected {
-    final client = widget.controller.eventStreamClient;
+    final client = widget.client;
     if (client == null) return false;
     return client.state == WebSocketConnectionState.connected;
   }
+
+  ResourcePressure? get _taskPressure => widget.client?.lastTaskPressure;
+
+  ResourcePressure? get _globalRecoverySuppression =>
+      widget.client?.lastGlobalRecoverySuppression;
+
+  Iterable<ResourcePressure> get _runtimePressure =>
+      widget.client?.lastRuntimePressure ?? const <ResourcePressure>[];
 
   /// Whether portal state is active enough to include in health aggregation.
   bool get _portalStateRelevant {
@@ -278,10 +362,14 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
     return s != null && s != 'disabled' && s != 'stopped';
   }
 
-  String get _aggregateStatus {
+  DockHealthLevel get _aggregateStatus {
     var hasError = false;
     var hasDegraded = false;
     var hasRecovering = false;
+
+    if (_taskPressure?.isCritical ?? false) {
+      return DockHealthLevel.recovering;
+    }
 
     for (final health in _healthMap.values) {
       if (health.isError) hasError = true;
@@ -297,60 +385,57 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
       }
     }
 
-    if (hasError) return 'error';
-    if (hasDegraded) return 'degraded';
-    if (hasRecovering) return 'recovering';
-    return 'ok';
+    if (_taskPressure?.isWarning ?? false) hasDegraded = true;
+    if (_globalRecoverySuppression != null) hasDegraded = true;
+    if (_runtimePressure.isNotEmpty) hasDegraded = true;
+
+    if (hasError) return DockHealthLevel.error;
+    if (hasDegraded) return DockHealthLevel.degraded;
+    if (hasRecovering) return DockHealthLevel.recovering;
+    return DockHealthLevel.healthy;
   }
 
   Color get _statusColor {
     if (!_isConnected || _pendingSnapshot) return PiccoloTheme.inkMuted;
     switch (_aggregateStatus) {
-      case 'error':
+      case DockHealthLevel.error:
         return PiccoloTheme.critical;
-      case 'degraded':
-      case 'recovering':
+      case DockHealthLevel.degraded:
+      case DockHealthLevel.recovering:
         return PiccoloTheme.warning;
-      default:
+      case DockHealthLevel.healthy:
         return PiccoloTheme.success;
     }
   }
 
-  String get _statusLabel {
-    if (!_isConnected || _pendingSnapshot) return 'Offline';
-    switch (_aggregateStatus) {
-      case 'error':
-        return 'Error';
-      case 'degraded':
-        return 'Degraded';
-      case 'recovering':
-        return 'Recovering';
-      default:
-        return 'Healthy';
-    }
-  }
-
-  String get _tooltipMessage {
-    if (!_isConnected) return 'Connection lost - Reconnecting...';
-    if (_pendingSnapshot) return 'Connected - Waiting for health data...';
-    switch (_aggregateStatus) {
-      case 'error':
-        return 'System Error - Check app details';
-      case 'degraded':
-        return 'System Degraded - Action may be required';
-      case 'recovering':
-        return 'System Recovering - Auto-healing in progress';
-      default:
-        return 'System Healthy';
-    }
+  DockHealthPresentation get _presentation {
+    final hasAutomaticRecoveryBackoff =
+        _globalRecoverySuppression != null ||
+        _runtimePressure.any(
+          (pressure) => pressure.isRecoverySuppressed,
+        );
+    final hasUnknownAppObservation = _runtimePressure.any(
+      (pressure) => pressure.isRuntimeUnknown,
+    );
+    return resolveDockHealthPresentation(
+      connected: _isConnected,
+      snapshotsPending: _pendingSnapshot,
+      aggregateLevel: _aggregateStatus,
+      taskCritical: _taskPressure?.isCritical ?? false,
+      taskWarning: _taskPressure?.isWarning ?? false,
+      taskMonitorUnavailable: _taskPressure?.isMonitorUnavailable ?? false,
+      automaticRecoveryBackoff: hasAutomaticRecoveryBackoff,
+      unknownAppObservation: hasUnknownAppObservation,
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     final color = _statusColor;
+    final presentation = _presentation;
 
     return Tooltip(
-      message: _tooltipMessage,
+      message: presentation.message,
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
@@ -360,7 +445,7 @@ class _HealthIndicatorState extends State<_HealthIndicator> {
         ),
         child: StatusDot(
           color: color,
-          label: _statusLabel,
+          label: presentation.label,
           labelStyle: PiccoloTheme.textTheme.labelSmall?.copyWith(
             color: PiccoloTheme.ink,
             fontWeight: FontWeight.w500,
@@ -376,7 +461,8 @@ class _NetworkStatusIndicator extends StatefulWidget {
   final DesktopController controller;
 
   @override
-  State<_NetworkStatusIndicator> createState() => _NetworkStatusIndicatorState();
+  State<_NetworkStatusIndicator> createState() =>
+      _NetworkStatusIndicatorState();
 }
 
 class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
@@ -546,7 +632,6 @@ class _NetworkStatusIndicatorState extends State<_NetworkStatusIndicator> {
 }
 
 class _RunningWindowItem extends StatelessWidget {
-
   const _RunningWindowItem({
     required this.window,
     required this.isActive,
@@ -611,7 +696,6 @@ class _RunningWindowItem extends StatelessWidget {
 }
 
 class _ProfileButton extends StatelessWidget {
-
   const _ProfileButton({required this.onLogout});
   final VoidCallback onLogout;
 
@@ -660,9 +744,10 @@ class _ProfileButton extends StatelessWidget {
 }
 
 class DockItem extends StatelessWidget {
-
   const DockItem({
-    required this.icon, required this.label, super.key,
+    required this.icon,
+    required this.label,
+    super.key,
     this.isOpen = false,
     this.isActive = false,
     this.onTap,
@@ -824,44 +909,50 @@ class _NetworkPeersIndicatorState extends State<_NetworkPeersIndicator> {
           ),
         ),
         const PopupMenuDivider(),
-        ..._peers.map((peer) => PopupMenuItem<DiscoveredPeer>(
-              value: peer.online ? peer : null,
-              enabled: peer.online,
-              child: Row(
-                children: [
-                  StatusDot(
-                    color: peer.online ? PiccoloTheme.success : PiccoloTheme.inkMuted,
-                  ),
-                  const SizedBox(width: Spacing.md),
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      mainAxisSize: MainAxisSize.min,
-                      children: [
+        ..._peers.map(
+          (peer) => PopupMenuItem<DiscoveredPeer>(
+            value: peer.online ? peer : null,
+            enabled: peer.online,
+            child: Row(
+              children: [
+                StatusDot(
+                  color: peer.online
+                      ? PiccoloTheme.success
+                      : PiccoloTheme.inkMuted,
+                ),
+                const SizedBox(width: Spacing.md),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Text(
+                        peer.displayName,
+                        style: const TextStyle(fontWeight: FontWeight.w500),
+                      ),
+                      if (peer.model != null || peer.ipv4 != null)
                         Text(
-                          peer.displayName,
-                          style: const TextStyle(fontWeight: FontWeight.w500),
+                          peer.online
+                              ? (peer.model ?? peer.ipv4 ?? '')
+                              : '(offline)',
+                          style: PiccoloTheme.textTheme.labelSmall,
                         ),
-                        if (peer.model != null || peer.ipv4 != null)
-                          Text(
-                            peer.online
-                                ? (peer.model ?? peer.ipv4 ?? '')
-                                : '(offline)',
-                            style: PiccoloTheme.textTheme.labelSmall,
-                          ),
-                      ],
-                    ),
+                    ],
                   ),
-                ],
-              ),
-            )),
+                ),
+              ],
+            ),
+          ),
+        ),
       ],
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
         decoration: BoxDecoration(
           color: PiccoloTheme.cobalt600.withValues(alpha: 0.1),
           borderRadius: BorderRadius.circular(Radii.md),
-          border: Border.all(color: PiccoloTheme.cobalt600.withValues(alpha: 0.3)),
+          border: Border.all(
+            color: PiccoloTheme.cobalt600.withValues(alpha: 0.3),
+          ),
         ),
         child: Row(
           mainAxisSize: MainAxisSize.min,

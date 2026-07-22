@@ -37,7 +37,7 @@ type Session struct {
 	scrollback *RingBuffer
 	client     *Client // nil when detached
 	closed     bool
-	doneCh     chan struct{}   // closed when PTY process exits
+	doneCh     chan struct{}  // closed when PTY process exits
 	outputWg   sync.WaitGroup // tracks outputLoop goroutine
 }
 
@@ -171,6 +171,10 @@ func (s *Session) Close(reason string) {
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
+		// outputLoop is the sole cmd.Wait owner. A concurrent close may observe
+		// closed after that loop has claimed shutdown but before it has reaped
+		// the child, so still join it here.
+		s.outputWg.Wait()
 		return
 	}
 	s.closed = true
@@ -180,10 +184,9 @@ func (s *Session) Close(reason string) {
 	s.client = nil
 	s.mu.Unlock()
 
-	// Wait for outputLoop to exit (bounded: ptmx close unblocks Read)
+	// Wait for outputLoop to exit. It closes the PTY, cancels the command
+	// context, and is the single owner of cmd.Wait.
 	s.outputWg.Wait()
-	// Reap child process (may already be waited by outputLoop; Wait is safe to call multiple times)
-	_ = s.cmd.Wait()
 
 	if c != nil {
 		c.SendSessionEnded()
@@ -192,6 +195,27 @@ func (s *Session) Close(reason string) {
 	if reason != "shell-exit" {
 		log.Printf("terminal: session %s closed (reason: %s)", s.ID, reason)
 	}
+}
+
+// closeDetachedWithoutWait initiates shutdown only when no client is attached
+// and returns without joining outputLoop/cmd.Wait. The existing output loop
+// remains the sole child reaper. This is the task-pressure shedding path; an
+// explicit manager shutdown still uses Close and joins every session.
+func (s *Session) closeDetachedWithoutWait(reason string) bool {
+	s.mu.Lock()
+	if s.closed || s.client != nil {
+		s.mu.Unlock()
+		return false
+	}
+	s.closed = true
+	_ = s.ptmx.Close()
+	s.cancel()
+	s.mu.Unlock()
+
+	if reason != "shell-exit" {
+		log.Printf("terminal: session %s close requested (reason: %s)", s.ID, reason)
+	}
+	return true
 }
 
 // Done returns a channel that is closed when the PTY process exits.

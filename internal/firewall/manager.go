@@ -1,11 +1,14 @@
 package firewall
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"os/exec"
 	"strings"
 	"sync"
+
+	"piccolod/internal/resources/pressure"
 )
 
 // Rule describes a port to open or close in the firewall.
@@ -16,8 +19,8 @@ type Rule struct {
 
 // Manager manages runtime firewalld rules for port claims.
 type Manager interface {
-	OpenPort(rule Rule) error
-	ClosePort(rule Rule) error
+	OpenPort(ctx context.Context, rule Rule) error
+	ClosePort(ctx context.Context, rule Rule) error
 }
 
 var rfc1918Subnets = []string{
@@ -50,7 +53,14 @@ func (m *FirewalldManager) richRule(rule Rule, subnet string) string {
 	)
 }
 
-func (m *FirewalldManager) applyRule(rule Rule, action string) error {
+func (m *FirewalldManager) applyRule(ctx context.Context, rule Rule, action string) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkNetworkProbe); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("network")()
 	flag := "--add-rich-rule="
 	if action == "remove" {
 		flag = "--remove-rich-rule="
@@ -67,7 +77,7 @@ func (m *FirewalldManager) applyRule(rule Rule, action string) error {
 		go func(i int, subnet string) {
 			defer wg.Done()
 			rr := m.richRule(rule, subnet)
-			cmd := exec.Command("firewall-cmd", "--zone="+m.zone, flag+rr)
+			cmd := exec.CommandContext(ctx, "firewall-cmd", "--zone="+m.zone, flag+rr)
 			out, err := cmd.CombinedOutput()
 			results[i] = result{subnet: subnet, output: strings.TrimSpace(string(out)), err: err}
 		}(i, subnet)
@@ -86,20 +96,24 @@ func (m *FirewalldManager) applyRule(rule Rule, action string) error {
 }
 
 // OpenPort adds runtime rich rules for all RFC1918 subnets.
-func (m *FirewalldManager) OpenPort(rule Rule) error { return m.applyRule(rule, "add") }
+func (m *FirewalldManager) OpenPort(ctx context.Context, rule Rule) error {
+	return m.applyRule(ctx, rule, "add")
+}
 
 // ClosePort removes runtime rich rules for all RFC1918 subnets.
-func (m *FirewalldManager) ClosePort(rule Rule) error { return m.applyRule(rule, "remove") }
+func (m *FirewalldManager) ClosePort(ctx context.Context, rule Rule) error {
+	return m.applyRule(ctx, rule, "remove")
+}
 
 // stubManager is a no-op fallback when firewall-cmd is not available.
 type stubManager struct{}
 
-func (s *stubManager) OpenPort(rule Rule) error {
+func (s *stubManager) OpenPort(_ context.Context, rule Rule) error {
 	log.Printf("INFO: firewall stub: open port %d/%s (no-op)", rule.Port, rule.Protocol)
 	return nil
 }
 
-func (s *stubManager) ClosePort(rule Rule) error {
+func (s *stubManager) ClosePort(_ context.Context, rule Rule) error {
 	log.Printf("INFO: firewall stub: close port %d/%s (no-op)", rule.Port, rule.Protocol)
 	return nil
 }

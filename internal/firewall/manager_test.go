@@ -1,18 +1,21 @@
 package firewall
 
-import "testing"
+import (
+	"context"
+	"testing"
+)
 
 func TestStubManager(t *testing.T) {
 	stub := &stubManager{}
 
 	t.Run("open_no_error", func(t *testing.T) {
-		if err := stub.OpenPort(Rule{Port: 53, Protocol: "udp"}); err != nil {
+		if err := stub.OpenPort(context.Background(), Rule{Port: 53, Protocol: "udp"}); err != nil {
 			t.Fatalf("stub OpenPort should succeed: %v", err)
 		}
 	})
 
 	t.Run("close_no_error", func(t *testing.T) {
-		if err := stub.ClosePort(Rule{Port: 53, Protocol: "udp"}); err != nil {
+		if err := stub.ClosePort(context.Background(), Rule{Port: 53, Protocol: "udp"}); err != nil {
 			t.Fatalf("stub ClosePort should succeed: %v", err)
 		}
 	})

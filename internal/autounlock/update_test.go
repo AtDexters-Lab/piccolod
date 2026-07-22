@@ -46,8 +46,8 @@ func TestUpdate_DisableTriggersCleanup(t *testing.T) {
 	if BlobExists() {
 		t.Errorf("blob retained after disable")
 	}
-	if nc.revokeCount != 1 {
-		t.Errorf("revoke not called on disable (count=%d)", nc.revokeCount)
+	if nc.revokeCount != 0 {
+		t.Errorf("legacy revoke called on disable (count=%d)", nc.revokeCount)
 	}
 	got, _ := LoadState()
 	if got.Enabled {

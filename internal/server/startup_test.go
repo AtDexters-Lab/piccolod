@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"piccolod/internal/container"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/update"
 )
@@ -35,6 +36,46 @@ func (m *blockingUpdateManager) Watch(ctx context.Context) error {
 	return ctx.Err()
 }
 
+func TestTaskPressureResumeStopsBeforeAppDrain(t *testing.T) {
+	opCtx, opCancel := context.WithCancel(context.Background())
+	srv := &GinServer{
+		opCtx:               opCtx,
+		opCancel:            opCancel,
+		taskResumeAccepting: true,
+	}
+	started := make(chan struct{})
+	finished := make(chan struct{})
+	srv.queueTaskPressureResume(func(ctx context.Context) {
+		close(started)
+		<-ctx.Done()
+		close(finished)
+	})
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("task-pressure resume did not start")
+	}
+
+	// Stop closes callback admission before canceling the operation context,
+	// then waits for the already-owned reconcile before app DRAIN.
+	srv.stopTaskPressureResumeAdmission()
+	opCancel()
+	srv.waitTaskPressureResume()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("task-pressure resume was not joined before drain")
+	}
+
+	late := make(chan struct{})
+	srv.queueTaskPressureResume(func(context.Context) { close(late) })
+	select {
+	case <-late:
+		t.Fatal("task-pressure resume started after shutdown admission closed")
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
 func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 	// Requires piccolo-runtime system user — skip in CI/dev environments.
 	if _, err := user.Lookup(container.RuntimeUsername); err != nil {
@@ -57,6 +98,10 @@ func TestServerStartup_WithBlockingWatchdog(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Failed to create server: %v", err)
 	}
+	// Production applies the optional-work fence after core construction and
+	// releases it only once the external listener has entered Accept.
+	pressure.DefaultAdmission.FenceStartup()
+	t.Cleanup(pressure.DefaultAdmission.OpenStartup)
 
 	// Capture the dynamically allocated port from the listener?
 	// Gin's Run() doesn't easily expose the listener address until it runs.

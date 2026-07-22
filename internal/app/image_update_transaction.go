@@ -566,14 +566,28 @@ func (m *AppManager) recoverPendingImageUpdates(ctx context.Context, state *File
 		if skip != nil && skip[appInst.InstanceID] {
 			continue
 		}
-		recovered, err := m.recoverPendingImageUpdateForApp(ctx, state, appInst)
-		if !recovered {
+		txn, err := state.LoadImageUpdateTransaction(appInst.InstanceID)
+		if errors.Is(err, os.ErrNotExist) {
 			continue
 		}
+		if err != nil {
+			log.Printf("ERROR: image update recovery %s: load transaction: %v", appInst.InstanceID, err)
+			m.setObservedStatus(appInst.InstanceID, StatusError)
+			blocked[appInst.InstanceID] = true
+			continue
+		}
+		recoveryCtx, admitted := admitPendingTransitionRecovery(ctx)
+		if !admitted {
+			return blocked
+		}
+		err = m.recoverOneImageUpdate(recoveryCtx, state, appInst, txn)
 		if err != nil {
 			log.Printf("ERROR: image update recovery %s: %v", appInst.InstanceID, err)
 			m.setObservedStatus(appInst.InstanceID, StatusError)
 			blocked[appInst.InstanceID] = true
+		}
+		if transitionRecoveryMustYield(recoveryCtx) {
+			return blocked
 		}
 	}
 	return blocked

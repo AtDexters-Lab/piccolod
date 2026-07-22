@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/base64"
 	"errors"
 	"io"
 	"time"
@@ -16,7 +15,7 @@ import (
 
 // TestResult is returned by RunTest. ErrorKind is one of the failure-reason
 // tokens (`service_unreachable`, `auth_failed`, etc.) when Success is false;
-// empty otherwise. LatencyMs measures the full deposit + pickup + revoke
+// empty otherwise. LatencyMs measures the full deposit + pickup
 // round-trip.
 type TestResult struct {
 	Success   bool
@@ -25,9 +24,8 @@ type TestResult struct {
 }
 
 // testWindowSeconds is the deposit window used by RunTest. Smaller than the
-// production ceremony window (600s) since the test immediately picks up and
-// revokes; using the production window would needlessly hold escrow state at
-// namek for the full TTL after a failed test.
+// production ceremony window (600s). The remote singleton factor is not
+// revoked because Namek v1 revoke is unkeyed; it expires after this short TTL.
 const testWindowSeconds = 60
 
 // ErrTestPreconditions is returned when RunTest is called from a state where
@@ -38,7 +36,7 @@ var ErrTestPreconditions = errors.New("autounlock: test preconditions not met")
 // ErrTestRateLimit is returned when RunTest is called within testRateLimit of
 // the last invocation. HTTP handler maps to 429 Too Many Requests with
 // Retry-After. Closes the "admin script clicks Test in a loop" surface that
-// would otherwise bombard namek and starve other orchestrator users on o.mu.
+// would otherwise bombard the recovery provider and starve other operations.
 var ErrTestRateLimit = errors.New("autounlock: test rate limited (≥5s between calls)")
 
 // testRateLimit is the minimum gap between successive RunTest invocations.
@@ -46,14 +44,25 @@ var ErrTestRateLimit = errors.New("autounlock: test rate limited (≥5s between 
 // over-engineering for a single-user appliance.
 const testRateLimit = 5 * time.Second
 
-// RunTest exercises the full namek round-trip without touching the on-disk
+// RunTest exercises the full provider round-trip without touching the on-disk
 // blob or the manager's SDEK. Generates a fresh random F, deposits, picks up,
-// verifies byte-equality, revokes. Validates that namek connectivity works
-// for THIS device's AK; does NOT validate the local crypto path or the
+// and verifies byte-equality. Validates that provider connectivity works for
+// THIS device; does NOT validate the local crypto path or the
 // shutdown-ceremony / boot-pickup orchestration.
 func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
-	o.mu.Lock()
-	defer o.mu.Unlock()
+	if err := o.acquire(ctx); err != nil {
+		return TestResult{}, err
+	}
+	defer o.release()
+
+	// The provider is a singleton slot in v1. Never let Test overwrite a
+	// factor that an outstanding raw blob still needs, regardless of whether
+	// its optional metadata is understood.
+	if _, err := ReadBlob(); err == nil {
+		return TestResult{}, ErrHandoffBusy
+	} else if !errors.Is(err, ErrBlobMissing) {
+		return TestResult{}, err
+	}
 
 	now := o.deps.Now()
 	if !o.lastTestAt.IsZero() && now.Sub(o.lastTestAt) < testRateLimit {
@@ -67,17 +76,24 @@ func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 	if err != nil && !errors.Is(err, ErrInvalidStateFile) {
 		return TestResult{}, err
 	}
+	if err == nil && len(state.Handoff) != 0 {
+		// Metadata without a raw blob is orphaned and cannot authorize pickup.
+		state.Handoff = nil
+		if err := SaveState(state); err != nil {
+			return TestResult{}, err
+		}
+	}
 	if !state.Enabled {
 		return TestResult{}, ErrTestPreconditions
 	}
 	if !o.deps.Manager.SDEKLoaded() {
 		return TestResult{}, ErrTestPreconditions
 	}
-	if !o.deps.IsIdentityReady() {
+	if !o.providerReady() {
 		return TestResult{}, ErrTestPreconditions
 	}
-	client := o.deps.NamekClient()
-	if client == nil {
+	binding, ok := o.configuredProvider()
+	if !ok {
 		return TestResult{}, ErrTestPreconditions
 	}
 
@@ -90,43 +106,24 @@ func (o *Orchestrator) RunTest(ctx context.Context) (TestResult, error) {
 		return TestResult{Success: false, ErrorKind: ReasonDepositFailed}, nil
 	}
 
-	if _, err := client.DepositUnlockEscrow(ctx, F, testWindowSeconds); err != nil {
+	if _, err := binding.provider.Deposit(ctx, F, testWindowSeconds*time.Second); err != nil {
 		kind := classifyTestErr(err)
 		o.emitTestRun(false, kind, start)
 		return TestResult{Success: false, ErrorKind: kind}, nil
 	}
 
-	resp, err := client.PickupUnlockEscrow(ctx)
+	got, err := binding.provider.Pickup(ctx)
 	if err != nil {
-		// Best-effort revoke since deposit succeeded but pickup didn't —
-		// don't leave orphan state at namek.
-		_ = client.RevokeUnlockEscrow(ctx)
 		kind := classifyTestErr(err)
 		o.emitTestRun(false, kind, start)
 		return TestResult{Success: false, ErrorKind: kind}, nil
 	}
 
-	got, err := base64.RawURLEncoding.DecodeString(resp.Secret)
-	if err != nil {
-		_ = client.RevokeUnlockEscrow(ctx)
-		o.emitTestRun(false, ReasonBlobCorrupt, start)
-		return TestResult{Success: false, ErrorKind: ReasonBlobCorrupt}, nil
-	}
 	defer cryptoutil.SecureZero(got)
 
 	if !bytes.Equal(F, got) {
-		_ = client.RevokeUnlockEscrow(ctx)
 		o.emitTestRun(false, ReasonBlobCorrupt, start)
 		return TestResult{Success: false, ErrorKind: ReasonBlobCorrupt}, nil
-	}
-
-	// Revoke synchronously — the test contract is "no escrow state at namek
-	// after RunTest returns." Revoke errors map to test failure since they
-	// indicate transient namek trouble worth surfacing to the user.
-	if err := client.RevokeUnlockEscrow(ctx); err != nil {
-		kind := classifyTestErr(err)
-		o.emitTestRun(false, kind, start)
-		return TestResult{Success: false, ErrorKind: kind}, nil
 	}
 
 	o.emitTestRun(true, "", start)
@@ -155,6 +152,9 @@ func classifyTestErr(err error) string {
 	}
 	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 		return ReasonServiceUnreachable
+	}
+	if errors.Is(err, ErrRecoveryFactorInvalid) {
+		return ReasonBlobCorrupt
 	}
 	// auth_failed (401/403) maps via APIError; anything else is "service
 	// unreachable" from the user's perspective.

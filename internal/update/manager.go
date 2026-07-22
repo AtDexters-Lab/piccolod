@@ -18,6 +18,7 @@ import (
 
 	"piccolod/internal/fsutil"
 	"piccolod/internal/health"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/state/paths"
 )
 
@@ -247,12 +248,14 @@ func NewManager(opts ...Option) (*Manager, error) {
 }
 
 // Status returns the current OS update status (graceful on unsupported hosts).
-func (m *Manager) Status(ctx context.Context) (Status, error) { return m.backend.Status(ctx) }
+func (m *Manager) Status(ctx context.Context) (Status, error) {
+	return m.backend.Status(pressure.WithWorkClass(ctx, pressure.WorkUpdate))
+}
 
 // SnapshotState returns the fast active/default snapshot relationship without
 // snapper/zypper/RPM enrichment.
 func (m *Manager) SnapshotState(ctx context.Context) (SnapshotState, error) {
-	return m.backend.SnapshotState(ctx)
+	return m.backend.SnapshotState(pressure.WithWorkClass(ctx, pressure.WorkUpdate))
 }
 
 // Apply, Rollback, and Reboot invalidate the status cache unconditionally on
@@ -262,34 +265,83 @@ func (m *Manager) SnapshotState(ctx context.Context) (SnapshotState, error) {
 
 // Apply triggers transactional-update dup.
 func (m *Manager) Apply(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkUpdate); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	defer m.backend.invalidateStatusCache()
 	return m.backend.Apply(ctx)
 }
 
 // Rollback sets the requested snapshot as default for next boot.
 func (m *Manager) Rollback(ctx context.Context, targetID string) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkUpdate); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	defer m.backend.invalidateStatusCache()
 	return m.backend.Rollback(ctx, targetID)
 }
 
 // Reboot validates the staged snapshot and triggers a system reboot.
 func (m *Manager) Reboot(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkUpdate); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	defer m.backend.invalidateStatusCache()
 	return m.backend.Reboot(ctx)
 }
 
 // ForceReboot triggers a system reboot without snapshot validation.
 func (m *Manager) ForceReboot(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkUpdate); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	return m.backend.ForceReboot(ctx)
 }
 
 // PowerOff triggers a system power off.
 func (m *Manager) PowerOff(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkUpdate); err != nil {
+		return err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	return m.backend.PowerOff(ctx)
 }
 
 // Watch starts a background monitoring loop to detect and recover from update failures.
 func (m *Manager) Watch(ctx context.Context) error {
+	return m.backend.Watch(pressure.WithWorkClass(ctx, pressure.WorkUpdate))
+}
+
+type initialRecoveryBackend interface {
+	RunInitialRecovery(context.Context)
+	WatchAfterInitial(context.Context) error
+}
+
+// RunInitialRecovery joins the update owner's bounded startup probes. Backends
+// without an eager recovery pass intentionally no-op.
+func (m *Manager) RunInitialRecovery(ctx context.Context) {
+	if backend, ok := m.backend.(initialRecoveryBackend); ok {
+		backend.RunInitialRecovery(pressure.WithWorkClass(ctx, pressure.WorkUpdate))
+	}
+}
+
+// WatchAfterInitial starts only steady-state update monitoring after a joined
+// task-recovery pass. It falls back to Watch for backends without split startup
+// semantics.
+func (m *Manager) WatchAfterInitial(ctx context.Context) error {
+	ctx = pressure.WithWorkClass(ctx, pressure.WorkUpdate)
+	if backend, ok := m.backend.(initialRecoveryBackend); ok {
+		return backend.WatchAfterInitial(ctx)
+	}
 	return m.backend.Watch(ctx)
 }
 
@@ -335,9 +387,6 @@ func newMicroOSBackend(opts ...Option) (*microOSBackend, error) {
 	m.loadRecoveryLedger()
 
 	m.supported = m.overrideSupport || m.detectSupported()
-
-	// Proactive cleanup of stale locks on startup
-	m.cleanupStaleState(context.Background())
 
 	return m, nil
 }
@@ -766,19 +815,64 @@ func (m *microOSBackend) PowerOff(ctx context.Context) error {
 
 // Watch runs a background loop to monitor system update status and trigger fallbacks.
 func (m *microOSBackend) Watch(ctx context.Context) error {
+	return m.watch(ctx, true)
+}
+
+// RunInitialRecovery executes the same bounded probes that normal Watch would
+// launch eagerly, but synchronously so recovery-mode owner ordering is real.
+func (m *microOSBackend) RunInitialRecovery(ctx context.Context) {
+	if !m.supported {
+		return
+	}
+	m.cleanupStaleState(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+	case <-ctx.Done():
+		return
+	}
+	m.checkAndRecover(ctx)
+	if ctx.Err() != nil {
+		return
+	}
+	m.watchSnapshots(ctx)
+}
+
+func (m *microOSBackend) WatchAfterInitial(ctx context.Context) error {
+	return m.watch(ctx, false)
+}
+
+func (m *microOSBackend) watch(ctx context.Context, runInitial bool) error {
 	if !m.supported {
 		// Just block until done if unsupported, to satisfy interface
 		<-ctx.Done()
 		return nil
 	}
+	// This probe may shell out and therefore belongs to the post-Ready update
+	// owner, not construction. Probe failure preserves the marker below.
+	if runInitial {
+		m.cleanupStaleState(ctx)
+	}
 
 	// Run an immediate check (in a goroutine to not block startup if called synchronously)
-	go func() {
-		// Small delay to let system settle
-		time.Sleep(10 * time.Second)
-		m.checkAndRecover(ctx)
-		m.watchSnapshots(ctx)
-	}()
+	if runInitial {
+		go func() {
+			// Small delay to let system settle
+			timer := time.NewTimer(10 * time.Second)
+			defer timer.Stop()
+			select {
+			case <-timer.C:
+			case <-ctx.Done():
+				return
+			}
+			m.checkAndRecover(ctx)
+			m.watchSnapshots(ctx)
+		}()
+	}
 
 	recoveryTicker := time.NewTicker(15 * time.Minute)
 	defer recoveryTicker.Stop()
@@ -1196,6 +1290,10 @@ type commandRunner interface {
 type execRunner struct{}
 
 func (execRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkClassFromContext(ctx, pressure.WorkUpdate)); err != nil {
+		return "", "", -1, err
+	}
+	defer pressure.BeginLifecycleOwner("update")()
 	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
 	code := 0
@@ -1420,6 +1518,7 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	}
 	// Persist intent immediately so we survive restarts during TU
 	m.persistState(action, targetHint, unit, -1, "started")
+	runCtx = pressure.WithTransitionContinuation(runCtx)
 	// Enforce 1h hard timeout at the systemd level to kill hung zypper processes.
 	args := []string{"--unit", unit, "--property=RuntimeMaxSec=3600"}
 	if wait {
@@ -1429,7 +1528,7 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	stdout, stderr, code, err := m.runner.Run(runCtx, "systemd-run", args...)
 	if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
 		// Best-effort: stop the transient unit to avoid a still-running TU after timeout.
-		stopCtx, cancelStop := context.WithTimeout(context.Background(), 30*time.Second)
+		stopCtx, cancelStop := context.WithTimeout(pressure.WithTransitionContinuation(context.Background()), 30*time.Second)
 		_, _, _, _ = m.runner.Run(stopCtx, "systemctl", "stop", unit)
 		cancelStop()
 		m.persistState(action, "", unit, code, "timeout")
@@ -1482,7 +1581,14 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 			unit = fields[1]
 		}
 		if unit != "" {
-			if _, _, code, _ := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", unit); code == 0 {
+			if _, _, code, probeErr := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", unit); code == 0 {
+				return true
+			} else if probeErr != nil {
+				// Admission pressure, timeout, and control-plane errors are not
+				// proof that the durable operation is stale.
+				if ctx.Err() != nil {
+					return false
+				}
 				return true
 			}
 			if ctx.Err() != nil {

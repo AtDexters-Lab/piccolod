@@ -9,6 +9,7 @@ import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/task_progress_client.dart';
 import 'package:piccolo_os/features/apps/app_detail_view.dart';
 import 'package:piccolo_os/features/apps/app_launcher.dart';
+import 'package:piccolo_os/features/apps/app_operation_lifecycle.dart';
 import 'package:piccolo_os/shared/widgets/action_progress_dialog.dart';
 import 'package:piccolo_os/shared/widgets/app_icon.dart';
 import 'package:piccolo_os/shared/widgets/uninstall_confirmation_dialog.dart';
@@ -314,6 +315,9 @@ class _StageState extends State<Stage> {
       taskType: 'start_app',
       action: (taskId) =>
           widget.controller.appService.startApp(app.name, taskId: taskId),
+      errorMessageBuilder: (error) =>
+          appOperationSubmitFailureMessage(AppOperationType.start, error) ??
+          'Starting App failed: $error',
     );
     // notifyAppsChanged triggers _loadApps via the listener
     widget.controller.notifyAppsChanged();

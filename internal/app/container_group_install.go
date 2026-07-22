@@ -14,6 +14,7 @@ import (
 	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 )
 
@@ -489,6 +490,9 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 // reference without pulling layers. Uses skopeo inspect for a lightweight
 // manifest-only fetch. Returns the digest (e.g., "sha256:abc123...").
 func resolveRemoteDigest(ctx context.Context, imageRef string) (string, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return "", err
+	}
 	cmd := exec.CommandContext(ctx, "skopeo", "inspect", "--format", "{{.Digest}}", "docker://"+imageRef)
 	out, err := cmd.Output()
 	if err != nil {

@@ -7,9 +7,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"piccolod/internal/persistence"
+	"piccolod/internal/resources/pressure"
+	statepaths "piccolod/internal/state/paths"
 )
+
+var errAppVolumeObservationUnavailable = errors.New("app volume observation prerequisites unavailable")
 
 type appVolumeLayout struct {
 	VolumeID     string
@@ -91,8 +96,12 @@ func (m *AppManager) currentVolumeManager() persistence.VolumeManager {
 }
 
 func (m *AppManager) ResizeStorage(ctx context.Context, instanceID string, sizeBytes int64) (StorageResizeResult, error) {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
 	if sizeBytes <= 0 {
 		return StorageResizeResult{}, fmt.Errorf("storage size must be positive")
+	}
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return StorageResizeResult{}, err
 	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
@@ -201,6 +210,67 @@ func (m *AppManager) ensureAppVolumeLayout(ctx context.Context, instanceID strin
 	return appVolumeLayout{
 		VolumeID:     volID,
 		MountDir:     handle.MountDir,
+		DiskDir:      diskDir,
+		PodmanRoot:   podmanRoot,
+		DataDir:      dataDir,
+		WorkspaceDir: workspaceDir,
+	}, nil
+}
+
+// observeAppVolumeLayout returns the layout only when the existing volume is
+// already attached and its datasets exist. It never creates, attaches, or
+// chmods storage; reconciliation must cross the explicit bounded readiness
+// repair boundary before calling ensureAppVolumeLayout.
+func (m *AppManager) observeAppVolumeLayout(ctx context.Context, instanceID string) (appVolumeLayout, error) {
+	volumes := m.currentVolumeManager()
+	if volumes == nil {
+		return appVolumeLayout{}, fmt.Errorf("app manager: volume manager not configured")
+	}
+
+	volID := appVolumeID(instanceID)
+	mountDir := statepaths.MountDir(volID)
+	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") == "1" {
+		// Test volume managers may intentionally use a noncanonical temp mount.
+		handle, err := volumes.EnsureVolume(ctx, persistence.VolumeRequest{
+			ID:          volID,
+			Class:       persistence.VolumeClassApplication,
+			ClusterMode: persistence.ClusterModeStateful,
+		})
+		if err != nil {
+			return appVolumeLayout{}, err
+		}
+		mountDir = handle.MountDir
+	} else if !volumes.IsAttachedAdvisory(ctx, volID) {
+		return appVolumeLayout{}, fmt.Errorf("%w: volume %s is not attached", errAppVolumeObservationUnavailable, volID)
+	}
+	if strings.TrimSpace(mountDir) == "" {
+		return appVolumeLayout{}, fmt.Errorf("%w: volume %s mount dir unavailable", errAppVolumeObservationUnavailable, volID)
+	}
+
+	diskDir := filepath.Join(mountDir, "disk")
+	podmanRoot := filepath.Join(diskDir, "podman")
+	dataDir := filepath.Join(mountDir, "data")
+	workspaceDir := filepath.Join(diskDir, "workspace")
+	for label, path := range map[string]string{
+		"mount":       mountDir,
+		"podman root": podmanRoot,
+		"data":        dataDir,
+	} {
+		info, err := os.Stat(path)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return appVolumeLayout{}, fmt.Errorf("%w: %s path %s does not exist", errAppVolumeObservationUnavailable, label, path)
+			}
+			return appVolumeLayout{}, fmt.Errorf("observe %s path %s: %w", label, path, err)
+		}
+		if !info.IsDir() {
+			return appVolumeLayout{}, fmt.Errorf("%w: %s path %s is not a directory", errAppVolumeObservationUnavailable, label, path)
+		}
+	}
+
+	return appVolumeLayout{
+		VolumeID:     volID,
+		MountDir:     mountDir,
 		DiskDir:      diskDir,
 		PodmanRoot:   podmanRoot,
 		DataDir:      dataDir,

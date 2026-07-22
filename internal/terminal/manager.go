@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/resources/pressure"
 )
 
 const (
@@ -45,6 +46,7 @@ type Manager struct {
 	wg             sync.WaitGroup
 	eventBus       *events.Bus
 	eventCancel    func()
+	admission      *pressure.AdmissionGate
 }
 
 // ManagerOption configures a Manager.
@@ -65,6 +67,10 @@ func WithMaxSessions(max int) ManagerOption {
 	return func(m *Manager) { m.maxSessions = max }
 }
 
+func WithAdmissionGate(gate *pressure.AdmissionGate) ManagerOption {
+	return func(m *Manager) { m.admission = gate }
+}
+
 // NewManager creates a new session manager.
 func NewManager(opts ...ManagerOption) *Manager {
 	m := &Manager{
@@ -73,6 +79,7 @@ func NewManager(opts ...ManagerOption) *Manager {
 		scrollbackSize: DefaultScrollbackSize,
 		maxSessions:    DefaultMaxSessions,
 		stopCh:         make(chan struct{}),
+		admission:      pressure.DefaultAdmission,
 	}
 	for _, opt := range opts {
 		opt(m)
@@ -129,6 +136,13 @@ func (m *Manager) SetEventBus(bus *events.Bus) {
 // Create creates a new persistent terminal session.
 // Uses slot reservation to prevent TOCTOU races on maxSessions.
 func (m *Manager) Create(kind SessionKind, appName string, cmdFactory CmdFactory) (*Session, error) {
+	return m.CreateContext(context.Background(), kind, appName, cmdFactory)
+}
+
+func (m *Manager) CreateContext(ctx context.Context, kind SessionKind, appName string, cmdFactory CmdFactory) (*Session, error) {
+	if err := m.admission.Check(ctx, pressure.WorkTerminal); err != nil {
+		return nil, err
+	}
 	id, err := generateID()
 	if err != nil {
 		return nil, fmt.Errorf("generate session ID: %w", err)
@@ -157,6 +171,12 @@ func (m *Manager) Create(kind SessionKind, appName string, cmdFactory CmdFactory
 	if err != nil {
 		return nil, fmt.Errorf("create command: %w", err)
 	}
+	// The factory may perform observation before returning the command. Recheck
+	// immediately at the actual PTY child boundary so a concurrent fence cannot
+	// admit a new shell from a stale decision.
+	if err := m.admission.Check(ctx, pressure.WorkTerminal); err != nil {
+		return nil, err
+	}
 
 	sess, err := NewSession(id, kind, appName, cmd, m.scrollbackSize)
 	if err != nil {
@@ -179,6 +199,30 @@ func (m *Manager) Create(kind SessionKind, appName string, cmdFactory CmdFactory
 	}()
 
 	return sess, nil
+}
+
+// CloseDetached sheds only sessions without an attached client. Active
+// sessions retain their existing owner until Critical or normal completion.
+func (m *Manager) CloseDetached() {
+	m.mu.Lock()
+	for id, session := range m.sessions {
+		if session != nil && session.closeDetachedWithoutWait("task-pressure") {
+			delete(m.sessions, id)
+		}
+	}
+	m.mu.Unlock()
+}
+
+func (m *Manager) Count() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	count := 0
+	for _, session := range m.sessions {
+		if session != nil {
+			count++
+		}
+	}
+	return count
 }
 
 // Get retrieves a session by ID. Returns false for nil placeholders.

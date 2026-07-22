@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"piccolod/internal/events"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/lvm"
 )
@@ -28,15 +29,15 @@ func exitError(code int) *exec.ExitError {
 
 // fakeDiskPreparer implements DiskPreparer for testing.
 type fakeDiskPreparer struct {
-	coreExists         bool
-	partitionState     *PartitionState
-	partitionStateErr  error
-	createPartitionDev string
+	coreExists          bool
+	partitionState      *PartitionState
+	partitionStateErr   error
+	createPartitionDev  string
 	createPartitionSlot int
-	createPartitionErr error
-	expandErr          error
-	expandDataErr      error
-	ensureDirsErr      error
+	createPartitionErr  error
+	expandErr           error
+	expandDataErr       error
+	ensureDirsErr       error
 
 	createCalls     int
 	expandCalls     int
@@ -251,9 +252,9 @@ func TestManager_Phase1_ExpandRoot(t *testing.T) {
 	prep := &fakeDiskPreparer{
 		coreExists: true,
 		partitionState: &PartitionState{
-			Disk:              "/dev/sda",
-			RootPartition:     "/dev/sda2",
-			DataPartition:     "/dev/sda3",
+			Disk:               "/dev/sda",
+			RootPartition:      "/dev/sda2",
+			DataPartition:      "/dev/sda3",
 			RootNeedsExpansion: true,
 		},
 	}
@@ -363,10 +364,10 @@ func TestManager_Phase1_RetryOnFailure(t *testing.T) {
 		verifyCoreExists: func(ctx context.Context, p string) bool { return true },
 		getPartitionState: func(ctx context.Context) (*PartitionState, error) {
 			return &PartitionState{
-				Disk:              "/dev/sda",
-				RootPartition:     "/dev/sda2",
+				Disk:               "/dev/sda",
+				RootPartition:      "/dev/sda2",
 				RootNeedsExpansion: true,
-				DataPartition:     "/dev/sda3",
+				DataPartition:      "/dev/sda3",
 			}, nil
 		},
 		expandRoot: func(ctx context.Context, disk string, root string) error {
@@ -683,6 +684,31 @@ func TestEnsurePhase1_StartsIfNotStarted(t *testing.T) {
 	}
 	if !mgr.IsPhase1Complete() {
 		t.Error("expected phase 1 complete after EnsurePhase1")
+	}
+}
+
+func TestEnsurePhase1PreservesDurableContinuationWhenDetachingRequest(t *testing.T) {
+	paths.SetRootsForTest(t)
+	bus := events.NewBus()
+	defer bus.Close()
+	prep := &fakeDiskPreparer{
+		coreExists: true,
+		partitionState: &PartitionState{
+			Disk:          "/dev/sda",
+			RootPartition: "/dev/sda2",
+			DataPartition: "/dev/sda3",
+		},
+	}
+	mgr := NewManager(prep, bus, nil)
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+	ctx := pressure.WithTransitionContinuation(context.Background())
+	if err := mgr.EnsurePhase1(ctx); err != nil {
+		t.Fatalf("durable continuation was dropped: %v", err)
+	}
+	if !mgr.IsPhase1Complete() {
+		t.Fatal("durable continuation did not complete phase 1")
 	}
 }
 

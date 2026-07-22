@@ -26,9 +26,12 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Tracks the server-side persistent session ID.
   /// Null means no session exists yet (will be created on connect).
   String? _terminalSessionId;
+  String? _terminalCreationError;
 
   static const _clipboardHint =
       '\r\n\x1b[33mClipboard unavailable. Browsers block copy/paste on insecure origins.\x1b[0m\r\n';
+  static const terminalTaskPressureMessage =
+      'Terminal is temporarily unavailable while Piccolo is under heavy load. Try again shortly.';
 
   /// Returns the REST path for creating a new persistent session.
   /// Example: '/api/v1/terminal/sessions'
@@ -42,6 +45,10 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
   /// Subclasses can override to close window/navigate away.
   void Function()? getOnSessionEnd() => null;
 
+  @visibleForTesting
+  Future<Object?> createTerminalSession() =>
+      ApiClient().post(getSessionCreatePath());
+
   /// Initialize terminal components. Call in initState().
   void initTerminal() {
     terminal = Terminal(maxLines: 10000);
@@ -54,7 +61,7 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     // Create a new server-side session if we don't have one
     if (_terminalSessionId == null) {
       try {
-        final result = await ApiClient().post(getSessionCreatePath());
+        final result = await createTerminalSession();
         // Guard against widget disposal during async gap
         if (!mounted) return;
         if (result is Map && result.containsKey('id')) {
@@ -65,7 +72,13 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
         }
       } on Object catch (e) {
         if (!mounted) return;
-        terminal.write('\r\n\x1b[31mFailed to create terminal session: $e\x1b[0m\r\n');
+        if (e is ApiException && e.isRetryableTaskPressure) {
+          setState(() => _terminalCreationError = terminalTaskPressureMessage);
+          return;
+        }
+        terminal.write(
+          '\r\n\x1b[31mFailed to create terminal session: $e\x1b[0m\r\n',
+        );
         return;
       }
     }
@@ -102,6 +115,9 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
     if (!mounted) return;
     terminalBackend?.dispose();
     terminalBackend = null;
+    if (_terminalCreationError != null) {
+      setState(() => _terminalCreationError = null);
+    }
     unawaited(connectTerminal());
   }
 
@@ -203,42 +219,74 @@ mixin TerminalWidgetMixin<T extends StatefulWidget> on State<T> {
       child: RepaintBoundary(
         child: ColoredBox(
           color: PiccoloTheme.terminalBg,
-          child: SizedBox.expand(
-            child: Scrollbar(
-              controller: terminalScrollController,
-              thumbVisibility: true,
-              child: CallbackShortcuts(
-                bindings: {
-                  // Ctrl+Shift+C - explicit copy (Linux terminal convention)
-                  const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
-                      copyTerminalSelection,
-                  // Ctrl+Shift+V - explicit paste (Linux terminal convention)
-                  const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
-                      pasteToTerminal,
-                  // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
-                  const SingleActivator(LogicalKeyboardKey.keyC, control: true):
-                      _handleCopyShortcut,
-                  // Cmd+C on macOS
-                  const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
-                      _handleCopyShortcut,
-                  // Cmd+V on macOS
-                  const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
-                      pasteToTerminal,
-                },
-                child: TerminalView(
-                  terminal,
-                  controller: terminalController,
-                  scrollController: terminalScrollController,
-                  textStyle: const TerminalStyle(
-                    fontFamily: 'JetBrainsMono',
+          child: Stack(
+            children: [
+              SizedBox.expand(
+                child: Scrollbar(
+                  controller: terminalScrollController,
+                  thumbVisibility: true,
+                  child: CallbackShortcuts(
+                    bindings: {
+                      // Ctrl+Shift+C - explicit copy (Linux terminal convention)
+                      const SingleActivator(LogicalKeyboardKey.keyC, control: true, shift: true):
+                          copyTerminalSelection,
+                      // Ctrl+Shift+V - explicit paste (Linux terminal convention)
+                      const SingleActivator(LogicalKeyboardKey.keyV, control: true, shift: true):
+                          pasteToTerminal,
+                      // Ctrl+C on Linux/Windows - intercept to handle copy vs SIGINT
+                      const SingleActivator(LogicalKeyboardKey.keyC, control: true):
+                          _handleCopyShortcut,
+                      // Cmd+C on macOS
+                      const SingleActivator(LogicalKeyboardKey.keyC, meta: true):
+                          _handleCopyShortcut,
+                      // Cmd+V on macOS
+                      const SingleActivator(LogicalKeyboardKey.keyV, meta: true):
+                          pasteToTerminal,
+                    },
+                    child: TerminalView(
+                      terminal,
+                      controller: terminalController,
+                      scrollController: terminalScrollController,
+                      textStyle: const TerminalStyle(
+                        fontFamily: 'JetBrainsMono',
+                      ),
+                      padding: const EdgeInsets.all(Spacing.md),
+                      autofocus: true,
+                      onSecondaryTapDown: (details, cell) =>
+                          showTerminalContextMenu(context, details.globalPosition),
+                    ),
                   ),
-                  padding: const EdgeInsets.all(Spacing.md),
-                  autofocus: true,
-                  onSecondaryTapDown: (details, cell) =>
-                      showTerminalContextMenu(context, details.globalPosition),
                 ),
               ),
-            ),
+              if (_terminalCreationError case final error?)
+                Positioned.fill(
+                  child: ColoredBox(
+                    color: PiccoloTheme.terminalBg,
+                    child: Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(Spacing.xl),
+                        child: Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Text(
+                              error,
+                              textAlign: TextAlign.center,
+                              style: PiccoloTheme.textTheme.bodyLarge?.copyWith(
+                                color: PiccoloTheme.porcelain,
+                              ),
+                            ),
+                            const SizedBox(height: Spacing.base),
+                            FilledButton(
+                              onPressed: reconnectTerminal,
+                              child: const Text('Retry'),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+            ],
           ),
         ),
       ),

@@ -1,26 +1,42 @@
 import 'dart:async';
 import 'dart:convert';
 
+import 'package:flutter/foundation.dart';
 import 'package:piccolo_os/core/services/websocket_connection.dart';
 import 'package:xterm/xterm.dart';
 
 class PiccoloTerminalBackend {
 
   PiccoloTerminalBackend(
+    Terminal terminal,
+    String url, {
+    void Function()? onSessionEnd,
+    void Function()? onSessionLost,
+  }) : this.withConnection(
+         terminal,
+         url,
+         WebSocketConnection(
+           url,
+           onReconnectScheduled: (delay) {
+             terminal.write(
+               '\r\n\x1b[33mReconnecting in ${delay.inSeconds}s...\x1b[0m\r\n',
+             );
+           },
+           onSessionEnd: onSessionEnd,
+         ),
+         onSessionEnd: onSessionEnd,
+         onSessionLost: onSessionLost,
+       );
+
+  @visibleForTesting
+  PiccoloTerminalBackend.withConnection(
     this.terminal,
-    this.url, {
+    this.url,
+    WebSocketConnection connection, {
     this.onSessionEnd,
     this.onSessionLost,
   }) {
-    _connection = WebSocketConnection(
-      url,
-      onReconnectScheduled: (delay) {
-        terminal.write(
-          '\r\n\x1b[33mReconnecting in ${delay.inSeconds}s...\x1b[0m\r\n',
-        );
-      },
-      onSessionEnd: onSessionEnd,
-    );
+    _connection = connection;
     _connectionListener = _handleConnectionUpdate;
     _connection.addListener(_connectionListener);
   }

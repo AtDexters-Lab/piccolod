@@ -172,6 +172,21 @@ func makeFakeVolume(id, slot1ID, slot2ID string) keyslotVolume {
 	}
 }
 
+func TestKeyslotReconcilerInitialPassDoneAndStartIdempotent(t *testing.T) {
+	paths.SetRootsForTest(t)
+	r := NewKeyslotReconciler(KeyslotReconcilerOptions{})
+	ctx, cancel := context.WithCancel(context.Background())
+	r.Start(ctx)
+	r.Start(ctx)
+	select {
+	case <-r.InitialPassDone():
+	case <-time.After(time.Second):
+		t.Fatal("initial pass did not complete")
+	}
+	cancel()
+	r.Stop()
+}
+
 // Convergence on a clean run: 3 volumes at mixed states (pre-RFC empty,
 // unprovisioned, stale fingerprint, current fingerprint) — all converge
 // to live id with correct kill/add semantics surfaced via the call log.
@@ -183,10 +198,10 @@ func TestReconciler_SlotConvergence(t *testing.T) {
 	const oldID = "deadbeefdeadbeef"
 	vm := &fakeReconcilerVM{
 		volumes: []keyslotVolume{
-			makeFakeVolume("v1", "", ""),                                     // pre-RFC
-			makeFakeVolume("v2", "", KeyslotKeyIDUnprovisioned),              // unprovisioned slot 2
-			makeFakeVolume("v3", "", oldID),                                  // stale fingerprint
-			makeFakeVolume("v4", "", liveID),                                 // already converged — skip
+			makeFakeVolume("v1", "", ""),                        // pre-RFC
+			makeFakeVolume("v2", "", KeyslotKeyIDUnprovisioned), // unprovisioned slot 2
+			makeFakeVolume("v3", "", oldID),                     // stale fingerprint
+			makeFakeVolume("v4", "", liveID),                    // already converged — skip
 		},
 	}
 

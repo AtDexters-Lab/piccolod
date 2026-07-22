@@ -13,30 +13,34 @@ import (
 
 	"piccolod/internal/events"
 	"piccolod/internal/network"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 )
 
 // Supported event stream topics
 const (
-	topicAppStatus      = "app_status"
-	topicListenerHealth = "listener_health"
-	topicRemoteConfig   = "remote_config"
-	topicCertificate    = "certificate"
-	topicNetworkPeers   = "network_peers"
-	topicIdentity       = "identity"
-	topicNetworkStatus  = "network_status"
-	topicStorageAlert   = "storage_alert"
+	topicAppStatus        = "app_status"
+	topicListenerHealth   = "listener_health"
+	topicRemoteConfig     = "remote_config"
+	topicCertificate      = "certificate"
+	topicNetworkPeers     = "network_peers"
+	topicIdentity         = "identity"
+	topicNetworkStatus    = "network_status"
+	topicStorageAlert     = "storage_alert"
+	topicResourcePressure = "resource_pressure"
+	topicSnapshotComplete = "snapshot_complete"
 )
 
 var supportedTopics = map[string][]events.Topic{
-	topicAppStatus:      {events.TopicAppStatusChanged},
-	topicListenerHealth: {events.TopicListenerHealthChanged},
-	topicRemoteConfig:   {events.TopicRemoteConfigChanged},
-	topicCertificate:    {events.TopicCertificateChanged},
-	topicNetworkPeers:   {events.TopicNetworkPeersChanged},
-	topicIdentity:       {events.TopicIdentityChanged},
-	topicNetworkStatus:  {events.TopicNetworkTransition, events.TopicWiFiSignalChanged},
-	topicStorageAlert:   {events.TopicStorageAlert},
+	topicAppStatus:        {events.TopicAppStatusChanged},
+	topicListenerHealth:   {events.TopicListenerHealthChanged},
+	topicRemoteConfig:     {events.TopicRemoteConfigChanged},
+	topicCertificate:      {events.TopicCertificateChanged},
+	topicNetworkPeers:     {events.TopicNetworkPeersChanged},
+	topicIdentity:         {events.TopicIdentityChanged},
+	topicNetworkStatus:    {events.TopicNetworkTransition, events.TopicWiFiSignalChanged},
+	topicStorageAlert:     {events.TopicStorageAlert},
+	topicResourcePressure: {events.TopicResourcePressure},
 }
 
 type streamMessage struct {
@@ -50,7 +54,7 @@ type streamMessage struct {
 // Query parameters:
 //   - topics: (optional) comma-separated list of topics to subscribe to.
 //     Supported: app_status, listener_health, remote_config, certificate,
-//     network_peers, identity, network_status, storage_alert
+//     network_peers, identity, network_status, storage_alert, resource_pressure
 //     If omitted, subscribes to all topics.
 //     network_peers is automatically stripped for remote clients (via Nexus proxy).
 //     network_status requires admin plus LAN or same-public-IP access.
@@ -65,6 +69,7 @@ type streamMessage struct {
 //	{ "type": "identity", "payload": IdentityStatusPayload }
 //	{ "type": "network_status", "payload": network.NetworkStatus }
 //	{ "type": "storage_alert", "payload": events.StorageAlertEvent }
+//	{ "type": "resource_pressure", "payload": events.ResourcePressureEvent }
 //
 // Keep-alive uses WebSocket Ping frames (not application-level messages).
 //
@@ -223,7 +228,16 @@ func (s *GinServer) handleGinEventStream(c *gin.Context) {
 	if requestedTopics[topicNetworkStatus] {
 		s.sendInitialNetworkStatus(sendJSON)
 	}
+	if requestedTopics[topicResourcePressure] {
+		s.sendInitialResourcePressure(isAppAllowed, sendJSON)
+	}
 	// Certificate topic doesn't need initial snapshot (included in remote_config)
+	for topicName := range requestedTopics {
+		_ = sendJSON(streamMessage{
+			Type:    topicSnapshotComplete,
+			Payload: map[string]string{"topic": topicName},
+		})
+	}
 
 	// Merge all subscription channels
 	eventCh := make(chan struct {
@@ -362,8 +376,55 @@ func (s *GinServer) processEvent(topic string, evt events.Event, isAppAllowed fu
 			payload.AffectedApps = nil
 		}
 		return &streamMessage{Type: topicStorageAlert, Payload: payload}
+
+	case topicResourcePressure:
+		payload, ok := evt.Payload.(events.ResourcePressureEvent)
+		if !ok {
+			return nil
+		}
+		if payload.AppInstanceID != "" && !isAppAllowed(payload.AppInstanceID) {
+			return nil
+		}
+		return &streamMessage{Type: topicResourcePressure, Payload: payload}
 	}
 	return nil
+}
+
+func (s *GinServer) sendInitialResourcePressure(isAppAllowed func(string) bool, sendJSON func(any) error) {
+	snapshot := s.TaskPressureSnapshot()
+	payload := events.ResourcePressureEvent{
+		Resource:    events.PressureResourceTasks,
+		Severity:    events.PressureSeverityOK,
+		ReasonCode:  snapshot.ReasonCode,
+		ActionTaken: snapshot.ActionTaken,
+	}
+	if snapshot.CurrentKnown {
+		current := snapshot.Current
+		payload.TaskCurrent = &current
+	}
+	if snapshot.LimitKnown {
+		limit := snapshot.Limit
+		payload.TaskLimit = &limit
+	}
+	switch snapshot.State {
+	case pressure.TaskPressureWarning, pressure.TaskPressureUnavailable:
+		payload.Severity = events.PressureSeverityWarn
+	case pressure.TaskPressureCritical:
+		payload.Severity = events.PressureSeverityUrgent
+	}
+	_ = sendJSON(streamMessage{Type: topicResourcePressure, Payload: payload})
+	if recoveryPayload := s.taskRecoveryGlobalPressureSnapshot(); recoveryPayload != nil {
+		_ = sendJSON(streamMessage{Type: topicResourcePressure, Payload: *recoveryPayload})
+	}
+	if s.appManager == nil {
+		return
+	}
+	for _, runtimePayload := range s.appManager.RuntimeObservationPressureSnapshot() {
+		if runtimePayload.AppInstanceID != "" && !isAppAllowed(runtimePayload.AppInstanceID) {
+			continue
+		}
+		_ = sendJSON(streamMessage{Type: topicResourcePressure, Payload: runtimePayload})
+	}
 }
 
 func (s *GinServer) sendInitialNetworkStatus(sendJSON func(any) error) {

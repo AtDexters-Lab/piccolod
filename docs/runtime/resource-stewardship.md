@@ -199,6 +199,30 @@ tick. See
 [`20260718-per-app-runtime-oom-session-recovery-amendment.md`](../rfc/20260718-per-app-runtime-oom-session-recovery-amendment.md)
 for the lifecycle contract and release requirements.
 
+## Piccolod task-pressure boundary
+
+`piccolod.service` also has a finite task budget (`TasksMax=15%`). Piccolod
+reads its cgroup-v2 `pids.current`, `pids.max`, and `pids.events` files without
+spawning a helper. At 50% sustained usage it reports Degraded and fences new
+child-producing work; below 40% for two samples it reopens admission. At 75%,
+on a new `pids.events:max`, or after 60 seconds of sustained Warning, it writes
+a bounded volatile recovery marker and exits for systemd to replace the whole
+service cgroup.
+
+The production service policy is `Restart=always`, `RestartSec=5s`,
+`WatchdogSec=60s`, `KillMode=control-group`, and unlimited restart attempts.
+Development processes that deliberately run outside that finite production
+cgroup may set `PICCOLO_DISABLE_TASK_GUARD=1`; production packages must not.
+This is an access-plane recovery contract, not permission to raise the task
+limit or to classify failed Podman observation as container absence. During an
+incomplete observation Piccolod retains last-known app state and routes. A
+persistent failure may quarantine only the affected app's replaceable Podman
+metadata after task pressure is Normal, PID 1 proves its app user cgroup empty,
+and shared runtime/rootfs checks veto a global failure.
+
+The service watchdog is systemd's userspace `WatchdogSec`; it does not enable
+the hardware `RuntimeWatchdogSec` disabled on affected Intel systems.
+
 ## Catalog-author guide: picking priority + profile
 
 **Priority:**

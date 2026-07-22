@@ -15,7 +15,7 @@ import (
 // --- Host terminal session handlers ---
 
 func (s *GinServer) handleCreateHostTerminalSession(c *gin.Context) {
-	sess, err := s.terminalManager.Create(terminal.SessionKindHost, "", func() (*exec.Cmd, error) {
+	sess, err := s.terminalManager.CreateContext(c.Request.Context(), terminal.SessionKindHost, "", func() (*exec.Cmd, error) {
 		cmd := exec.Command(getShell())
 		cmd.WaitDelay = 5 * time.Second
 		cmd.Env = append(os.Environ(), "TERM=xterm-256color")
@@ -23,6 +23,9 @@ func (s *GinServer) handleCreateHostTerminalSession(c *gin.Context) {
 	})
 	if err != nil {
 		log.Printf("terminal: create host session failed: %v", err)
+		if writeTaskPressureError(c, err) {
+			return
+		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}
@@ -62,11 +65,14 @@ func (s *GinServer) handleCreateWorkspaceTerminalSession(c *gin.Context) {
 	// resulting *exec.Cmd will be wrapped with a fresh context by NewSession
 	// so the PTY outlives this HTTP request.
 	reqCtx := c.Request.Context()
-	sess, err := s.terminalManager.Create(terminal.SessionKindContainer, appName, func() (*exec.Cmd, error) {
+	sess, err := s.terminalManager.CreateContext(c.Request.Context(), terminal.SessionKindContainer, appName, func() (*exec.Cmd, error) {
 		return s.appManager.ExecShellCmdForService(reqCtx, appName, service)
 	})
 	if err != nil {
 		log.Printf("terminal: create workspace session failed for %s: %v", appName, err)
+		if writeTaskPressureError(c, err) {
+			return
+		}
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": err.Error()})
 		return
 	}

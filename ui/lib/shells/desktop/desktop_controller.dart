@@ -144,12 +144,19 @@ class DesktopController extends ChangeNotifier {
 
   void _onAuthRequired() {
     if (_showReauth || _needsSetup || _bootCheckInProgress) return;
-    unawaited(_handleAuthRequired());
+    unawaited(_handleAuthRequired(transitionToSetupOnProbeFailure: true));
+  }
+
+  Future<void> _onEventStreamRecoveryProbeRequired() async {
+    if (_showReauth || _needsSetup || _bootCheckInProgress) return;
+    await _handleAuthRequired(transitionToSetupOnProbeFailure: false);
   }
 
   /// Checks boot state to decide whether the device is locked (needs unlock
   /// via SetupWizard) or just session-expired (needs ReauthOverlay).
-  Future<void> _handleAuthRequired() async {
+  Future<void> _handleAuthRequired({
+    required bool transitionToSetupOnProbeFailure,
+  }) async {
     _bootCheckInProgress = true;
     try {
       final boot = await ApiClient()
@@ -181,8 +188,15 @@ class DesktopController extends ChangeNotifier {
       }
     } on Object catch (e) {
       debugPrint('Boot check during reauth failed: $e');
-      // Backend may still be restarting. SetupWizard has error + retry UI.
-      _transitionToSetupWizard();
+      if (transitionToSetupOnProbeFailure) {
+        // An explicit HTTP 401 still needs a visible recovery surface if its
+        // confirming probe fails.
+        _transitionToSetupWizard();
+      }
+      // A passive event-stream probe can race the daemon restart. Without a
+      // confirmed boot state, retain the desktop's last-known state and let
+      // the event stream continue reconnecting; the dock already shows it as
+      // Offline.
     } finally {
       _bootCheckInProgress = false;
     }
@@ -264,7 +278,9 @@ class DesktopController extends ChangeNotifier {
 
     // Connect event stream
     _eventStreamClient ??= EventStreamClient();
-    _eventStreamClient!.onAuthFailure = _onAuthRequired;
+    _eventStreamClient!
+      ..onAuthFailure = _onAuthRequired
+      ..onRecoveryProbeRequired = _onEventStreamRecoveryProbeRequired;
     _eventStreamClient!.connect();
 
     notifyListeners();

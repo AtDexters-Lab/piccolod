@@ -1,4 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
+import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/features/apps/app_operation_lifecycle.dart';
 
 void main() {
@@ -74,6 +75,56 @@ void main() {
       expect(settlement.keepTracking, isTrue);
       expect(settlement.detailAction, AppOperationDetailAction.none);
       expect(settlement.isTerminal, isFalse);
+    });
+
+    test('typed task-pressure start rejection closes tracking promptly', () {
+      final error = ApiException(
+        503,
+        '{"error":"busy","code":"task_pressure","retryable":true}',
+      );
+
+      expect(
+        classifyAppOperationSubmitFailure(AppOperationType.start, error),
+        AppOperationOutcome.submitRejected,
+      );
+      expect(
+        appOperationSubmitFailureMessage(AppOperationType.start, error),
+        manualAppStartTaskPressureMessage,
+      );
+
+      final settlement = settleAppOperationSubmitFailure(
+        AppOperationType.start,
+        error,
+        hasProgress: true,
+      );
+      expect(settlement.clearActiveOperation, isTrue);
+      expect(settlement.clearRecentSubmission, isTrue);
+      expect(settlement.closeProgressDialog, isTrue);
+      expect(settlement.keepTracking, isFalse);
+    });
+
+    test('generic 503 start failure remains ambiguous', () {
+      final error = ApiException(503, '{"error":"service unavailable"}');
+      final typedStartOnlyError = ApiException(
+        503,
+        '{"error":"busy","code":"task_pressure","retryable":true}',
+      );
+
+      expect(
+        classifyAppOperationSubmitFailure(AppOperationType.start, error),
+        AppOperationOutcome.submitUnclear,
+      );
+      expect(
+        classifyAppOperationSubmitFailure(
+          AppOperationType.stop,
+          typedStartOnlyError,
+        ),
+        AppOperationOutcome.submitUnclear,
+      );
+      expect(
+        appOperationSubmitFailureMessage(AppOperationType.start, error),
+        isNull,
+      );
     });
 
     test('http success completion respects operation semantics', () {

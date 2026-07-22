@@ -188,6 +188,9 @@ func (m *AppManager) reconcilePartialRollback(ctx context.Context, state *Filesy
 
 	// Do not consult the possibly-missing app LV or rootless Podman store: PID 1
 	// owns the authoritative process-absence proof at this recovery boundary.
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(instanceID)
+	}
 	if err := m.quiesceAppUserSession(ctx, instanceID); err != nil {
 		return false, fmt.Errorf("quiesce user session before rollback recovery: %w", err)
 	}

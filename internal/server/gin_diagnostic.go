@@ -13,6 +13,7 @@ import (
 
 	"piccolod/internal/container"
 	"piccolod/internal/logutil"
+	"piccolod/internal/resources/pressure"
 )
 
 const (
@@ -29,6 +30,16 @@ const (
 // Optional ?from=YYYY-MM-DD&to=YYYY-MM-DD narrows to a date range (max 7 days).
 // Default (no params): current boot, 50k line cap.
 func (s *GinServer) handleDiagnosticLog(c *gin.Context) {
+	if err := pressure.DefaultAdmission.Check(c.Request.Context(), pressure.WorkDiagnostic); err != nil {
+		writeTaskPressureError(c, err)
+		return
+	}
+	releaseCapacity, admitted := s.acquireChildDiagnostic()
+	if !admitted {
+		writeChildCapacityError(c, "diagnostics")
+		return
+	}
+	defer releaseCapacity()
 	var args []string
 
 	fromStr, toStr := c.Query("from"), c.Query("to")
@@ -174,6 +185,16 @@ func (s *GinServer) handleNetworkCheck(c *gin.Context) {
 // Runs a quick podman command to test if overlay storage initialization works.
 // Creates an ephemeral podman root and runs `podman images` against it.
 func (s *GinServer) handleStorageCheck(c *gin.Context) {
+	if err := pressure.DefaultAdmission.Check(c.Request.Context(), pressure.WorkDiagnostic); err != nil {
+		writeTaskPressureError(c, err)
+		return
+	}
+	releaseCapacity, admitted := s.acquireChildDiagnostic()
+	if !admitted {
+		writeChildCapacityError(c, "diagnostics")
+		return
+	}
+	defer releaseCapacity()
 	if s.appManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "app manager not ready"})
 		return
@@ -218,7 +239,11 @@ func (s *GinServer) handleStorageCheck(c *gin.Context) {
 	}
 	imagesArgs = append(imagesArgs, "images", "--format", "{{.Repository}}:{{.Tag}}")
 
-	cmd := newDiagnosticPodmanImagesCommand(ctx, ephRT, imagesArgs)
+	cmd, err := newDiagnosticPodmanImagesCommand(ctx, ephRT, imagesArgs)
+	if err != nil {
+		writeTaskPressureError(c, err)
+		return
+	}
 	out, cmdErr := cmd.CombinedOutput()
 	r := checkResult{
 		Name:    "podman_images",
@@ -238,15 +263,21 @@ func newDiagnosticPodmanImagesCommand(
 	ctx context.Context,
 	rt container.PodmanRuntime,
 	args []string,
-) *exec.Cmd {
+) (*exec.Cmd, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkDiagnostic); err != nil {
+		return nil, err
+	}
 	cmd := exec.CommandContext(ctx, "podman", args...)
 	container.ApplyRuntimeCredential(cmd, rt)
-	return cmd
+	return cmd, nil
 }
 
 // fetchRedactedJournal runs journalctl with the given extra args and applies redaction.
 // Returns full system journal (no unit filter) for comprehensive diagnostics.
 func fetchRedactedJournal(ctx context.Context, extraArgs ...string) ([]byte, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkDiagnostic); err != nil {
+		return nil, err
+	}
 	args := []string{"--no-pager", "-o", "short-iso"}
 	args = append(args, extraArgs...)
 

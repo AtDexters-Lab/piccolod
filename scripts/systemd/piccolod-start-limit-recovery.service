@@ -1,0 +1,10 @@
+[Unit]
+Description=Recover after repeated Piccolod start failures
+ConditionPathExists=/usr/lib/systemd/system/health-checker.service
+After=health-checker.service
+FailureAction=reboot
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/piccolod-start-limit-recovery
+TimeoutStartSec=5min 15s

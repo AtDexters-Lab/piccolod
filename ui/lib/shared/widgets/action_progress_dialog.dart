@@ -16,6 +16,7 @@ Future<bool> runWithProgressDialog({
   required String title,
   required String taskType,
   required Future<void> Function(String taskId) action,
+  String Function(Object error)? errorMessageBuilder,
 }) async {
   final taskId = generateTaskId();
   final progressDone = Completer<void>();
@@ -58,7 +59,11 @@ Future<bool> runWithProgressDialog({
 
   if (error != null) {
     messenger.showSnackBar(
-      SnackBar(content: Text('$title failed: $error')),
+      SnackBar(
+        content: Text(
+          errorMessageBuilder?.call(error) ?? '$title failed: $error',
+        ),
+      ),
     );
     return false;
   }

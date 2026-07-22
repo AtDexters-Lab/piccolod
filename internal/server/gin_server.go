@@ -94,6 +94,11 @@ type osUpdateManager interface {
 	Watch(context.Context) error
 }
 
+type recoveryUpdateManager interface {
+	RunInitialRecovery(context.Context)
+	WatchAfterInitial(context.Context) error
+}
+
 // GinServer holds all the core components for our application using Gin framework.
 type GinServer struct {
 	appManager     *app.AppManager
@@ -105,15 +110,20 @@ type GinServer struct {
 	router         *gin.Engine
 	version        string
 	events         *events.Bus
-	progress       *events.BusProgressReporter
-	leadership     *cluster.Registry
-	supervisor     *supervisor.Supervisor
-	dispatcher     *commands.Dispatcher
-	routeManager   *router.Manager
-	tlsMux         *services.TlsMux
-	tunnelAuth     *tunnelauth.Service
-	remoteResolver *serviceRemoteResolver
-	httpSrv        *http.Server
+	// decryptedEvents is the lifecycle-filtered view consumed by app/catalog
+	// owners. Raw persistence unlock events never enter this bus.
+	decryptedEvents *events.Bus
+	progress        *events.BusProgressReporter
+	leadership      *cluster.Registry
+	supervisor      *supervisor.Supervisor
+	dispatcher      *commands.Dispatcher
+	routeManager    *router.Manager
+	tlsMux          *services.TlsMux
+	tunnelAuth      *tunnelauth.Service
+	remoteResolver  *serviceRemoteResolver
+	httpSrv         *http.Server
+	unlockReady     chan struct{}
+	unlockReadyOnce sync.Once
 
 	secureSrv      *http.Server
 	secureListener net.Listener
@@ -148,13 +158,19 @@ type GinServer struct {
 	setupMu sync.Mutex
 
 	// Crypto manager for lock/unlock of app data volumes
-	cryptoManager  *crypt.Manager
-	storageMgr     *storage.Manager
-	pcvPublisher   *pcv.Publisher
-	pcvImporter    *pcv.Importer
-	healthTracker  *health.Tracker
-	updateManager  osUpdateManager
-	catalogManager *catalog.Manager
+	cryptoManager      *crypt.Manager
+	storageMgr         *storage.Manager
+	pcvPublisher       *pcv.Publisher
+	pcvImporter        *pcv.Importer
+	healthTracker      *health.Tracker
+	taskGuard          *pressure.TaskGuard
+	taskCriticalCommit func(pressure.TaskSnapshot) bool
+	taskCensus         chan<- pressure.TaskCensus
+	taskRecoveryStart  func(context.Context, *GinServer)
+	taskGuardDisabled  bool
+	childCapacity      childRequestCapacity
+	updateManager      osUpdateManager
+	catalogManager     *catalog.Manager
 
 	// Keyslot reconciler — drains slot-1 (admin password) and slot-2
 	// (recovery mnemonic) passphrase blobs across all v3 LUKS volumes
@@ -175,6 +191,13 @@ type GinServer struct {
 	// Phase 0 calls this BEFORE invoking RunCeremony so a slow pickup (e.g.,
 	// mid-namek-HTTP) returns promptly and releases the orchestrator mutex.
 	autounlockPickupCancel context.CancelFunc
+
+	// Automatic pickup and manual unlock share this one process-local complete-
+	// unlock owner. Main pre-registers the non-blocking fatal callback.
+	unlockExecutionMu      sync.Mutex
+	unlockExecution        *unlockExecutionCoordinator
+	unlockFatalRecovery    func()
+	decryptedOwnersStarted atomic.Bool
 
 	// timezoneMgr wraps timedatectl set-timezone + /etc/localtime readback.
 	// Used by the X-Browser-Timezone middleware (one-shot capture from the
@@ -216,7 +239,8 @@ type GinServer struct {
 	terminalManager *terminal.Manager
 
 	// Network manager (WiFi uplink + watchdog)
-	networkManager *network.Manager
+	networkManager    *network.Manager
+	networkSupervisor *network.Supervisor
 
 	// Namek identity service (RFC 20260312)
 	identityService *identity.Service
@@ -244,6 +268,44 @@ type GinServer struct {
 	// lifetime while remaining visible to graceful shutdown.
 	opCtx    context.Context
 	opCancel context.CancelFunc
+
+	// Task-pressure recovery reconciliation is an optional mutating owner. Stop
+	// closes admission before DRAIN, cancels any in-flight pass through opCtx,
+	// and waits for it before app quiescence begins.
+	taskResumeMu        sync.Mutex
+	taskResumeWG        sync.WaitGroup
+	taskResumeAccepting bool
+	taskResumeQueued    bool
+
+	// The process-level recovery controller owns ordering and retry policy. The
+	// server owns only capability execution and makes app steady-state startup
+	// idempotent while per-app startup attempts remain explicitly serialized.
+	taskRecoveryAppsMu          sync.Mutex
+	taskRecoveryPendingApps     map[string]struct{}
+	taskRecoveryPressureMu      sync.RWMutex
+	taskRecoveryGlobalPressure  *events.ResourcePressureEvent
+	taskRecoveryAppSteadyOnce   sync.Once
+	taskRecoveryUpdateWatchOnce sync.Once
+	taskRecoverySchedulerOnce   sync.Once
+}
+
+// acceptReadyListener closes accepting immediately before the HTTP server
+// enters its first kernel Accept. Binding alone is not sufficient readiness
+// proof for Piccolod because this listener is the appliance's only access
+// plane.
+type acceptReadyListener struct {
+	net.Listener
+	once      sync.Once
+	accepting chan struct{}
+}
+
+func newAcceptReadyListener(listener net.Listener) *acceptReadyListener {
+	return &acceptReadyListener{Listener: listener, accepting: make(chan struct{})}
+}
+
+func (l *acceptReadyListener) Accept() (net.Conn, error) {
+	l.once.Do(func() { close(l.accepting) })
+	return l.Listener.Accept()
 }
 
 // serverContext returns the server-scoped operation context, falling back to
@@ -253,6 +315,41 @@ func (s *GinServer) serverContext() context.Context {
 		return s.opCtx
 	}
 	return context.Background()
+}
+
+func (s *GinServer) queueTaskPressureResume(reconcile func(context.Context)) {
+	if reconcile == nil {
+		return
+	}
+	s.taskResumeMu.Lock()
+	ctx := s.serverContext()
+	if !s.taskResumeAccepting || s.taskResumeQueued || ctx.Err() != nil {
+		s.taskResumeMu.Unlock()
+		return
+	}
+	s.taskResumeQueued = true
+	s.taskResumeWG.Add(1)
+	s.taskResumeMu.Unlock()
+
+	go func() {
+		defer func() {
+			s.taskResumeMu.Lock()
+			s.taskResumeQueued = false
+			s.taskResumeMu.Unlock()
+			s.taskResumeWG.Done()
+		}()
+		reconcile(ctx)
+	}()
+}
+
+func (s *GinServer) stopTaskPressureResumeAdmission() {
+	s.taskResumeMu.Lock()
+	s.taskResumeAccepting = false
+	s.taskResumeMu.Unlock()
+}
+
+func (s *GinServer) waitTaskPressureResume() {
+	s.taskResumeWG.Wait()
 }
 
 // opContext returns a context for state-mutating operations that survives HTTP
@@ -757,8 +854,58 @@ func WithUpdateManager(m osUpdateManager) GinServerOption {
 	}
 }
 
+// WithTaskEmergencyOwner connects the constant-size task guard to the
+// process-level first-wins fatal owner in cmd/piccolod. commitCritical must be
+// synchronous and non-blocking.
+func WithTaskEmergencyOwner(commitCritical func(pressure.TaskSnapshot) bool, census chan<- pressure.TaskCensus) GinServerOption {
+	return func(s *GinServer) {
+		s.taskCriticalCommit = commitCritical
+		s.taskCensus = census
+	}
+}
+
+// WithTaskRecoveryStart installs the cmd-owned recovery runner. In recovery
+// mode Start invokes this callback after the sole access listener is accepting
+// instead of entering the normal bulk optional-owner path. A non-nil callback
+// is the sole recovery-mode authority.
+func WithTaskRecoveryStart(start func(context.Context, *GinServer)) GinServerOption {
+	return func(s *GinServer) {
+		s.taskRecoveryStart = start
+	}
+}
+
+// WithTaskGuardDisabled is an explicit development/test escape hatch for
+// processes that do not run inside the finite production systemd cgroup.
+// Production callers must leave the guard enabled and satisfy the image policy.
+func WithTaskGuardDisabled(disabled bool) GinServerOption {
+	return func(s *GinServer) {
+		s.taskGuardDisabled = disabled
+	}
+}
+
+// WithUnlockFatalRecovery registers the process-level owner signalled when the
+// complete-unlock body exceeds its independent liveness bound. The callback
+// owns marker advancement and bounded process exit; server code never exits.
+func WithUnlockFatalRecovery(callback func()) GinServerOption {
+	return func(s *GinServer) {
+		s.unlockFatalRecovery = callback
+	}
+}
+
 // NewGinServer creates the main server application using Gin and initializes all its components.
 func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
+	// A missing or malformed task monitor must not prevent construction of the
+	// appliance's sole access plane. The admission gate permits monitor-
+	// unavailable child work only inside this synchronous core window; genuine
+	// Warning and Critical pressure remain fenced.
+	pressure.DefaultAdmission.BeginCoreStartup()
+	defer pressure.DefaultAdmission.EndCoreStartup()
+
+	preconfigured := &GinServer{}
+	for _, opt := range opts {
+		opt(preconfigured)
+	}
+
 	// Create Podman CLI for app management
 	podmanCLI := &container.PodmanCLI{}
 
@@ -775,6 +922,49 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		return nil, fmt.Errorf("crypto manager init: %w", err)
 	}
 	healthTracker := health.NewTracker()
+	var serverRef atomic.Pointer[GinServer]
+	taskGuard := pressure.NewTaskGuard(pressure.TaskGuardConfig{
+		Disabled:       preconfigured.taskGuardDisabled,
+		Admission:      pressure.DefaultAdmission,
+		Health:         healthTracker,
+		Bus:            eventsBus,
+		CommitCritical: preconfigured.taskCriticalCommit,
+		Census:         preconfigured.taskCensus,
+		CloseDetached: func() {
+			if srv := serverRef.Load(); srv != nil && srv.terminalManager != nil {
+				srv.terminalManager.CloseDetached()
+			}
+		},
+		OnNormal: func() {
+			srv := serverRef.Load()
+			if srv == nil || srv.appManager == nil {
+				return
+			}
+			srv.queueTaskPressureResume(srv.appManager.ReconcileOnce)
+		},
+		SessionCount: func() int {
+			if srv := serverRef.Load(); srv != nil && srv.terminalManager != nil {
+				return srv.terminalManager.Count()
+			}
+			return 0
+		},
+		LifecycleOwner: pressure.CurrentLifecycleOwner,
+	})
+	// Sample synchronously before any constructor-owned child probe. The
+	// supervisor reuses this already-running component and stops it last.
+	taskGuard.SampleNow()
+	if err := taskGuard.Start(context.Background()); err != nil {
+		return nil, fmt.Errorf("start task guard: %w", err)
+	}
+	constructionComplete := false
+	defer func() {
+		if !constructionComplete {
+			stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			_ = taskGuard.Stop(stopCtx)
+		}
+	}()
+	sup.Register(taskGuard)
 
 	// Wire key material changed callback to emit control store commit event.
 	// This signals the PCV publisher (Phase 7) to re-snapshot after key rotations.
@@ -802,13 +992,9 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	var nbdSrv *nbd.Server
 	var drbdMgr *drbd.ResourceManager
 
-	// Initialize onboarding manager (detects boot mode for USB onboarding flow).
-	bootMode, bootErr := storage.DetectBootMode(context.Background(), execRunner)
-	if bootErr != nil {
-		log.Printf("WARN: boot mode detection failed during init: %v", bootErr)
-		bootMode = storage.BootModeUnknown
-	}
-	onboardingMgr := onboarding.NewManager(bootMode)
+	// Boot-mode probing shells out. Begin conservatively at Unknown and perform
+	// the real observation only after the access listener is serving.
+	onboardingMgr := onboarding.NewManager(storage.BootModeUnknown)
 	installer := onboarding.NewInstaller(execRunner, events.NewBusProgressReporter(eventsBus), onboardingMgr)
 
 	// Initialize PCV publisher and importer.
@@ -817,6 +1003,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Initialize app manager with filesystem state management
 	svcMgr := services.NewServiceManager()
+	decryptedEvents := events.NewBus()
 	routeMgr := router.NewManager()
 	remoteResolver := newServiceRemoteResolver(svcMgr)
 	svcMgr.ObserveRuntimeEvents(eventsBus)
@@ -828,10 +1015,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to init app manager: %w", err)
 	}
-	appMgr.ObserveRuntimeEvents(eventsBus)
+	appMgr.ObserveRuntimeEvents(decryptedEvents)
 	appMgr.SetRouter(routeMgr)
 	appMgr.SetProgressReporter(progressReporter)
 	appMgr.SetEventBus(eventsBus)
+	appMgr.SetTaskPressureNormal(func() bool {
+		return taskGuard.Snapshot().AllowsAutomaticRecovery()
+	})
 	// SyncHost is wired post-construction below once GinServer is in scope.
 
 	// Initialize persistence module (skeleton; concrete components wired later)
@@ -897,33 +1087,45 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	catalogMgr := catalog.NewManager(os.Getenv("PICCOLO_APP_STORE_URL"), paths.CoreJoin("cache", "catalog"))
 
 	s := &GinServer{
-		appManager:        appMgr,
-		serviceManager:    svcMgr,
-		persistence:       persist,
-		mdnsManager:       mdnsMgr,
-		routeManager:      routeMgr,
-		tlsMux:            tlsMux,
-		tunnelAuth:        tunnelAuth,
-		remoteResolver:    remoteResolver,
-		events:            eventsBus,
-		progress:          progressReporter,
-		leadership:        leadershipReg,
-		supervisor:        sup,
-		dispatcher:        dispatch,
-		cryptoManager:     cmgr,
-		storageMgr:        storageMgr,
-		pcvPublisher:      pcvPub,
-		pcvImporter:       pcvImp,
-		healthTracker:     healthTracker,
-		catalogManager:    catalogMgr,
-		onboardingMgr:     onboardingMgr,
-		installer:         installer,
-		execRunner:        execRunner,
-		timezoneMgr:       timezoneMgr,
-		provisioningState: provisioning.New(onboardingMgr),
-		lifecycle:         lifecycle.New(initialLifecycleState(cmgr)),
+		appManager:          appMgr,
+		serviceManager:      svcMgr,
+		persistence:         persist,
+		mdnsManager:         mdnsMgr,
+		routeManager:        routeMgr,
+		tlsMux:              tlsMux,
+		tunnelAuth:          tunnelAuth,
+		remoteResolver:      remoteResolver,
+		events:              eventsBus,
+		decryptedEvents:     decryptedEvents,
+		progress:            progressReporter,
+		leadership:          leadershipReg,
+		supervisor:          sup,
+		dispatcher:          dispatch,
+		cryptoManager:       cmgr,
+		storageMgr:          storageMgr,
+		pcvPublisher:        pcvPub,
+		pcvImporter:         pcvImp,
+		healthTracker:       healthTracker,
+		taskGuard:           taskGuard,
+		taskCriticalCommit:  preconfigured.taskCriticalCommit,
+		taskCensus:          preconfigured.taskCensus,
+		taskRecoveryStart:   preconfigured.taskRecoveryStart,
+		taskGuardDisabled:   preconfigured.taskGuardDisabled,
+		unlockReady:         make(chan struct{}),
+		unlockFatalRecovery: preconfigured.unlockFatalRecovery,
+		version:             preconfigured.version,
+		updateManager:       preconfigured.updateManager,
+		catalogManager:      catalogMgr,
+		onboardingMgr:       onboardingMgr,
+		installer:           installer,
+		execRunner:          execRunner,
+		timezoneMgr:         timezoneMgr,
+		provisioningState:   provisioning.New(onboardingMgr),
+		lifecycle:           lifecycle.New(initialLifecycleState(cmgr)),
 	}
 	s.opCtx, s.opCancel = context.WithCancel(context.Background())
+	s.taskResumeAccepting = true
+	serverRef.Store(s)
 	tlsMux.SetTunnelAuthDecisionRecorder(s.publishTunnelAuthDecision)
 
 	// Wire catalog manifest sync now that GinServer is in scope. The adapter
@@ -973,7 +1175,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(s.terminalManager)
 
 	s.supervisor.Register(supervisor.NewComponent("app-manager", func(ctx context.Context) error {
-		s.appManager.StartBackground()
+		// Optional app restore/background convergence starts only after the
+		// externally bound core access plane has reported Ready.
 		return nil
 	}, func(ctx context.Context) error {
 		s.appManager.StopBackground()
@@ -995,7 +1198,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.supervisor.Register(supervisor.NewComponent("consensus", consensusMgr.Start, consensusMgr.Stop))
 	s.supervisor.Register(newLeadershipObserver(eventsBus))
 	s.supervisor.Register(supervisor.NewComponent("catalog", func(ctx context.Context) error {
-		catalogMgr.ObserveLockState(eventsBus)
+		catalogMgr.ObserveLockState(decryptedEvents)
 		return nil
 	}, func(ctx context.Context) error {
 		catalogMgr.Stop()
@@ -1006,10 +1209,6 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 	s.observeRemoteConfig(eventsBus)
 	s.observeProxyOIDCClients(eventsBus)
 	s.observeStorageEvents(eventsBus)
-
-	for _, opt := range opts {
-		opt(s)
-	}
 
 	// Wire version to mDNS service metadata (after options are applied)
 	if s.mdnsManager != nil && s.version != "" {
@@ -1467,6 +1666,7 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 		log.Printf("WARN: auto-unlock orchestrator init failed (feature disabled): %v", err)
 	} else {
 		s.autounlockOrch = autounlockOrch
+		attachTaskPressureRestartContinuity(s.serverContext(), s.taskGuard, autounlockOrch)
 		// Scheduler shares the same audit emit. Constructed alongside the
 		// orchestrator; spawned in Start. updateManager adapter maps fast
 		// snapshot readiness into the scheduler's small interface.
@@ -1513,8 +1713,13 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			networkMgr.AttachSupervisor(netSup)
 			netTransitions = netSup
 			netState = netSup
-			s.supervisor.Register(networkMgr) // must come before netSup
-			s.supervisor.Register(netSup)
+			s.networkSupervisor = netSup
+			s.supervisor.Register(networkMgr)
+			// Start is deferred until after core Ready. The wrapper keeps reverse
+			// shutdown ownership even when repeated-culprit recovery suppresses it.
+			s.supervisor.Register(supervisor.NewComponent(netSup.Name(), func(context.Context) error {
+				return nil
+			}, netSup.Stop))
 		}
 		healthTracker.Setf("network", health.LevelWarn, "network manager initializing")
 	}
@@ -1535,9 +1740,25 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 			nexusclient.WithAdapterEventHandler(rm.RelayEventHandler()),
 		)
 	}
+	// Persisted aliases are desired configuration, not proof that an app route
+	// exists in this process. Portal aliases are core access; app aliases enter
+	// relay registration only while ServiceManager retains their proven route.
+	rm.SetAliasPublicationFilter(func(alias nexusclient.AliasEntry) bool {
+		return nexusAliasPublicationEligible(svcMgr, alias)
+	})
 	rm.SetNexusAdapter(nexusAdapter)
 	svcMgr.SetFirewallManager(firewall.NewFirewalldManager()) // falls back to no-op stub if firewall-cmd absent
 	rm.SetPortClaimProvider(svcMgr)
+	svcMgr.SetRuntimePublicationCallbacks(func(ctx context.Context) error {
+		// Local resolver and TLS mux denial is synchronous and precedes the
+		// bounded external adapter withdrawal.
+		s.refreshRemoteRuntime()
+		return rm.RefreshPortClaimsContext(ctx)
+	}, func() {
+		// Resume commits active routes before this callback is invoked.
+		s.refreshRemoteRuntime()
+		rm.RefreshPortClaims()
+	})
 	s.subscribeSelfHostedNetworkTransitions(netTransitions, rm)
 	s.subscribeLANNetworkTransitions(netTransitions)
 
@@ -1793,8 +2014,8 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// Register the update watchdog. It blocks until context is cancelled.
 	s.supervisor.Register(supervisor.NewComponent("os-update-watchdog", func(ctx context.Context) error {
-		go s.updateManager.Watch(ctx) // Start the watch loop in a goroutine
-		return nil                    // Return immediately to the supervisor
+		// Optional child-producing update probes start after core Ready.
+		return nil
 	}, func(ctx context.Context) error {
 		// Cancellation is handled by the context passed to Watch
 		return nil
@@ -1810,27 +2031,14 @@ func NewGinServer(opts ...GinServerOption) (*GinServer, error) {
 
 	// (Simplified) No dynamic port publish/unpublish wiring; allow dial to fail gracefully.
 
-	// Start the keyslot reconciler (RFC 20260510 §Reconciler shape).
-	// Goroutine binds to the server's long-lived opCtx so it survives
-	// individual request lifetimes and respects shutdown via Stop().
-	// Initial pass drains any blobs left pending by a prior process /
-	// system reboot (restart-safe by design — blobs live on the encrypted
-	// control plane).
-	if s.keyslotReconciler != nil {
-		s.keyslotReconciler.Start(s.serverContext())
-	}
-
-	// Rehydrate proxies for containers that survived restarts
-	appMgr.RestoreServices(context.Background())
-	// Start self-hosted remote routing after app endpoints have been restored.
-	// Otherwise Nexus can advertise persisted app aliases while ServiceManager
-	// still has no local listener metadata, producing a transient no-route
-	// window on boot.
-	s.refreshRemoteRuntime()
+	// Bring up only the persisted portal base here. App aliases are installed
+	// after typed app observation restores their local routes.
+	s.refreshRemotePortalRuntime()
 
 	s.staticCache = newStaticAssetCache(webassets.FS, "web")
 
 	s.setupGinRoutes()
+	constructionComplete = true
 	return s, nil
 }
 
@@ -1841,56 +2049,19 @@ func (s *GinServer) Start() error {
 		port = "80"
 	}
 
+	listener, err := net.Listen("tcp", ":"+port)
+	if err != nil {
+		return fmt.Errorf("bind external HTTP listener: %w", err)
+	}
+	s.httpSrv = &http.Server{
+		Addr:     ":" + port,
+		Handler:  s.router,
+		ErrorLog: newFilteredErrorLogger(),
+	}
+
 	if err := s.supervisor.Start(context.Background()); err != nil {
+		_ = listener.Close()
 		return fmt.Errorf("failed to start runtime components: %w", err)
-	}
-
-	// Auto-unlock pickup goroutine. Runs in parallel with the locked HTTP
-	// server — password-unlock path stays available the whole time. Pickup
-	// holds the orchestrator mutex; Stop Phase 0 cancels pickupCtx before
-	// invoking ceremony so a slow namek round-trip aborts promptly and the
-	// mutex is released. Disabled / no-blob fast-exit, no async cost.
-	if s.autounlockOrch != nil {
-		pickupCtx, pickupCancel := context.WithCancel(s.serverContext())
-		s.autounlockPickupCancel = pickupCancel
-		go s.autounlockOrch.RunPickup(pickupCtx, func(ctx context.Context) error {
-			_, err := s.completeUnlockChain(ctx)
-			return err
-		})
-	}
-	// Auto-reboot scheduler tick goroutine. Gated on enabled + auto_reboot
-	// + in-window + has-staged-update; calls updateManager.Reboot which
-	// triggers SIGTERM → ceremony → reboot.
-	if s.autounlockScheduler != nil {
-		go s.autounlockScheduler.Run(s.serverContext())
-	}
-
-	// Start disk preparation based on boot mode and onboarding state.
-	if s.storageMgr != nil && s.onboardingMgr != nil {
-		switch {
-		case s.onboardingMgr.BootMode() == storage.BootModeInternal:
-			log.Printf("INFO: internal boot detected; starting disk preparation")
-			s.storageMgr.StartPartitioningAsync(context.Background())
-		case s.onboardingMgr.State() == onboarding.StateTryPiccolo ||
-			s.onboardingMgr.State() == onboarding.StateComplete:
-			log.Printf("INFO: returning USB user (state=%s); starting disk preparation", s.onboardingMgr.State())
-			s.storageMgr.StartPartitioningAsync(context.Background())
-		default:
-			// USB/unknown boot with state=pending. Check if the system was
-			// previously set up (e.g. disk moved between controllers). If so,
-			// auto-advance onboarding to try_piccolo and start partitioning
-			// so the user sees the unlock screen instead of onboarding.
-			if s.storageMgr.IsPreviouslySetUp(context.Background()) {
-				log.Printf("INFO: previously set up system detected on %s boot; auto-advancing onboarding", s.onboardingMgr.BootMode())
-				if err := s.onboardingMgr.Choose(onboarding.StateTryPiccolo); err != nil {
-					log.Printf("WARN: failed to auto-advance onboarding: %v", err)
-				}
-				s.storageMgr.StartPartitioningAsync(context.Background())
-			} else {
-				log.Printf("INFO: boot mode is %s, onboarding state is %s; deferring disk preparation to onboarding",
-					s.onboardingMgr.BootMode(), s.onboardingMgr.State())
-			}
-		}
 	}
 
 	s.startSecureLoopback()
@@ -1906,24 +2077,197 @@ func (s *GinServer) Start() error {
 	}
 
 	log.Printf("INFO: Starting piccolod server with Gin on http://localhost:%s", port)
+	readyListener := newAcceptReadyListener(listener)
+	serveErr := make(chan error, 1)
+	go func() {
+		err := s.httpSrv.Serve(readyListener)
+		if errors.Is(err, http.ErrServerClosed) {
+			err = nil
+		}
+		serveErr <- err
+	}()
+	select {
+	case <-readyListener.accepting:
+		// The external HTTP server is now inside its accept loop.
+	case err := <-serveErr:
+		if err == nil {
+			return errors.New("external HTTP server stopped before entering accept loop")
+		}
+		return fmt.Errorf("external HTTP server failed before entering accept loop: %w", err)
+	}
 
-	// Notify systemd that we're ready (for Type=notify services)
-	// This enables proper health checking and rollback functionality in MicroOS
+	// Notify only after the appliance's sole access plane is accepting.
+	// Optional app, storage, update, and unlock owners have not started
+	// child-producing recovery yet.
 	if sent, err := daemon.SdNotify(false, daemon.SdNotifyReady); err != nil {
 		log.Printf("WARN: Failed to notify systemd of readiness: %v", err)
 	} else if sent {
 		log.Printf("INFO: Notified systemd that service is ready")
 	}
+	// Release only the startup-ordering latch. A task Warning, Critical, or
+	// unavailable monitor keeps the independent pressure latch fenced.
+	pressure.DefaultAdmission.OpenStartup()
+	s.startOwnersAfterCoreReady()
+	return <-serveErr
+}
 
-	s.httpSrv = &http.Server{
-		Addr:     ":" + port,
-		Handler:  s.router,
-		ErrorLog: newFilteredErrorLogger(),
+func (s *GinServer) startOwnersAfterCoreReady() {
+	if s.taskRecoveryStart != nil {
+		go s.taskRecoveryStart(s.serverContext(), s)
+		return
 	}
-	if err := s.httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-		return err
+	go s.startOptionalOwners()
+}
+
+// startOptionalOwners runs only after core access is bound, systemd Ready, and
+// its accept loop has been launched. Recovery startup is owned by the cmd
+// callback and never enters this normal bulk path.
+func (s *GinServer) startOptionalOwners() {
+	// Initial pass drains crash-safe keyslot work left by an earlier process.
+	// The reconciler claims ownership around each actual pass.
+	if s.keyslotReconciler != nil {
+		s.keyslotReconciler.Start(s.serverContext())
 	}
-	return nil
+
+	// Auto-unlock pickup runs alongside the locked, already-serving HTTP plane.
+	if s.autounlockOrch != nil {
+		pickupCtx, pickupCancel := context.WithCancel(s.serverContext())
+		s.autounlockPickupCancel = pickupCancel
+		runPickup := func() {
+			releaseOwner := pressure.BeginLifecycleOwner("autounlock")
+			defer releaseOwner()
+			s.autounlockOrch.RunPickup(pickupCtx, func(ctx context.Context) error {
+				_, err := s.completeAutomaticUnlockChain(ctx)
+				return err
+			})
+		}
+		go runPickup()
+	}
+	if s.autounlockScheduler != nil {
+		go s.autounlockScheduler.Run(s.serverContext())
+	}
+
+	bootCtx := pressure.WithWorkClass(s.serverContext(), pressure.WorkStorage)
+	bootMode, err := storage.DetectBootMode(bootCtx, s.execRunner)
+	if err != nil {
+		log.Printf("WARN: post-Ready boot mode detection failed: %v", err)
+	} else {
+		s.onboardingMgr.SetBootMode(bootMode)
+	}
+	s.startOptionalStoragePreparation()
+
+	// Storage preparation and automatic pickup are allowed while locked. Every
+	// decrypted optional owner below this point waits for the coordinator's
+	// post-Ready signal; a raw persistence unlock event cannot release it.
+	if !s.waitForUnlockReady(s.serverContext()) {
+		return
+	}
+	if s.catalogManager != nil {
+		if err := s.catalogManager.EnsureCacheDir(); err != nil {
+			log.Printf("WARN: catalog cache dir creation after lifecycle Ready failed: %v", err)
+		}
+	}
+	s.decryptedOwnersStarted.Store(true)
+
+	if s.appManager != nil {
+		s.appManager.RestoreServices(s.serverContext())
+		s.refreshRemoteRuntime()
+		s.appManager.StartBackground()
+	}
+	if s.networkSupervisor != nil {
+		if err := s.networkSupervisor.Start(s.serverContext()); err != nil {
+			log.Printf("WARN: network supervisor start after core Ready failed: %v", err)
+		}
+	}
+	if s.updateManager != nil {
+		go func() {
+			if err := s.updateManager.Watch(s.serverContext()); err != nil && !errors.Is(err, context.Canceled) {
+				log.Printf("WARN: update watchdog exited: %v", err)
+			}
+		}()
+	}
+}
+
+func (s *GinServer) waitForUnlockReady(ctx context.Context) bool {
+	if s == nil || s.lifecycle == nil {
+		return true
+	}
+	if s.unlockReady == nil {
+		return s.lifecycle.IsReady()
+	}
+	select {
+	case <-s.unlockReady:
+		return s.lifecycle.IsReady()
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// onUnlockChainReady runs only after a successful body won the atomic
+// completion decision and lifecycle Ready was committed. The initial optional-
+// owner barrier closes after reload work; later unlocks publish one filtered
+// event so app/catalog observers never act on raw persistence unlock alone.
+func (s *GinServer) onUnlockChainReady() {
+	if s == nil {
+		return
+	}
+	if s.healthTracker != nil {
+		s.healthTracker.Setf("persistence", health.LevelOK, "control store unlocked")
+		s.healthTracker.Setf("app-manager", health.LevelOK, "app manager ready")
+	}
+	if s.decryptedOwnersStarted.Load() && s.decryptedEvents != nil {
+		s.decryptedEvents.Publish(events.Event{
+			Topic:   events.TopicLockStateChanged,
+			Payload: events.LockStateChanged{Locked: false},
+		})
+	}
+	if s.unlockReady != nil {
+		s.unlockReadyOnce.Do(func() { close(s.unlockReady) })
+	}
+}
+
+// TaskPressureSnapshot exposes the guard's bounded current state to the
+// process-level volatile-marker clearer without transferring ownership.
+func (s *GinServer) TaskPressureSnapshot() pressure.TaskSnapshot {
+	if s == nil || s.taskGuard == nil {
+		return pressure.TaskSnapshot{State: pressure.TaskPressureUnavailable, ReasonCode: pressure.ReasonMonitorUnavailable}
+	}
+	return s.taskGuard.Snapshot()
+}
+
+// RestartUnlockContinuity exposes the provider-neutral continuity capability
+// to the process-level fatal owner without leaking identity or Namek details.
+func (s *GinServer) RestartUnlockContinuity() autounlock.RestartUnlockContinuity {
+	if s == nil || s.autounlockOrch == nil {
+		return nil
+	}
+	return s.autounlockOrch
+}
+
+func (s *GinServer) startOptionalStoragePreparation() {
+	if s.storageMgr == nil || s.onboardingMgr == nil {
+		return
+	}
+	switch {
+	case s.onboardingMgr.BootMode() == storage.BootModeInternal:
+		log.Printf("INFO: internal boot detected; starting disk preparation")
+		s.storageMgr.StartPartitioningAsync(s.serverContext())
+	case s.onboardingMgr.State() == onboarding.StateTryPiccolo ||
+		s.onboardingMgr.State() == onboarding.StateComplete:
+		log.Printf("INFO: returning USB user (state=%s); starting disk preparation", s.onboardingMgr.State())
+		s.storageMgr.StartPartitioningAsync(s.serverContext())
+	default:
+		if s.storageMgr.IsPreviouslySetUp(s.serverContext()) {
+			log.Printf("INFO: previously set up system detected on %s boot; auto-advancing onboarding", s.onboardingMgr.BootMode())
+			if err := s.onboardingMgr.Choose(onboarding.StateTryPiccolo); err != nil {
+				log.Printf("WARN: failed to auto-advance onboarding: %v", err)
+			}
+			s.storageMgr.StartPartitioningAsync(s.serverContext())
+		} else {
+			log.Printf("INFO: boot mode is %s, onboarding state is %s; deferring disk preparation to onboarding",
+				s.onboardingMgr.BootMode(), s.onboardingMgr.State())
+		}
+	}
 }
 
 // runWatchdogLoop pings the systemd service-level watchdog at half the
@@ -1963,6 +2307,7 @@ func (s *GinServer) runWatchdogLoop(ctx context.Context) {
 // The context is used for overall timeout control during shutdown.
 func (s *GinServer) Stop(ctx context.Context) error {
 	log.Printf("INFO: Beginning graceful shutdown...")
+	s.stopTaskPressureResumeAdmission()
 
 	// Phase 0: pre-shutdown auto-unlock ceremony.
 	// namekStopped flips FIRST so identity-event subscribers (applyNamekState)
@@ -2032,6 +2377,10 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	if s.opCancel != nil {
 		s.opCancel()
 	}
+	// An OnNormal callback may already own reconciliation. Its context is now
+	// canceled; wait for that owner to release before StopAllApps starts
+	// stopping containers and detaching their volumes.
+	s.waitTaskPressureResume()
 
 	// Stop the keyslot reconciler with a bounded budget. Per RFC D7 the
 	// kill+add pair runs under context.WithoutCancel so an in-flight
@@ -2410,8 +2759,6 @@ func (s *GinServer) setupGinRoutes() {
 			apps.POST("/:name/rollback", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppRollback)
 			apps.POST("/:name/clone", s.requireUnlocked(), s.requireAdmin(), s.handleGinAppClone)
 			apps.GET("/:name/clones", s.requireAdmin(), s.handleGinAppListClones)
-			apps.GET("/:name/terminal", s.requireAdmin(), s.handleWorkspaceTerminal)
-
 			// Persistent container terminal sessions (Admin only)
 			apps.POST("/:name/terminal/sessions", s.requireAdmin(), s.handleCreateWorkspaceTerminalSession)
 			apps.GET("/:name/terminal/sessions", s.requireAdmin(), s.handleListWorkspaceTerminalSessions)
@@ -2508,9 +2855,6 @@ func (s *GinServer) setupGinRoutes() {
 
 		// UI telemetry (Admin only)
 		admin.POST("/telemetry/log", s.handleTelemetryLog)
-
-		// Debug terminal (Admin only) — legacy ephemeral endpoint
-		admin.GET("/terminal", s.handleTerminal)
 
 		// Persistent terminal sessions (Admin only)
 		termSessions := admin.Group("/terminal/sessions")
@@ -3050,10 +3394,32 @@ func (s *GinServer) refreshRemoteRuntime() {
 		return
 	}
 	status := s.remoteManager.Status()
-	s.applyRemoteRuntimeFromStatus(status)
+	s.applyRemoteRuntimeFromStatusWithAliases(status, true)
+}
+
+func nexusAliasPublicationEligible(svcMgr *services.ServiceManager, alias nexusclient.AliasEntry) bool {
+	if alias.HostLabel == nexusclient.PortalHostLabel {
+		return true
+	}
+	if svcMgr == nil || strings.TrimSpace(alias.HostLabel) == "" {
+		return false
+	}
+	_, routed := svcMgr.ResolveByHostLabelAnyPort(alias.HostLabel)
+	return routed
+}
+
+func (s *GinServer) refreshRemotePortalRuntime() {
+	if s == nil || s.remoteManager == nil {
+		return
+	}
+	s.applyRemoteRuntimeFromStatusWithAliases(s.remoteManager.Status(), false)
 }
 
 func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
+	s.applyRemoteRuntimeFromStatusWithAliases(status, true)
+}
+
+func (s *GinServer) applyRemoteRuntimeFromStatusWithAliases(status remote.Status, includeAppAliases bool) {
 	if s == nil || s.tlsMux == nil {
 		return
 	}
@@ -3067,6 +3433,12 @@ func (s *GinServer) applyRemoteRuntimeFromStatus(status remote.Status) {
 		hostLabel := a.Listener
 		if hostLabel == "" || hostLabel == "portal" {
 			hostLabel = nexusclient.PortalHostLabel
+		} else if !includeAppAliases {
+			continue
+		} else if s.serviceManager != nil {
+			if _, routed := s.serviceManager.ResolveByHostLabelAnyPort(hostLabel); !routed {
+				continue
+			}
 		}
 		aliasMap[h] = hostLabel
 	}
@@ -3459,10 +3831,13 @@ func (s *GinServer) observeLockState(bus *events.Bus) {
 			if payload.Locked {
 				s.healthTracker.Setf("persistence", health.LevelWarn, "control store locked")
 				s.healthTracker.Setf("app-manager", health.LevelWarn, "app manager gated by lock state")
+				if s.decryptedEvents != nil {
+					s.decryptedEvents.Publish(evt)
+				}
 			} else {
-				s.healthTracker.Setf("persistence", health.LevelOK, "control store unlocked")
-				s.healthTracker.Setf("app-manager", health.LevelOK, "app manager ready")
-				s.reloadComponentsAfterUnlock()
+				// Persistence unlock is an intermediate observation. Only the
+				// complete-unlock coordinator may release decrypted owners.
+				s.healthTracker.Setf("persistence", health.LevelWarn, "control store unlocked; recovery finalizing")
 			}
 		}
 	}()
@@ -3479,6 +3854,9 @@ func (s *GinServer) observeLeadership(bus *events.Bus) {
 			payload, ok := evt.Payload.(events.LeadershipChanged)
 			if !ok {
 				continue
+			}
+			if s.decryptedEvents != nil {
+				s.decryptedEvents.Publish(evt)
 			}
 			if payload.Resource != cluster.ResourceKernel {
 				continue
@@ -3536,13 +3914,31 @@ func (s *GinServer) observeRemotePortClaims(bus *events.Bus) {
 	go func() {
 		var debounceTimer *time.Timer
 		var mu sync.Mutex
-		for range ch {
+		for evt := range ch {
+			change, ok := evt.Payload.(events.ServiceEndpointsChanged)
+			immediateRemoval := ok && (len(change.Removed) > 0 || len(change.Deactivated) > 0)
 			mu.Lock()
 			if debounceTimer != nil {
 				debounceTimer.Stop()
+				debounceTimer = nil
+			}
+			if immediateRemoval {
+				mu.Unlock()
+				// Removals fail closed immediately; the debounce applies only to
+				// additions, where delaying advertisement is safe.
+				s.refreshRemoteRuntime()
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				if err := s.remoteManager.RefreshPortClaimsContext(ctx); err != nil {
+					log.Printf("WARN: immediate remote publication withdrawal: %v", err)
+				}
+				cancel()
+				continue
 			}
 			debounceTimer = time.AfterFunc(portClaimsDebounceDelay, func() {
 				s.remoteManager.RefreshPortClaims()
+				// App aliases become externally visible only after their local
+				// endpoint exists; endpoint changes re-evaluate that proof.
+				s.refreshRemoteRuntime()
 			})
 			mu.Unlock()
 		}

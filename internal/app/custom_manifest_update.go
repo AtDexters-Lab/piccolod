@@ -20,6 +20,7 @@ import (
 	"piccolod/internal/container"
 	"piccolod/internal/fsutil"
 	"piccolod/internal/persistence"
+	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 
 	"gopkg.in/yaml.v3"
@@ -565,6 +566,10 @@ func (m *AppManager) DryRunCustomManifestUpdate(ctx context.Context, req Manifes
 }
 
 func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req ManifestUpdateRequest) (res *ManifestUpdateResult, err error) {
+	defer pressure.BeginLifecycleOwner("app:" + req.InstanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 
@@ -771,7 +776,7 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	}, nil
 }
 
-func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, prevDef, failedDef *api.AppDefinition, txn *ManifestUpdateTransaction, taskType, operationKind string, cause error) error {
+func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, prevDef, failedDef *api.AppDefinition, txn *ManifestUpdateTransaction, taskType, operationKind string, publicationResumeToken services.PublicationResumeToken, cause error) error {
 	instanceID := appInst.InstanceID
 	txn.Phase = "restoring_previous"
 	txn.LastError = cause.Error()
@@ -801,13 +806,16 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 	} else if err := m.cleanupPrecommitDataSnapshot(ctx, txn); err != nil {
 		rollbackErrs = append(rollbackErrs, err)
 	}
+	runtimePublicationReady := !manifestTransactionRuntimeSwitchStarted(txn)
 	if manifestTransactionRuntimeSwitchStarted(txn) {
-		if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, failedDef, appInst); err != nil {
+		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, publicationResumeToken); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers failed: %w", err))
+		} else {
+			runtimePublicationReady = true
 		}
 	}
-	if txn.AccessSuspended && m.serviceManager != nil {
-		if err := m.serviceManager.ResumeAppPublicationChecked(instanceID); err != nil {
+	if txn.AccessSuspended && m.serviceManager != nil && runtimePublicationReady {
+		if err := m.serviceManager.ResumeAppPublicationWithResumeTokenContext(pressure.WithTransitionContinuation(ctx), publicationResumeToken, instanceID); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("resume app publication failed: %w", err))
 		} else {
 			txn.AccessSuspended = false
@@ -925,8 +933,15 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 		return fmt.Errorf("manifest update recovery %s: persist access repair marker: %w", instanceID, err)
 	}
 	if appInst.Enabled && (manifestTransactionRuntimeSwitchStarted(txn) || txn.AccessSuspended || len(txn.PreparedListenerEndpoints) > 0) {
+		var publicationResumeToken services.PublicationResumeToken
+		if m.serviceManager != nil {
+			// Recovery may be re-entering a process that never observed the
+			// original suspension. Reassert it to withdraw any partial routes
+			// and mint fresh process-local resume authority.
+			publicationResumeToken = m.serviceManager.SuspendAppPublication(instanceID)
+		}
 		if len(txn.PreparedListenerEndpoints) > 0 && m.serviceManager != nil {
-			if err := m.serviceManager.RestorePreparedPublication(instanceID, txn.PreparedListenerEndpoints); err != nil {
+			if err := m.serviceManager.RestorePreparedPublicationWithResumeTokenContext(pressure.WithTransitionContinuation(ctx), publicationResumeToken, instanceID, txn.PreparedListenerEndpoints); err != nil {
 				txn.LastError = err.Error()
 				txn.UpdatedAt = time.Now().UTC()
 				_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
@@ -934,19 +949,19 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 			}
 		} else if txn.AccessSuspended && m.serviceManager != nil {
 			if endpoints, err := m.serviceManager.GetByApp(instanceID); err == nil && len(endpoints) > 0 && reflect.DeepEqual(prevDef.Listeners, candidateDef.Listeners) {
-				if err := m.serviceManager.ResumeAppPublicationChecked(instanceID); err != nil {
+				if err := m.serviceManager.ResumeAppPublicationWithResumeTokenContext(pressure.WithTransitionContinuation(ctx), publicationResumeToken, instanceID); err != nil {
 					txn.LastError = err.Error()
 					txn.UpdatedAt = time.Now().UTC()
 					_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 					return fmt.Errorf("manifest update recovery %s: resume listener publication: %w", instanceID, err)
 				}
-			} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, appInst, candidateDef); err != nil {
+			} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, publicationResumeToken, appInst, candidateDef); err != nil {
 				txn.LastError = err.Error()
 				txn.UpdatedAt = time.Now().UTC()
 				_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 				return fmt.Errorf("manifest update recovery %s: repair access: %w", instanceID, err)
 			}
-		} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, appInst, candidateDef); err != nil {
+		} else if err := m.restoreManifestUpdateAccessFromRuntime(ctx, publicationResumeToken, appInst, candidateDef); err != nil {
 			txn.LastError = err.Error()
 			txn.UpdatedAt = time.Now().UTC()
 			_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
@@ -979,7 +994,7 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 	return nil
 }
 
-func (m *AppManager) restoreManifestUpdateAccessFromRuntime(ctx context.Context, appInst *AppInstance, def *api.AppDefinition) error {
+func (m *AppManager) restoreManifestUpdateAccessFromRuntime(ctx context.Context, publicationResumeToken services.PublicationResumeToken, appInst *AppInstance, def *api.AppDefinition) error {
 	if m.serviceManager == nil || def == nil {
 		return nil
 	}
@@ -1011,7 +1026,7 @@ func (m *AppManager) restoreManifestUpdateAccessFromRuntime(ctx context.Context,
 		}
 		return nil
 	}
-	if _, err := m.serviceManager.RestoreFromPodman(instanceID, def.Listeners, ports); err != nil {
+	if _, err := m.serviceManager.RestoreFromPodmanWithResumeTokenContext(pressure.WithTransitionContinuation(ctx), publicationResumeToken, instanceID, def.Listeners, ports); err != nil {
 		return fmt.Errorf("restore service publication: %w", err)
 	}
 	m.serviceManager.SetAppContainerID(instanceID, publishCID)
@@ -4286,15 +4301,20 @@ func (m *AppManager) recoverPendingManifestUpdates(ctx context.Context, state *F
 			blocked[appInst.InstanceID] = true
 			continue
 		}
+		recoveryCtx, admitted := admitPendingTransitionRecovery(ctx)
+		if !admitted {
+			return blocked
+		}
 		if txn.Phase == "committed" || txn.Phase == "committed_cleanup_pending" {
-			if err := m.cleanupCommittedManifestUpdateTransaction(ctx, state, appInst.InstanceID, txn); err != nil {
+			if err := m.cleanupCommittedManifestUpdateTransaction(recoveryCtx, state, appInst.InstanceID, txn); err != nil {
 				log.Printf("WARN: manifest update recovery %s: cleanup committed transaction: %v", appInst.InstanceID, err)
 			}
-			continue
-		}
-		if err := m.recoverOneManifestUpdate(ctx, state, appInst, txn); err != nil {
+		} else if err := m.recoverOneManifestUpdate(recoveryCtx, state, appInst, txn); err != nil {
 			log.Printf("ERROR: manifest update recovery %s: %v", appInst.InstanceID, err)
 			blocked[appInst.InstanceID] = true
+		}
+		if transitionRecoveryMustYield(recoveryCtx) {
+			return blocked
 		}
 	}
 	return blocked
@@ -4406,13 +4426,23 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	} else if err := m.cleanupPrecommitDataSnapshot(ctx, txn); err != nil {
 		rollbackErrs = append(rollbackErrs, err)
 	}
+	var publicationResumeToken services.PublicationResumeToken
+	if txn.AccessSuspended && m.serviceManager != nil {
+		// The original token was process-local and cannot survive a crash.
+		// Reassert suspension before rebuilding the previous runtime so only
+		// this recovery attempt can publish it again.
+		publicationResumeToken = m.serviceManager.SuspendAppPublication(instanceID)
+	}
+	runtimePublicationReady := !manifestTransactionRuntimeSwitchStarted(txn) || !appInst.Enabled
 	if manifestTransactionRuntimeSwitchStarted(txn) && appInst.Enabled {
-		if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, failedDef, appInst); err != nil {
+		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, publicationResumeToken); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers: %w", err))
+		} else {
+			runtimePublicationReady = true
 		}
 	}
-	if txn.AccessSuspended && m.serviceManager != nil {
-		if err := m.serviceManager.ResumeAppPublicationChecked(instanceID); err != nil {
+	if txn.AccessSuspended && m.serviceManager != nil && runtimePublicationReady {
+		if err := m.serviceManager.ResumeAppPublicationWithResumeTokenContext(pressure.WithTransitionContinuation(ctx), publicationResumeToken, instanceID); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("resume app publication: %w", err))
 		} else {
 			txn.AccessSuspended = false

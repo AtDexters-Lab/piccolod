@@ -8,6 +8,7 @@ import (
 	"sync"
 
 	"piccolod/internal/cryptoutil"
+	"piccolod/internal/resources/pressure"
 )
 
 // KeyslotReconciler converges LUKS keyslot 1 (admin password) and keyslot 2
@@ -85,16 +86,18 @@ type KeyslotReconcilerStatus struct {
 
 // KeyslotReconciler is the goroutine + state for converging both slots.
 type KeyslotReconciler struct {
-	vm                  keyslotReconcilerVM
-	crypto              keyslotCryptoProvider
-	livePasswordKeyID   keyslotLiveKeyID
-	liveRecoveryKeyID   keyslotLiveKeyID
-	sdekLoaded          keyslotSDEKLoaded
+	vm                keyslotReconcilerVM
+	crypto            keyslotCryptoProvider
+	livePasswordKeyID keyslotLiveKeyID
+	liveRecoveryKeyID keyslotLiveKeyID
+	sdekLoaded        keyslotSDEKLoaded
 
-	nudgeCh chan struct{}
-	stopCh  chan struct{}
-	done    chan struct{}
-	wg      sync.WaitGroup
+	nudgeCh     chan struct{}
+	stopCh      chan struct{}
+	done        chan struct{}
+	initialDone chan struct{}
+	startOnce   sync.Once
+	wg          sync.WaitGroup
 
 	mu     sync.RWMutex
 	status map[KeyslotSlot]KeyslotReconcilerStatus
@@ -132,6 +135,7 @@ func NewKeyslotReconciler(opts KeyslotReconcilerOptions) *KeyslotReconciler {
 		nudgeCh:           make(chan struct{}, 1),
 		stopCh:            make(chan struct{}),
 		done:              make(chan struct{}),
+		initialDone:       make(chan struct{}),
 		status:            make(map[KeyslotSlot]KeyslotReconcilerStatus),
 		auditFn:           opts.AuditFn,
 	}
@@ -149,30 +153,43 @@ func NewKeyslotReconciler(opts KeyslotReconcilerOptions) *KeyslotReconciler {
 
 // Start launches the reconciler goroutine. Runs orphan cleanup once at
 // startup (covers blobs from a crashed prior process) then enters the
-// nudge loop. Idempotent if called twice — second call returns the
-// existing goroutine's done channel.
+// nudge loop. Start is idempotent; repeated calls leave the existing
+// goroutine and initial-pass proof unchanged.
 func (r *KeyslotReconciler) Start(ctx context.Context) {
-	r.wg.Add(1)
-	go func() {
-		defer r.wg.Done()
-		defer close(r.done)
-		// Startup orphan cleanup — survive a crash mid-pass that left
-		// orphan blobs for keys that have since rotated away.
-		r.startupOrphanCleanup()
-		// Drive an initial pass to drain whatever the prior process left
-		// pending (system reboot mid-reconcile path).
-		r.runOnePass(ctx)
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-r.stopCh:
-				return
-			case <-r.nudgeCh:
-				r.runOnePass(ctx)
+	r.startOnce.Do(func() {
+		r.wg.Add(1)
+		go func() {
+			defer r.wg.Done()
+			defer close(r.done)
+			// Cleanup and the initial pass drain whatever a prior process left
+			// pending before recovery startup advances to another owner.
+			r.runOwnedPass(ctx, true)
+			close(r.initialDone)
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-r.stopCh:
+					return
+				case <-r.nudgeCh:
+					r.runOwnedPass(ctx, false)
+				}
 			}
-		}
-	}()
+		}()
+	})
+}
+
+// InitialPassDone closes after startup orphan cleanup and the first bounded
+// convergence pass have both returned.
+func (r *KeyslotReconciler) InitialPassDone() <-chan struct{} { return r.initialDone }
+
+func (r *KeyslotReconciler) runOwnedPass(ctx context.Context, startup bool) {
+	releaseOwner := pressure.BeginLifecycleOwner("keyslot")
+	defer releaseOwner()
+	if startup {
+		r.startupOrphanCleanup()
+	}
+	r.runOnePass(ctx)
 }
 
 // Stop signals the reconciler to exit and waits for the goroutine to

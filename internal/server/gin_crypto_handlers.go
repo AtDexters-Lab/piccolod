@@ -28,6 +28,7 @@ const (
 	errorCodeStorageInitFailed   = "storage_init_failed"
 	errorCodeStorageUnlockFailed = "storage_unlock_failed"
 	errorCodeStorageEmergency    = "storage_emergency"
+	errorCodeRecoveryInProgress  = "recovery_in_progress"
 	// errorCodeAuthMigrationDegradedStorage: persistence.Unlock aborted
 	// because the recovery_ack_at backfill could not evaluate keyset.json on
 	// degraded storage (RFC 20260510 §Backfill migration). The control store
@@ -129,78 +130,9 @@ type unlockChainResult struct {
 	luksErr       error
 }
 
-// completeUnlockChain runs the post-decrypt chain after Manager.Unlock has
-// installed m.sdek: release KDF memory, unlock the data volume, propagate
-// the unlocked state to persistence, activate the PCV publisher, and
-// reconcile the provisioning marker.
-//
-// Returns (result, err) where err is fatal (caller should respond 500) and
-// result.luksErr is a non-fatal warning surfaced as a `warning` field in
-// the success response.
-//
-// Lifecycle ownership: this helper claims the unlock-chain phase via
-// lifecycle.BeginUnlock at entry and resolves it via MarkReady (success,
-// including LUKS-warning) or MarkFailed (persistence-fatal) before
-// returning. Concurrent unlock paths (manual + auto-unlock pickup racing
-// at boot) lose the BeginUnlock claim race; the loser runs the chain
-// idempotently but does NOT publish a terminal transition (the winner
-// owns it). LUKS data-volume warnings are reported as Ready, mirroring
-// the existing semantic that the control plane is usable even if the
-// data plane is degraded.
-func (s *GinServer) completeUnlockChain(ctx context.Context) (unlockChainResult, error) {
-	owned := false
-	if s.lifecycle != nil {
-		if err := s.lifecycle.BeginUnlock(); err == nil {
-			owned = true
-		} else {
-			log.Printf("INFO: lifecycle: BeginUnlock skipped (%v); chain runs idempotently", err)
-		}
-	}
-
-	result, fatalErr := s.runUnlockChain(ctx)
-
-	if owned && s.lifecycle != nil {
-		if fatalErr != nil {
-			_ = s.lifecycle.MarkFailed(fatalErr)
-		} else {
-			_ = s.lifecycle.MarkReady()
-		}
-		return result, fatalErr
-	}
-
-	// Loser-of-race override. We did not own the unlock claim; another path
-	// (manual + auto racing at boot) is or was driving the chain to a
-	// terminal state. If the system is genuinely Ready by the time our
-	// idempotent body returns, the winner already established success —
-	// suppress any transient error from our pass and report a synthesized
-	// success. Without this, a transient persistence-notify failure on the
-	// loser surfaces as a 500 to the user even though the system is up.
-	if s.lifecycle != nil && s.lifecycle.IsReady() {
-		setupComplete := result.setupComplete
-		if fatalErr != nil {
-			log.Printf("INFO: lifecycle: idempotent unlock body errored after winner reached Ready; reporting success (suppressed err=%v)", fatalErr)
-			// Loser's runUnlockChain returned the zero value on error;
-			// re-derive setupComplete from a fresh query (persistence is
-			// loaded since IsReady() returned true). Fail closed on any
-			// query error (including TOCTOU ErrLocked from a concurrent
-			// /crypto/lock): the winner reached Ready, so the system IS
-			// set up — assume so to avoid misrouting to setup.
-			complete, err := s.isSetupComplete(ctx)
-			if err != nil {
-				setupComplete = true
-			} else {
-				setupComplete = complete
-			}
-		}
-		return unlockChainResult{setupComplete: setupComplete, luksErr: result.luksErr}, nil
-	}
-	return result, fatalErr
-}
-
 // runUnlockChain is the lifecycle-unaware body of the post-decrypt chain.
-// Split from completeUnlockChain so the lifecycle BeginUnlock/MarkReady
-// pairing wraps a single linear body without intermediate early-returns
-// leaking the Unlocking state.
+// The joinable execution coordinator is the only owner allowed to publish a
+// lifecycle terminal transition after this function returns.
 func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, error) {
 	var luksErr error
 
@@ -252,6 +184,7 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
 		// Fail closed for genuine transient errors: assume provisioned,
 		// route to login. The user can retry if needed.
+		s.reloadComponentsAfterUnlock()
 		return unlockChainResult{setupComplete: true, luksErr: luksErr}, nil
 	}
 	// Reconcile the durable provisioning marker from the authoritative
@@ -260,6 +193,11 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 	if rerr := s.provisioningState.ReconcileFromPersistence(setupComplete); rerr != nil {
 		log.Printf("WARN: reconcile provisioning: %v", rerr)
 	}
+	// Reloaders are part of the complete-unlock execution, not a detached
+	// post-success callback. Keeping them inside this body means the
+	// coordinator's independent liveness timer also covers a blocked reloader
+	// and lifecycle Ready cannot be published prematurely.
+	s.reloadComponentsAfterUnlock()
 	return unlockChainResult{setupComplete: setupComplete, luksErr: luksErr}, nil
 }
 
@@ -529,7 +467,15 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 			return
 		}
 		if ready {
-			_ = s.lifecycle.MarkReady()
+			// Fresh setup does not run through the joinable unlock execution
+			// owner. Complete the same post-decrypt reload work before publishing
+			// lifecycle Ready so decrypted observers cannot run ahead of it.
+			s.reloadComponentsAfterUnlock()
+			if err := s.lifecycle.MarkReady(); err != nil {
+				log.Printf("WARN: lifecycle: setup Ready commit failed: %v", err)
+				return
+			}
+			s.onUnlockChainReady()
 		} else {
 			_ = s.lifecycle.MarkFailed(errors.New("setup did not complete"))
 		}
@@ -787,6 +733,14 @@ func (s *GinServer) handleCryptoUnlock(c *gin.Context) {
 		s.healthTracker.Clear("auth-migration")
 	}
 	if err != nil {
+		var inProgress *recoveryInProgressError
+		if errors.As(err, &inProgress) {
+			c.JSON(http.StatusConflict, gin.H{
+				"error": inProgress.Error(),
+				"code":  inProgress.Code(),
+			})
+			return
+		}
 		if errors.Is(err, persistence.ErrAuthMigrationDegradedStorage) {
 			// RFC 20260510 §Backfill migration: keep the typed signal alive
 			// for /system/boot to surface a degraded-startup banner so

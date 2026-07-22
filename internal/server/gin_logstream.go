@@ -14,6 +14,8 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
+
+	"piccolod/internal/resources/pressure"
 )
 
 const maxLogTail = 5000
@@ -69,6 +71,10 @@ func (s *commandStream) Close() error {
 }
 
 func startCommandStream(ctx context.Context, cmd *exec.Cmd, cancel context.CancelFunc) (io.ReadCloser, error) {
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLogStream); err != nil {
+		cancel()
+		return nil, err
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
@@ -98,6 +104,7 @@ func startCommandStream(ctx context.Context, cmd *exec.Cmd, cancel context.Cance
 
 	done := make(chan error, 1)
 	go func() {
+		// This goroutine is the sole Wait owner for the journalctl child.
 		err := cmd.Wait()
 		wg.Wait()
 		_ = pw.Close()
@@ -133,6 +140,12 @@ func (s *GinServer) handleGinAppLogStream(c *gin.Context) {
 	tail := parseLogTail(c, 200)
 	timestamps := parseBoolQuery(c, "timestamps", true)
 	service := strings.TrimSpace(c.Query("service"))
+	releaseCapacity, admitted := s.acquireChildLogStream()
+	if !admitted {
+		writeChildCapacityError(c, "log streams")
+		return
+	}
+	defer releaseCapacity()
 
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	stream, err := s.appManager.LogsStreamForService(ctx, instanceID, service, tail, timestamps)
@@ -184,6 +197,12 @@ func (s *GinServer) handleGinSystemLogStream(c *gin.Context) {
 		return
 	}
 	tail := parseLogTail(c, 200)
+	releaseCapacity, admitted := s.acquireChildLogStream()
+	if !admitted {
+		writeChildCapacityError(c, "log streams")
+		return
+	}
+	defer releaseCapacity()
 
 	ctx, cancel := context.WithCancel(c.Request.Context())
 	cmd := exec.CommandContext(ctx, "journalctl",
@@ -196,6 +215,9 @@ func (s *GinServer) handleGinSystemLogStream(c *gin.Context) {
 	cmd.WaitDelay = 5 * time.Second
 	stream, err := startCommandStream(ctx, cmd, cancel)
 	if err != nil {
+		if writeTaskPressureError(c, err) {
+			return
+		}
 		writeGinError(c, http.StatusInternalServerError, "Failed to start journald stream: "+err.Error())
 		return
 	}

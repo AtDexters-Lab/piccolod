@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/resources/pressure"
 )
 
 const (
@@ -1211,6 +1212,10 @@ func (m *AppManager) DryRunInstalledConfigUpdate(ctx context.Context, instanceID
 }
 
 func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID string, req InstalledConfigUpdateRequest) (res *InstalledConfigUpdateResult, err error) {
+	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
+	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
+		return nil, err
+	}
 	m.reconcileMu.Lock()
 	defer m.reconcileMu.Unlock()
 

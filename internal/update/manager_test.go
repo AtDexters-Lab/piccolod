@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"piccolod/internal/resources/pressure"
 )
 
 func TestStatusWithStagedSnapshot(t *testing.T) {
@@ -175,6 +177,9 @@ func TestRunTransactionalUpdateStopsOnTimeout(t *testing.T) {
 	if !foundStop {
 		t.Fatalf("expected systemctl stop of transient unit on timeout, got calls %#v", r.calls)
 	}
+	if !r.stopWasTransitionContinuation {
+		t.Fatal("timed-out transactional update cleanup was not marked as a durable transition continuation")
+	}
 }
 
 type call struct {
@@ -183,7 +188,8 @@ type call struct {
 }
 
 type timeoutRunner struct {
-	calls []call
+	calls                         []call
+	stopWasTransitionContinuation bool
 }
 
 func (r *timeoutRunner) Run(ctx context.Context, name string, args ...string) (string, string, int, error) {
@@ -194,6 +200,7 @@ func (r *timeoutRunner) Run(ctx context.Context, name string, args ...string) (s
 			return "", "", 3, nil
 		}
 		if len(args) > 0 && args[0] == "stop" {
+			r.stopWasTransitionContinuation = pressure.IsTransitionContinuation(ctx)
 			return "", "", 0, nil
 		}
 	case "systemd-run":
@@ -1801,5 +1808,28 @@ func TestStatusInProgressTimeoutDoesNotRemoveMarker(t *testing.T) {
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("in-progress marker should remain after timeout, got %v", err)
+	}
+}
+
+func TestCleanupStaleStatePreservesMarkerWhenAdmissionIsFenced(t *testing.T) {
+	tmp := t.TempDir()
+	runDir := filepath.Join(tmp, "run")
+	m, err := newMicroOSBackend(
+		WithStateDir(tmp),
+		WithRuntimeDir(runDir),
+		WithSupportOverride(true),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+	marker := filepath.Join(runDir, "update.inprogress")
+	if err := os.WriteFile(marker, []byte("apply piccolo-tu-test.service"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	pressure.DefaultAdmission.Fence()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+	m.cleanupStaleState(context.Background())
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("admission failure removed durable marker: %v", err)
 	}
 }

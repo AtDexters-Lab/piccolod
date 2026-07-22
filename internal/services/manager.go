@@ -18,29 +18,37 @@ import (
 	"piccolod/internal/events"
 	"piccolod/internal/firewall"
 	"piccolod/internal/hostname"
+	"piccolod/internal/resources/pressure"
 )
 
 // ServiceManager coordinates listener allocation, registry, and proxy startup
 type ServiceManager struct {
-	allocator       *PortAllocator
-	registry        map[string]map[string]ServiceEndpoint // app -> name -> endpoint
-	proxyManager    *ProxyManager
-	mu              sync.RWMutex
-	stopCh          chan struct{}
-	wg              sync.WaitGroup
-	containerIDs    map[string]string // app -> containerID (optional)
-	eventsMu        sync.Mutex
-	eventCancel     context.CancelFunc
-	eventSubCancels []func() // SubscribeWithCancel cleanup
-	eventBus        *events.Bus
-	statusMu        sync.RWMutex
-	leadership      map[string]cluster.Role
-	unpublisher     PortUnpublisher
-	publisher       PortPublisher
-	firewallMgr     firewall.Manager
-	lockReader      LockStateReader
-	lockOverrideMu  sync.RWMutex
-	lockOverride    *bool
+	allocator    *PortAllocator
+	registry     map[string]map[string]ServiceEndpoint // app -> name -> endpoint
+	proxyManager *ProxyManager
+	mu           sync.RWMutex
+	// publicationLifecycleMu serializes publication suspend/resume transitions
+	// while allowing the runtime publication projection to be refreshed without
+	// holding mu. The refresh callback may re-enter ServiceManager route lookups.
+	publicationLifecycleMu sync.Mutex
+	publicationRefreshMu   sync.RWMutex
+	publicationWithdraw    func(context.Context) error
+	publicationAdvertise   func()
+	stopCh                 chan struct{}
+	wg                     sync.WaitGroup
+	containerIDs           map[string]string // app -> containerID (optional)
+	eventsMu               sync.Mutex
+	eventCancel            context.CancelFunc
+	eventSubCancels        []func() // SubscribeWithCancel cleanup
+	eventBus               *events.Bus
+	statusMu               sync.RWMutex
+	leadership             map[string]cluster.Role
+	unpublisher            PortUnpublisher
+	publisher              PortPublisher
+	firewallMgr            firewall.Manager
+	lockReader             LockStateReader
+	lockOverrideMu         sync.RWMutex
+	lockOverride           *bool
 
 	// Backend health debouncing (RFC 20260125)
 	backendHealth *BackendHealthState
@@ -51,9 +59,10 @@ type ServiceManager struct {
 	// Health aggregator cancellation
 	healthAggregatorCancel func()
 
-	// deactivated tracks endpoint metadata cleared by DeactivateApp so that a
-	// subsequent RemoveApp can still emit a permanent removal event for cert cleanup.
-	deactivated map[string][]events.ServiceEndpointInfo
+	// deactivated is the sole inactive-publication record. Ordinary stopped
+	// records permit passive runtime restore; suspended records require the
+	// exact process-local authority returned by SuspendAppPublication.
+	deactivated map[string]*publicationInactiveRecord
 
 	// preparedReservations tracks committed prepared endpoints that own
 	// allocator reservations while access repair is pending, even if proxy
@@ -69,6 +78,31 @@ type ServiceManager struct {
 	// registry or publication-state mutation.
 	portClaimCache []api.PortClaimInfo
 }
+
+type publicationInactiveKind uint8
+
+const (
+	publicationInactiveStopped publicationInactiveKind = iota + 1
+	publicationInactiveSuspended
+)
+
+type publicationInactiveRecord struct {
+	kind      publicationInactiveKind
+	endpoints []events.ServiceEndpointInfo
+}
+
+// PublicationResumeToken is the opaque, process-local authority for exactly
+// one SuspendAppPublication record. Its zero value carries no authority.
+type PublicationResumeToken struct {
+	manager *ServiceManager
+	appName string
+	record  *publicationInactiveRecord
+}
+
+var (
+	ErrPublicationSuspended         = errors.New("app publication is suspended")
+	ErrPublicationRestoreIncomplete = errors.New("app publication restore is incomplete")
+)
 
 // LockStateReader exposes the control lock state for services.
 type LockStateReader interface {
@@ -88,7 +122,7 @@ func NewServiceManager() *ServiceManager {
 		containerIDs:         make(map[string]string),
 		leadership:           make(map[string]cluster.Role),
 		backendHealth:        NewBackendHealthState(),
-		deactivated:          make(map[string][]events.ServiceEndpointInfo),
+		deactivated:          make(map[string]*publicationInactiveRecord),
 		preparedReservations: make(map[string]map[string]ServiceEndpoint),
 		appTransient:         make(map[string]time.Time),
 	}
@@ -165,6 +199,36 @@ func (m *ServiceManager) notifyUnpublish(port int) {
 // PortPublisher abstracts remote publish notifications (e.g., Nexus re-enable).
 type PortPublisher interface{ Publish(port int) }
 
+// SetRuntimePublicationCallbacks wires the process-local publication
+// projection. withdraw must first fail local alias resolution closed and then
+// attempt bounded adapter withdrawal. advertise republishes the active
+// projection after a lifecycle transition has committed.
+func (m *ServiceManager) SetRuntimePublicationCallbacks(withdraw func(context.Context) error, advertise func()) {
+	m.publicationRefreshMu.Lock()
+	m.publicationWithdraw = withdraw
+	m.publicationAdvertise = advertise
+	m.publicationRefreshMu.Unlock()
+}
+
+func (m *ServiceManager) withdrawRuntimePublication(ctx context.Context) error {
+	m.publicationRefreshMu.RLock()
+	withdraw := m.publicationWithdraw
+	m.publicationRefreshMu.RUnlock()
+	if withdraw == nil {
+		return nil
+	}
+	return withdraw(ctx)
+}
+
+func (m *ServiceManager) advertiseRuntimePublication() {
+	m.publicationRefreshMu.RLock()
+	advertise := m.publicationAdvertise
+	m.publicationRefreshMu.RUnlock()
+	if advertise != nil {
+		advertise()
+	}
+}
+
 // SetRemotePublisher wires a remote publisher for proxy lifecycle hooks.
 func (m *ServiceManager) SetRemotePublisher(p PortPublisher) {
 	m.statusMu.Lock()
@@ -187,12 +251,13 @@ func (m *ServiceManager) SetFirewallManager(fw firewall.Manager) {
 	m.firewallMgr = fw
 }
 
-func (m *ServiceManager) openFirewallClaim(ep ServiceEndpoint) {
+func (m *ServiceManager) openFirewallClaim(ctx context.Context, ep ServiceEndpoint) error {
 	if ep.PortClaim != nil && m.firewallMgr != nil {
-		if err := m.firewallMgr.OpenPort(firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
-			log.Printf("ERROR: firewall open port %d: %v", *ep.PortClaim, err)
+		if err := m.firewallMgr.OpenPort(ctx, firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
+			return fmt.Errorf("firewall open port %d/%s: %w", *ep.PortClaim, ep.Flow.TransportProtocol(), err)
 		}
 	}
+	return nil
 }
 
 type publicationEndpointRef struct {
@@ -222,7 +287,7 @@ func (m *ServiceManager) applyNetworkPublicationFirewall(open bool) int {
 	m.mu.RLock()
 	var refs []publicationEndpointRef
 	for app, byListener := range m.registry {
-		if len(m.deactivated[app]) > 0 {
+		if _, inactive := m.deactivated[app]; inactive {
 			continue
 		}
 		for listener, ep := range byListener {
@@ -245,7 +310,7 @@ func (m *ServiceManager) applyNetworkPublicationFirewall(open bool) int {
 func (m *ServiceManager) applyCurrentFirewallClaim(ref publicationEndpointRef, open bool) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	if len(m.deactivated[ref.app]) > 0 {
+	if _, inactive := m.deactivated[ref.app]; inactive {
 		return false
 	}
 	byListener, ok := m.registry[ref.app]
@@ -257,9 +322,12 @@ func (m *ServiceManager) applyCurrentFirewallClaim(ref publicationEndpointRef, o
 		return false
 	}
 	if open {
-		m.openFirewallClaim(ep)
+		if err := m.openFirewallClaim(context.Background(), ep); err != nil {
+			log.Printf("ERROR: %v", err)
+			return false
+		}
 	} else {
-		m.closeFirewallClaim(ep)
+		m.closeFirewallClaim(context.Background(), ep)
 	}
 	return true
 }
@@ -451,9 +519,9 @@ func (m *ServiceManager) reservePreparedPublicationLocked(appName string, endpoi
 	return nil
 }
 
-func (m *ServiceManager) closeFirewallClaim(ep ServiceEndpoint) {
+func (m *ServiceManager) closeFirewallClaim(ctx context.Context, ep ServiceEndpoint) {
 	if ep.PortClaim != nil && m.firewallMgr != nil {
-		if err := m.firewallMgr.ClosePort(firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
+		if err := m.firewallMgr.ClosePort(ctx, firewall.Rule{Port: *ep.PortClaim, Protocol: ep.Flow.TransportProtocol()}); err != nil {
 			log.Printf("ERROR: firewall close port %d: %v", *ep.PortClaim, err)
 		}
 	}
@@ -474,7 +542,7 @@ func (m *ServiceManager) ActivePortClaims() []api.PortClaimInfo {
 func (m *ServiceManager) rebuildPortClaimCache() {
 	var claims []api.PortClaimInfo
 	for app, mapp := range m.registry {
-		if len(m.deactivated[app]) > 0 {
+		if _, inactive := m.deactivated[app]; inactive {
 			continue
 		}
 		for _, ep := range mapp {
@@ -785,8 +853,46 @@ func (m *ServiceManager) ClearLockOverride() {
 
 // RestoreFromPodman rebuilds proxies for an app using existing host-bind ports.
 func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppListener, hostByGuest map[string]int) ([]ServiceEndpoint, error) {
-	// Stop any existing proxies first
-	m.DeactivateApp(appName)
+	return m.RestoreFromPodmanContext(context.Background(), appName, listeners, hostByGuest)
+}
+
+// RestoreFromPodmanContext rebuilds an app's complete route set while holding
+// the same lifecycle authority used by suspend/resume. A suspension that
+// starts after this restore therefore always observes and withdraws the final
+// replacement rather than being lost in the deactivate/restore gap.
+func (m *ServiceManager) RestoreFromPodmanContext(ctx context.Context, appName string, listeners []api.AppListener, hostByGuest map[string]int) ([]ServiceEndpoint, error) {
+	return m.restoreFromPodmanContext(ctx, PublicationResumeToken{}, appName, listeners, hostByGuest)
+}
+
+// RestoreFromPodmanWithResumeTokenContext permits a durable transition to
+// replace and reactivate routes only for the exact suspension it owns.
+func (m *ServiceManager) RestoreFromPodmanWithResumeTokenContext(ctx context.Context, token PublicationResumeToken, appName string, listeners []api.AppListener, hostByGuest map[string]int) ([]ServiceEndpoint, error) {
+	return m.restoreFromPodmanContext(ctx, token, appName, listeners, hostByGuest)
+}
+
+func (m *ServiceManager) restoreFromPodmanContext(ctx context.Context, token PublicationResumeToken, appName string, listeners []api.AppListener, hostByGuest map[string]int) ([]ServiceEndpoint, error) {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
+	m.mu.Lock()
+	if err := m.authorizePublicationActivationLocked(appName, token); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.mu.Unlock()
+
+	// Restoring a subset is not a successful publication restore. In
+	// particular, task recovery must not treat one surviving listener as proof
+	// that a multi-listener app is reachable. Validate the complete Podman
+	// binding snapshot before withdrawing any last-known publication.
+	for _, listener := range listeners {
+		guestKey := fmt.Sprintf("%d/%s", listener.GuestPort, listener.Flow.TransportProtocol())
+		if _, ok := hostByGuest[guestKey]; !ok {
+			return nil, fmt.Errorf("%w: restore app %s: missing Podman binding for listener %s (%s)", ErrPublicationRestoreIncomplete, appName, listener.Name, guestKey)
+		}
+	}
+
+	// Stop any existing proxies first without releasing lifecycle ownership.
+	m.removeAppEndpointsLocked(appName, false)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -804,10 +910,16 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 		gpKey := fmt.Sprintf("%d/%s", l.GuestPort, l.Flow.TransportProtocol())
 		host, ok := hostByGuest[gpKey]
 		if !ok {
-			continue
+			// The complete snapshot was checked above. Keep this guard local to
+			// the allocation boundary in case that validation changes later.
+			return nil, fmt.Errorf("%w: restore app %s: missing Podman binding for listener %s (%s)", ErrPublicationRestoreIncomplete, appName, l.Name, gpKey)
 		}
 		if err := m.allocator.ReserveHost(host); err != nil {
-			continue
+			for _, allocated := range endpoints {
+				m.releaseEndpointPorts(allocated)
+			}
+			m.rebuildPortClaimCache()
+			return nil, fmt.Errorf("%w: restore app %s listener %s host binding %d: %v", ErrPublicationRestoreIncomplete, appName, l.Name, host, err)
 		}
 		var public int
 		var err error
@@ -839,9 +951,9 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 
 	started := 0
 	for _, ep := range endpoints {
-		if err := m.startEndpointPublicationLocked(ep); err != nil {
+		if err := m.startEndpointPublicationLocked(ctx, ep); err != nil {
 			for _, startedEp := range endpoints[:started] {
-				m.stopEndpointPublicationLocked(startedEp)
+				m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), startedEp)
 			}
 			for _, allocated := range endpoints {
 				m.releaseEndpointPorts(allocated)
@@ -872,8 +984,17 @@ func (m *ServiceManager) RestoreFromPodman(appName string, listeners []api.AppLi
 
 // AllocateForApp allocates ports for all listeners of an app and starts proxies.
 func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListener) ([]ServiceEndpoint, error) {
+	return m.allocateForAppContext(context.Background(), appName, listeners)
+}
+
+func (m *ServiceManager) allocateForAppContext(ctx context.Context, appName string, listeners []api.AppListener) ([]ServiceEndpoint, error) {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.authorizePublicationActivationLocked(appName, PublicationResumeToken{}); err != nil {
+		return nil, err
+	}
 
 	// Determine the primary listener for host-based routing
 	primaryName, _ := hostname.ResolvePrimaryListener(listeners)
@@ -907,9 +1028,9 @@ func (m *ServiceManager) AllocateForApp(appName string, listeners []api.AppListe
 	// Start proxies and open firewall for port claims
 	started := 0
 	for _, ep := range endpoints {
-		if err := m.startEndpointPublicationLocked(ep); err != nil {
+		if err := m.startEndpointPublicationLocked(ctx, ep); err != nil {
 			for _, startedEp := range endpoints[:started] {
-				m.stopEndpointPublicationLocked(startedEp)
+				m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), startedEp)
 			}
 			for _, allocated := range endpoints {
 				m.releaseEndpointPorts(allocated)
@@ -1045,7 +1166,10 @@ func (m *ServiceManager) ResolveByHostLabel(label string, remotePort int) (Servi
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, mapp := range m.registry {
+	for app, mapp := range m.registry {
+		if _, inactive := m.deactivated[app]; inactive {
+			continue
+		}
 		for _, ep := range mapp {
 			if ep.DerivedHostLabel == label && matchesRemotePort(ep, remotePort) {
 				return ep, true
@@ -1064,7 +1188,10 @@ func (m *ServiceManager) ResolveByHostLabelAnyPort(label string) (ServiceEndpoin
 	}
 	m.mu.RLock()
 	defer m.mu.RUnlock()
-	for _, mapp := range m.registry {
+	for app, mapp := range m.registry {
+		if _, inactive := m.deactivated[app]; inactive {
+			continue
+		}
 		for _, ep := range mapp {
 			if ep.DerivedHostLabel == label {
 				return ep, true
@@ -1595,18 +1722,40 @@ func (p *PreparedReconcile) RetainReservationsForRepair() {
 // Publish makes the prepared endpoint set authoritative and starts/stops public
 // proxy/firewall/remote publication state.
 func (p *PreparedReconcile) Publish() (ReconcileResult, bool, error) {
+	return p.PublishContext(context.Background())
+}
+
+// PublishContext makes the prepared route-set replacement authoritative under
+// the same lifecycle lock as suspend/resume and carries the owning operation's
+// task-pressure continuation into required firewall publication.
+func (p *PreparedReconcile) PublishContext(ctx context.Context) (ReconcileResult, bool, error) {
+	return p.publishContext(ctx, PublicationResumeToken{})
+}
+
+// PublishWithResumeTokenContext publishes a prepared route replacement only
+// for the exact transaction suspension represented by token.
+func (p *PreparedReconcile) PublishWithResumeTokenContext(ctx context.Context, token PublicationResumeToken) (ReconcileResult, bool, error) {
+	return p.publishContext(ctx, token)
+}
+
+func (p *PreparedReconcile) publishContext(ctx context.Context, token PublicationResumeToken) (ReconcileResult, bool, error) {
 	if p == nil || p.manager == nil {
 		return ReconcileResult{}, false, fmt.Errorf("prepared reconcile is nil")
 	}
+	p.manager.publicationLifecycleMu.Lock()
+	defer p.manager.publicationLifecycleMu.Unlock()
 	p.manager.mu.Lock()
 	defer p.manager.mu.Unlock()
+	if err := p.manager.authorizePublicationActivationLocked(p.appName, token); err != nil {
+		return ReconcileResult{}, false, err
+	}
 	if p.released {
 		return ReconcileResult{}, false, fmt.Errorf("prepared reconcile already released")
 	}
 	if p.published {
 		return p.result, p.containerChange, nil
 	}
-	if err := p.manager.publishPreparedReconcileLocked(p); err != nil {
+	if err := p.manager.publishPreparedReconcileLocked(ctx, p); err != nil {
 		return ReconcileResult{}, false, err
 	}
 	p.published = true
@@ -1791,36 +1940,68 @@ func (m *ServiceManager) prepareReconcileLocked(appName string, listeners []api.
 	return prepared, nil
 }
 
-func (m *ServiceManager) startEndpointPublicationLocked(ep ServiceEndpoint) error {
-	m.openFirewallClaim(ep)
-	if err := m.proxyManager.StartListenerChecked(ep); err != nil {
-		m.closeFirewallClaim(ep)
-		return fmt.Errorf("start listener %s/%s public %d: %w", ep.App, ep.Name, ep.PublicPort, err)
+func publicationCleanupContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return pressure.WithTransitionContinuation(context.WithoutCancel(ctx))
+}
+
+func (m *ServiceManager) startEndpointPublicationLocked(ctx context.Context, ep ServiceEndpoint) error {
+	if err := m.activateEndpointPublicationLocked(ctx, ep); err != nil {
+		return err
 	}
 	m.notifyPublish(ep.PublicPort)
 	return nil
 }
 
-func (m *ServiceManager) stopEndpointPublicationLocked(ep ServiceEndpoint) {
-	m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
-	m.closeFirewallClaim(ep)
+func (m *ServiceManager) activateEndpointPublicationLocked(ctx context.Context, ep ServiceEndpoint) error {
+	if err := m.openFirewallClaim(ctx, ep); err != nil {
+		// Firewalld applies one rule per private subnet, so a reported failure
+		// may still follow partial success. Withdraw the candidate rule before
+		// leaving publication suspended/pending.
+		m.closeFirewallClaim(publicationCleanupContext(ctx), ep)
+		return err
+	}
+	if err := m.proxyManager.StartListenerChecked(ep); err != nil {
+		m.closeFirewallClaim(publicationCleanupContext(ctx), ep)
+		return fmt.Errorf("start listener %s/%s public %d: %w", ep.App, ep.Name, ep.PublicPort, err)
+	}
+	return nil
+}
+
+func (m *ServiceManager) stopEndpointPublicationLocked(ctx context.Context, ep ServiceEndpoint) {
+	m.deactivateEndpointPublicationLocked(ctx, ep)
 	m.notifyUnpublish(ep.PublicPort)
 }
 
-func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconcile) error {
-	wasDeactivated := len(m.deactivated[prepared.appName]) > 0
+func (m *ServiceManager) deactivateEndpointPublicationLocked(ctx context.Context, ep ServiceEndpoint) {
+	m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
+	m.closeFirewallClaim(ctx, ep)
+}
+
+func (m *ServiceManager) publishPreparedReconcileLocked(ctx context.Context, prepared *PreparedReconcile) error {
+	_, wasDeactivated := m.deactivated[prepared.appName]
 	started := []ServiceEndpoint{}
 	restarted := []endpointReplacement{}
+	updatedClaims := []endpointReplacement{}
 	startedKeys := make(map[string]struct{})
 	rollbackStarted := func(cause error) error {
 		errs := []error{cause}
+		for i := len(updatedClaims) - 1; i >= 0; i-- {
+			replacement := updatedClaims[i]
+			m.closeFirewallClaim(publicationCleanupContext(ctx), replacement.New)
+			if err := m.openFirewallClaim(publicationCleanupContext(ctx), replacement.Old); err != nil {
+				errs = append(errs, fmt.Errorf("restore previous firewall publication: %w", err))
+			}
+		}
 		for i := len(started) - 1; i >= 0; i-- {
-			m.stopEndpointPublicationLocked(started[i])
+			m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), started[i])
 		}
 		for i := len(restarted) - 1; i >= 0; i-- {
 			replacement := restarted[i]
 			if wasDeactivated {
-				m.stopEndpointPublicationLocked(replacement.New)
+				m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), replacement.New)
 				continue
 			}
 			m.proxyManager.StopEndpoint(replacement.New.PublicPort, replacement.New.Flow)
@@ -1835,7 +2016,7 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 		m.proxyManager.StopEndpoint(replacement.Old.PublicPort, replacement.Old.Flow)
 		var err error
 		if wasDeactivated {
-			err = m.startEndpointPublicationLocked(replacement.New)
+			err = m.startEndpointPublicationLocked(ctx, replacement.New)
 		} else if startErr := m.proxyManager.StartListenerChecked(replacement.New); startErr != nil {
 			err = fmt.Errorf("restart listener %s/%s public %d: %w", replacement.New.App, replacement.New.Name, replacement.New.PublicPort, startErr)
 		}
@@ -1851,7 +2032,7 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 		startedKeys[replacement.New.endpointKey()] = struct{}{}
 	}
 	for _, ep := range prepared.start {
-		if err := m.startEndpointPublicationLocked(ep); err != nil {
+		if err := m.startEndpointPublicationLocked(ctx, ep); err != nil {
 			return rollbackStarted(err)
 		}
 		started = append(started, ep)
@@ -1862,14 +2043,23 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 			if _, alreadyStarted := startedKeys[replacement.New.endpointKey()]; alreadyStarted {
 				continue
 			}
-			if err := m.startEndpointPublicationLocked(replacement.New); err != nil {
+			if err := m.startEndpointPublicationLocked(ctx, replacement.New); err != nil {
 				return rollbackStarted(err)
 			}
 			started = append(started, replacement.New)
 			startedKeys[replacement.New.endpointKey()] = struct{}{}
 		} else {
-			m.closeFirewallClaim(replacement.Old)
-			m.openFirewallClaim(replacement.New)
+			m.closeFirewallClaim(publicationCleanupContext(ctx), replacement.Old)
+			if err := m.openFirewallClaim(ctx, replacement.New); err != nil {
+				m.closeFirewallClaim(publicationCleanupContext(ctx), replacement.New)
+				// Restore the prior required rule before leaving the durable
+				// transaction pending for retry.
+				if restoreErr := m.openFirewallClaim(publicationCleanupContext(ctx), replacement.Old); restoreErr != nil {
+					err = errors.Join(err, fmt.Errorf("restore previous firewall publication: %w", restoreErr))
+				}
+				return rollbackStarted(err)
+			}
+			updatedClaims = append(updatedClaims, replacement)
 		}
 	}
 	if wasDeactivated {
@@ -1877,7 +2067,7 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 			if _, alreadyStarted := startedKeys[ep.endpointKey()]; alreadyStarted {
 				continue
 			}
-			if err := m.startEndpointPublicationLocked(ep); err != nil {
+			if err := m.startEndpointPublicationLocked(ctx, ep); err != nil {
 				return rollbackStarted(err)
 			}
 			started = append(started, ep)
@@ -1894,7 +2084,7 @@ func (m *ServiceManager) publishPreparedReconcileLocked(prepared *PreparedReconc
 	}
 	for _, ep := range prepared.stopRelease {
 		if !wasDeactivated {
-			m.stopEndpointPublicationLocked(ep)
+			m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), ep)
 		}
 		m.releaseEndpointPorts(ep)
 	}
@@ -2046,36 +2236,72 @@ func (m *ServiceManager) DeactivateApp(appName string) {
 	m.removeAppEndpoints(appName, false)
 }
 
-// SuspendAppPublication temporarily closes an app's public/remote publication
-// while preserving registry endpoints and their allocated ports. Container
-// recreation can still reuse the existing HostBind mappings, and
-// ResumeAppPublication can restore the same public surface after commit.
-func (m *ServiceManager) SuspendAppPublication(appName string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	mapp, ok := m.registry[appName]
-	if !ok {
-		return
+func (m *ServiceManager) authorizePublicationActivationLocked(appName string, token PublicationResumeToken) error {
+	inactive := m.deactivated[appName]
+	if inactive == nil || inactive.kind == publicationInactiveStopped {
+		return nil
 	}
-	endpoints := make([]ServiceEndpoint, 0, len(mapp))
-	for _, ep := range mapp {
-		endpoints = append(endpoints, ep)
-		m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
-		m.closeFirewallClaim(ep)
+	if token.manager == m && token.appName == appName && token.record == inactive {
+		return nil
+	}
+	return fmt.Errorf("%w: %s", ErrPublicationSuspended, appName)
+}
+
+// SuspendAppPublication temporarily closes an app's public/remote publication
+// while preserving registry endpoints and their allocated ports. Every call
+// installs a fresh record, invalidating any older resume token even when the
+// app was already inactive.
+func (m *ServiceManager) SuspendAppPublication(appName string) PublicationResumeToken {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
+
+	m.mu.Lock()
+	previous := m.deactivated[appName]
+	endpoints := []ServiceEndpoint{}
+	info := []events.ServiceEndpointInfo{}
+	if mapp, ok := m.registry[appName]; ok {
+		endpoints = make([]ServiceEndpoint, 0, len(mapp))
+		for _, ep := range mapp {
+			endpoints = append(endpoints, ep)
+		}
+		info = endpointInfoSlice(endpoints)
+	} else if previous != nil {
+		info = append(info, previous.endpoints...)
+	}
+	// The inactive marker is the authoritative publication state. Commit it
+	// before invoking the runtime filter, including for an empty endpoint set.
+	record := &publicationInactiveRecord{kind: publicationInactiveSuspended, endpoints: info}
+	m.deactivated[appName] = record
+	m.rebuildPortClaimCache()
+	m.mu.Unlock()
+	token := PublicationResumeToken{manager: m, appName: appName, record: record}
+	if previous != nil {
+		return token
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := m.withdrawRuntimePublication(ctx); err != nil {
+		log.Printf("WARN: withdraw runtime publication for %s: %v", appName, err)
+	}
+	cancel()
+
+	// Local alias denial and adapter withdrawal are ordered before route
+	// teardown. The lifecycle lock prevents a concurrent resume from
+	// reactivating the projection during this gap.
+	for _, ep := range endpoints {
+		m.deactivateEndpointPublicationLocked(publicationCleanupContext(context.Background()), ep)
 		m.notifyUnpublish(ep.PublicPort)
 		if m.backendHealth != nil {
 			m.backendHealth.RemoveEndpoint(ep.endpointKey())
 		}
 	}
-	if len(endpoints) > 0 {
-		info := endpointInfoSlice(endpoints)
-		m.deactivated[appName] = info
-		m.rebuildPortClaimCache()
+	if len(info) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:         appName,
 			Deactivated: info,
 		})
 	}
+	return token
 }
 
 // ResumeAppPublication restarts proxy/firewall/remote publication for an app
@@ -2089,26 +2315,64 @@ func (m *ServiceManager) ResumeAppPublication(appName string) {
 // ResumeAppPublicationChecked restarts publication and reports listener bind
 // failures to callers that need transaction recovery to remain open.
 func (m *ServiceManager) ResumeAppPublicationChecked(appName string) error {
+	return m.ResumeAppPublicationCheckedContext(context.Background(), appName)
+}
+
+// ResumeAppPublicationCheckedContext restarts publication using the owning
+// durable transition's context, including its Warning-pressure continuation.
+func (m *ServiceManager) ResumeAppPublicationCheckedContext(ctx context.Context, appName string) error {
+	return m.resumeAppPublicationCheckedContext(ctx, PublicationResumeToken{}, appName)
+}
+
+// ResumeAppPublicationWithResumeTokenContext resumes only the exact suspended
+// publication owned by token.
+func (m *ServiceManager) ResumeAppPublicationWithResumeTokenContext(ctx context.Context, token PublicationResumeToken, appName string) error {
+	return m.resumeAppPublicationCheckedContext(ctx, token, appName)
+}
+
+func (m *ServiceManager) resumeAppPublicationCheckedContext(ctx context.Context, token PublicationResumeToken, appName string) error {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
+	if err := m.authorizePublicationActivationLocked(appName, token); err != nil {
+		m.mu.Unlock()
+		return err
+	}
 	mapp, ok := m.registry[appName]
 	if !ok {
+		m.mu.Unlock()
+		return nil
+	}
+	if _, inactive := m.deactivated[appName]; !inactive {
+		m.mu.Unlock()
 		return nil
 	}
 	endpoints := make([]ServiceEndpoint, 0, len(mapp))
 	started := []ServiceEndpoint{}
 	for _, ep := range mapp {
 		endpoints = append(endpoints, ep)
-		if err := m.startEndpointPublicationLocked(ep); err != nil {
+		// Activate the complete route set before making any of it eligible for
+		// runtime publication.
+		if err := m.activateEndpointPublicationLocked(ctx, ep); err != nil {
 			for i := len(started) - 1; i >= 0; i-- {
-				m.stopEndpointPublicationLocked(started[i])
+				m.deactivateEndpointPublicationLocked(publicationCleanupContext(ctx), started[i])
 			}
+			m.mu.Unlock()
 			return err
 		}
 		started = append(started, ep)
 	}
 	delete(m.deactivated, appName)
 	m.rebuildPortClaimCache()
+	m.mu.Unlock()
+
+	// Publication becomes observable only after every required endpoint was
+	// activated and the active projection was committed.
+	for _, ep := range endpoints {
+		m.notifyPublish(ep.PublicPort)
+	}
+	m.advertiseRuntimePublication()
 	if len(endpoints) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:   appName,
@@ -2122,8 +2386,30 @@ func (m *ServiceManager) ResumeAppPublicationChecked(appName string) error {
 // durably recorded before a manifest update commit. It is used during recovery
 // when the in-memory PreparedReconcile was lost after the ledger crossed.
 func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []ServiceEndpoint) error {
+	return m.RestorePreparedPublicationContext(context.Background(), appName, endpoints)
+}
+
+// RestorePreparedPublicationContext replaces an app's complete route set under
+// publication lifecycle ownership and carries a durable recovery continuation
+// into required firewall work.
+func (m *ServiceManager) RestorePreparedPublicationContext(ctx context.Context, appName string, endpoints []ServiceEndpoint) error {
+	return m.restorePreparedPublicationContext(ctx, PublicationResumeToken{}, appName, endpoints)
+}
+
+// RestorePreparedPublicationWithResumeTokenContext restores a durable prepared
+// route set only for the exact suspension owned by token.
+func (m *ServiceManager) RestorePreparedPublicationWithResumeTokenContext(ctx context.Context, token PublicationResumeToken, appName string, endpoints []ServiceEndpoint) error {
+	return m.restorePreparedPublicationContext(ctx, token, appName, endpoints)
+}
+
+func (m *ServiceManager) restorePreparedPublicationContext(ctx context.Context, token PublicationResumeToken, appName string, endpoints []ServiceEndpoint) error {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if err := m.authorizePublicationActivationLocked(appName, token); err != nil {
+		return err
+	}
 	newMap := make(map[string]ServiceEndpoint, len(endpoints))
 	newHosts := make(map[int]struct{}, len(endpoints))
 	newPublic := make(map[string]struct{}, len(endpoints))
@@ -2145,13 +2431,13 @@ func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []
 	}
 
 	var removed []ServiceEndpoint
-	wasDeactivated := len(m.deactivated[appName]) > 0
+	_, wasDeactivated := m.deactivated[appName]
 	stoppedExisting := []ServiceEndpoint{}
 	if existing, ok := m.registry[appName]; ok {
 		for _, ep := range existing {
 			removed = append(removed, ep)
 			if !wasDeactivated {
-				m.stopEndpointPublicationLocked(ep)
+				m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), ep)
 				stoppedExisting = append(stoppedExisting, ep)
 			}
 		}
@@ -2160,12 +2446,12 @@ func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []
 	rollbackRestore := func(cause error) error {
 		errs := []error{cause}
 		for i := len(started) - 1; i >= 0; i-- {
-			m.stopEndpointPublicationLocked(started[i])
+			m.stopEndpointPublicationLocked(publicationCleanupContext(ctx), started[i])
 		}
 		if !wasDeactivated {
 			for i := len(stoppedExisting) - 1; i >= 0; i-- {
 				ep := stoppedExisting[i]
-				if err := m.startEndpointPublicationLocked(ep); err != nil {
+				if err := m.startEndpointPublicationLocked(publicationCleanupContext(ctx), ep); err != nil {
 					errs = append(errs, fmt.Errorf("restore listener %s/%s public %d: %w", ep.App, ep.Name, ep.PublicPort, err))
 				}
 			}
@@ -2173,7 +2459,7 @@ func (m *ServiceManager) RestorePreparedPublication(appName string, endpoints []
 		return errors.Join(errs...)
 	}
 	for _, ep := range added {
-		if err := m.startEndpointPublicationLocked(ep); err != nil {
+		if err := m.startEndpointPublicationLocked(ctx, ep); err != nil {
 			return rollbackRestore(err)
 		}
 		started = append(started, ep)
@@ -2225,20 +2511,21 @@ func (m *ServiceManager) SetAppOIDCConfig(appName string, authorizePaths []strin
 }
 
 func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
+	m.removeAppEndpointsLocked(appName, permanent)
+}
+
+// removeAppEndpointsLocked performs the route teardown while the caller owns
+// publicationLifecycleMu. RestoreFromPodman uses it so no suspend operation can
+// disappear between teardown and replacement publication.
+func (m *ServiceManager) removeAppEndpointsLocked(appName string, permanent bool) {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	var removed []ServiceEndpoint
 	if mapp, ok := m.registry[appName]; ok {
 		removed = make([]ServiceEndpoint, 0, len(mapp))
 		for _, ep := range mapp {
 			removed = append(removed, ep)
-			m.proxyManager.StopEndpoint(ep.PublicPort, ep.Flow)
-			m.closeFirewallClaim(ep)
-			m.releaseEndpointPorts(ep)
-			m.notifyUnpublish(ep.PublicPort)
-			if m.backendHealth != nil {
-				m.backendHealth.RemoveEndpoint(ep.endpointKey())
-			}
 		}
 		delete(m.registry, appName)
 	}
@@ -2247,35 +2534,65 @@ func (m *ServiceManager) removeAppEndpoints(appName string, permanent bool) {
 	}
 	m.rebuildPortClaimCache()
 	delete(m.containerIDs, appName)
-
-	m.appTransientMu.Lock()
-	delete(m.appTransient, appName)
-	m.appTransientMu.Unlock()
-
 	info := endpointInfoSlice(removed)
 
 	if !permanent {
 		// Stash endpoint metadata so a subsequent RemoveApp can emit a
 		// permanent Removed event even though the endpoints are already gone.
-		if len(info) > 0 {
-			m.deactivated[appName] = info
-			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
-				App:         appName,
-				Deactivated: info,
-			})
+		// Never downgrade a transaction suspension: its record identity is the
+		// exact resume authority held by the owning operation.
+		if inactive := m.deactivated[appName]; inactive != nil && inactive.kind == publicationInactiveSuspended {
+			if len(info) > 0 {
+				inactive.endpoints = info
+			}
+		} else {
+			m.deactivated[appName] = &publicationInactiveRecord{kind: publicationInactiveStopped, endpoints: info}
 		}
 	} else {
 		// Include any previously deactivated endpoints that are no longer
 		// in the registry (app was stopped before uninstall).
 		if prev, ok := m.deactivated[appName]; ok {
-			info = append(info, prev...)
+			info = append(info, prev.endpoints...)
 			delete(m.deactivated, appName)
 		}
-		if len(info) > 0 {
-			m.publishEndpointsEvent(events.ServiceEndpointsChanged{
-				App:     appName,
-				Removed: info,
-			})
+	}
+	m.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	if err := m.withdrawRuntimePublication(ctx); err != nil {
+		log.Printf("WARN: withdraw runtime publication for %s: %v", appName, err)
+	}
+	cancel()
+
+	for _, ep := range removed {
+		m.deactivateEndpointPublicationLocked(publicationCleanupContext(context.Background()), ep)
+		m.notifyUnpublish(ep.PublicPort)
+		if m.backendHealth != nil {
+			m.backendHealth.RemoveEndpoint(ep.endpointKey())
 		}
 	}
+	m.mu.Lock()
+	for _, ep := range removed {
+		m.releaseEndpointPorts(ep)
+	}
+	m.mu.Unlock()
+
+	m.appTransientMu.Lock()
+	delete(m.appTransient, appName)
+	m.appTransientMu.Unlock()
+
+	if len(info) == 0 {
+		return
+	}
+	if permanent {
+		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+			App:     appName,
+			Removed: info,
+		})
+		return
+	}
+	m.publishEndpointsEvent(events.ServiceEndpointsChanged{
+		App:         appName,
+		Deactivated: info,
+	})
 }

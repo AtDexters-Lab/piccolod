@@ -25,11 +25,11 @@ const (
 
 // OnboardingConfig is the persisted onboarding state.
 type OnboardingConfig struct {
-	State                OnboardingState `json:"state"`
-	BootMode             string          `json:"boot_mode,omitempty"`
-	InstallDone          bool            `json:"install_done,omitempty"`
-	BootOrderConfigured  bool            `json:"boot_order_configured,omitempty"`
-	UpdatedAt            string          `json:"updated_at,omitempty"`
+	State               OnboardingState `json:"state"`
+	BootMode            string          `json:"boot_mode,omitempty"`
+	InstallDone         bool            `json:"install_done,omitempty"`
+	BootOrderConfigured bool            `json:"boot_order_configured,omitempty"`
+	UpdatedAt           string          `json:"updated_at,omitempty"`
 }
 
 // Manager manages the onboarding state machine.
@@ -92,21 +92,35 @@ func (m *Manager) State() OnboardingState {
 
 // BootMode returns the detected boot mode.
 func (m *Manager) BootMode() storage.BootMode {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.bootMode
+}
+
+// SetBootMode supplies the post-Ready boot-device observation. Constructors
+// deliberately begin at Unknown so boot probing cannot spawn a child before
+// the access listener is available.
+func (m *Manager) SetBootMode(mode storage.BootMode) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.bootMode = mode
+	m.config.BootMode = string(mode)
 }
 
 // IsRequired returns true when USB/Unknown boot and state is pending.
 func (m *Manager) IsRequired() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	if m.bootMode == storage.BootModeInternal {
 		return false
 	}
-	m.mu.RLock()
-	defer m.mu.RUnlock()
 	return m.config.State == StatePending
 }
 
 // IsUSBBoot returns true when running from USB (for Settings visibility).
 func (m *Manager) IsUSBBoot() bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
 	return m.bootMode == storage.BootModeUSB || m.bootMode == storage.BootModeUnknown
 }
 
@@ -232,11 +246,11 @@ func (m *Manager) StatusResponse() map[string]any {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	return map[string]any{
-		"state":                  string(m.config.State),
-		"boot_mode":              m.config.BootMode,
-		"required":               m.isRequiredLocked(),
-		"install_done":           m.config.InstallDone,
-		"boot_order_configured":  m.config.BootOrderConfigured,
+		"state":                 string(m.config.State),
+		"boot_mode":             m.config.BootMode,
+		"required":              m.isRequiredLocked(),
+		"install_done":          m.config.InstallDone,
+		"boot_order_configured": m.config.BootOrderConfigured,
 	}
 }
 

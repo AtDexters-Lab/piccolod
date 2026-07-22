@@ -2,12 +2,16 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"reflect"
+	"strings"
 	"testing"
 	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/resources/pressure"
 )
 
 func TestReconcileMultiContainer_StopsServicesWhenAnchorMissingAndDesiredStopped(t *testing.T) {
@@ -149,6 +153,438 @@ func newReconcileTestEnv(t *testing.T) (*AppManager, *MockContainerManager, *Fil
 	}
 
 	return mgr, mock, state, def, layout, runtime
+}
+
+func createRunningReconcileGroup(t *testing.T, mock *MockContainerManager, state *FilesystemStateManager, def *api.AppDefinition, runtime container.PodmanRuntime) *AppInstance {
+	t.Helper()
+	ctx := context.Background()
+	anchorID, err := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{
+		Name:   networkAnchorContainerName("testapp"),
+		Labels: piccoloLabels("testapp", "", "anchor"),
+		Ports:  []container.PortMapping{{Host: 32001, Container: 8080, Protocol: "tcp"}},
+	})
+	if err != nil {
+		t.Fatalf("create anchor: %v", err)
+	}
+	if err := mock.StartContainer(ctx, runtime, anchorID); err != nil {
+		t.Fatalf("start anchor: %v", err)
+	}
+
+	containers := make(map[string]string, len(def.Services))
+	primary := primaryServiceFor(def, nil)
+	for serviceName := range def.Services {
+		id, createErr := mock.CreateContainer(ctx, runtime, container.ContainerCreateSpec{
+			Name:   containerNameForService("testapp", serviceName, primary),
+			Labels: piccoloLabels("testapp", serviceName, "service"),
+		})
+		if createErr != nil {
+			t.Fatalf("create service %s: %v", serviceName, createErr)
+		}
+		if startErr := mock.StartContainer(ctx, runtime, id); startErr != nil {
+			t.Fatalf("start service %s: %v", serviceName, startErr)
+		}
+		containers[serviceName] = id
+	}
+	now := time.Now()
+	appInst := &AppInstance{
+		InstanceID:      "testapp",
+		Enabled:         true,
+		Status:          StatusRunning,
+		PrimaryService:  primary,
+		NetworkAnchorID: anchorID,
+		Containers:      containers,
+		CreatedAt:       now,
+		UpdatedAt:       now,
+		Definition:      def,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	return appInst
+}
+
+func TestReconcileUnknownObservationPreservesRunningProjectionRoutesAndAttemptBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func(*MockContainerManager, *AppInstance)
+	}{
+		{
+			name: "anchor inspect",
+			inject: func(mock *MockContainerManager, app *AppInstance) {
+				mock.inspectErrorForContainer = map[string]error{app.NetworkAnchorID: fmt.Errorf("pthread_create failed: resource temporarily unavailable")}
+			},
+		},
+		{
+			name: "service inspect",
+			inject: func(mock *MockContainerManager, app *AppInstance) {
+				mock.inspectErrorForContainer = map[string]error{app.Containers["main"]: fmt.Errorf("podman inspect timed out")}
+			},
+		},
+		{
+			name: "container enumeration",
+			inject: func(mock *MockContainerManager, _ *AppInstance) {
+				mock.listError = fmt.Errorf("podman ps failed")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+			if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+				t.Fatalf("allocate route: %v", err)
+			}
+			tc.inject(mock, appInst)
+
+			if err := mgr.reconcileApp(context.Background(), state, appInst); err != nil {
+				t.Fatalf("reconcile unknown observation: %v", err)
+			}
+			if appInst.StartupAttempts != 0 {
+				t.Fatalf("unknown observation consumed startup attempts: %d", appInst.StartupAttempts)
+			}
+			if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusRunning {
+				t.Fatalf("status = %q, want retained %q", got, StatusRunning)
+			}
+			if _, err := mgr.serviceManager.GetByApp(appInst.InstanceID); err != nil {
+				t.Fatalf("route was deactivated after unknown observation: %v", err)
+			}
+			if _, ok := mock.containers[appInst.NetworkAnchorID]; !ok {
+				t.Fatal("anchor was mutated after unknown observation")
+			}
+			for serviceName, id := range appInst.Containers {
+				if _, ok := mock.containers[id]; !ok {
+					t.Fatalf("service %s was mutated after unknown observation", serviceName)
+				}
+			}
+		})
+	}
+}
+
+func TestRestoreServicesPreservesExistingRouteWhenObservationIsUnknown(t *testing.T) {
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("allocate route: %v", err)
+	}
+	mock.inspectErrorForContainer = map[string]error{appInst.NetworkAnchorID: fmt.Errorf("podman unavailable")}
+
+	mgr.RestoreServices(context.Background())
+
+	if _, err := mgr.serviceManager.GetByApp(appInst.InstanceID); err != nil {
+		t.Fatalf("restore deactivated last-known route on unknown: %v", err)
+	}
+}
+
+func TestReconcileMissingAnchorWarningAfterRootfsPreservesActivePublication(t *testing.T) {
+	pressure.DefaultAdmission.ResetForTest()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	mgr.serviceManager.UseInMemoryNetworkForTest()
+	claim := 32080
+	def.Listeners[0].PortClaim = &claim
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+	mgr.setObservedStatusMessage(appInst.InstanceID, "healthy")
+	if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("publish route: %v", err)
+	}
+	if !mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+		t.Fatal("precondition: route-bearing publication is not active")
+	}
+
+	firstFailure := time.Now().Add(-time.Minute)
+	appInst.StartupAttempts = 2
+	appInst.FirstStartupFailureAt = &firstFailure
+	appInst.ActiveRootfs = map[string]string{"main": "rootfs-main"}
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		t.Fatalf("store pre-reconcile state: %v", err)
+	}
+	beforeRegistry := mgr.serviceManager.SnapshotRegistry()
+	beforeClaims := mgr.serviceManager.ActivePortClaims()
+	beforeContainers := make(map[string]string, len(appInst.Containers))
+	for serviceName, id := range appInst.Containers {
+		beforeContainers[serviceName] = id
+	}
+	beforeNextID := mock.nextID
+
+	// Preserve running services but remove the anchor, then fence admission
+	// exactly after the rootfs preflight. The second lifecycle check must stop
+	// before cleanup or publication withdrawal.
+	delete(mock.containers, appInst.NetworkAnchorID)
+	rootfs := newStubRootfsManager(t.TempDir())
+	rootfs.exists = map[string]bool{"rootfs-main": true}
+	rootfs.attachHook = pressure.DefaultAdmission.Fence
+	mgr.SetRootfsManager(rootfs)
+
+	err := mgr.reconcileApp(context.Background(), state, appInst)
+	if !pressure.IsAdmissionError(err) {
+		t.Fatalf("reconcile error = %v, want task-pressure admission error", err)
+	}
+	if mock.nextID != beforeNextID {
+		t.Fatalf("container recreation started: next ID = %d, want %d", mock.nextID, beforeNextID)
+	}
+	for serviceName, id := range beforeContainers {
+		got, ok := mock.containers[id]
+		if !ok || got.Status != "running" {
+			t.Fatalf("service %s changed across admission fence: %+v", serviceName, got)
+		}
+	}
+	if !mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+		t.Fatal("active publication was withdrawn; app aliases would become ineligible")
+	}
+	if got := mgr.serviceManager.SnapshotRegistry(); !reflect.DeepEqual(got, beforeRegistry) {
+		t.Fatalf("route registry changed across admission fence: got %+v want %+v", got, beforeRegistry)
+	}
+	if got := mgr.serviceManager.ActivePortClaims(); !reflect.DeepEqual(got, beforeClaims) {
+		t.Fatalf("active port claims changed across admission fence: got %+v want %+v", got, beforeClaims)
+	}
+	if status, message := mgr.getObservedStatusAndMessage(appInst.InstanceID); status != StatusRunning || message != "healthy" {
+		t.Fatalf("observed projection = (%q, %q), want (%q, %q)", status, message, StatusRunning, "healthy")
+	}
+	if appInst.StartupAttempts != 2 || appInst.FirstStartupFailureAt == nil || !appInst.FirstStartupFailureAt.Equal(firstFailure) {
+		t.Fatalf("startup history changed: attempts=%d first=%v", appInst.StartupAttempts, appInst.FirstStartupFailureAt)
+	}
+	if mgr.startupAttemptActive(appInst.InstanceID) {
+		t.Fatal("admission pause retained startup-attempt ownership")
+	}
+	stored, ok := state.GetApp(appInst.InstanceID)
+	if !ok {
+		t.Fatal("stored app missing")
+	}
+	if stored.NetworkAnchorID != appInst.NetworkAnchorID || !reflect.DeepEqual(stored.Containers, beforeContainers) || stored.StartupAttempts != 2 {
+		t.Fatalf("stored lifecycle state changed: anchor=%q containers=%v attempts=%d", stored.NetworkAnchorID, stored.Containers, stored.StartupAttempts)
+	}
+}
+
+func TestDesiredRunningWarningAfterFinalRemoveCommitsInactiveClearedState(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*MockContainerManager, *AppInstance)
+	}{
+		{
+			name: "missing anchor cleanup",
+			mutate: func(mock *MockContainerManager, appInst *AppInstance) {
+				delete(mock.containers, appInst.NetworkAnchorID)
+			},
+		},
+		{
+			name: "stale anchor recovery",
+			mutate: func(mock *MockContainerManager, _ *AppInstance) {
+				for _, item := range mock.containers {
+					item.Status = "stale"
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pressure.DefaultAdmission.ResetForTest()
+			t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+			mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+			mgr.serviceManager.UseInMemoryNetworkForTest()
+			claim := 32080
+			def.Listeners[0].PortClaim = &claim
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+			mgr.setObservedStatusMessage(appInst.InstanceID, "healthy")
+			if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+				t.Fatalf("publish route: %v", err)
+			}
+			firstFailure := time.Now().Add(-time.Minute)
+			appInst.StartupAttempts = 2
+			appInst.FirstStartupFailureAt = &firstFailure
+			if err := state.StoreAppMetadata(appInst); err != nil {
+				t.Fatalf("store pre-reconcile state: %v", err)
+			}
+			beforeRegistry := mgr.serviceManager.SnapshotRegistry()
+			tc.mutate(mock, appInst)
+			mock.removeHook = func(string) {
+				if len(mock.containers) == 0 {
+					pressure.DefaultAdmission.Fence()
+				}
+			}
+
+			err := mgr.reconcileApp(context.Background(), state, appInst)
+			if !pressure.IsAdmissionError(err) {
+				t.Fatalf("reconcile error = %v, want task-pressure admission error", err)
+			}
+			if len(mock.containers) != 0 {
+				t.Fatalf("postcondition: final removal did not complete: %+v", mock.containers)
+			}
+			if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+				t.Fatal("publication remained active after its runtime was authoritatively removed")
+			}
+			if got := mgr.serviceManager.SnapshotRegistry(); !reflect.DeepEqual(got, beforeRegistry) {
+				t.Fatalf("suspended route registry changed: got %+v want %+v", got, beforeRegistry)
+			}
+			if got := mgr.serviceManager.ActivePortClaims(); len(got) != 0 {
+				t.Fatalf("active port claims remained after runtime removal: %+v", got)
+			}
+			if status, message := mgr.getObservedStatusAndMessage(appInst.InstanceID); status != StatusStarting || message != "Containers removed; recreation pending" {
+				t.Fatalf("observed projection = (%q, %q), want safe pending projection", status, message)
+			}
+			if appInst.NetworkAnchorID != "" || len(appInst.Containers) != 0 {
+				t.Fatalf("in-memory IDs were not cleared: anchor=%q containers=%v", appInst.NetworkAnchorID, appInst.Containers)
+			}
+			if appInst.StartupAttempts != 2 || appInst.FirstStartupFailureAt == nil || !appInst.FirstStartupFailureAt.Equal(firstFailure) {
+				t.Fatalf("startup history changed: attempts=%d first=%v", appInst.StartupAttempts, appInst.FirstStartupFailureAt)
+			}
+			stored, ok := state.GetApp(appInst.InstanceID)
+			if !ok {
+				t.Fatal("stored app missing")
+			}
+			if stored.NetworkAnchorID != "" || len(stored.Containers) != 0 || stored.StartupAttempts != 2 {
+				t.Fatalf("stored cleared state = anchor=%q containers=%v attempts=%d", stored.NetworkAnchorID, stored.Containers, stored.StartupAttempts)
+			}
+			if containerID, ok := mgr.serviceManager.GetAppContainerID(appInst.InstanceID); ok && containerID != "" {
+				t.Fatalf("service publication retained stale container ID %q", containerID)
+			}
+
+			pressure.DefaultAdmission.ResetForTest()
+			mock.removeHook = nil
+			if err := mgr.reconcileApp(context.Background(), state, appInst); err != nil {
+				t.Fatalf("retry reconcile after pressure cleared: %v", err)
+			}
+			if appInst.NetworkAnchorID == "" || len(appInst.Containers) != len(def.Services) {
+				t.Fatalf("retry did not persist replacement IDs: anchor=%q containers=%v", appInst.NetworkAnchorID, appInst.Containers)
+			}
+			if !mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+				t.Fatal("retry did not reactivate publication with its fresh suspension token")
+			}
+			if got := mgr.serviceManager.ActivePortClaims(); len(got) != 1 || got[0].Port != claim {
+				t.Fatalf("retry active port claims = %+v, want claim %d", got, claim)
+			}
+			if status, _ := mgr.getObservedStatusAndMessage(appInst.InstanceID); status != StatusRunning {
+				t.Fatalf("retry observed status = %q, want %q", status, StatusRunning)
+			}
+		})
+	}
+}
+
+func TestDesiredStoppedReconcileStillWithdrawsPublicationUnderWarning(t *testing.T) {
+	pressure.DefaultAdmission.ResetForTest()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+	mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+	mgr.serviceManager.UseInMemoryNetworkForTest()
+	claim := 32080
+	def.Listeners[0].PortClaim = &claim
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+	if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("publish route: %v", err)
+	}
+	pressure.DefaultAdmission.Fence()
+
+	if err := mgr.reconcileContainerGroup(context.Background(), state, appInst, def, layout, runtime, false); err != nil {
+		t.Fatalf("desired-stopped reconcile: %v", err)
+	}
+	if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+		t.Fatal("desired-stopped reconcile retained active publication")
+	}
+	if claims := mgr.serviceManager.ActivePortClaims(); len(claims) != 0 {
+		t.Fatalf("desired-stopped reconcile retained active port claims: %+v", claims)
+	}
+	if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusStopped {
+		t.Fatalf("observed status = %q, want %q", got, StatusStopped)
+	}
+}
+
+func TestDesiredRunningCleanupAdmissionErrorFailsPublicationClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		inject func(*MockContainerManager)
+	}{
+		{
+			name: "stop",
+			inject: func(mock *MockContainerManager) {
+				mock.stopError = &pressure.AdmissionError{Class: pressure.WorkPodman}
+			},
+		},
+		{
+			name: "remove",
+			inject: func(mock *MockContainerManager) {
+				mock.removeError = &pressure.AdmissionError{Class: pressure.WorkPodman}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pressure.DefaultAdmission.ResetForTest()
+			t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+			mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+			mgr.serviceManager.UseInMemoryNetworkForTest()
+			claim := 32080
+			def.Listeners[0].PortClaim = &claim
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+				t.Fatalf("publish route: %v", err)
+			}
+			beforeRegistry := mgr.serviceManager.SnapshotRegistry()
+			beforeNextID := mock.nextID
+			tc.inject(mock)
+
+			_, err := mgr.cleanupDesiredRunningGroupForRecreate(context.Background(), state, appInst, def, runtime, "test")
+			if !pressure.IsAdmissionError(err) {
+				t.Fatalf("cleanup error = %v, want task-pressure admission error", err)
+			}
+			if mock.nextID != beforeNextID {
+				t.Fatalf("cleanup recreated containers: next ID = %d, want %d", mock.nextID, beforeNextID)
+			}
+			for serviceName, id := range appInst.Containers {
+				if _, ok := mock.containers[id]; !ok {
+					t.Fatalf("service %s was removed after admission error", serviceName)
+				}
+			}
+			if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+				t.Fatal("publication remained active after cleanup could have partially stopped the group")
+			}
+			if got := mgr.serviceManager.SnapshotRegistry(); !reflect.DeepEqual(got, beforeRegistry) {
+				t.Fatalf("suspended route registry changed: got %+v want %+v", got, beforeRegistry)
+			}
+			if got := mgr.serviceManager.ActivePortClaims(); len(got) != 0 {
+				t.Fatalf("active port claims remained after uncertain teardown: %+v", got)
+			}
+		})
+	}
+}
+
+func TestDesiredRunningCleanupRemovalFailureDoesNotProceedToRecreation(t *testing.T) {
+	pressure.DefaultAdmission.ResetForTest()
+	t.Cleanup(pressure.DefaultAdmission.ResetForTest)
+
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	mgr.serviceManager.UseInMemoryNetworkForTest()
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("publish route: %v", err)
+	}
+	mock.removeError = errors.New("remove unavailable")
+
+	_, err := mgr.cleanupDesiredRunningGroupForRecreate(context.Background(), state, appInst, def, runtime, "test")
+	if err == nil || !strings.Contains(err.Error(), "remove unavailable") {
+		t.Fatalf("cleanup removal error = %v, want explicit retryable failure", err)
+	}
+	if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+		t.Fatal("publication remained active after backends were stopped but removal failed")
+	}
+	if got := mgr.serviceManager.ActivePortClaims(); len(got) != 0 {
+		t.Fatalf("active port claims remained after failed teardown: %+v", got)
+	}
+	if appInst.NetworkAnchorID == "" || len(appInst.Containers) == 0 {
+		t.Fatalf("failed removal falsely committed absent runtime: anchor=%q containers=%v", appInst.NetworkAnchorID, appInst.Containers)
+	}
+}
+
+func TestContainerStatusesRejectsPartialUnknownProjection(t *testing.T) {
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	mock.inspectErrorForContainer = map[string]error{appInst.Containers["side"]: fmt.Errorf("inspect unavailable")}
+
+	if _, err := mgr.ContainerStatuses(context.Background(), appInst.InstanceID); err == nil {
+		t.Fatal("ContainerStatuses projected a partial observation as stopped")
+	}
 }
 
 func TestAutomaticStartupRecoveryUsesOneAttemptAcrossFailureAndSuccess(t *testing.T) {
@@ -302,6 +738,8 @@ func TestDisabledReconcileCompletionClearsStartupHistory(t *testing.T) {
 		t.Fatalf("StoreApp: %v", err)
 	}
 	mgr.startupRecovery[appInst.InstanceID] = startupRecoveryWindow{ProbationSince: now}
+	mgr.beginObservationPass()
+	mgr.recordUnknownObservation(appInst.InstanceID, errors.New("podman unavailable"))
 
 	if err := mgr.reconcileApp(context.Background(), state, appInst); err != nil {
 		t.Fatalf("disabled reconcile: %v", err)
@@ -311,6 +749,9 @@ func TestDisabledReconcileCompletionClearsStartupHistory(t *testing.T) {
 	}
 	if _, ok := mgr.startupRecovery[appInst.InstanceID]; ok {
 		t.Fatal("disabled stop completion retained recovery window")
+	}
+	if snapshot := mgr.RuntimeObservationPressureSnapshot(); len(snapshot) != 0 {
+		t.Fatalf("disabled stop completion retained observation pressure: %+v", snapshot)
 	}
 }
 
