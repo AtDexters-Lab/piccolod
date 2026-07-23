@@ -8,6 +8,9 @@
 # - Fields that must exist in a runnable manifest are marked "REQUIRED".
 # - All examples are safe to delete; the schema only cares about the YAML keys/values.
 # - This documentation is aligned with the parser in `internal/app/parser.go`, and incorporates RFCs where noted.
+# - Fields covered by `capability_bindings_v1` and `artifact_bindings_v1` are an
+#   ACCEPTED contract from RFC 20260722; the current parser/runtime does not yet
+#   implement those feature gates.
 #
 # Templating (install-time):
 # - The manifest is rendered as a Go template. You can reference:
@@ -30,6 +33,7 @@
 # - Listener auth rules + service-level `oidc_client`: docs/rfc/20260112-listener-auth-rules.md
 # - Hostname scheme + optional LAN host-based routing: docs/rfc/20260114-hostname-scheme-routing.md
 # - Unified app identity model: docs/rfc/20260130-unified-app-identity-model.md
+# - Capability bindings + reconstructible artifacts: docs/rfc/20260722-capability-bindings-and-reconstructible-artifacts.md
 #
 # -----------------------------------------------------------------------------
 # App Identity (RFC 20260130)
@@ -88,6 +92,117 @@
 #   mode: service
 #
 # -----------------------------------------------------------------------------
+# Capability provider (listener-level declaration)
+#
+# The following capability and artifact examples are focused fragments, not
+# standalone runnable manifests. Add them to the full reference below; its
+# required app identity, inputs, services, and listeners still apply.
+#
+# listeners:
+#   - name: __primary
+#     guest_port: 8000
+#     flow: tcp
+#     protocol: http
+#     provides:
+#       - capability: ai.inference.openai.v1
+#         base_path: /v3
+# x-piccolo:
+#   mode: service
+#   requires_features:
+#     - capability_bindings_v1
+#
+# -----------------------------------------------------------------------------
+# Capability consumer (service-level explicit environment binding)
+#
+# services:
+#   worker:
+#     image: example/consumer:1
+#     bind_ports: []
+#     consumes:
+#       - capability: ai.inference.openai.v1
+#         env:
+#           OPENAI_BASE_URL: base_url
+# x-piccolo:
+#   mode: service
+#   requires_features:
+#     - capability_bindings_v1
+#
+# `env` maps ENVIRONMENT_VARIABLE -> capability binding property. Piccolod does
+# not generate a second automatic environment-variable name. For
+# ai.inference.openai.v1, `base_url` is the private per-consumer origin plus the
+# selected provider's declared base_path. Until a provider is selected it is the
+# stable private origin alone and requests return HTTP 503; provider selection
+# reconciles the consumer with the composed value. Consumer clients append
+# OpenAI resource suffixes such as chat/completions. Piccolod accepts only the
+# base_path itself or a segment-descendant, then preserves the accepted
+# normalized path and query; other paths receive HTTP 404. Piccolod does not
+# define a capability-specific response body. Authorization and forwarding use
+# the same canonical path segments; ambiguous encoded separators, backslashes,
+# empty segments, and dot segments are rejected before proxying. `base_path: /`
+# intentionally makes the provider's whole listener available through the
+# private binding; Piccolod does not classify the provider's endpoint purposes.
+# Binding target names must not collide with service.environment,
+# service.oidc_client.env, or another binding target.
+# V1 supplies no provider credential; a conforming local provider accepts this
+# private capability path using the base URL alone. A provider must start and
+# bind this listener without capability-derived accelerator devices; it may
+# remain idle or return HTTP 503 until selected. Piccolod applies grant changes
+# by container recreation and never grants devices to a pre-commit candidate.
+# See the RFC for provider selection, locality, switching, and recovery.
+#
+# -----------------------------------------------------------------------------
+# Reconstructible artifact and read-only service mount
+#
+# artifacts:
+#   model:
+#     source:
+#       type: huggingface
+#       repository: OpenVINO/Qwen3-0.6B-int4-ov
+#       revision: main
+#       path: . # File or recursively selected directory; . selects repo root.
+# services:
+#   inference:
+#     image: example/provider:1
+#     bind_ports: [8000]
+#     storage:
+#       artifacts:
+#         model:
+#           container: /models/model
+# x-piccolo:
+#   mode: service
+#   requires_features:
+#     - artifact_bindings_v1
+#
+# A Piccolo artifact is a manifest-level relationship for consuming golden
+# content read-only; it is not an OCI artifact and not a separate storage type.
+# The selected file/directory becomes the artifact root mounted read-only at
+# `container`. A directory preserves its relative contents; a selected file
+# appears at its basename. Single-file Hugging Face alternative:
+#
+# artifacts:
+#   model:
+#     source:
+#       type: huggingface
+#       repository: bartowski/example-GGUF
+#       revision: main
+#       path: example.Q4_K_M.gguf
+#       digest: sha256:<expected-file-digest> # Optional for a file only.
+#
+# OCI is the alternative source shape:
+#
+# artifacts:
+#   model:
+#     source:
+#       type: oci
+#       reference: ghcr.io/example/model:latest
+#       # digest: sha256:<expected-descriptor-digest>  # Optional verification pin.
+#
+# OCI sources may name an OCI image or OCI artifact; either is exposed as its
+# extracted read-only root. Private source credentials are outside this
+# contract. See the RFC for transport, storage, lifecycle, and feature
+# availability.
+#
+# -----------------------------------------------------------------------------
 # Full reference (all fields documented)
 #
 
@@ -130,6 +245,50 @@ inputs:
     default:
       - ".example.com"
 
+# Optional: consume reconstructible golden content read-only in one or more
+# services in this app. This declaration does not create a separate artifact
+# storage class. Every source resolves to a durable identity and materializes as
+# a directory.
+# V1 schema contract:
+# - `artifacts` is a non-empty map when present. Keys use the service-name
+#   grammar (`^[a-z](?:[a-z0-9-]*[a-z0-9])?$`) and cannot contain `--`.
+# - Each value is a closed map with exactly one required field, `source`.
+#   `source` is a closed map with a required string discriminator, `type`.
+# - `type: huggingface` permits only `type`, `repository`, `revision`, `path`,
+#   and optional `digest`. The first four are required non-empty strings.
+#   `repository` is a Hugging Face repository ID, not a URL. `path` is `.` or a
+#   clean relative POSIX path: no leading slash, `..`, empty segment, backslash,
+#   or NUL. `digest`, when present, is `sha256:` plus 64 lowercase hex digits
+#   and is valid only when `path` resolves to one file.
+# - `type: oci` permits only required non-empty string fields `type` and
+#   `reference`, plus optional string `digest`. `reference` must parse as an OCI
+#   registry reference. `digest`, when present, has the same canonical sha256
+#   shape and verifies the resolved descriptor.
+# - Unknown source types, unknown fields, and duplicate keys in these new maps
+#   are rejected. These closed-map rules do not change legacy-field handling.
+# Where supported, `digest` is optional: if provided, it is verified. Each
+# materialization attempt resolves a mutable source to one concrete identity and
+# records the verified Ready content. An ordinary app start reuses that recorded
+# identity; policy for triggering a later fresh resolution is outside this
+# manifest contract.
+# Every declaration must be mounted by at least one service. Hugging Face `path`
+# is `.` or a clean repository-relative file/directory. A directory is selected
+# recursively; a supplied digest is valid only when path resolves to one file.
+artifacts:
+  model:
+    source:
+      type: huggingface # huggingface | oci
+      repository: OpenVINO/Qwen3-0.6B-int4-ov # REQUIRED for type: huggingface
+      revision: main # REQUIRED for type: huggingface; branch/tag/commit
+      path: . # REQUIRED for type: huggingface; file, directory, or . for repo root
+      # digest: sha256:<expected-file-digest> # Optional; only for a selected file
+  # OCI alternative (use this complete source shape instead of Hugging Face fields):
+  # model_oci:
+  #   source:
+  #     type: oci
+  #     reference: ghcr.io/example/model:latest # REQUIRED for type: oci; tag or digest reference
+  #     digest: sha256:<expected-descriptor-digest> # Optional
+
 # Optional: Which service receives all listener traffic (v1 listeners target the primary service).
 # Defaults to "main".
 # Service mode only: if exactly one service is defined, that service name is also accepted as the default.
@@ -157,7 +316,7 @@ services:
     environment:
       EXAMPLE_ENV: "hello"
 
-    # Optional: storage mounts for durable and temporary data.
+    # Optional: storage mounts for durable, temporary, and reconstructible data.
     # Host paths are NOT user-configurable; Piccolo maps these into the per-app encrypted volume.
     storage:
       persistent:
@@ -168,6 +327,20 @@ services:
         cache:
           container: /var/lib/example/cache
           size_limit: 1GB
+      artifacts:
+        # This is a non-empty map when present. Each key MUST reference a
+        # top-level `artifacts` entry and each closed value map has exactly one
+        # field: required non-empty string `container`. The path must be an
+        # absolute clean POSIX path other than `/`, with no NUL, backslash, empty
+        # segment, or dot segment. The complete artifact root is mounted
+        # read-only; `host`, `read_only`, `size_limit`, subpaths, and replication
+        # controls are not fields in this contract. Its normalized target may
+        # not equal, contain, or be contained by any other mount-producing
+        # target in this service. One top-level artifact may be mounted by
+        # multiple services, but every declaration must be mounted at least
+        # once. Unknown fields and duplicate keys are rejected.
+        model:
+          container: /models/model
 
     # Optional: resource limits.
     resources:
@@ -219,6 +392,19 @@ services:
     after: [main]
     environment:
       WORKER: "1"
+    # Optional: consume platform-known capabilities. This is a non-empty list
+    # when present. Each item is a closed map with exactly two required fields:
+    # non-empty string `capability` and non-empty string-to-string map `env`.
+    # Unknown fields and duplicate map keys are rejected. A service declares a
+    # registered capability at most once. `env` maps ENVIRONMENT_VARIABLE ->
+    # registered binding property; target names match
+    # `^[A-Za-z_][A-Za-z0-9_]*$` and MUST NOT collide with service.environment,
+    # oidc_client.env, or another binding target. For
+    # `ai.inference.openai.v1`, the only V1 binding property is `base_url`.
+    consumes:
+      - capability: ai.inference.openai.v1
+        env:
+          OPENAI_BASE_URL: base_url
 
 # LISTENERS -------------------------------------------------------------------
 # Listeners are required in service mode. Workspace mode may omit listeners.
@@ -265,6 +451,29 @@ listeners:
     flow: tcp # tcp (default) | tls (passthrough; no HTTP visibility) | udp (raw UDP transport)
     protocol: http # raw (default) | http | websocket
     remote_ports: [80, 443]
+
+    # Optional: publish platform-known capabilities from this listener. This is
+    # a non-empty list when present. Each item is a closed map with exactly two
+    # required non-empty string fields: `capability` and `base_path`. Unknown
+    # fields and duplicate map keys are rejected; the capability must be
+    # registered. One app cannot provide the same capability more than once
+    # across all listeners.
+    # ai.inference.openai.v1 requires flow: tcp + protocol: http. Piccolod checks
+    # only structural compatibility; base_path is required, absolute, has no
+    # query/fragment, and has no trailing slash unless it is `/`. Piccolod
+    # rejects non-canonical/ambiguous path representations, including encoded
+    # separators, backslashes, empty segments, and dot segments. It uses the
+    # same canonical segments for subtree authorization and forwarding,
+    # composes base_path into consumer base_url, and does not certify OpenAI API
+    # behavior. `base_path: /` intentionally exposes the whole listener through
+    # the private binding. A provider must bind this listener without
+    # capability-derived accelerator devices; selection later recreates it with
+    # the grant.
+    # The capability ID's `.v1` versions Piccolo's contract; it does not require
+    # the provider HTTP path itself to be /v1.
+    provides:
+      - capability: ai.inference.openai.v1
+        base_path: /v3
 
     # Optional: claim a specific well-known port on the LAN instead of auto-allocating
     # from the 35000-45000 range. When a self-managed Nexus relay is configured, the
@@ -411,6 +620,9 @@ permissions:
     privileged: false
   filesystem:
     read_only_root: false
+    # This broad legacy field is independent of capability-derived accelerator
+    # grants. It is not a second approval gate and does not grant GPU/NPU devices
+    # to a non-provider.
     device_access: deny # allow | deny
 
 # WORKSPACE NAME ---------------------------------------------------------------
@@ -435,6 +647,8 @@ x-piccolo:
   mode: service # service | workspace
   requires_features:
     - connection_auth_mtls_v1 # Required if any listener uses connection_auth.mtls.
+    - capability_bindings_v1 # Required if any listener provides or service consumes a capability.
+    - artifact_bindings_v1 # Required if top-level artifacts or storage.artifacts are used.
 
   replication:
     hot:
