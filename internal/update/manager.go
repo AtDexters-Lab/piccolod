@@ -131,6 +131,8 @@ type microOSBackend struct {
 	snapshotsDir   string
 
 	mu              sync.Mutex
+	markerMu        sync.Mutex
+	markerLaunching bool
 	supported       bool
 	overrideSupport bool
 
@@ -1374,7 +1376,7 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 	}
 
 	if cnt, ok, err := m.rpmUpdateCount(ctx); err != nil {
-		enrichmentErrs.add("zypper --xmlout lu", err)
+		enrichmentErrs.add("zypper --no-refresh --xmlout lu", err)
 	} else if ok {
 		meta["rpm_updates_available"] = cnt
 	}
@@ -1491,7 +1493,11 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.isInProgress(ctx) {
+	// Serialize stale-marker cleanup with publication, and keep status probes
+	// busy until systemd-run has made the transient unit observable.
+	m.markerMu.Lock()
+	if m.isInProgressLocked(ctx) {
+		m.markerMu.Unlock()
 		return ErrInProgress
 	}
 
@@ -1504,6 +1510,7 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	// runs before any persistent-pool write below.
 	if createsSnapshot(action) {
 		if free, err := m.freeBytes(m.snapshotsDir); err != nil || free < minFreeBytesForRecovery {
+			m.markerMu.Unlock()
 			return ErrInsufficientDisk
 		}
 	}
@@ -1513,9 +1520,16 @@ func (m *microOSBackend) runTransactionalUpdate(ctx context.Context, cmd []strin
 	defer cancel()
 	marker := filepath.Join(m.runtimeDir, "update.inprogress")
 	_ = fsutil.AtomicWriteFile(marker, []byte(action+" "+unit), 0o644)
-	if wait {
-		defer os.Remove(marker)
-	}
+	m.markerLaunching = true
+	m.markerMu.Unlock()
+	defer func() {
+		m.markerMu.Lock()
+		m.markerLaunching = false
+		if wait {
+			_ = os.Remove(marker)
+		}
+		m.markerMu.Unlock()
+	}()
 	// Persist intent immediately so we survive restarts during TU
 	m.persistState(action, targetHint, unit, -1, "started")
 	runCtx = pressure.WithTransitionContinuation(runCtx)
@@ -1573,6 +1587,16 @@ func (m *microOSBackend) cleanupStaleState(ctx context.Context) {
 }
 
 func (m *microOSBackend) isInProgress(ctx context.Context) bool {
+	m.markerMu.Lock()
+	defer m.markerMu.Unlock()
+	return m.isInProgressLocked(ctx)
+}
+
+func (m *microOSBackend) isInProgressLocked(ctx context.Context) bool {
+	if m.markerLaunching {
+		return true
+	}
+
 	marker := filepath.Join(m.runtimeDir, "update.inprogress")
 	if data, err := os.ReadFile(marker); err == nil {
 		fields := strings.Fields(string(data))
@@ -1581,18 +1605,15 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 			unit = fields[1]
 		}
 		if unit != "" {
-			if _, _, code, probeErr := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", unit); code == 0 {
-				return true
-			} else if probeErr != nil {
-				// Admission pressure, timeout, and control-plane errors are not
-				// proof that the durable operation is stale.
-				if ctx.Err() != nil {
-					return false
-				}
+			active, conclusive := m.systemdUnitActivity(ctx, unit)
+			if active {
 				return true
 			}
-			if ctx.Err() != nil {
-				return false
+			if !conclusive {
+				// Admission pressure, timeout, and control-plane errors are not
+				// proof that the durable operation is stale. Keep both the
+				// marker and the fail-closed busy response for this request.
+				return true
 			}
 		}
 		// Clean up stale marker
@@ -1616,6 +1637,25 @@ func (m *microOSBackend) isInProgress(ctx context.Context) bool {
 		return false
 	}
 	return false
+}
+
+// systemdUnitActivity distinguishes normal `systemctl is-active` negative
+// results from failures to inspect systemd. execRunner returns *exec.ExitError
+// for every non-zero exit, including the expected inactive (3) and unknown (4)
+// states, so the error value alone cannot decide whether a marker is stale.
+func (m *microOSBackend) systemdUnitActivity(ctx context.Context, unit string) (active, conclusive bool) {
+	_, _, code, probeErr := m.runner.Run(ctx, "systemctl", "is-active", "--quiet", unit)
+	if ctx.Err() != nil {
+		return false, false
+	}
+	switch code {
+	case 0:
+		return probeErr == nil, probeErr == nil
+	case 3, 4:
+		return false, true
+	default:
+		return false, false
+	}
 }
 
 func (m *microOSBackend) persistState(action, target, unit string, exit int, msg string) {
@@ -1936,7 +1976,7 @@ func (m *microOSBackend) readJournal(ctx context.Context, unit string) []string 
 }
 
 func (m *microOSBackend) rpmUpdateCount(ctx context.Context) (int, bool, error) {
-	stdout, stderr, code, err := m.runner.Run(ctx, "zypper", "--xmlout", "lu")
+	stdout, stderr, code, err := m.runner.Run(ctx, "zypper", "--no-refresh", "--xmlout", "lu")
 	if err := commandFailure(stderr, code, err); err != nil {
 		return 0, false, err
 	}

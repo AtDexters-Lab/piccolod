@@ -43,6 +43,8 @@ class SystemTab extends StatelessWidget {
 
     final update = controller.osUpdate;
     final isBusy = controller.isUpdateInProgress || controller.isBackendBusy;
+    final isRefreshing = controller.isOSUpdateLoading;
+    final refreshError = controller.osUpdateError;
 
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
@@ -54,11 +56,19 @@ class SystemTab extends StatelessWidget {
         Text('System Update', style: PiccoloTheme.textTheme.titleMedium),
         const SizedBox(height: 16),
 
-        if (update != null || isBusy) ...[
+        if (update != null ||
+            isBusy ||
+            isRefreshing ||
+            refreshError != null) ...[
           _UpdateStatusCard(
             update: update,
             isChecking: isBusy,
+            isRefreshing: isRefreshing,
+            refreshError: refreshError,
             onCheck: controller.checkForUpdates,
+            onRefresh: () async {
+              await controller.fetchOSUpdate();
+            },
             onReboot: controller.rebootOS,
             autoUnlock: controller.autoUnlock,
           ),
@@ -179,13 +189,19 @@ class _UpdateStatusCard extends StatelessWidget {
   const _UpdateStatusCard({
     required this.update,
     required this.isChecking,
+    required this.isRefreshing,
+    required this.refreshError,
     required this.onCheck,
+    required this.onRefresh,
     required this.onReboot,
     required this.autoUnlock,
   });
   final OSUpdate? update; // Make nullable
   final bool isChecking;
+  final bool isRefreshing;
+  final String? refreshError;
   final VoidCallback onCheck;
+  final VoidCallback onRefresh;
   final VoidCallback onReboot;
   // When auto-reboot is configured + enabled, the "Update Available" state
   // shows the maintenance-window subtitle alongside Restart Now so the
@@ -208,7 +224,7 @@ class _UpdateStatusCard extends StatelessWidget {
     if (isChecking) {
       accentColor = PiccoloTheme.cobalt600;
       icon = PiccoloIcons.sync;
-      title = 'Checking for updates...';
+      title = 'System update in progress...';
       subtitle = 'Please wait.';
       action = const SizedBox(
         height: 24,
@@ -232,13 +248,66 @@ class _UpdateStatusCard extends StatelessWidget {
       } else {
         subtitle = 'Version ${update!.availableVersion} is ready to install.';
       }
-      action = FilledButton.icon(
+      if (isRefreshing) {
+        subtitle = '$subtitle Refreshing update status...';
+      } else if (refreshError != null) {
+        subtitle = '$subtitle Some update details could not be refreshed.';
+      }
+      final restartButton = FilledButton.icon(
         onPressed: onReboot,
         icon: const Icon(PiccoloIcons.restart),
         label: const Text('Restart Now'),
         style: FilledButton.styleFrom(
           padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 12),
         ),
+      );
+      action = refreshError == null
+          ? restartButton
+          : Wrap(
+              spacing: 12,
+              runSpacing: 8,
+              children: [
+                OutlinedButton.icon(
+                  onPressed: onRefresh,
+                  icon: const Icon(PiccoloIcons.refresh),
+                  label: const Text('Retry'),
+                ),
+                restartButton,
+              ],
+            );
+    } else if (isRefreshing) {
+      accentColor = PiccoloTheme.cobalt600;
+      icon = PiccoloIcons.refresh;
+      title = update == null
+          ? 'Loading update status...'
+          : 'Refreshing update status...';
+      subtitle = update == null
+          ? 'Please wait.'
+          : 'The latest known system state will remain available.';
+    } else if (refreshError != null) {
+      accentColor = PiccoloTheme.warning;
+      icon = PiccoloIcons.warning;
+      title = update == null
+          ? 'Update status could not be loaded'
+          : refreshError!;
+      subtitle = update == null
+          ? 'No previous update status is available.'
+          : 'Showing the latest known system state.';
+      action = OutlinedButton.icon(
+        onPressed: onRefresh,
+        icon: const Icon(PiccoloIcons.refresh),
+        label: const Text('Retry'),
+      );
+    } else if (update?.isUncertain ?? false) {
+      accentColor = PiccoloTheme.warning;
+      icon = PiccoloIcons.warning;
+      title = 'Update status temporarily unavailable';
+      subtitle =
+          'Showing the latest known system state. Try again in a moment.';
+      action = OutlinedButton.icon(
+        onPressed: onRefresh,
+        icon: const Icon(PiccoloIcons.refresh),
+        label: const Text('Retry'),
       );
     } else if (update != null) {
       // Idle / Up to date
