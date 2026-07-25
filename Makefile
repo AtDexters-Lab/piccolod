@@ -105,7 +105,7 @@ service: ## Build and install/update piccolod systemd service
 	@echo 'TasksMax=15%' >> piccolod.service
 	@echo 'WatchdogSec=60s' >> piccolod.service
 	@echo 'TimeoutStopSec=120' >> piccolod.service
-	@echo 'KillMode=control-group' >> piccolod.service
+	@echo 'KillMode=mixed' >> piccolod.service
 	@echo 'OOMScoreAdjust=-500' >> piccolod.service
 	@echo '' >> piccolod.service
 	@echo '[Install]' >> piccolod.service

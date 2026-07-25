@@ -210,7 +210,11 @@ a bounded volatile recovery marker and exits for systemd to replace the whole
 service cgroup.
 
 The production service policy is `Restart=always`, `RestartSec=5s`,
-`WatchdogSec=60s`, `KillMode=control-group`, and unlimited restart attempts.
+`WatchdogSec=60s`, `KillMode=mixed`, and unlimited restart attempts. The
+initial stop signal reaches only the Piccolod main process so its graceful
+shutdown can finish child-dependent work such as the software-TPM auto-unlock
+handoff. Once main exits, or the stop timeout expires, systemd kills any
+remaining process in the service cgroup before starting the replacement.
 Development processes that deliberately run outside that finite production
 cgroup may set `PICCOLO_DISABLE_TASK_GUARD=1`; production packages must not.
 This is an access-plane recovery contract, not permission to raise the task
