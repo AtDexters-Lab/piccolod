@@ -288,6 +288,44 @@ func (snapshotRunner) Run(ctx context.Context, name string, args ...string) (str
 	}
 }
 
+type snapperListRunner struct {
+	calls []call
+}
+
+func (r *snapperListRunner) Run(_ context.Context, name string, args ...string) (string, string, int, error) {
+	r.calls = append(r.calls, call{name: name, args: append([]string{}, args...)})
+	return `{"root":[{"number":7,"date":"2025-11-23 10:00:00","description":"staged"}]}`, "", 0, nil
+}
+
+func TestSnapperSnapshotsDisablesUsedSpace(t *testing.T) {
+	r := &snapperListRunner{}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithSupportOverride(true),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(filepath.Join(t.TempDir(), "run")),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	snapshots, err := m.snapperSnapshots(context.Background())
+	if err != nil {
+		t.Fatalf("snapper snapshots: %v", err)
+	}
+	if got := snapshots["7"].Description; got != "staged" {
+		t.Fatalf("snapshot 7 description = %q, want staged", got)
+	}
+	if len(r.calls) != 1 {
+		t.Fatalf("snapper call count = %d, want 1; calls=%#v", len(r.calls), r.calls)
+	}
+	got := r.calls[0]
+	if got.name != "snapper" || len(got.args) != 3 ||
+		got.args[0] != "--json" || got.args[1] != "list" || got.args[2] != "--disable-used-space" {
+		t.Fatalf("snapper call = %s %v, want snapper --json list --disable-used-space", got.name, got.args)
+	}
+}
+
 func TestApplyReturnsInProgressWhenTUAlreadyRunning(t *testing.T) {
 	m, err := newMicroOSBackend(
 		WithRunner(inProgressRunner{}),

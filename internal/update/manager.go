@@ -1354,7 +1354,7 @@ func (m *microOSBackend) readStatus(ctx context.Context) (Status, error) {
 	meta["default_snapshot_id"] = defaultID
 
 	snapshots, err := m.snapperSnapshots(ctx)
-	enrichmentErrs.add("snapper --json list", err)
+	enrichmentErrs.add("snapper --json list --disable-used-space", err)
 	if active, ok := snapshots[activeID]; ok {
 		meta["active_snapshot"] = active
 	}
@@ -1831,7 +1831,7 @@ func snapshotNumberFromPath(path string) (string, bool) {
 
 // snapper --json list parser (best effort, with failure signal for backoff).
 func (m *microOSBackend) snapperSnapshots(ctx context.Context) (map[string]snapshotInfo, error) {
-	stdout, stderr, code, err := m.runner.Run(ctx, "snapper", "--json", "list")
+	stdout, stderr, code, err := m.runner.Run(ctx, "snapper", "--json", "list", "--disable-used-space")
 	if err := commandFailure(stderr, code, err); err != nil {
 		return map[string]snapshotInfo{}, err
 	}
