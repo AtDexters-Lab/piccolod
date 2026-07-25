@@ -1919,8 +1919,8 @@ print(json.dumps({
     "systemctl cat piccolod.service --no-pager" "RestartSec=5"
   check_ssh "21.3c1" "Effective piccolod restart delay is bounded" \
     "systemctl show piccolod.service -p RestartUSec" "RestartUSec=5s"
-  check_ssh "21.3d" "Piccolod restart empties its helper cgroup" \
-    "systemctl show piccolod.service -p KillMode" "KillMode=control-group"
+  check_ssh "21.3d" "Piccolod preserves graceful helper dependencies before final cgroup cleanup" \
+    "systemctl show piccolod.service -p KillMode" "KillMode=mixed"
   check_ssh "21.3e" "Piccolod repeated-start window is bounded" \
     "systemctl cat piccolod.service --no-pager" "StartLimitIntervalSec=900"
   check_ssh_ok "21.3e1" "Effective Piccolod repeated-start window is fifteen minutes" \
