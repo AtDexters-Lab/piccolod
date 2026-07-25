@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
+	"piccolod/internal/api"
 	"piccolod/internal/firewall"
+	"piccolod/internal/persistence"
 	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 	"piccolod/internal/state/paths"
@@ -139,7 +142,9 @@ func TestAuthorizedRollbackPublishesOnlyAfterInstallPersistUnderWarning(t *testi
 	err = mgr.recreateContainersInPlaceWithHookAndPublicationResumeToken(
 		context.Background(), "piclu", previousDef, failedDef, appInst,
 		func() error { return preInstallErr },
+		nil,
 		resumeToken,
+		false,
 	)
 	if !errors.Is(err, preInstallErr) {
 		t.Fatalf("pre-install error = %v, want injected failure", err)
@@ -184,7 +189,9 @@ func TestAuthorizedRollbackPublishesOnlyAfterInstallPersistUnderWarning(t *testi
 			beforeInstallSeen = true
 			return nil
 		},
+		nil,
 		resumeToken,
+		false,
 	)
 	if err != nil {
 		t.Fatalf("authorized rollback recreate: %v", err)
@@ -237,7 +244,7 @@ func TestEqualListenerRecreatePreparesMissingRegistryBeforeDestructiveWork(t *te
 	}
 	resumeToken := serviceManager.SuspendAppPublication("piclu")
 
-	if err := mgr.recreateContainersInPlaceWithHookAndPublicationResumeToken(context.Background(), "piclu", def, def, appInst, nil, resumeToken); err != nil {
+	if err := mgr.recreateContainersInPlaceWithHookAndPublicationResumeToken(context.Background(), "piclu", def, def, appInst, nil, nil, resumeToken, false); err != nil {
 		t.Fatalf("equal-listener recreate with missing registry: %v", err)
 	}
 	endpoints, err := serviceManager.GetByApp("piclu")
@@ -246,6 +253,164 @@ func TestEqualListenerRecreatePreparesMissingRegistryBeforeDestructiveWork(t *te
 	}
 	if !serviceManager.AppPublicationActive("piclu") {
 		t.Fatal("missing-registry recreate did not publish prepared endpoints")
+	}
+}
+
+func TestInstalledAppApplyPersistsCandidateArtifactsBeforeMetadataPublication(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		failPersist bool
+	}{
+		{name: "publish after durable candidate ownership"},
+		{name: "persistence failure compensates unpublished candidate", failPersist: true},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			tempDir := t.TempDir()
+			paths.SetCoreRootForTest(t, tempDir)
+			serviceManager := services.NewServiceManager()
+			serviceManager.UseInMemoryNetworkForTest()
+			mock := NewMockContainerManager()
+			mgr, err := NewAppManagerForTestWithServices(mock, tempDir, serviceManager, nil)
+			if err != nil {
+				t.Fatalf("new manager: %v", err)
+			}
+			allowHostStorage(t, mgr)
+			mgr.ForceLockState(false)
+			rootfs := &compensationRootfsManager{
+				stubRootfsManager: newStubRootfsManager(tempDir),
+			}
+			mgr.SetRootfsManager(rootfs)
+			state, err := mgr.ensureStateManager()
+			if err != nil {
+				t.Fatalf("state manager: %v", err)
+			}
+
+			previousDef := customManifestPolicyBaseDef()
+			candidateDef := customManifestPolicyClone(t, previousDef)
+			previousDef.Artifacts = map[string]api.AppArtifact{
+				"model": {Source: api.ArtifactSource{Type: persistence.GoldenSourceOCI, Reference: "docker.io/example/model:old"}},
+			}
+			candidateDef.Artifacts = map[string]api.AppArtifact{
+				"model": {Source: api.ArtifactSource{Type: persistence.GoldenSourceOCI, Reference: "docker.io/example/model:new"}},
+			}
+			if _, err := serviceManager.AllocateForApp("piclu", previousDef.Listeners); err != nil {
+				t.Fatalf("allocate previous listeners: %v", err)
+			}
+
+			now := time.Now().UTC()
+			appInst := &AppInstance{
+				InstanceID:         "piclu",
+				Enabled:            true,
+				PrimaryService:     "main",
+				NetworkAnchorID:    "anchor-old",
+				Containers:         map[string]string{"main": "main-old"},
+				ActiveRootfs:       map[string]string{"main": "rootfs-main", networkAnchorServiceName: "rootfs-anchor"},
+				ArtifactReferences: map[string]string{"model": "ref-previous"},
+				CreatedAt:          now,
+				UpdatedAt:          now,
+				Definition:         previousDef,
+			}
+			mock.containers["anchor-old"] = &mockContainer{ID: "anchor-old", Status: "running"}
+			mock.containers["main-old"] = &mockContainer{ID: "main-old", Status: "running"}
+			if err := state.StoreApp(appInst); err != nil {
+				t.Fatalf("store app: %v", err)
+			}
+
+			manifestTxn := &ManifestUpdateTransaction{
+				OperationID:           "op-artifact-publication-order",
+				OperationKind:         "service_app_update",
+				Phase:                 "recreating_runtime",
+				RuntimeSwitchStarted:  true,
+				RuntimeTouched:        true,
+				PreviousArtifactRefs:  map[string]string{"model": "ref-previous"},
+				CandidateArtifactRefs: map[string]string{"model": "ref-previous"},
+				CreatedAt:             now,
+				UpdatedAt:             now,
+			}
+			if err := state.StoreManifestUpdateTransaction(appInst.InstanceID, manifestTxn); err != nil {
+				t.Fatalf("store transaction: %v", err)
+			}
+			applyTxn := &installedAppApplyTransaction{
+				manager: mgr,
+				ctx:     context.Background(),
+				state:   state,
+				spec: installedAppApplyTransactionSpec{
+					InstanceID: appInst.InstanceID,
+					AppInst:    appInst,
+				},
+				txn: manifestTxn,
+			}
+			wantReference := artifactReferenceID(appInst.InstanceID, "model", "golden-candidate-model")
+			injected := errors.New("injected candidate ownership persistence failure")
+			if test.failPersist {
+				state.storeManifestUpdateTransactionHook = func(instanceID string, txn *ManifestUpdateTransaction) error {
+					if instanceID == appInst.InstanceID && txn.CandidateArtifactRefs["model"] == wantReference {
+						return injected
+					}
+					return nil
+				}
+			}
+			metadataWrites := 0
+			state.storeAppMetadataHook = func(instanceID string, candidate *AppInstance) error {
+				if instanceID != appInst.InstanceID || candidate.NetworkAnchorID == "anchor-old" {
+					return nil
+				}
+				metadataWrites++
+				storedTxn, err := state.LoadManifestUpdateTransaction(instanceID)
+				if err != nil {
+					return fmt.Errorf("load transaction at metadata publication: %w", err)
+				}
+				if got := storedTxn.CandidateArtifactRefs; !reflect.DeepEqual(got, candidate.ArtifactReferences) {
+					return fmt.Errorf("metadata candidate refs %v preceded durable transaction refs %v", candidate.ArtifactReferences, got)
+				}
+				return nil
+			}
+
+			resumeToken := serviceManager.SuspendAppPublication(appInst.InstanceID)
+			err = mgr.recreateContainersInPlaceWithHookAndPublicationResumeToken(
+				context.Background(),
+				appInst.InstanceID,
+				candidateDef,
+				previousDef,
+				appInst,
+				nil,
+				applyTxn.persistCandidateArtifactReferences,
+				resumeToken,
+				false,
+			)
+			if test.failPersist {
+				if !errors.Is(err, injected) {
+					t.Fatalf("recreate error = %v, want persistence failure", err)
+				}
+				if metadataWrites != 0 {
+					t.Fatalf("candidate metadata writes = %d, want none", metadataWrites)
+				}
+				if len(mock.containers) != 0 {
+					t.Fatalf("unpublished candidate containers survived: %+v", mock.containers)
+				}
+				if !reflect.DeepEqual(rootfs.artifactDetached, []string{wantReference}) {
+					t.Fatalf("detached artifact references = %v, want %q", rootfs.artifactDetached, wantReference)
+				}
+				if !reflect.DeepEqual(rootfs.artifactDestroyed, []string{wantReference}) {
+					t.Fatalf("destroyed artifact references = %v, want %q", rootfs.artifactDestroyed, wantReference)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("recreate: %v", err)
+			}
+			if metadataWrites != 1 {
+				t.Fatalf("candidate metadata writes = %d, want one", metadataWrites)
+			}
+			storedTxn, err := state.LoadManifestUpdateTransaction(appInst.InstanceID)
+			if err != nil {
+				t.Fatalf("load transaction: %v", err)
+			}
+			if got := storedTxn.CandidateArtifactRefs["model"]; got != wantReference {
+				t.Fatalf("durable candidate artifact ref = %q, want %q", got, wantReference)
+			}
+		})
 	}
 }
 

@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"piccolod/internal/app"
 )
 
 const syncTriggerTimeout = 5 * time.Minute
@@ -58,7 +59,9 @@ func (s *GinServer) handleGinAppSyncEnable(c *gin.Context) {
 // POST /api/v1/apps/:name/sync/trigger
 func (s *GinServer) handleGinAppSyncTrigger(c *gin.Context) {
 	appName := c.Param("name")
-	ctx, cancel := s.opContext(c, syncTriggerTimeout)
+	// A catalog candidate can introduce artifact declarations that are not
+	// visible from the currently installed definition.
+	ctx, cancel := s.opContext(c, app.ArtifactOperationTimeout)
 	defer cancel()
 	if err := s.appManager.SyncManifest(ctx, appName); err != nil {
 		if handleAppManagerError(c, err, "trigger sync") {
@@ -77,7 +80,7 @@ func (s *GinServer) handleGinAppSyncTrigger(c *gin.Context) {
 // POST /api/v1/apps/:name/sync/refresh-context
 func (s *GinServer) handleGinAppSyncRefreshContext(c *gin.Context) {
 	appName := c.Param("name")
-	ctx, cancel := s.opContext(c, syncTriggerTimeout)
+	ctx, cancel := s.opContext(c, app.ArtifactOperationTimeout)
 	defer cancel()
 	if err := s.appManager.RefreshInstallSystemContext(ctx, appName); err != nil {
 		if handleAppManagerError(c, err, "refresh sync context") {

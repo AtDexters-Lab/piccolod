@@ -38,9 +38,10 @@ const (
 	// Sync stores a manifest-review pending source; UpdateImage only refreshes
 	// the currently committed source and must not consume catalog drift.
 	DiffKindImageOnly
-	// DiffKindStructuralWithImage — both image and structural fields changed.
-	// Sync stores a manifest-review pending source when stageable, otherwise
-	// fails closed with the service-app update policy reason.
+	// DiffKindStructuralWithImage — structural fields changed together with
+	// service-image or reconstructible-artifact content. The legacy enum name
+	// is retained for compatibility. Sync stores a manifest-review pending
+	// source when stageable, otherwise fails closed.
 	DiffKindStructuralWithImage
 )
 
@@ -81,6 +82,8 @@ func classifyDiff(oldDef, newDef *api.AppDefinition) DiffKind {
 	}
 
 	imageChanged := serviceImageDiff(oldDef, newDef)
+	artifactContentChanged := !reflect.DeepEqual(oldDef.Artifacts, newDef.Artifacts)
+	contentChanged := imageChanged || artifactContentChanged
 	oidcLibChanged, oidcLibExclusive := serviceOIDCLibraryDiff(oldDef, newDef)
 	structuralBeyondOIDC := serviceStructuralDiffExcludingOIDCLibrary(oldDef, newDef)
 	listenersChanged := !reflect.DeepEqual(oldDef.Listeners, newDef.Listeners)
@@ -97,19 +100,19 @@ func classifyDiff(oldDef, newDef *api.AppDefinition) DiffKind {
 	wsNameChanged := oldDef.WorkspaceName != newDef.WorkspaceName
 
 	structural := structuralBeyondOIDC ||
-		listenersChanged || storageChanged || permsChanged ||
+		listenersChanged || artifactContentChanged || storageChanged || permsChanged ||
 		envChanged || resourcesChanged || healthCheckChanged ||
 		appConfigChanged || authChanged || extensionsChanged ||
 		primaryChanged || typeChanged || wsNameChanged
 
 	switch {
-	case !imageChanged && !structural && !oidcLibChanged:
+	case !contentChanged && !structural && !oidcLibChanged:
 		return DiffKindNone
-	case !imageChanged && !structural && oidcLibChanged && oidcLibExclusive:
+	case !contentChanged && !structural && oidcLibChanged && oidcLibExclusive:
 		return DiffKindOIDCLibraryOnly
-	case imageChanged && !structural && !oidcLibChanged:
+	case contentChanged && !structural && !oidcLibChanged:
 		return DiffKindImageOnly
-	case imageChanged && (structural || oidcLibChanged):
+	case contentChanged && (structural || oidcLibChanged):
 		return DiffKindStructuralWithImage
 	default:
 		return DiffKindStructuralNoImage
@@ -577,7 +580,7 @@ func (m *AppManager) syncManifestIfDriftedLocked(ctx context.Context, host SyncH
 		}
 		return nil
 	case DiffKindImageOnly, DiffKindStructuralWithImage:
-		reason := fmt.Errorf("update requires operator review: catalog %s includes image changes", diffKind)
+		reason := fmt.Errorf("update requires operator review: catalog %s includes content changes", diffKind)
 		if err := m.storePendingRenderedCatalogManifestReviewSource(state, instanceID, installSt, rawBytes, reason); err != nil {
 			log.Printf("WARN: catalog sync %s: store pending catalog image update source: %v", instanceID, err)
 		}
@@ -856,16 +859,17 @@ func (m *AppManager) rollbackManifestOnly(
 		}
 	}
 	curDef := appInst.Definition
-	appInst.Definition = prevDef
-	if err := state.StoreApp(appInst); err != nil {
-		// Disk write failed — restore cache to curDef so cache and disk
-		// stay aligned (disk still has the failed-apply newDef).
-		appInst.Definition = curDef
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return err
+	}
+	candidate.Definition = prevDef
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		return fmt.Errorf("restore previous app.yaml: %w", err)
 	}
 	// removeDef is the failed-apply def (curDef) — that's what is currently
 	// materialized as containers, not prevDef.
-	if err := m.recreateContainersInPlace(ctx, instanceID, prevDef, curDef, appInst); err != nil {
+	if err := m.recreateCommittedContainersInPlace(ctx, instanceID, prevDef, curDef, appInst); err != nil {
 		// Container recreate failed for the previous definition too. The
 		// disk and cache both already hold prevDef; leave them that way so
 		// the reconciler retries against the correct (rolled-back) state.
@@ -901,7 +905,17 @@ func (m *AppManager) recreateContainersInPlace(
 	removeDef *api.AppDefinition,
 	appInst *AppInstance,
 ) error {
-	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, nil, services.PublicationResumeToken{})
+	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, nil, nil, services.PublicationResumeToken{}, false)
+}
+
+func (m *AppManager) recreateCommittedContainersInPlace(
+	ctx context.Context,
+	instanceID string,
+	def *api.AppDefinition,
+	removeDef *api.AppDefinition,
+	appInst *AppInstance,
+) error {
+	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, def, removeDef, appInst, nil, nil, services.PublicationResumeToken{}, true)
 }
 
 func (m *AppManager) recreateContainersInPlaceWithHook(
@@ -912,7 +926,7 @@ func (m *AppManager) recreateContainersInPlaceWithHook(
 	appInst *AppInstance,
 	beforeInstall func() error,
 ) error {
-	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, beforeInstall, services.PublicationResumeToken{})
+	return m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, newDef, removeDef, appInst, beforeInstall, nil, services.PublicationResumeToken{}, false)
 }
 
 func (m *AppManager) recreateContainersInPlaceWithHookAndPublicationResumeToken(
@@ -922,7 +936,9 @@ func (m *AppManager) recreateContainersInPlaceWithHookAndPublicationResumeToken(
 	removeDef *api.AppDefinition,
 	appInst *AppInstance,
 	beforeInstall func() error,
+	beforeCandidatePublish func(*AppInstance) error,
 	publicationResumeToken services.PublicationResumeToken,
+	committedRuntime bool,
 ) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -969,16 +985,30 @@ func (m *AppManager) recreateContainersInPlaceWithHookAndPublicationResumeToken(
 			return fmt.Errorf("attach existing rootfs: %w", err)
 		}
 	}
-	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	reuseArtifacts := committedRuntime || reflect.DeepEqual(newDef.Artifacts, removeDef.Artifacts)
+	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs, reuseArtifacts, false)
 	if err != nil {
 		return fmt.Errorf("install container group: %w", err)
 	}
-	appInst.NetworkAnchorID = result.NetworkAnchorID
-	appInst.Containers = result.Containers
-	appInst.PrimaryService = result.PrimaryService
-	appInst.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, newDef)
-	if err := state.StoreApp(appInst); err != nil {
-		return fmt.Errorf("persist container ids: %w", err)
+	if beforeCandidatePublish != nil {
+		if err := beforeCandidatePublish(result); err != nil {
+			return m.abortUncommittedContainerGroup(err, state, appInst, result, newDef, runtime)
+		}
+	}
+	candidate, err := recreatedAppCandidate(appInst, result)
+	if err != nil {
+		return m.abortUncommittedContainerGroup(err, state, appInst, result, newDef, runtime)
+	}
+	candidate.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, newDef)
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
+		return m.abortUncommittedContainerGroup(
+			fmt.Errorf("persist container ids: %w", err),
+			state,
+			appInst,
+			result,
+			newDef,
+			runtime,
+		)
 	}
 	publicationCtx := pressure.WithTransitionContinuation(ctx)
 	if _, _, err := listenerPlan.PublishWithResumeTokenContext(publicationCtx, publicationResumeToken); err != nil {

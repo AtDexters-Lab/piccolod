@@ -134,13 +134,17 @@ func (m *AppManager) commitRollbackAppState(state *FilesystemStateManager, appIn
 	if err != nil {
 		return fmt.Errorf("load previous definition for rollback generation %s: %w", active.ID, err)
 	}
-	appInst.ActiveRootfs = make(map[string]string, len(active.RootfsVolIDs))
-	for serviceName, volumeID := range active.RootfsVolIDs {
-		appInst.ActiveRootfs[serviceName] = volumeID
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return err
 	}
-	appInst.Definition = prevDef
-	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst); err != nil {
+	candidate.ActiveRootfs = make(map[string]string, len(active.RootfsVolIDs))
+	for serviceName, volumeID := range active.RootfsVolIDs {
+		candidate.ActiveRootfs[serviceName] = volumeID
+	}
+	candidate.Definition = prevDef
+	candidate.UpdatedAt = time.Now()
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		return fmt.Errorf("store tuple-authoritative rollback app state: %w", err)
 	}
 

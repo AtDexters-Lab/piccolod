@@ -14,6 +14,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-inspect  # stage 5: SSH storage inspection
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-verify    # stage 6: block-native rootfs verification
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> ai-provider      # stage 22: released AI provider + private capability binding
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
@@ -33,6 +34,7 @@
 set -euo pipefail
 umask 077
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IP="${1:?Usage: $0 <VM_IP> [stage]}"
 STAGE="${2:-all}"
 if [[ -n "${PICCOLO_TEST_PASS_FILE:-}" ]] && [[ -f "$PICCOLO_TEST_PASS_FILE" ]]; then
@@ -68,10 +70,11 @@ SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLeve
 # SSH into the VM.
 vssh() { ssh "${SSH_OPTS[@]}" "root@$IP" "$@"; }
 
-# HTTP helpers (same as production test script).
-api()  { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" "http://$IP$1" 2>/dev/null; }
+# HTTP helpers (same as production test script). GETs are safe to retry across
+# transient dev-VM NIC resets; mutation helpers remain single-attempt.
+api()  { curl -sf --retry 5 --retry-delay 1 --retry-all-errors --connect-timeout 5 -b "$COOKIE_JAR" -c "$COOKIE_JAR" "http://$IP$1" 2>/dev/null; }
 apij() { api "$1" | python3 -m json.tool 2>/dev/null; }
-csrf() { curl -sf --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/auth/csrf" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null; }
+csrf() { curl -sf --retry 5 --retry-delay 1 --retry-all-errors --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/auth/csrf" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('token',''))" 2>/dev/null; }
 post() {
   local _body_file; _body_file=$(mktemp "$ALPHA_STATE_DIR/post-body-XXXXXX")
   printf '%s' "$2" > "$_body_file"
@@ -99,14 +102,14 @@ ensure_session() {
   local authed locked login_code unlock_code
   authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
     "http://$IP/api/v1/auth/session" 2>/dev/null \
-    | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
+    | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null) || authed=""
   [[ "$authed" == "True" ]] && return 0
   local _body; _body=$(mktemp "$ALPHA_STATE_DIR/session-body-XXXXXX")
   rm -f "$COOKIE_JAR"
   for _ in $(seq 1 10); do
     locked=$(curl -s --connect-timeout 5 \
       "http://$IP/api/v1/crypto/status" 2>/dev/null \
-      | python3 -c "import sys,json; print(json.load(sys.stdin).get('locked',False))" 2>/dev/null)
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('locked',False))" 2>/dev/null) || locked=""
     if [[ "$locked" == "True" ]]; then
       printf '{"password":"%s"}' "$PASS" > "$_body"
       unlock_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 30 \
@@ -125,7 +128,7 @@ ensure_session() {
     if [[ "$login_code" == "200" ]]; then
       authed=$(curl -s --connect-timeout 5 -b "$COOKIE_JAR" \
         "http://$IP/api/v1/auth/session" 2>/dev/null \
-        | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null)
+        | python3 -c "import sys,json; print(json.load(sys.stdin).get('authenticated',False))" 2>/dev/null) || authed=""
       if [[ "$authed" == "True" ]]; then
         rm -f "$_body"
         return 0
@@ -248,7 +251,7 @@ delete_app_if_present() {
   code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 30 --max-time 120 \
     -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
     -X DELETE -H "X-CSRF-Token: $token" \
-    "http://$IP/api/v1/apps/$app_name" 2>/dev/null || true)
+    "http://$IP/api/v1/apps/$app_name?acknowledge_provider_change=true" 2>/dev/null || true)
   echo "$code"
 }
 
@@ -303,6 +306,9 @@ stage_prereq() {
   # Binaries
   check_ssh_ok "0.12" "pvcreate available" "which pvcreate"
   check_ssh_ok "0.13" "cryptsetup available" "which cryptsetup"
+  check_ssh_ok "0.16" "setfacl available for accelerator grants" "command -v setfacl"
+  check_ssh_ok "0.17" "Podman artifact pull/inspect/extract available" \
+    "podman artifact pull --help >/dev/null && podman artifact inspect --help >/dev/null && podman artifact extract --help >/dev/null"
 
   # Rootless podman prerequisites
   # newuidmap/newgidmap need setuid for rootless podman user namespace mapping.
@@ -3586,6 +3592,318 @@ except: print('||0|0|False')" 2>/dev/null)
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 22: Released Piccolo AI provider + private consumer binding
+#
+# Kept out of `all`: this stage downloads a real model and provider image.
+# It uses the published store manifest and only supplies a tiny consumer fixture.
+# ─────────────────────────────────────────────────────────
+stage_ai_provider() {
+  echo -e "\n${CYAN}═══ Stage 22: Piccolo AI Provider + Capability Binding ═══${NC}"
+  ensure_session
+
+  # These cleanup-owned values intentionally outlive the function's local
+  # scope because the EXIT trap can run after an early return.
+  provider="ai"
+  consumer="aiconsumer"
+  local api_token="PiccoloAlphaProviderToken2026"
+  provider_created=0
+  consumer_created=0
+  local artifact_reference=""
+  local artifact_golden=""
+  local first_device=""
+
+  _ai_app_field() {
+    local app_name="$1" field="$2" response
+    response=$(api "/api/v1/apps/$app_name" 2>/dev/null || true)
+    printf '%s' "$response" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin).get('data',{}).get('app',{}).get('$field',''))
+except Exception:
+    print('')
+" 2>/dev/null
+  }
+
+  _ai_wait_status() {
+    local app_name="$1" expected="$2" attempts="${3:-120}" status=""
+    for _ in $(seq 1 "$attempts"); do
+      status=$(_ai_app_field "$app_name" status)
+      [[ "$status" == "$expected" ]] && return 0
+      sleep 1
+    done
+    return 1
+  }
+
+  _ai_podman_prefix() {
+    local app_name="$1" username="pa-$1" uid home
+    uid=$(vssh "id -u $username 2>/dev/null" | tail -1 | tr -d '[:space:]')
+    home=$(vssh "getent passwd $username | cut -d: -f6" | tail -1 | tr -d '[:space:]')
+    [[ "$uid" =~ ^[1-9][0-9]*$ && -n "$home" ]] || return 1
+    printf 'cd /tmp && /usr/sbin/runuser --user %s -- /usr/bin/env HOME=%s XDG_RUNTIME_DIR=/run/user/%s /usr/bin/podman --root /run/piccolo/podman/apps/%s --runroot /run/piccolo/podman/app-%s --storage-driver overlay' \
+      "$username" "$home" "$uid" "$app_name" "$app_name"
+  }
+
+  _ai_cleanup() {
+    local code
+    if [[ "${consumer_created:-0}" == "1" ]]; then
+      code=$(delete_app_if_present "$consumer")
+      [[ "$code" == "200" || "$code" == "404" ]] && consumer_created=0
+    fi
+    if [[ "${provider_created:-0}" == "1" ]]; then
+      code=$(delete_app_if_present "$provider")
+      [[ "$code" == "200" || "$code" == "404" ]] && provider_created=0
+    fi
+  }
+  trap _ai_cleanup EXIT
+
+  # Reuse a matching interrupted run; remove foreign fixtures with our reserved
+  # names before creating deterministic test state.
+  local existing_source
+  existing_source=$(api "/api/v1/apps/$provider" 2>/dev/null | python3 -c "
+import json, sys
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('catalog_source',''))
+except Exception: print('')
+" 2>/dev/null || true)
+  if [[ "$existing_source" == "piccolo-ai" ]]; then
+    provider_created=1
+  elif [[ -n "$existing_source" ]]; then
+    delete_app_if_present "$provider" >/dev/null
+  fi
+
+  if [[ "$(_ai_app_field "$consumer" status)" == "running" ]]; then
+    consumer_created=1
+  elif curl -sf --connect-timeout 5 -b "$COOKIE_JAR" "http://$IP/api/v1/apps/$consumer" >/dev/null 2>&1; then
+    delete_app_if_present "$consumer" >/dev/null
+  fi
+
+  local template_yaml payload token install_http
+  if [[ "$provider_created" != "1" ]]; then
+    template_yaml=$(api "/api/v1/catalog/piccolo-ai/template" || true)
+    if [[ -z "$template_yaml" ]]; then
+      echo -e "  ${RED}FAIL${NC} [22.1] Released piccolo-ai catalog template available"
+      ((FAIL_COUNT++)) || true
+      return
+    fi
+    echo -e "  ${GREEN}PASS${NC} [22.1] Released piccolo-ai catalog template available"
+    ((PASS_COUNT++)) || true
+
+    payload=$(YAML="$template_yaml" TOKEN="$api_token" python3 -c '
+import json, os
+print(json.dumps({
+    "app_definition": os.environ["YAML"],
+    "inputs": {
+        "__app_address__": "ai",
+        "api_token": os.environ["TOKEN"],
+        "target_device": "CPU",
+    },
+    "catalog_source": "piccolo-ai",
+}))
+')
+    token=$(csrf || true)
+    install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 1800 \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null || true)
+    [[ "$install_http" =~ ^[0-9]{3}$ ]] || install_http="000"
+    check "22.2" "Released Piccolo AI provider installed" "$install_http" "201"
+    [[ "$install_http" == "201" ]] || { dump_logs "stage22-provider-install"; return; }
+    provider_created=1
+  else
+    echo -e "  ${CYAN}INFO${NC} [22.1/22.2] Reusing matching provider from interrupted alpha run"
+  fi
+
+  if _ai_wait_status "$provider" running 180; then
+    echo -e "  ${GREEN}PASS${NC} [22.3] Provider reaches running"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [22.3] Provider did not reach running"
+    ((FAIL_COUNT++)) || true
+    dump_logs "stage22-provider-running"
+    return
+  fi
+
+  local capability_status
+  capability_status=$(api "/api/v1/capabilities")
+  check "22.4" "Provider is selected capability default" "$capability_status" \
+    '"default":"ai"'
+
+  artifact_reference=$(api "/api/v1/apps/$provider" | python3 -c "
+import json, sys
+try:
+    print(json.load(sys.stdin)['data']['app']['artifact_references']['model'])
+except Exception:
+    print('')
+" 2>/dev/null)
+  local reference_record
+  reference_record=$(vssh "cat /piccolo-core/golden-references/$artifact_reference.json 2>/dev/null" || true)
+  check "22.5" "Artifact reference records exact Hugging Face commit" "$reference_record" \
+    '"resolved_identity":"f864c6106efb6c7f7b4ef274a78a98e37210dddd"'
+  check "22.6" "Artifact reference records directory projection" "$reference_record" \
+    '"projection":"huggingface-path:."'
+  artifact_golden=$(echo "$reference_record" | python3 -c "
+import json, sys
+try: print(json.load(sys.stdin).get('golden_id',''))
+except Exception: print('')
+" 2>/dev/null)
+
+  local artifact_mount="/piccolo-core/mounts/artifact-$artifact_reference"
+  check_ssh "22.7" "Artifact mount is read-only" \
+    "findmnt -n -o OPTIONS '$artifact_mount'" "ro,"
+  check_ssh "22.7a" "Artifact mount is idmapped" \
+    "findmnt -n -o OPTIONS '$artifact_mount'" "idmapped"
+  check_ssh "22.8" "OpenVINO multi-file model projection is complete" \
+    "test -s '$artifact_mount/openvino_model.xml' && test -s '$artifact_mount/openvino_model.bin' && test -s '$artifact_mount/tokenizer.json' && echo complete" \
+    "complete"
+
+  local app_devices first_device
+  app_devices=$(api "/api/v1/apps/$provider")
+  first_device=$(vssh \
+    "find /dev/dri /dev/accel -maxdepth 1 -type c -print 2>/dev/null | sort | head -n1" \
+    | tail -1)
+  if [[ -n "$first_device" ]]; then
+    check "22.9" "Selected provider records discovered accelerator" "$app_devices" "$first_device"
+    local provider_prefix
+    provider_prefix=$(_ai_podman_prefix "$provider")
+    check_ssh_ok "22.10" "Accelerator device is visible inside provider container" \
+      "$provider_prefix exec $provider test -c '$first_device'"
+    check_ssh "22.11" "Accelerator ACL grants the provider app user" \
+      "getfacl -cp '$first_device' | grep 'user:pa-$provider:rw-'" "user:pa-$provider:rw-"
+  else
+    skip "22.9-22.11" "Accelerator grant" "alpha VM exposes no DRM/accel character device"
+  fi
+
+  local primary_port inference_port public_code=""
+  primary_port=$(api "/api/v1/apps/$provider" | python3 -c "
+import json, sys
+try:
+    listeners=json.load(sys.stdin)['data']['listeners']
+    print(next(x['public_port'] for x in listeners if x.get('primary')))
+except Exception: print('')
+" 2>/dev/null)
+  inference_port=$(api "/api/v1/apps/$provider" | python3 -c "
+import json, sys
+try:
+    listeners=json.load(sys.stdin)['data']['listeners']
+    print(next(x['public_port'] for x in listeners if x.get('name') == 'inference'))
+except Exception: print('')
+" 2>/dev/null)
+  for _ in $(seq 1 120); do
+    public_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
+      -H "Authorization: Bearer $api_token" \
+      "http://$IP:$primary_port/v3/models" 2>/dev/null || true)
+    [[ "$public_code" == "200" ]] && break
+    sleep 1
+  done
+  check "22.12" "Public provider gateway reaches declared base path" "$public_code" "200"
+  local protected_code
+  protected_code=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 --max-time 10 \
+    "http://$IP:$inference_port/v3/models" 2>/dev/null || true)
+  check "22.13" "Ordinary direct access to backend listener remains protected" "$protected_code" "401"
+
+  if [[ "$consumer_created" != "1" ]]; then
+    local consumer_yaml
+    consumer_yaml=$(<"$SCRIPT_DIR/fixtures/ai-capability-consumer.yaml")
+    payload=$(YAML="$consumer_yaml" python3 -c '
+import json, os
+print(json.dumps({
+    "app_definition": os.environ["YAML"],
+    "inputs": {"__app_address__": "aiconsumer"},
+    "catalog_source": "none",
+}))
+')
+    token=$(csrf || true)
+    install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 600 \
+      -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+      -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+      -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null || true)
+    [[ "$install_http" =~ ^[0-9]{3}$ ]] || install_http="000"
+    check "22.14" "Capability consumer fixture installed" "$install_http" "201"
+    [[ "$install_http" == "201" ]] || { dump_logs "stage22-consumer-install"; return; }
+    consumer_created=1
+  else
+    echo -e "  ${CYAN}INFO${NC} [22.14] Reusing matching consumer from interrupted alpha run"
+  fi
+  if _ai_wait_status "$consumer" running 120; then
+    echo -e "  ${GREEN}PASS${NC} [22.15] Consumer reaches running"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [22.15] Consumer did not reach running"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+
+  local consumer_prefix provider_prefix base_url consumer_pid provider_pid
+  consumer_prefix=$(_ai_podman_prefix "$consumer")
+  provider_prefix=$(_ai_podman_prefix "$provider")
+  base_url=$(vssh "$consumer_prefix inspect $consumer --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | sed -n 's/^OPENAI_BASE_URL=//p'" | tail -1)
+  check "22.16" "Consumer receives explicit private base URL" "$base_url" "http://127.0.0.1:"
+  check "22.17" "Provider base_path is preserved in binding" "$base_url" "/v3"
+  consumer_pid=$(vssh "$consumer_prefix inspect ${consumer}__netns__ --format '{{.State.Pid}}' 2>/dev/null" | tail -1)
+  provider_pid=$(vssh "$provider_prefix inspect ${provider}__netns__ --format '{{.State.Pid}}' 2>/dev/null" | tail -1)
+
+  local private_code
+  private_code=$(vssh "nsenter -t '$consumer_pid' -n curl -sS -o /dev/null -w '%{http_code}' --max-time 30 '$base_url/models'" 2>/dev/null || true)
+  check "22.18" "Consumer private ingress reaches selected provider" "$private_code" "200"
+  check_ssh_fail "22.19" "Private ingress is absent from Piccolod host namespace" \
+    "curl -fsS --max-time 3 '$base_url/models'"
+  check_ssh_fail "22.20" "Private ingress is absent from provider namespace" \
+    "nsenter -t '$provider_pid' -n curl -fsS --max-time 3 '$base_url/models'"
+
+  if post_csrf "/api/v1/apps/$provider/stop" >/dev/null && _ai_wait_status "$provider" stopped 120; then
+    echo -e "  ${GREEN}PASS${NC} [22.22] Provider stops cleanly"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [22.22] Provider stop failed"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  local stopped_code
+  stopped_code=$(vssh "nsenter -t '$consumer_pid' -n curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$base_url/models'" 2>/dev/null || true)
+  check "22.23" "Consumer gets generic 503 while provider is stopped" "$stopped_code" "503"
+  check_ssh_fail "22.24" "Provider stop detaches live artifact mount" "mountpoint -q '$artifact_mount'"
+  check_ssh_fail "22.24a" "Provider stop leaves no running provider containers" \
+    "$provider_prefix ps --filter 'label=io.piccolo.instance=$provider' --format '{{.ID}}' | grep -q ."
+  if [[ -n "$first_device" ]]; then
+    check_ssh "22.25" "Selected provider retains accelerator ACL while stopped" \
+      "getfacl -cp '$first_device' | grep 'user:pa-$provider:rw-'" "user:pa-$provider:rw-"
+  fi
+
+  if post_csrf "/api/v1/apps/$provider/start" >/dev/null && _ai_wait_status "$provider" running 180; then
+    echo -e "  ${GREEN}PASS${NC} [22.26] Provider restarts cleanly"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [22.26] Provider restart failed"
+    ((FAIL_COUNT++)) || true
+    return
+  fi
+  for _ in $(seq 1 120); do
+    private_code=$(vssh "nsenter -t '$consumer_pid' -n curl -sS -o /dev/null -w '%{http_code}' --max-time 10 '$base_url/models'" 2>/dev/null || true)
+    [[ "$private_code" == "200" ]] && break
+    sleep 1
+  done
+  check "22.27" "Existing consumer binding recovers after provider restart" "$private_code" "200"
+  check_ssh_ok "22.28" "Provider restart reattaches artifact mount" "mountpoint -q '$artifact_mount'"
+
+  local uninstall_code
+  uninstall_code=$(delete_app_if_present "$consumer")
+  check "22.29" "Consumer fixture uninstalled" "$uninstall_code" "200"
+  [[ "$uninstall_code" == "200" ]] && consumer_created=0
+  uninstall_code=$(delete_app_if_present "$provider")
+  check "22.30" "Provider fixture uninstalled" "$uninstall_code" "200"
+  [[ "$uninstall_code" == "200" ]] && provider_created=0
+  sleep 3
+
+  check_ssh_fail "22.31" "Artifact reference removed after uninstall" \
+    "test -e '/piccolo-core/golden-references/$artifact_reference.json'"
+  if [[ -n "$artifact_golden" ]]; then
+    check_ssh_fail "22.32" "Unreferenced artifact golden LV is garbage collected" \
+      "lvs 'piccolo-data-vg/$artifact_golden' >/dev/null 2>&1"
+  fi
+
+  trap - EXIT
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 if [[ -L "$ALPHA_STATE_DIR" ]] || { [[ -e "$ALPHA_STATE_DIR" ]] && [[ ! -d "$ALPHA_STATE_DIR" ]]; }; then
@@ -3620,6 +3938,7 @@ case "$STAGE" in
   storage-inspect)   stage_storage_inspect ;;
   rootfs-verify)     stage_rootfs_verify ;;
   service-app)       stage_service_app ;;
+  ai-provider)       stage_ai_provider ;;
   workspace-app)     stage_workspace_app ;;
   app-resize)        stage_app_resize ;;
   image-update-rollback) stage_image_update_rollback ;;
@@ -3665,7 +3984,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app workspace-app app-resize image-update-rollback reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider workspace-app app-resize image-update-rollback reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac

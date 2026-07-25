@@ -42,6 +42,60 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 		return fmt.Errorf("failed to attach rootfs: %w", err)
 	}
+	artifactHandles, err := m.ensureAppArtifactAttachments(ctx, state, appInst, def, runtime)
+	if err != nil {
+		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+		return fmt.Errorf("failed to attach artifacts: %w", err)
+	}
+	desiredBindings, err := desiredCapabilityBindings(state, appInst.InstanceID, def)
+	if err != nil {
+		return fmt.Errorf("resolve capability bindings: %w", err)
+	}
+	desiredAccelerators, err := m.desiredAcceleratorDevices(state, appInst.InstanceID, def)
+	if err != nil {
+		return fmt.Errorf("resolve accelerator grant: %w", err)
+	}
+	if !capabilityGenerationMatches(appInst, desiredBindings) ||
+		!acceleratorGenerationMatches(appInst, desiredAccelerators) {
+		if len(appInst.AcceleratorDevices) > 0 && len(desiredAccelerators) == 0 {
+			if err := m.recreateAppForCapabilityEffects(ctx, state, appInst.InstanceID, func() error {
+				return m.revokeAcceleratorAccess(ctx, state, appInst.InstanceID)
+			}); err != nil {
+				m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+				return err
+			}
+			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+			return nil
+		}
+		if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
+			"committed capability effects changed; recreating container group", blockNativeRootfsMap); recoverErr != nil {
+			m.updateStatusWithEvent(appInst.InstanceID, StatusError)
+			return recoverErr
+		}
+		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
+		return nil
+	}
+	acceleratorUIDs, err := m.desiredAcceleratorHostUIDs(
+		state,
+		appInst.InstanceID,
+		runtime,
+		def,
+		blockNativeRootfsMap,
+	)
+	if err != nil {
+		return fmt.Errorf("resolve accelerator principals: %w", err)
+	}
+	acceleratorDevices, err := m.ensureAcceleratorAccess(
+		ctx,
+		state,
+		appInst.InstanceID,
+		runtime,
+		def,
+		acceleratorUIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare accelerator grant: %w", err)
+	}
 
 	// Podman may retain running metadata after the container PID has died or
 	// been reused. In that state `podman start` is a successful no-op, so manual
@@ -72,7 +126,10 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 		m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 		return nil
 	}
-
+	bindingEnvironment, err := m.ensureCapabilityBindingEnvironment(ctx, state, appInst, def, anchorID, runtime)
+	if err != nil {
+		return fmt.Errorf("prepare capability bindings: %w", err)
+	}
 	for _, svcName := range startOrder {
 		cid := observed.Services[svcName].ID
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
@@ -80,13 +137,16 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 				appInst.InstanceID, svcName, err)
 
 			opts := serviceContainerOptions{
-				layout:     layout,
-				appDef:     def,
-				instanceID: appInst.InstanceID,
-				primary:    primary,
-				svcName:    svcName,
-				anchorID:   anchorID,
-				credential: runtime.Credential,
+				layout:             layout,
+				appDef:             def,
+				instanceID:         appInst.InstanceID,
+				primary:            primary,
+				svcName:            svcName,
+				anchorID:           anchorID,
+				credential:         runtime.Credential,
+				artifactHandles:    artifactHandles,
+				bindingEnvironment: bindingEnvironment[svcName],
+				acceleratorDevices: acceleratorDevices,
 			}
 			if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
 				opts.rootfsHandle = &svcRootfs.handle
@@ -156,6 +216,9 @@ func (m *AppManager) finalizeQuiescedContainerGroup(ctx context.Context, appInst
 	// Detach rootfs only after graceful stop or PID 1 empty-cgroup proof.
 	if m.appHasAnyServiceRootfs(appInst.InstanceID, mode, def, appInst) {
 		m.detachAllServiceRootfs(ctx, appInst.InstanceID, mode, def, appInst)
+	}
+	if err := m.detachArtifactReferences(ctx, appInst.ArtifactReferences); err != nil {
+		log.Printf("WARN: detach artifact references for %s: %v", appInst.InstanceID, err)
 	}
 	m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 	if m.serviceManager != nil {

@@ -69,6 +69,59 @@ func TestWriteAppConfig(t *testing.T) {
 
 }
 
+func TestArtifactMountConflictUsesFinalGeneratedMountPlan(t *testing.T) {
+	spec := container.ContainerCreateSpec{
+		Volumes: []container.VolumeMapping{
+			{Container: "/piccolo/config"},
+			{Container: "/piccolo/boot.sh"},
+			{Container: "/usr/local/bin/piccolo-startup"},
+		},
+		Tmpfs: []container.TmpfsMount{{Container: "/run"}},
+		CAMounts: []container.CAMount{{
+			ContainerPath: "/etc/ssl/certs/piccolo-internal-ca.crt",
+		}},
+		Devices: []string{
+			"/dev/dri/renderD128",
+			"/dev/accel/accel0",
+		},
+		UseInit: true,
+	}
+	for _, target := range []string{
+		"/piccolo/config",
+		"/piccolo/config/models",
+		"/piccolo",
+		"/piccolo/boot.sh",
+		"/usr/local/bin",
+		"/run/models",
+		"/etc/ssl/certs",
+		"/dev/dri",
+		"/dev/dri/renderD128",
+		"/dev/dri/renderD128/models",
+		"/dev/accel",
+		"/run/podman-init",
+	} {
+		if owner, overlaps := artifactMountConflict(spec, target); !overlaps {
+			t.Fatalf("artifact target %s did not conflict; owner=%q", target, owner)
+		}
+	}
+	if owner, overlaps := artifactMountConflict(spec, "/models/model"); overlaps {
+		t.Fatalf("independent artifact target conflicts with %s", owner)
+	}
+
+	readOnly := container.ContainerCreateSpec{ReadOnly: true}
+	for _, target := range []string{"/tmp/model", "/run/model", "/var/tmp/model"} {
+		if _, overlaps := artifactMountConflict(readOnly, target); !overlaps {
+			t.Fatalf("read-only implicit tmpfs target %s did not conflict", target)
+		}
+	}
+	if _, overlaps := artifactMountConflict(
+		container.ContainerCreateSpec{UseInit: true},
+		"/run/podman-init",
+	); !overlaps {
+		t.Fatal("Podman init target did not independently conflict")
+	}
+}
+
 func TestBuildServiceContainerSpec(t *testing.T) {
 	// Common setup: point asset paths to a temp dir with dummy boot.sh/piccolo-startup.
 	stateDir := t.TempDir()

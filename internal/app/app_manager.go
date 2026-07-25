@@ -124,6 +124,12 @@ type AppManager struct {
 	// to the browser after dry run.
 	configUpdateMu         sync.Mutex
 	configUpdateCandidates map[string]*installedConfigCandidate
+
+	capabilityIngressMu   sync.Mutex
+	capabilityIngresses   map[capabilityIngressKey]*capabilityIngress
+	capabilityListen      capabilityIngressListenFunc
+	acceleratorDiscover   func() ([]string, error)
+	acceleratorPermission func(context.Context, uint32, []string, bool) error
 }
 
 var (
@@ -229,6 +235,7 @@ func NewAppManagerWithServices(containerManager ContainerManager, stateDir strin
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
 		configUpdateCandidates:   make(map[string]*installedConfigCandidate),
+		capabilityIngresses:      make(map[capabilityIngressKey]*capabilityIngress),
 	}
 
 	return mgr, nil
@@ -541,6 +548,30 @@ func (m *AppManager) emitProgress(ctx context.Context, taskType, instanceID, pha
 	m.emitProgressWithMetadata(ctx, taskType, instanceID, phase, progress, message, complete, nil, opErr)
 }
 
+type taskProgressReader interface {
+	Last(taskID string) (events.TaskProgressEvent, bool)
+}
+
+func (m *AppManager) inheritedTaskProgress(ctx context.Context, fallbackType string, fallbackProgress int) (string, int) {
+	taskID := TaskIDFromContext(ctx)
+	reporter := m.currentProgressReporter()
+	reader, ok := reporter.(taskProgressReader)
+	if taskID == "" || !ok {
+		return fallbackType, fallbackProgress
+	}
+	last, ok := reader.Last(taskID)
+	if !ok {
+		return fallbackType, fallbackProgress
+	}
+	if strings.TrimSpace(last.TaskType) != "" {
+		fallbackType = last.TaskType
+	}
+	if last.Progress > fallbackProgress {
+		fallbackProgress = last.Progress
+	}
+	return fallbackType, fallbackProgress
+}
+
 func (m *AppManager) emitProgressWithMetadata(ctx context.Context, taskType, instanceID, phase string, progress int, message string, complete bool, metadata map[string]any, opErr error) {
 	taskID := TaskIDFromContext(ctx)
 	if taskID == "" {
@@ -791,6 +822,7 @@ func (m *AppManager) StopBackground() {
 	case <-time.After(15 * time.Second):
 		log.Printf("WARN: StopBackground timed out after 15s waiting for reconcile goroutine")
 	}
+	m.closeCapabilityIngresses()
 }
 
 // StopAllApps proves every app cgroup quiescent before detaching its volume.
@@ -907,7 +939,13 @@ func (m *AppManager) stopAppForShutdown(ctx context.Context, instanceID string) 
 
 	def, err := stateMgr.GetAppDefinition(instanceID)
 	if err != nil {
-		return fmt.Errorf("failed to load app definition: %w", err)
+		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
+			return errors.Join(fmt.Errorf("failed to load app definition: %w", err), quiesceErr)
+		}
+		if detachErr := m.detachArtifactReferences(ctx, app.ArtifactReferences); detachErr != nil {
+			return errors.Join(fmt.Errorf("failed to load app definition: %w", err), detachErr)
+		}
+		return fmt.Errorf("failed to load app definition after safe quiescence: %w", err)
 	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
@@ -1255,6 +1293,7 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		acceleratorDiscover:      func() ([]string, error) { return nil, nil },
 		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
@@ -1294,6 +1333,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		acceleratorDiscover:      func() ([]string, error) { return nil, nil },
 		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
 		manifestUpdateCandidates: make(map[string]*manifestUpdateCandidate),
@@ -1866,18 +1906,43 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return
 	}
+	ownershipReconcileReady := true
+	if err := m.reconcileArtifactReferences(ctx, state); err != nil {
+		// Artifact ownership stays fail closed, but a corrupt owner must not
+		// prevent unrelated installed apps from reconciling their runtime.
+		log.Printf("ERROR: reconcile artifact references: %v", err)
+		ownershipReconcileReady = false
+	}
+	if ownershipReconcileReady {
+		if err := m.reconcileCapabilityDefaultsAndEffects(ctx, state); err != nil {
+			log.Printf("ERROR: reconcile capability defaults: %v", err)
+			return
+		}
+	} else {
+		log.Printf("WARN: reconcile capability ownership deferred until app/artifact ownership is readable")
+	}
 	m.beginObservationPass()
 
-	// Clean up orphaned per-app users on first reconciliation.
-	m.orphanCleanupOnce.Do(func() {
+	// Clean up orphaned per-app users on first reconciliation. On-disk
+	// publications, including incomplete or unreadable ones, remain user
+	// owners until their dedicated recovery path proves process absence.
+	appDirectoryIDs, directoryErr := state.listAppDirectoryIDs()
+	if directoryErr != nil {
+		log.Printf("ERROR: orphan app-user cleanup: list app directories: %v", directoryErr)
+	} else {
 		knownIDs := make(map[string]bool)
 		for _, app := range state.ListApps() {
 			if app != nil {
 				knownIDs[app.InstanceID] = true
 			}
 		}
-		container.CleanupOrphanAppUsers(knownIDs)
-	})
+		for _, instanceID := range appDirectoryIDs {
+			knownIDs[instanceID] = true
+		}
+		m.orphanCleanupOnce.Do(func() {
+			container.CleanupOrphanAppUsers(knownIDs)
+		})
+	}
 
 	for _, appInst := range state.ListApps() {
 		if ctx.Err() != nil {
@@ -2085,7 +2150,8 @@ func (m *AppManager) ensureServicesForRunningApp(ctx context.Context, def *api.A
 	if m.serviceManager == nil {
 		return nil
 	}
-	if _, err := m.serviceManager.GetByApp(instanceID); err == nil {
+	if _, err := m.serviceManager.GetByApp(instanceID); err == nil &&
+		m.serviceManager.AppPublicationActive(instanceID) {
 		return nil
 	}
 
@@ -2183,7 +2249,8 @@ func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*A
 	// difference is safe.
 	// Per D-9: num_active_elastic may have changed, so every elastic app's share
 	// needs recompute, not just the newly-installed app.
-	if err == nil {
+	var capabilityPending *CapabilitySelectionReconcilePendingError
+	if err == nil || (inst != nil && errors.As(err, &capabilityPending)) {
 		m.ReconcileAllSlicePolicies()
 	}
 	return inst, err
@@ -2194,6 +2261,12 @@ func (m *AppManager) installLocked(ctx context.Context, appDef *api.AppDefinitio
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseValidating, 0, "Validating app manifest", false, nil)
 	defer func() {
 		if err != nil {
+			var pending *CapabilitySelectionReconcilePendingError
+			if errors.As(err, &pending) && inst != nil {
+				instanceID = inst.InstanceID
+				m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseComplete, 100, "Install complete; capability reconciliation pending", true, nil)
+				return
+			}
 			m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseComplete, 100, "Install failed", true, err)
 			return
 		}
@@ -2317,8 +2390,15 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
-	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints, nil)
+	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints, nil, false, true)
 	if err != nil {
+		if uncommittedContainerGroupMaySurvive(err) {
+			// The candidate still owns the app volume, rootfs, artifact
+			// attachments, and possibly live processes. Preserve those resources
+			// for an explicit retry or restart to reconcile safely.
+			cleanupResources = false
+			return nil, err
+		}
 		var portErr *container.PortInUseError
 		if errors.As(err, &portErr) {
 			cleanupResources = false // Reuse volume/user on retry
@@ -2340,27 +2420,42 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRegisteringServices, 90, "Finalizing installation", false, nil)
 	if err := state.StoreApp(app); err != nil {
-		// Cleanup all containers if storage fails.
-		// Use a detached context — the caller's ctx may be near expiry after
-		// a long pull + flatten phase.
-		storeCleanupCtx, storeCleanupCancel := context.WithTimeout(context.Background(), cleanupBudget)
-		defer storeCleanupCancel()
-		if app.NetworkAnchorID != "" {
-			_ = m.containerManager.StopContainer(storeCleanupCtx, runtime, app.NetworkAnchorID)
-			_ = m.containerManager.RemoveContainer(storeCleanupCtx, runtime, app.NetworkAnchorID)
+		storeErr := fmt.Errorf("failed to store app: %w", err)
+		if cleanupErr := m.compensateUncommittedContainerGroup(
+			state,
+			nil,
+			app,
+			appDef,
+			runtime,
+		); cleanupErr != nil {
+			// A surviving process still owns the app volume and user. Preserve
+			// those resources so reconciliation/administrative cleanup can prove
+			// absence before destroying them.
+			cleanupResources = false
+			return nil, errors.Join(
+				storeErr,
+				fmt.Errorf("compensate uncommitted container group: %w", cleanupErr),
+			)
 		}
-		for _, cid := range app.Containers {
-			_ = m.containerManager.StopContainer(storeCleanupCtx, runtime, cid)
-			_ = m.containerManager.RemoveContainer(storeCleanupCtx, runtime, cid)
+		if cleanupErr := state.removeIncompleteApp(instanceID); cleanupErr != nil {
+			// Process absence is proven, but keep the deterministic user,
+			// volume, and artifact identities intact so background reconcile
+			// can repeat the proof before retrying publication cleanup.
+			cleanupResources = false
+			return nil, errors.Join(
+				storeErr,
+				fmt.Errorf("remove incomplete app publication: %w", cleanupErr),
+			)
 		}
-		// Cleanup rootfs.
-		mode := piccoloModeFromExtensions(appDef.Extensions)
-		m.detachAllServiceRootfs(storeCleanupCtx, instanceID, mode, appDef, nil)
-		m.serviceManager.RemoveApp(instanceID)
-		cleanupServices = false
-		// cleanupResources runs via defer: destroys volume, runroot, per-app user
-		return nil, fmt.Errorf("failed to store app: %w", err)
+		return nil, storeErr
 	}
+
+	// StoreApp is the ordinary install commit. From this point the persisted app
+	// owns its resources even if first-provider capability effects need repair.
+	// In particular, a reconciliation-pending return must not run candidate
+	// cleanup against the now-committed runtime.
+	cleanupResources = false
+	cleanupServices = false
 
 	// Atomically set observed status and clear any transient message, then populate for API callers.
 	m.observedStatusMu.Lock()
@@ -2368,10 +2463,40 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 	m.observedStatusMessage[instanceID] = ""
 	m.observedStatusMu.Unlock()
 	app.Status = StatusRunning
-	m.publishAppStatusChanged(instanceID, "installed", "", "")
 
-	cleanupResources = false
-	cleanupServices = false
+	// The first installed provider becomes the automatic default only after its
+	// ordinary install has committed. Converge that default and its runtime
+	// effects before returning while this lifecycle still owns reconcileMu.
+	// Other provider installs do not steal or re-finalize an existing default.
+	providedCapabilities := make([]string, 0, len(registeredCapabilities()))
+	for _, capability := range registeredCapabilities() {
+		if _, _, provides := providedCapability(appDef, capability); provides {
+			providedCapabilities = append(providedCapabilities, capability)
+		}
+	}
+	var capabilityReconcileErr error
+	if len(providedCapabilities) > 0 {
+		durable, loadErr := state.loadCapabilityState()
+		if loadErr != nil {
+			capabilityReconcileErr = loadErr
+		} else {
+			for _, capability := range providedCapabilities {
+				if durable.Defaults[capability] == "" {
+					capabilityReconcileErr = m.finalizeCommittedCapabilityRuntime(ctx, state, instanceID)
+					break
+				}
+			}
+		}
+	}
+
+	app.Status, app.StatusMessage = m.getObservedStatusAndMessage(instanceID)
+	if app.Status == "" {
+		app.Status = StatusRunning
+	}
+	m.publishAppStatusChanged(instanceID, "installed", "", "")
+	if capabilityReconcileErr != nil {
+		return app, &CapabilitySelectionReconcilePendingError{Cause: capabilityReconcileErr}
+	}
 	return app, nil
 }
 
@@ -2454,7 +2579,15 @@ func (m *AppManager) Upsert(ctx context.Context, appDef *api.AppDefinition) (*Ap
 // The clone is a fully independent AppInstance with its own containers, volumes, and per-app user.
 // The origin must be a workspace-mode app and must be stopped.
 // After cloning, both origin and clone are (re-)started automatically.
-func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (*AppInstance, error) {
+func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID string) (inst *AppInstance, err error) {
+	m.emitProgress(ctx, taskTypeCloneApp, cloneID, taskPhaseValidating, 0, "Validating workspace clone", false, nil)
+	defer func() {
+		if err != nil {
+			m.emitProgress(ctx, taskTypeCloneApp, cloneID, taskPhaseComplete, 100, "Clone failed", true, err)
+			return
+		}
+		m.emitProgress(ctx, taskTypeCloneApp, cloneID, taskPhaseComplete, 100, "Clone complete", true, nil)
+	}()
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
@@ -2476,7 +2609,7 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 	}
 
 	// Validate origin exists.
-	_, exists := state.GetApp(originID)
+	originInst, exists := state.GetApp(originID)
 	if !exists {
 		return nil, fmt.Errorf("clone %s from %s: origin not found", cloneID, originID)
 	}
@@ -2618,26 +2751,46 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 	cleanupServices = true
 
 	// Install the clone's container group with prebuilt rootfs.
-	cloneInst, err := m.installContainerGroup(ctx, &cloneDef, cloneID, layout, runtime, endpoints, prebuiltRootfs)
+	cloneInst, err := m.installContainerGroup(ctx, &cloneDef, cloneID, layout, runtime, endpoints, prebuiltRootfs, false, false)
 	if err != nil {
+		if uncommittedContainerGroupMaySurvive(err) {
+			cleanupResources = false
+			cleanupRootfs = false
+		}
 		return nil, fmt.Errorf("clone %s from %s: install containers: %w", cloneID, originID, err)
 	}
 
 	// Set clone provenance.
 	cloneInst.ClonedFrom = originID
+	cloneInst.Init = cloneInitState(originInst.Init)
 
 	// Persist clone state.
 	if err := state.StoreApp(cloneInst); err != nil {
-		// Cleanup containers created by installContainerGroup.
-		if cloneInst.NetworkAnchorID != "" {
-			_ = m.containerManager.StopContainer(ctx, runtime, cloneInst.NetworkAnchorID)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, cloneInst.NetworkAnchorID)
+		storeErr := fmt.Errorf("clone %s from %s: persist state: %w", cloneID, originID, err)
+		cleanupErr := m.compensateUncommittedContainerGroup(
+			state,
+			nil,
+			cloneInst,
+			&cloneDef,
+			runtime,
+		)
+		if cleanupErr != nil {
+			cleanupResources = false
+			cleanupRootfs = false
+			return nil, errors.Join(
+				storeErr,
+				fmt.Errorf("compensate uncommitted container group: %w", cleanupErr),
+			)
 		}
-		for _, cid := range cloneInst.Containers {
-			_ = m.containerManager.StopContainer(ctx, runtime, cid)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+		if cleanupErr := state.removeIncompleteApp(cloneID); cleanupErr != nil {
+			cleanupResources = false
+			cleanupRootfs = false
+			return nil, errors.Join(
+				storeErr,
+				fmt.Errorf("remove incomplete clone publication: %w", cleanupErr),
+			)
 		}
-		return nil, fmt.Errorf("clone %s from %s: persist state: %w", cloneID, originID, err)
+		return nil, storeErr
 	}
 
 	// Success — disable deferred cleanup.
@@ -2975,7 +3128,6 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	if err != nil {
 		return err
 	}
-
 	// Unified start path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting containers", false, nil)
 	if strings.TrimSpace(app.NetworkAnchorID) == "" {
@@ -3132,6 +3284,9 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 		if quiesceErr := m.quiesceAppUserSession(ctx, instanceID); quiesceErr != nil {
 			return errors.Join(fmt.Errorf("failed to load app definition: %w", defErr), quiesceErr)
 		}
+		if err := m.detachArtifactReferences(ctx, app.ArtifactReferences); err != nil {
+			return fmt.Errorf("detach artifact references after fallback quiescence: %w", err)
+		}
 		m.updateStatusWithEvent(instanceID, StatusStopped)
 		if m.serviceManager != nil {
 			m.serviceManager.DeactivateApp(instanceID)
@@ -3166,6 +3321,14 @@ func (m *AppManager) stopInternal(ctx context.Context, instanceID string) (err e
 // Uninstall removes an application instance completely by instanceID,
 // including all container data, encrypted volumes, and podman state.
 func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
+	return m.uninstall(ctx, instanceID, true)
+}
+
+func (m *AppManager) UninstallAcknowledged(ctx context.Context, instanceID string, acknowledged bool) error {
+	return m.uninstall(ctx, instanceID, acknowledged)
+}
+
+func (m *AppManager) uninstall(ctx context.Context, instanceID string, acknowledged bool) error {
 	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
@@ -3180,17 +3343,35 @@ func (m *AppManager) Uninstall(ctx context.Context, instanceID string) error {
 		m.reconcileMu.Unlock()
 		return err
 	}
+	capability, selected, err := capabilitySelectedByProvider(state, instanceID)
+	if err != nil {
+		m.reconcileMu.Unlock()
+		return err
+	}
+	if selected && !acknowledged {
+		m.reconcileMu.Unlock()
+		return &CapabilityProviderChangeConfirmationRequiredError{
+			Capability: capability,
+			Current:    instanceID,
+		}
+	}
 
 	// Remove the slice drop-in before the user is destroyed. Live-reset is
 	// unnecessary because the slice itself is about to be torn down.
 	m.RemoveSlicePolicyForApp(instanceID)
 
-	err := m.uninstallLocked(ctx, instanceID)
+	err = m.uninstallLocked(ctx, instanceID)
+	uninstalled := err == nil
+	if err == nil && selected {
+		if reconcileErr := m.reconcileCapabilityDefaultsAndEffects(ctx, state, instanceID); reconcileErr != nil {
+			err = &CapabilitySelectionReconcilePendingError{Cause: reconcileErr}
+		}
+	}
 	m.reconcileMu.Unlock()
 
 	// Recompute slice policies for remaining apps: num_active_elastic may
 	// have changed. Runs outside reconcileMu (systemctl calls).
-	if err == nil {
+	if uninstalled {
 		m.ReconcileAllSlicePolicies()
 	}
 	return err
@@ -3274,6 +3455,9 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 		return err
 	}
 	quiesced = true
+	if err := m.revokeAcceleratorAccess(ctx, state, instanceID); err != nil {
+		return fmt.Errorf("revoke accelerator access before uninstall: %w", err)
+	}
 
 	m.emitProgress(ctx, taskTypeUninstallApp, instanceID, taskPhaseRemovingContainer, 40, "Removing containers", false, nil)
 	if !runtimeUsable {
@@ -3285,8 +3469,14 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 			return err
 		}
 	}
+	m.removeCapabilityIngresses(instanceID)
+	if err := m.pruneCapabilityIngresses(state, instanceID, nil); err != nil {
+		return fmt.Errorf("remove capability ingress state: %w", err)
+	}
 
-	// Destroy block-native rootfs if applicable (before volume destroy).
+	// Keep artifact references until the app record is removed. If any later
+	// uninstall step fails, the disabled app still owns exact reconstructible
+	// identities and a retry never observes an app pointing at deleted refs.
 	m.destroyAllServiceRootfs(ctx, instanceID, mode, def)
 
 	// Reset podman storage BEFORE unmounting the volume.
@@ -3341,6 +3531,16 @@ func (m *AppManager) uninstallLocked(ctx context.Context, instanceID string) (er
 	// Remove from filesystem and cache (state only)
 	if err := state.RemoveApp(instanceID); err != nil {
 		return fmt.Errorf("failed to remove app from storage: %w", err)
+	}
+	if err := m.destroyArtifactReferences(ctx, app.ArtifactReferences); err != nil {
+		// The app is already authoritatively absent. Startup reconciliation
+		// derives retained references from installed app records and will reap
+		// this bounded cleanup debt.
+		log.Printf("WARN: uninstall %s: destroy orphaned artifact references: %v", instanceID, err)
+	} else if rootfs := m.currentRootfsManager(); rootfs != nil {
+		if err := rootfs.GarbageCollectGoldenLVs(ctx); err != nil {
+			log.Printf("WARN: uninstall %s: garbage collect golden content: %v", instanceID, err)
+		}
 	}
 	m.clearStartupRecovery(app)
 	m.retireRuntimeObservation(instanceID)
@@ -4029,7 +4229,7 @@ func (m *AppManager) updateServiceModeImage(
 	// 4. Read image config from golden LV for each changed service.
 	for i := range changed {
 		cs := &changed[i]
-		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, cs.canonical)
+		goldenCfg, cfgErr := m.readImageConfigForGoldenRootfs(ctx, rootfs, cs.handle.GoldenLV, cs.canonical)
 		if cfgErr != nil {
 			log.Printf("WARN: update %s: failed to read image config for %s: %v", instanceID, cs.svcName, cfgErr)
 		} else {
@@ -4162,8 +4362,12 @@ func (m *AppManager) updateServiceModeImage(
 	// (endpoints preserved or freshly allocated) — an app update may add,
 	// remove, or change authorize_paths and the proxy must reflect the new version.
 	m.configureOIDCAuthorizePaths(instanceID, newDef)
-	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	result, err := m.installContainerGroup(ctx, newDef, instanceID, layout, runtime, endpoints, prebuiltRootfs, true, false)
 	if err != nil {
+		if uncommittedContainerGroupMaySurvive(err) {
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf("recreate containers after update: %w", err)
+		}
 		// Detach new rootfs volumes, leave old ones for recovery.
 		for _, cs := range changed {
 			_ = rootfs.DetachRootfs(ctx, cs.volumeID)
@@ -4173,56 +4377,88 @@ func (m *AppManager) updateServiceModeImage(
 	}
 	if imageTxn == nil {
 		if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseCommitIntent, stagedRootfsIDs(), nil, result, nil); storeErr != nil {
-			if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
-				log.Printf("WARN: update %s: cleanup candidate containers after transition marker failure: %v", instanceID, rmErr)
+			cause := fmt.Errorf("store image update transition commit intent marker: %w", storeErr)
+			if cleanupErr := m.compensateUncommittedContainerGroup(
+				state,
+				appInst,
+				result,
+				newDef,
+				runtime,
+			); cleanupErr != nil {
+				m.setObservedStatus(instanceID, StatusError)
+				return errors.Join(
+					cause,
+					fmt.Errorf("compensate uncommitted container group: %w", cleanupErr),
+				)
 			}
-			return restartPreviousRuntime(fmt.Errorf("store image update transition commit intent marker: %w", storeErr))
+			return restartPreviousRuntime(cause)
 		}
 	}
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseFinalizing, 90, "Saving state", false, nil)
 
 	// 9. Update state: ActiveRootfs for changed services, definition, container IDs.
-	if appInst.ActiveRootfs == nil {
-		appInst.ActiveRootfs = make(map[string]string)
+	candidate, err := recreatedAppCandidate(appInst, result)
+	if err != nil {
+		return m.abortUncommittedContainerGroup(err, state, appInst, result, newDef, runtime)
+	}
+	candidate.ActiveRootfs = cloneStringMap(appInst.ActiveRootfs)
+	if candidate.ActiveRootfs == nil {
+		candidate.ActiveRootfs = make(map[string]string)
 	}
 	for _, cs := range changed {
-		appInst.ActiveRootfs[cs.svcName] = cs.volumeID
+		candidate.ActiveRootfs[cs.svcName] = cs.volumeID
 	}
-	appInst.Definition = newDef
-	appInst.PrimaryService = result.PrimaryService
-	appInst.NetworkAnchorID = result.NetworkAnchorID
-	appInst.Containers = result.Containers
-	appInst.UpdatedAt = time.Now()
+	oldArtifactReferences := cloneStringMap(appInst.ArtifactReferences)
+	candidate.Definition = newDef
+	candidate.UpdatedAt = time.Now()
 	if imageTxn != nil {
 		imageTxn.CandidatePrimaryService = result.PrimaryService
 		imageTxn.CandidateNetworkAnchorID = result.NetworkAnchorID
 		imageTxn.CandidateContainers = cloneStringMap(result.Containers)
 		_ = state.StoreImageUpdateTransaction(instanceID, imageTxn)
-		_ = storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, appInst)
+		_ = storeTransitionRecordForImageUpdate(state, instanceID, imageTxn, candidate)
 	}
-	if err := state.StoreApp(appInst); err != nil {
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
+		commitErr := fmt.Errorf("store app: %w", err)
+		var markerErr error
 		if imageTxn == nil {
 			if storeErr := storeTransitionRecordForImageUpdateNoJournal(state, instanceID, TransitionPhaseRestoringPrevious, stagedRootfsIDs(), nil, nil, err); storeErr != nil {
-				m.setObservedStatus(instanceID, StatusError)
-				return errors.Join(fmt.Errorf("store app: %w", err), fmt.Errorf("store image update transition restore marker: %w", storeErr))
+				markerErr = fmt.Errorf("store image update transition restore marker: %w", storeErr)
 			}
 		}
-		// Best-effort cleanup: remove containers created by installContainerGroup
-		// to prevent unmanaged containers running with stale on-disk metadata.
-		if rmErr := m.removeContainersForMultiApp(ctx, result, newDef, runtime); rmErr != nil {
-			log.Printf("WARN: update %s: cleanup after persist failure: %v", instanceID, rmErr)
+		if markerErr != nil {
+			// The durable commit-intent record still owns the live candidate.
+			// Removing it without durably advancing to restoring_previous would
+			// make recovery's recorded runtime identity false.
+			m.setObservedStatus(instanceID, StatusError)
+			return errors.Join(commitErr, markerErr)
+		}
+		abortCause := errors.Join(commitErr, markerErr)
+		if cleanupErr := m.compensateUncommittedContainerGroup(
+			state,
+			appInst,
+			result,
+			newDef,
+			runtime,
+		); cleanupErr != nil {
+			m.setObservedStatus(instanceID, StatusError)
+			return errors.Join(
+				abortCause,
+				fmt.Errorf("compensate uncommitted container group: %w", cleanupErr),
+			)
 		}
 		if imageTxn == nil {
-			rollbackErr := restartPreviousRuntime(fmt.Errorf("store app: %w", err))
+			rollbackErr := restartPreviousRuntime(abortCause)
 			if clearErr := state.ClearTransitionRecord(instanceID); clearErr != nil {
 				rollbackErr = errors.Join(rollbackErr, fmt.Errorf("clear aborted image transition: %w", clearErr))
 			}
 			return rollbackErr
 		}
 		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("store app: %w", err)
+		return abortCause
 	}
+	m.releaseSupersededArtifactReferences(ctx, oldArtifactReferences, appInst.ArtifactReferences)
 
 	// 10. Post-update: record new active generation (only when snapshot exists for rollback).
 	if tupleState != nil && snapshotOK {
@@ -4697,21 +4933,27 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 			return fmt.Errorf("rollback %s: attach snapshot rootfs: %w", instanceID, err)
 		}
 	}
-	result, err := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	result, err := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, endpoints, prebuiltRootfs, true, false)
 	if err != nil {
 		m.setObservedStatus(instanceID, StatusError)
 		return fmt.Errorf("recreate containers after rollback: %w", err)
 	}
 
-	// 9. Update container IDs and persist final state.
-	appInst.NetworkAnchorID = result.NetworkAnchorID
-	appInst.Containers = result.Containers
-	appInst.PrimaryService = result.PrimaryService
-	appInst.UpdatedAt = time.Now()
-
-	if err := state.StoreApp(appInst); err != nil {
+	// 9. Publish the recreated generation only after its metadata is durable.
+	candidate, err := recreatedAppCandidate(appInst, result)
+	if err != nil {
+		return m.abortUncommittedContainerGroup(err, state, appInst, result, curDef, runtime)
+	}
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		m.setObservedStatus(instanceID, StatusError)
-		return fmt.Errorf("store app after rollback: %w", err)
+		return m.abortUncommittedContainerGroup(
+			fmt.Errorf("store app after rollback: %w", err),
+			state,
+			appInst,
+			result,
+			curDef,
+			runtime,
+		)
 	}
 
 	m.setObservedStatus(instanceID, StatusRunning)
@@ -4764,11 +5006,6 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		return nil, fmt.Errorf("app instance not found: %s", instanceID)
 	}
 
-	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
-	if err != nil {
-		return nil, err
-	}
-
 	// Load current app definition
 	curDef, err := state.GetAppDefinition(instanceID)
 	if err != nil {
@@ -4785,9 +5022,10 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		return nil, fmt.Errorf("listener updates are only supported for workspace mode apps")
 	}
 
-	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
-	if err != nil {
-		return nil, err
+	if !listenerCapabilityProvidersEqual(curDef.Listeners, listeners) {
+		return nil, fmt.Errorf(
+			"invalid listener configuration: capability provider declarations can only be changed through manifest update review",
+		)
 	}
 
 	// Auto-designate a primary listener if none is marked.
@@ -4817,10 +5055,25 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		return nil, fmt.Errorf("invalid listener configuration: %w", err)
 	}
 
+	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
+	if err != nil {
+		return nil, err
+	}
+	runtime, err := m.podmanRuntimeForApp(ctx, instanceID, layout, mode, appRuntimeEnsureReady)
+	if err != nil {
+		return nil, err
+	}
+
 	// Backup current definition
 	if err := state.BackupCurrentAppDefinition(instanceID); err != nil {
 		return nil, fmt.Errorf("backup app.yaml: %w", err)
 	}
+	previousArtifactReferences := cloneStringMap(appInst.ArtifactReferences)
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return nil, err
+	}
+	var installedCandidate *AppInstance
 
 	// Reconcile services
 	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseReconcilingServices, 30, "Reconciling services", false, nil)
@@ -4871,20 +5124,41 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (rootfs): %v", cause, rbRootfsErr)
 			}
-			rbInst, rbInstErr := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, rbResult.Endpoints, rbRootfs)
+			rbInst, rbInstErr := m.installContainerGroup(ctx, curDef, instanceID, layout, runtime, rbResult.Endpoints, rbRootfs, true, false)
 			if rbInstErr != nil {
 				m.setObservedStatus(instanceID, StatusError)
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (install): %v", cause, rbInstErr)
 			}
-			appInst.Definition = curDef
-			appInst.PrimaryService = rbInst.PrimaryService
-			appInst.NetworkAnchorID = rbInst.NetworkAnchorID
-			appInst.Containers = rbInst.Containers
-			m.setObservedStatus(instanceID, StatusRunning)
-			if saveErr := state.StoreApp(appInst); saveErr != nil {
-				log.Printf("WARN: update listeners %s: failed to save rollback state: %v", instanceID, saveErr)
+			rbCandidate, candidateErr := recreatedAppCandidate(appInst, rbInst)
+			if candidateErr != nil {
+				m.setObservedStatus(instanceID, StatusError)
+				return nil, errors.Join(
+					cause,
+					m.abortUncommittedContainerGroup(
+						candidateErr,
+						state,
+						appInst,
+						rbInst,
+						curDef,
+						runtime,
+					),
+				)
 			}
+			rbCandidate.Definition = curDef
+			if saveErr := commitDetachedApp(state, appInst, rbCandidate); saveErr != nil {
+				m.setObservedStatus(instanceID, StatusError)
+				rollbackPersistErr := m.abortUncommittedContainerGroup(
+					fmt.Errorf("rollback persistence failed: %w", saveErr),
+					state,
+					appInst,
+					rbInst,
+					curDef,
+					runtime,
+				)
+				return nil, errors.Join(cause, rollbackPersistErr)
+			}
+			m.setObservedStatus(instanceID, StatusRunning)
 			return nil, fmt.Errorf("update failed: %w (rolled back to previous state)", cause)
 		}
 
@@ -4896,33 +5170,73 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 
 		// Recreate the entire container group (anchor + services) with updated endpoints.
 		m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseStarting, 70, "Starting containers", false, nil)
-		newInst, installErr := m.installContainerGroup(ctx, &newDef, instanceID, layout, runtime, result.Endpoints, prebuiltRootfs)
+		newInst, installErr := m.installContainerGroup(ctx, &newDef, instanceID, layout, runtime, result.Endpoints, prebuiltRootfs, true, false)
 		if installErr != nil {
+			if uncommittedContainerGroupMaySurvive(installErr) {
+				m.setObservedStatus(instanceID, StatusError)
+				return nil, fmt.Errorf("recreate containers: %w", installErr)
+			}
 			return rollbackContainers(fmt.Errorf("recreate containers: %w", installErr))
 		}
+		installedCandidate = newInst
 
-		// Update instance with new container group state.
-		appInst.PrimaryService = newInst.PrimaryService
-		appInst.NetworkAnchorID = newInst.NetworkAnchorID
-		appInst.Containers = newInst.Containers
-		m.setObservedStatus(instanceID, StatusRunning)
+		candidate, err = recreatedAppCandidate(appInst, newInst)
+		if err != nil {
+			if cleanupErr := m.compensateUncommittedContainerGroup(
+				state,
+				appInst,
+				newInst,
+				&newDef,
+				runtime,
+			); cleanupErr != nil {
+				return nil, errors.Join(
+					err,
+					fmt.Errorf("compensate uncommitted container group: %w", cleanupErr),
+				)
+			}
+			return rollbackContainers(err)
+		}
 	}
 
 	m.emitProgress(ctx, taskTypeUpdateListeners, instanceID, taskPhaseFinalizing, 90, "Saving configuration", false, nil)
-	appInst.UpdatedAt = time.Now()
-	appInst.Definition = &newDef
-	if err := state.StoreApp(appInst); err != nil {
-		// Cleanup containers created by installContainerGroup to prevent orphans.
+	candidate.UpdatedAt = time.Now()
+	candidate.Definition = &newDef
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
+		storeErr := fmt.Errorf("store app: %w", err)
 		if needsRecreation {
-			if rmErr := m.removeContainersForMultiApp(ctx, appInst, &newDef, runtime); rmErr != nil {
-				log.Printf("WARN: update listeners %s: cleanup after persist failure: %v", instanceID, rmErr)
-			}
 			m.setObservedStatus(instanceID, StatusError)
+			return nil, m.abortUncommittedContainerGroup(
+				storeErr,
+				state,
+				appInst,
+				installedCandidate,
+				&newDef,
+				runtime,
+			)
 		}
-		return nil, fmt.Errorf("store app: %w", err)
+		return nil, storeErr
 	}
+	if needsRecreation {
+		m.setObservedStatus(instanceID, StatusRunning)
+	}
+	m.releaseSupersededArtifactReferences(ctx, previousArtifactReferences, appInst.ArtifactReferences)
 
 	return &newDef, nil
+}
+
+func listenerCapabilityProvidersEqual(oldListeners, newListeners []api.AppListener) bool {
+	oldDef := &api.AppDefinition{Listeners: oldListeners}
+	newDef := &api.AppDefinition{Listeners: newListeners}
+	for _, capability := range registeredCapabilities() {
+		oldListener, oldBasePath, oldProvided := providedCapability(oldDef, capability)
+		newListener, newBasePath, newProvided := providedCapability(newDef, capability)
+		if oldListener != newListener ||
+			oldBasePath != newBasePath ||
+			oldProvided != newProvided {
+			return false
+		}
+	}
+	return true
 }
 
 // Revert is a no-op stub. Legacy revert is superseded by tuple-based rollback

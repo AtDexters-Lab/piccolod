@@ -22,6 +22,7 @@ import (
 
 	"github.com/acarl005/stripansi"
 	"github.com/creack/pty"
+	distref "github.com/distribution/reference"
 
 	"piccolod/internal/resources/pressure"
 )
@@ -72,6 +73,33 @@ type PullStallError struct {
 func (e *PullStallError) Error() string {
 	return fmt.Sprintf("pull stalled: no progress for %s (downloaded %s/%s) for image %s",
 		e.StallDuration.Truncate(time.Second), formatBytesCompact(e.DownloadedBytes), formatBytesCompact(e.TotalBytes), e.Image)
+}
+
+// NotContainerImageError is returned only when Podman explicitly classifies a
+// pulled OCI object as an artifact that cannot be consumed as a container
+// image. Callers may use this narrow classification to retry through
+// `podman artifact`; transport, authentication, capacity, and generic manifest
+// failures must not select that fallback.
+type NotContainerImageError struct {
+	Reference string
+	Output    string
+	Err       error
+}
+
+func (e *NotContainerImageError) Error() string {
+	return fmt.Sprintf("OCI object %s is not a container image: %v", e.Reference, e.Err)
+}
+
+func (e *NotContainerImageError) Unwrap() error { return e.Err }
+
+func podmanClassifiedNonImageArtifact(output string) bool {
+	lower := strings.ToLower(output)
+	// These are deliberately narrow Podman/container-image classifications.
+	// Do not add generic manifest or media-type failures here: those can also
+	// represent malformed images and must fail rather than silently changing
+	// materialization semantics.
+	return strings.Contains(lower, "unsupported image-specific operation on artifact") ||
+		strings.Contains(lower, "unsupported media type application/vnd.oci.empty.v1+json")
 }
 
 const (
@@ -142,6 +170,7 @@ type ContainerState struct {
 	Exists  bool
 	Running bool
 	Stale   bool
+	PID     int
 }
 
 // ContainerListItem captures minimal container identity information from `podman ps`.
@@ -372,6 +401,21 @@ func ValidateContainerName(name string) error {
 	return nil
 }
 
+// ValidateImageReference validates OCI/Docker image and artifact references
+// while leaving container-instance names on their narrower existing grammar.
+func ValidateImageReference(reference string) error {
+	if strings.TrimSpace(reference) != reference || reference == "" {
+		return fmt.Errorf("reference cannot be empty or contain surrounding whitespace")
+	}
+	if strings.Contains(reference, "://") {
+		return fmt.Errorf("reference must not include a URL scheme")
+	}
+	if _, err := distref.Parse(reference); err != nil {
+		return fmt.Errorf("invalid OCI reference: %w", err)
+	}
+	return nil
+}
+
 // ValidatePort validates port numbers
 func ValidatePort(port int) error {
 	if port < 1 || port > 65535 {
@@ -506,6 +550,8 @@ type ContainerCreateSpec struct {
 	// whose overlay layers or rootfs reside on filesystems where SELinux contexts
 	// don't match the standard container_file_t type.
 	SecurityOpt []string
+	// Devices maps host device nodes at the same path inside the container.
+	Devices []string
 
 	// LogPath, when non-empty, redirects the k8s-file log driver to a custom
 	// path (--log-opt path=). Used to persist per-service app logs on the
@@ -643,6 +689,13 @@ func buildCreateArgs(spec ContainerCreateSpec) []string {
 			tmpfsArg += ":" + mount.Options
 		}
 		args = append(args, "--tmpfs", tmpfsArg)
+	}
+	if len(spec.Devices) > 0 {
+		devices := append([]string(nil), spec.Devices...)
+		sort.Strings(devices)
+		for _, device := range devices {
+			args = append(args, "--device", device)
+		}
 	}
 
 	// Memory/CPU limits are enforced at the per-app-user systemd slice
@@ -872,7 +925,7 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 
 // ImageExists checks if an image exists in the local storage.
 func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imageName string) (bool, error) {
-	if err := ValidateContainerName(imageName); err != nil {
+	if err := ValidateImageReference(imageName); err != nil {
 		return false, fmt.Errorf("invalid image name: %w", err)
 	}
 
@@ -897,7 +950,7 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 
 // RemoveImage removes an image from local storage.
 func (p *PodmanCLI) RemoveImage(ctx context.Context, runtime PodmanRuntime, imageName string) error {
-	if err := ValidateContainerName(imageName); err != nil {
+	if err := ValidateImageReference(imageName); err != nil {
 		return fmt.Errorf("invalid image name: %w", err)
 	}
 	_, err := runPodman(ctx, runtime, []string{"rmi", imageName})
@@ -906,11 +959,69 @@ func (p *PodmanCLI) RemoveImage(ctx context.Context, runtime PodmanRuntime, imag
 
 // PullImage pulls an image by name
 func (p *PodmanCLI) PullImage(ctx context.Context, runtime PodmanRuntime, image string) error {
-	if err := ValidateContainerName(image); err != nil {
+	if err := ValidateImageReference(image); err != nil {
 		return fmt.Errorf("invalid image name: %w", err)
 	}
-	_, err := runPodman(ctx, runtime, []string{"pull", image})
+	output, err := runPodman(ctx, runtime, []string{"pull", image})
+	if err != nil && podmanClassifiedNonImageArtifact(string(output)+" "+err.Error()) {
+		return &NotContainerImageError{Reference: image, Output: string(output), Err: err}
+	}
 	return err
+}
+
+// ArtifactInfo is the identity and aggregate size reported by Podman's local
+// artifact store after a successful pull.
+type ArtifactInfo struct {
+	Digest         string `json:"Digest"`
+	TotalSizeBytes int64  `json:"TotalSizeBytes"`
+}
+
+// PullArtifact copies an OCI object into Podman's artifact store. Artifact
+// support is intentionally optional at the AppManager seam so older test
+// doubles and image-only runtimes remain unchanged.
+func (p *PodmanCLI) PullArtifact(ctx context.Context, runtime PodmanRuntime, reference string) error {
+	if err := ValidateImageReference(reference); err != nil {
+		return fmt.Errorf("invalid artifact reference: %w", err)
+	}
+	_, err := runPodman(ctx, runtime, []string{"artifact", "pull", reference})
+	return err
+}
+
+// InspectArtifact returns the resolved descriptor digest and aggregate size.
+func (p *PodmanCLI) InspectArtifact(ctx context.Context, runtime PodmanRuntime, reference string) (*ArtifactInfo, error) {
+	if err := ValidateImageReference(reference); err != nil {
+		return nil, fmt.Errorf("invalid artifact reference: %w", err)
+	}
+	output, err := runPodman(ctx, runtime, []string{"artifact", "inspect", reference})
+	if err != nil {
+		return nil, err
+	}
+	var info ArtifactInfo
+	if err := json.Unmarshal(output, &info); err != nil {
+		return nil, fmt.Errorf("parse podman artifact inspect output: %w", err)
+	}
+	if strings.TrimSpace(info.Digest) == "" {
+		return nil, &InvalidOutputError{Operation: "artifact inspect"}
+	}
+	return &info, nil
+}
+
+// ExtractArtifact asks Podman to project the complete artifact into a staging
+// directory. Podman owns OCI layout semantics; callers validate the resulting
+// tree before publishing it.
+func (p *PodmanCLI) ExtractArtifact(ctx context.Context, runtime PodmanRuntime, reference, targetDir string) error {
+	if err := ValidateImageReference(reference); err != nil {
+		return fmt.Errorf("invalid artifact reference: %w", err)
+	}
+	if err := ValidatePath(targetDir); err != nil {
+		return fmt.Errorf("invalid artifact target: %w", err)
+	}
+	_, err := runPodman(ctx, runtime, podmanArtifactExtractArgs(reference, targetDir))
+	return err
+}
+
+func podmanArtifactExtractArgs(reference, targetDir string) []string {
+	return []string{"artifact", "extract", reference, targetDir}
 }
 
 // Logs returns recent log lines from a container
@@ -1185,7 +1296,11 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 		}
 	}
 
-	return ContainerState{Exists: true, Running: running}, nil
+	pidNumber, err := strconv.Atoi(pid)
+	if err != nil || pidNumber < 0 {
+		return ContainerState{}, &InvalidOutputError{Operation: "inspect container state"}
+	}
+	return ContainerState{Exists: true, Running: running, PID: pidNumber}, nil
 }
 
 func containerPIDIsLive(procRoot, containerID, pid string) (bool, error) {
@@ -1465,7 +1580,7 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 		}
 	} else if spec.Image != "" {
 		// Image mode: validate the image name
-		if err := ValidateContainerName(spec.Image); err != nil {
+		if err := ValidateImageReference(spec.Image); err != nil {
 			return fmt.Errorf("invalid image name: %w", err)
 		}
 	} else {
@@ -1495,6 +1610,11 @@ func ValidateContainerSpec(spec ContainerCreateSpec) error {
 	for i, mount := range spec.Tmpfs {
 		if err := ValidatePath(mount.Container); err != nil {
 			return fmt.Errorf("invalid tmpfs container path at index %d: %w", i, err)
+		}
+	}
+	for i, device := range spec.Devices {
+		if err := ValidatePath(device); err != nil {
+			return fmt.Errorf("invalid device path at index %d: %w", i, err)
 		}
 	}
 
@@ -1544,7 +1664,7 @@ type ImageConfig struct {
 // The digest is the canonical image digest (sha256:...) which should be used for persistence
 // to ensure the same base image is used across reinstalls and failovers.
 func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, imageName string) (*ImageConfig, error) {
-	if err := ValidateContainerName(imageName); err != nil {
+	if err := ValidateImageReference(imageName); err != nil {
 		return nil, fmt.Errorf("invalid image name: %w", err)
 	}
 
@@ -1992,7 +2112,7 @@ func (p *pullProgressParser) shouldCallback() bool {
 // Uses a PTY to get progress output from podman, which only outputs progress bars when running in a TTY.
 // If callback is nil, behaves like PullImage without progress.
 func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRuntime, image string, callback ImagePullCallback) error {
-	if err := ValidateContainerName(image); err != nil {
+	if err := ValidateImageReference(image); err != nil {
 		return fmt.Errorf("invalid image name: %w", err)
 	}
 

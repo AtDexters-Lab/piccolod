@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"sort"
@@ -25,6 +26,41 @@ import (
 	"golang.org/x/mod/semver"
 	"gopkg.in/yaml.v3"
 )
+
+var (
+	artifactFeatureOnce        sync.Once
+	artifactFeatureSupported   bool
+	artifactFeatureAvailable   = podmanArtifactFeatureAvailable
+	capabilityFeatureOnce      sync.Once
+	capabilityFeatureSupported bool
+	capabilityFeatureAvailable = acceleratorCapabilityFeatureAvailable
+)
+
+func acceleratorCapabilityFeatureAvailable() bool {
+	capabilityFeatureOnce.Do(func() {
+		_, err := exec.LookPath("setfacl")
+		capabilityFeatureSupported = err == nil
+	})
+	return capabilityFeatureSupported
+}
+
+func podmanArtifactFeatureAvailable() bool {
+	artifactFeatureOnce.Do(func() {
+		artifactFeatureSupported = requiredPodmanArtifactCommandsAvailable(func(args ...string) error {
+			return exec.Command("podman", args...).Run()
+		})
+	})
+	return artifactFeatureSupported
+}
+
+func requiredPodmanArtifactCommandsAvailable(run func(args ...string) error) bool {
+	for _, command := range []string{"pull", "inspect", "extract"} {
+		if err := run("artifact", command, "--help"); err != nil {
+			return false
+		}
+	}
+	return true
+}
 
 const (
 	DefaultRepoURL   = "https://raw.githubusercontent.com/AtDexters-Lab/piccolo-store/main"
@@ -556,11 +592,20 @@ func (m *Manager) GetApps(ctx context.Context, opts FilterOptions) (*api.Catalog
 
 func supportedCatalogFeatures(features []string) bool {
 	for _, f := range features {
-		switch strings.TrimSpace(f) {
+		feature := strings.TrimSpace(f)
+		switch feature {
 		case "":
 			return false
-		case api.FeatureConnectionAuthMTLSV1:
+		case api.FeatureConnectionAuthMTLSV1,
+			api.FeatureCapabilityBindingsV1:
 			// supported by this binary
+			if feature == api.FeatureCapabilityBindingsV1 && !capabilityFeatureAvailable() {
+				return false
+			}
+		case api.FeatureArtifactBindingsV1:
+			if !artifactFeatureAvailable() {
+				return false
+			}
 		default:
 			return false
 		}

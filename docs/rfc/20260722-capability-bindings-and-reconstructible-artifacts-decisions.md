@@ -11,9 +11,11 @@
 2026-07-23
 **Canonical raw rollout:** `~/.codex/sessions/2026/07/19/rollout-2026-07-19T22-12-52-019f7b42-54c4-7510-8985-84cd86ec442b.jsonl`
 **Last audited raw user record:** `U145`
-**Propagation state:** Audited against the worktree based on
-`1e4a2d6f6ed188852e8771191c6a1b2081336c7f`; D-01 through D-25 are reflected
-in the RFC and specification, with no known unpropagated decision.
+**Propagation state:** D-01 through D-25 were audited against the worktree based
+on `1e4a2d6f6ed188852e8771191c6a1b2081336c7f`. D-26 through D-28 record the
+2026-07-24 subtractive implementation review and supersede the older
+generation-scoped grant, unconditional consumer-restart, automatic
+incomplete-install recovery, and artifact-diagnostics assumptions.
 
 ## How to use this ledger
 
@@ -78,6 +80,18 @@ AI artifacts are often large.
 Evidence for P-01 through P-04: `U126`, “artifact bada ... image file choti ...
 universal rule nahi ... general golden LV creation wale process mein kyon
 applicable nahi”; `U127`, “lock ... product philosophy ... persist”.
+
+### P-05 — Stable product identity owns authority
+
+Runtime container generations are replaceable implementations of an installed
+app instance. Authority that follows from the selected app belongs to that app
+instance; generating a replacement container does not create a new provider
+candidate or require a revoke/commit/regrant cycle.
+
+Evidence: post-ledger implementation review discussion on 2026-07-24,
+“Accelerator permission generation 17 ki thi ... unnecessary complicated” and
+“Jab tak piccolo-ai selected default hai, GPU use karne ka entitlement
+piccolo-ai ka hai.”
 
 ## Locked decisions
 
@@ -174,6 +188,8 @@ and authentication are sufficient.
 
 ### D-07 — Automatic default selection and opaque provider state
 
+**Status:** Superseded in part by D-26 and D-27 on 2026-07-24.
+
 The first eligible provider becomes default automatically. Installing another
 provider does not steal the default or require a blocking prompt. The user may
 explicitly switch; removal of the default chooses a deterministic replacement
@@ -202,6 +218,8 @@ accepting retained selection plus grant withdrawal/HTTP 503 on manual Stop and
 deterministic replacement when uninstall or update removes the capability.
 
 ### D-08 — Capability-derived accelerator access
+
+**Status:** Superseded in part by D-26 on 2026-07-24.
 
 Accelerator access follows from a recognized capability and selection as its
 default provider. It does not depend on Store provenance, maintainer identity,
@@ -440,6 +458,10 @@ and requiring actual Podman cross-behavior to be tested rather than assumed.
 
 ### D-24 — Providers boot without accelerator authority; handoff is sequential
 
+**Status:** Superseded in part by D-26 on 2026-07-24 for replacement generations
+of the same selected app. Fresh installs and different-provider handoffs retain
+this rule.
+
 Declaring a capability does not guarantee its accelerator grant. A provider
 must start and bind its declared listener without capability-derived devices;
 it may remain idle or report the capability unavailable until selected. After
@@ -472,6 +494,53 @@ Evidence: `U145`, “provider ne apna base path ... expect kar raha hai consumer
 is pe request marega to ye uski responsibility hai ... humme beech mein padne
 ki kya zarurat”.
 
+### D-26 — Accelerator authority belongs to the selected app instance
+
+The selected app instance owns the accelerator entitlement and host device-node
+permission. Its containers merely exercise that authority. Stop, start, crash,
+and same-app replacement do not revoke or reacquire the host permission.
+
+A replacement generation of the already-selected app is not a new provider
+candidate. After the previous generation is proven absent, the replacement
+starts once with the inherited device mappings. Piccolod does not commit a
+device-free replacement and then recreate it with devices.
+
+A fresh install or a different-provider switching candidate still receives no
+provisional grant. A different app receives the devices only after the old
+provider's processes are absent and its host permission is revoked. Uninstall
+or removal of the selected capability declaration follows that same handoff.
+
+Evidence: 2026-07-24 implementation review discussion, “Accelerator permission
+generation 17 ki thi ... unnecessary complicated”; “Jab tak piccolo-ai selected
+default hai, GPU use karne ka entitlement piccolo-ai ka hai”; and “app jab tak
+default hai perms reh sakti hain, start stop se matlab nahi”.
+
+### D-27 — Consumer restart follows injected configuration
+
+Piccolod restarts a consumer only when that consumer's injected binding
+environment changes. A provider switch or listener retarget that preserves the
+consumer's `base_url` updates the private ingress target without recreating the
+consumer. Running requests may still be interrupted.
+
+Evidence: accepted 2026-07-24 subtractive decision, “consumer ko tabhi restart
+karein jab usko injected environment/config actually badle.”
+
+### D-28 — V1 does not add recovery or observability products
+
+An incomplete fresh install remains unpublished and fail closed. If candidate
+cleanup cannot prove process absence, its resources remain owned for an
+explicit retry or ordinary restart recovery; it must not block unrelated
+installed apps. V1 does not add an artifact-specific background orphan healer
+or lifecycle coordinator.
+
+Artifact-reference tracking and reference-aware GC remain required correctness
+mechanisms. New artifact identity, projection, Ready-time, or reference-count
+fields in the storage-diagnostics API are deferred; diagnostics are not part of
+artifact materialization correctness.
+
+Evidence: accepted 2026-07-24 subtractive decisions covering the two broad
+product decisions and the three-item simplification list.
+
 ## Explicitly rejected or superseded mechanisms
 
 | ID | Do not reintroduce without explicit reopening | Evidence |
@@ -490,7 +559,7 @@ ki kya zarurat”.
 | R-12 | A custom OCI resolver/downloader, bespoke OCI-only SSRF layer, media-type interpretation, or custom artifact projection layout. | `U105`-`U107` |
 | R-13 | Multi-node feature/materializer voting, version floors, or similar coordination in V1. | `U89`-`U92` |
 | R-14 | A global thin-pool reservation coordinator introduced by this feature. | `U94` |
-| R-15 | Avoiding consumer restarts merely because old and new providers yield the same path. | `U97` |
+| R-15 | Superseded by D-27: consumer restart now follows an actual injected binding-environment change, not provider identity alone. | D-27 |
 | R-16 | Capability-specific graceful stream draining during provider switches. | `U99` |
 | R-17 | Automatic Store capability indexing/discovery in V1. | `U100` |
 | R-18 | User-facing manual artifact-download cancellation API/UI. | `U110` |
@@ -516,41 +585,12 @@ ki kya zarurat”.
 | F-04 | Capability-indexed Store discovery/ranking. | `U100`. |
 | F-05 | Consumer-specific post-materialization interpretation, conversion, archive extraction, shard handling, or model validation by Piccolod. Podman's OCI pull/extract step in D-14 is not deferred. | `U24`-`U25`, `U105`-`U107`; consuming app owns content meaning. |
 | F-06 | When an unpinned source is resolved again: app start, app update, explicit refresh, or a future automatic cadence. | `U126`-`U127`; mutability semantics are locked by D-20, while refresh timing remains a separate policy decision. |
+| F-07 | Generic golden-content inventory and storage-diagnostics fields for source identity, projection, Ready time, and reference counts. | D-28; core ownership and GC remain required without a new diagnostic API surface. |
 
 ## Resolved simplification questions
 
-### O-01 — Resolved by D-18 on 2026-07-23
-
-Pending artifact work has no capability authority. Current authoritative
-default/binding/grant state wins, and capability drift does not create a fresh
-review or reservation lifecycle. Artifact content identity remains bound
-separately.
-
-### O-02 — Resolved by D-19 and D-20 on 2026-07-23
-
-Artifact-bearing installs do not receive a special preflight or lifecycle.
-Every source uses the common golden materializer, and only the source adapter
-differs. A pinned source remains exact; an unpinned source may change between
-resolution events while each individual attempt remains internally consistent.
-The cadence for future re-resolution is deferred separately as F-06.
-
-### O-03 — Resolved by D-21 on 2026-07-23
-
-V1 reuses the existing kernel-leader install gate and per-app leadership
-lifecycle. It does not add a capability/artifact-specific multi-node protocol.
-Generic in-flight install behavior across future real failover belongs to the
-existing cluster lifecycle and is deferred with multi-node enablement.
-
-### O-04 — Resolved by D-22 on 2026-07-23
-
-The RFC retains decisions, observable contracts, and load-bearing invariants.
-Exact public schemas remain in the specification. Internal implementation
-mechanics and exhaustive test/UX enumeration move to a later implementation
-plan.
-
-## Open simplification questions
-
-None.
+`O-01` is resolved by D-18, `O-02` by D-19/D-20, `O-03` by D-21, and
+`O-04` by D-22. No open simplification question remains.
 
 ## Review and update guardrails
 

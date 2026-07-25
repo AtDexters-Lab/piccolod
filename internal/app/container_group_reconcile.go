@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 	"piccolod/internal/resources/pressure"
 	"piccolod/internal/services"
 )
@@ -421,12 +423,18 @@ func (m *AppManager) cleanupDesiredRunningGroupForRecreate(ctx context.Context, 
 // false. The suspension token is the sole authority allowed to republish after
 // successful recreation.
 func (m *AppManager) commitRemovedContainerGroup(state *FilesystemStateManager, appInst *AppInstance) error {
-	appInst.NetworkAnchorID = ""
-	appInst.Containers = nil
-	m.serviceManager.SetAppContainerID(appInst.InstanceID, "")
-	if err := state.StoreAppMetadata(appInst); err != nil {
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return fmt.Errorf("prepare cleared container state for %s: %w", appInst.InstanceID, err)
+	}
+	candidate.NetworkAnchorID = ""
+	candidate.Containers = nil
+	candidate.AcceleratorDevices = nil
+	candidate.CapabilityBindings = nil
+	if err := commitDetachedAppMetadata(state, appInst, candidate); err != nil {
 		return fmt.Errorf("persist cleared container state for %s: %w", appInst.InstanceID, err)
 	}
+	m.serviceManager.SetAppContainerID(appInst.InstanceID, "")
 	m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusStarting, "Containers removed; recreation pending")
 	return nil
 }
@@ -451,6 +459,61 @@ func (m *AppManager) recreateDesiredRunningContainerGroup(ctx context.Context, s
 	return m.recreateMissingMultiContainerPrepared(ctx, state, appInst, def, layout, runtime, prebuiltRootfs, listenerPlan, publicationResumeToken)
 }
 
+// reconcileDesiredStoppedContainerGroup proves process absence before
+// publishing Stopped. The selected app retains its host device-node permission;
+// stopped containers have no mapping or process that can exercise it. Manual
+// disable may withdraw publication immediately; a follower retains publication
+// until the local workload is authoritatively quiesced.
+func (m *AppManager) reconcileDesiredStoppedContainerGroup(
+	ctx context.Context,
+	state *FilesystemStateManager,
+	appInst *AppInstance,
+	def *api.AppDefinition,
+	runtime container.PodmanRuntime,
+) error {
+	if !appInst.Enabled && m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(appInst.InstanceID)
+	}
+
+	if stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime); stopErr != nil {
+		log.Printf(
+			"WARN: reconcile app %s: graceful desired-stopped quiescence failed, quiescing dedicated user unit: %v",
+			appInst.InstanceID,
+			stopErr,
+		)
+		if quiesceErr := m.quiesceAppUserSession(ctx, appInst.InstanceID); quiesceErr != nil {
+			return errors.Join(
+				fmt.Errorf("stop desired-stopped container group: %w", stopErr),
+				fmt.Errorf("PID 1 quiesce desired-stopped container group: %w", quiesceErr),
+			)
+		}
+	}
+
+	// A follower's publication remains active until the process-absence proof
+	// above succeeds. After that boundary, do not leave routes pointing at a
+	// stopped workload.
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(appInst.InstanceID)
+	}
+
+	selected, err := m.selectedAcceleratorProvider(state)
+	if err != nil {
+		return err
+	}
+	if selected != appInst.InstanceID && len(appInst.AcceleratorDevices) > 0 {
+		if err := m.revokeAcceleratorAccess(ctx, state, appInst.InstanceID); err != nil {
+			return fmt.Errorf("revoke stale accelerator access for non-selected provider: %w", err)
+		}
+		appInst.AcceleratorDevices = nil
+		if err := state.StoreAppMetadata(appInst); err != nil {
+			return fmt.Errorf("persist withdrawn accelerator generation: %w", err)
+		}
+	}
+
+	m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
+	return nil
+}
+
 // reconcileContainerGroup reconciles a container group (network anchor + service containers).
 // This is the unified reconcile path for both service and workspace modes.
 func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, desiredRunning bool, suppliedObservation ...containerGroupObservation) error {
@@ -459,6 +522,9 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 	if appInst == nil || def == nil || def.Services == nil {
 		return fmt.Errorf("reconcile: invalid container group app state")
+	}
+	if !desiredRunning {
+		return m.reconcileDesiredStoppedContainerGroup(ctx, state, appInst, def, runtime)
 	}
 
 	// Emit "starting" status if we're about to start containers (RFC 20260125).
@@ -483,7 +549,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	// (map, error) so the first create/recreate consumer triggers the attach and
 	// the rest reuse it. A steady-state pass reaches no consumer and never
 	// attaches, probes, or logs. Constructed only on the running path —
-	// consumers are unreachable when this is nil (the !desiredRunning branches
+	// consumers are unreachable when this is nil (the !desiredRunning branch
 	// return first).
 	var rootfsMap func() (map[string]*rootfsMountInfo, error)
 	if desiredRunning {
@@ -491,6 +557,13 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			return m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
 		})
 	}
+	// Artifact mounts are needed only when creating a service container. Keep
+	// steady-state reconciliation independent of artifact size: the first
+	// create/recreate consumer attaches and validates the recorded references,
+	// and any later consumer in this pass reuses the same handles.
+	artifactMap := sync.OnceValues(func() (map[string]persistence.ArtifactHandle, error) {
+		return m.ensureAppArtifactAttachments(ctx, state, appInst, def, runtime)
+	})
 
 	primary := primaryServiceFor(def, appInst)
 	startOrder, err := serviceStartOrder(def.Services)
@@ -530,30 +603,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	if anchorID == "" || !anchorState.Exists {
-		if !desiredRunning {
-			// Explicit Enabled=false may withdraw immediately. A follower keeps
-			// last-known access unless quiescence itself succeeds.
-			if !appInst.Enabled && m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(appInst.InstanceID)
-			}
-			// Best-effort cleanup; errors don't block the desired stopped state.
-			stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime)
-			if stopErr != nil {
-				log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
-			}
-			if appInst.Enabled {
-				if stopErr != nil {
-					return stopErr
-				}
-				if m.serviceManager != nil {
-					m.serviceManager.DeactivateApp(appInst.InstanceID)
-				}
-			}
-			// Observed status reflects local container state - containers are stopped on this machine.
-			m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
-			return nil
-		}
-
 		// If startup failures have exceeded escalation thresholds, stop retrying
 		// expensive recreation. This prevents infinite loops when recreation
 		// consistently fails (e.g., storage path mismatch after upgrade).
@@ -584,30 +633,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			m.handleStartupEffectFailure(state, appInst, err)
 			return err
 		}
-		return nil
-	}
-
-	// If we don't desire running (stopped app or follower), stop all containers and remove proxies
-	// but do not change persisted desired state (Enabled field).
-	if !desiredRunning {
-		if !appInst.Enabled && m.serviceManager != nil {
-			m.serviceManager.DeactivateApp(appInst.InstanceID)
-		}
-		// Best-effort cleanup; errors don't block the desired stopped state.
-		stopErr := m.stopContainersForMultiApp(ctx, appInst, def, runtime)
-		if stopErr != nil {
-			log.Printf("WARN: reconcile app %s: best-effort stop failed: %v", appInst.InstanceID, stopErr)
-		}
-		if appInst.Enabled {
-			if stopErr != nil {
-				return stopErr
-			}
-			if m.serviceManager != nil {
-				m.serviceManager.DeactivateApp(appInst.InstanceID)
-			}
-		}
-		// Observed status reflects local container state - containers are stopped on this machine.
-		m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 		return nil
 	}
 
@@ -647,6 +672,74 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	m.serviceManager.SetAppContainerID(appInst.InstanceID, anchorID)
+	desiredBindings, err := desiredCapabilityBindings(state, appInst.InstanceID, def)
+	if err != nil {
+		return fmt.Errorf("resolve capability bindings: %w", err)
+	}
+	if !capabilityGenerationMatches(appInst, desiredBindings) {
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+		m.setObservedStatusMessage(appInst.InstanceID, "Reconciling capability bindings")
+		if err := m.recreateDesiredRunningContainerGroup(ctx, state, appInst, def, layout, runtime, bn, "capability-binding-reconcile"); err != nil {
+			m.handleStartupEffectFailure(state, appInst, err)
+			return err
+		}
+		return nil
+	}
+	bindingEnvironment, err := m.ensureCapabilityBindingEnvironment(ctx, state, appInst, def, anchorID, runtime)
+	if err != nil {
+		return fmt.Errorf("prepare capability bindings: %w", err)
+	}
+	acceleratorUIDs := []uint32(nil)
+	desiredAccelerators, err := m.desiredAcceleratorDevices(state, appInst.InstanceID, def)
+	if err != nil {
+		return fmt.Errorf("resolve accelerator grant: %w", err)
+	}
+	if len(desiredAccelerators) > 0 {
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+		acceleratorUIDs, err = acceleratorHostUIDs(appInst.InstanceID, runtime, def, bn)
+		if err != nil {
+			return fmt.Errorf("resolve accelerator principals: %w", err)
+		}
+	}
+	acceleratorDevices, err := m.ensureAcceleratorAccess(
+		ctx,
+		state,
+		appInst.InstanceID,
+		runtime,
+		def,
+		acceleratorUIDs,
+	)
+	if err != nil {
+		return fmt.Errorf("prepare accelerator grant: %w", err)
+	}
+	if !acceleratorGenerationMatches(appInst, acceleratorDevices) {
+		if len(appInst.AcceleratorDevices) > 0 && len(acceleratorDevices) == 0 {
+			m.setObservedStatusMessage(appInst.InstanceID, "Withdrawing accelerator devices")
+			if err := m.recreateAppForCapabilityEffects(ctx, state, appInst.InstanceID, func() error {
+				return m.revokeAcceleratorAccess(ctx, state, appInst.InstanceID)
+			}); err != nil {
+				m.handleStartupEffectFailure(state, appInst, err)
+				return err
+			}
+			return nil
+		}
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
+		m.setObservedStatusMessage(appInst.InstanceID, "Reconciling accelerator devices")
+		if err := m.recreateDesiredRunningContainerGroup(ctx, state, appInst, def, layout, runtime, bn, "accelerator-reconcile"); err != nil {
+			m.handleStartupEffectFailure(state, appInst, err)
+			return err
+		}
+		return nil
+	}
 
 	// Ensure all declared services exist and are running.
 	for _, svcName := range startOrder {
@@ -660,14 +753,21 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			if rootfsErr != nil {
 				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 			}
+			artifactHandles, artifactErr := artifactMap()
+			if artifactErr != nil {
+				return fmt.Errorf("failed to attach artifacts: %w", artifactErr)
+			}
 			opts := serviceContainerOptions{
-				layout:     layout,
-				appDef:     def,
-				instanceID: appInst.InstanceID,
-				primary:    primary,
-				svcName:    svcName,
-				anchorID:   anchorID,
-				credential: runtime.Credential,
+				layout:             layout,
+				appDef:             def,
+				instanceID:         appInst.InstanceID,
+				primary:            primary,
+				svcName:            svcName,
+				anchorID:           anchorID,
+				credential:         runtime.Credential,
+				artifactHandles:    artifactHandles,
+				bindingEnvironment: bindingEnvironment[svcName],
+				acceleratorDevices: acceleratorDevices,
 			}
 			if svcRootfs, ok := bn[svcName]; ok {
 				opts.rootfsHandle = &svcRootfs.handle
@@ -710,14 +810,21 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 				if rootfsErr != nil {
 					return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 				}
+				artifactHandles, artifactErr := artifactMap()
+				if artifactErr != nil {
+					return fmt.Errorf("failed to attach artifacts: %w", artifactErr)
+				}
 				opts := serviceContainerOptions{
-					layout:     layout,
-					appDef:     def,
-					instanceID: appInst.InstanceID,
-					primary:    primary,
-					svcName:    svcName,
-					anchorID:   anchorID,
-					credential: runtime.Credential,
+					layout:             layout,
+					appDef:             def,
+					instanceID:         appInst.InstanceID,
+					primary:            primary,
+					svcName:            svcName,
+					anchorID:           anchorID,
+					credential:         runtime.Credential,
+					artifactHandles:    artifactHandles,
+					bindingEnvironment: bindingEnvironment[svcName],
+					acceleratorDevices: acceleratorDevices,
 				}
 				if svcRootfs, ok := bn[svcName]; ok {
 					opts.rootfsHandle = &svcRootfs.handle
@@ -871,6 +978,295 @@ func (m *AppManager) pruneMultiContainerZombies(ctx context.Context, runtime con
 	m.pruneObservedMultiContainerZombies(ctx, runtime, instanceID, expectedNames, items)
 }
 
+// detachedAppCandidate returns a caller-owned copy suitable for staging
+// positive replacement state. FilesystemStateManager.GetApp returns the
+// cache-owned committed instance, so candidate fields must never be assigned
+// to that pointer before the corresponding durable write succeeds.
+func detachedAppCandidate(current *AppInstance) (*AppInstance, error) {
+	if current == nil {
+		return nil, fmt.Errorf("detached app candidate requires current state")
+	}
+	candidate := *current
+	candidate.Containers = cloneStringMap(current.Containers)
+	candidate.ActiveRootfs = cloneStringMap(current.ActiveRootfs)
+	candidate.ArtifactReferences = cloneStringMap(current.ArtifactReferences)
+	candidate.AcceleratorDevices = append([]string(nil), current.AcceleratorDevices...)
+	candidate.CapabilityBindings = cloneStringMap(current.CapabilityBindings)
+	candidate.Init = cloneInitState(current.Init)
+	candidate.InitScriptHashes = cloneStringMap(current.InitScriptHashes)
+	return &candidate, nil
+}
+
+func recreatedAppCandidate(current, recreated *AppInstance) (*AppInstance, error) {
+	if recreated == nil {
+		return nil, fmt.Errorf("recreated app candidate requires replacement state")
+	}
+	candidate, err := detachedAppCandidate(current)
+	if err != nil {
+		return nil, err
+	}
+	candidate.PrimaryService = recreated.PrimaryService
+	candidate.NetworkAnchorID = recreated.NetworkAnchorID
+	candidate.Containers = cloneStringMap(recreated.Containers)
+	candidate.ArtifactReferences = cloneStringMap(recreated.ArtifactReferences)
+	candidate.AcceleratorDevices = append([]string(nil), recreated.AcceleratorDevices...)
+	candidate.CapabilityBindings = cloneStringMap(recreated.CapabilityBindings)
+	candidate.UpdatedAt = time.Now()
+	return candidate, nil
+}
+
+// commitDetachedApp publishes a positive candidate only after both app files
+// are durable. The prior cache pointer is synchronized afterward for callers
+// that retain it across the lifecycle transaction.
+func commitDetachedApp(
+	state *FilesystemStateManager,
+	current, candidate *AppInstance,
+) error {
+	if state == nil || current == nil || candidate == nil || current == candidate {
+		return fmt.Errorf("detached app commit requires distinct current and candidate state")
+	}
+	published, err := detachedAppCandidate(candidate)
+	if err != nil {
+		return err
+	}
+	if err := state.StoreApp(published); err != nil {
+		return err
+	}
+	synced, err := detachedAppCandidate(published)
+	if err != nil {
+		return err
+	}
+	*current = *synced
+	return nil
+}
+
+func commitDetachedAppMetadata(
+	state *FilesystemStateManager,
+	current, candidate *AppInstance,
+) error {
+	if state == nil || current == nil || candidate == nil || current == candidate {
+		return fmt.Errorf("detached metadata commit requires distinct current and candidate state")
+	}
+	published, err := detachedAppCandidate(candidate)
+	if err != nil {
+		return err
+	}
+	if err := state.StoreAppMetadata(published); err != nil {
+		return err
+	}
+	synced, err := detachedAppCandidate(published)
+	if err != nil {
+		return err
+	}
+	*current = *synced
+	return nil
+}
+
+func commitRecreatedAppMetadata(
+	state *FilesystemStateManager,
+	current, recreated *AppInstance,
+) error {
+	candidate, err := recreatedAppCandidate(current, recreated)
+	if err != nil {
+		return err
+	}
+	return commitDetachedAppMetadata(state, current, candidate)
+}
+
+type uncommittedContainerGroupMaySurviveError struct {
+	cause   error
+	cleanup error
+}
+
+func (e *uncommittedContainerGroupMaySurviveError) Error() string {
+	return errors.Join(
+		e.cause,
+		fmt.Errorf("candidate process absence is unproven: %w", e.cleanup),
+	).Error()
+}
+
+func (e *uncommittedContainerGroupMaySurviveError) Unwrap() []error {
+	return []error{e.cause, e.cleanup}
+}
+
+func uncommittedContainerGroupMaySurvive(err error) bool {
+	var target *uncommittedContainerGroupMaySurviveError
+	return errors.As(err, &target)
+}
+
+// removeUncommittedContainerGroup withdraws reachability and proves that no
+// process created by an uncommitted candidate remains. Container identity is
+// attempted first because it preserves the app user session; PID 1 user-session
+// quiescence is the authoritative fallback when Podman cannot prove removal.
+// Create/start errors may be ambiguous, and returned IDs may be missing or
+// stale.
+func (m *AppManager) removeUncommittedContainerGroup(
+	ctx context.Context,
+	candidate *AppInstance,
+	def *api.AppDefinition,
+	runtime container.PodmanRuntime,
+) error {
+	if candidate == nil || def == nil || strings.TrimSpace(candidate.InstanceID) == "" {
+		return fmt.Errorf("candidate container group is required for removal")
+	}
+	if m.serviceManager != nil {
+		m.serviceManager.DeactivateApp(candidate.InstanceID)
+		m.serviceManager.SetAppContainerID(candidate.InstanceID, "")
+	}
+	m.removeCapabilityIngresses(candidate.InstanceID)
+
+	var removalErrs []error
+	quiesceAfterPodmanFailure := func(podmanErr error) error {
+		if podmanErr != nil {
+			removalErrs = append(removalErrs, podmanErr)
+		}
+		if err := m.quiesceAppUserSession(ctx, candidate.InstanceID); err != nil {
+			removalErrs = append(removalErrs, fmt.Errorf("quiesce candidate user session: %w", err))
+			return errors.Join(removalErrs...)
+		}
+		log.Printf(
+			"WARN: Podman could not prove candidate container removal for %s; authoritative user-session quiescence proved process absence",
+			candidate.InstanceID,
+		)
+		return nil
+	}
+	// Known IDs and deterministic names cover the normal case. A final
+	// label-owned sweep covers an ambiguous create that succeeded without
+	// returning its ID.
+	if err := m.removeContainersForMultiApp(ctx, candidate, def, runtime); err != nil {
+		log.Printf("WARN: remove uncommitted group %s by recorded identity: %v", candidate.InstanceID, err)
+		removalErrs = append(removalErrs, err)
+	}
+	items, err := m.containerManager.ListContainersByLabel(
+		ctx,
+		runtime,
+		"io.piccolo.instance",
+		candidate.InstanceID,
+	)
+	if err != nil {
+		return quiesceAfterPodmanFailure(
+			fmt.Errorf("list candidate containers for absence proof: %w", err),
+		)
+	}
+	for _, item := range items {
+		id := strings.TrimSpace(item.ID)
+		if id == "" {
+			continue
+		}
+		if err := m.containerManager.StopContainer(ctx, runtime, id); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				log.Printf("WARN: stop uncommitted container %s (%s): %v", item.Name, id, err)
+				removalErrs = append(removalErrs, fmt.Errorf("stop %s: %w", item.Name, err))
+			}
+		}
+		if err := m.containerManager.RemoveContainer(ctx, runtime, id); err != nil {
+			var notFound *container.ContainerNotFoundError
+			if !errors.As(err, &notFound) {
+				log.Printf("WARN: remove uncommitted container %s (%s): %v", item.Name, id, err)
+				removalErrs = append(removalErrs, fmt.Errorf("remove %s: %w", item.Name, err))
+			}
+		}
+	}
+	remaining, err := m.containerManager.ListContainersByLabel(
+		ctx,
+		runtime,
+		"io.piccolo.instance",
+		candidate.InstanceID,
+	)
+	if err != nil {
+		return quiesceAfterPodmanFailure(
+			fmt.Errorf("verify candidate container absence: %w", err),
+		)
+	}
+	if len(remaining) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(remaining))
+	for _, item := range remaining {
+		name := strings.TrimSpace(item.Name)
+		if name == "" {
+			name = strings.TrimSpace(item.ID)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	removalErrs = append(removalErrs, fmt.Errorf("candidate containers remain: %s", strings.Join(names, ", ")))
+	return quiesceAfterPodmanFailure(nil)
+}
+
+// compensateUncommittedContainerGroup withdraws the live effects returned by
+// installContainerGroup when the caller cannot commit the candidate metadata.
+// The committed app remains the recovery authority; deterministic container
+// names and durable artifact/accelerator ownership make a partial retry
+// discoverable without adding another transition protocol.
+func (m *AppManager) compensateUncommittedContainerGroup(
+	state *FilesystemStateManager,
+	committed, candidate *AppInstance,
+	def *api.AppDefinition,
+	runtime container.PodmanRuntime,
+) error {
+	if candidate == nil || def == nil {
+		return fmt.Errorf("candidate container group is required for compensation")
+	}
+	cleanupCtx, cancel := context.WithTimeout(
+		pressure.WithTransitionContinuation(context.Background()),
+		cleanupBudget,
+	)
+	defer cancel()
+
+	// Mount ownership cannot be withdrawn until every candidate process is
+	// authoritatively absent. Accelerator permission belongs to the selected app
+	// instance, so a failed replacement must not revoke it with the candidate
+	// generation.
+	if err := m.removeUncommittedContainerGroup(cleanupCtx, candidate, def, runtime); err != nil {
+		return fmt.Errorf("remove candidate containers: %w", err)
+	}
+
+	var errs []error
+	if err := m.detachArtifactReferences(cleanupCtx, candidate.ArtifactReferences); err != nil {
+		errs = append(errs, fmt.Errorf("detach candidate artifacts: %w", err))
+	}
+	committedArtifacts := map[string]string(nil)
+	if committed != nil {
+		committedArtifacts = committed.ArtifactReferences
+	}
+	if err := m.discardUncommittedArtifactReferences(
+		cleanupCtx,
+		candidate.ArtifactReferences,
+		committedArtifacts,
+	); err != nil {
+		errs = append(errs, fmt.Errorf("destroy candidate artifact references: %w", err))
+	}
+	m.detachAllServiceRootfs(
+		cleanupCtx,
+		candidate.InstanceID,
+		piccoloModeFromExtensions(def.Extensions),
+		def,
+		candidate,
+	)
+	return errors.Join(errs...)
+}
+
+func (m *AppManager) abortUncommittedContainerGroup(
+	cause error,
+	state *FilesystemStateManager,
+	committed, candidate *AppInstance,
+	def *api.AppDefinition,
+	runtime container.PodmanRuntime,
+) error {
+	if cleanupErr := m.compensateUncommittedContainerGroup(
+		state,
+		committed,
+		candidate,
+		def,
+		runtime,
+	); cleanupErr != nil {
+		return errors.Join(cause, fmt.Errorf("compensate uncommitted container group: %w", cleanupErr))
+	}
+	return cause
+}
+
 func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, def *api.AppDefinition, layout appVolumeLayout, runtime container.PodmanRuntime, prebuiltRootfs map[string]*rootfsMountInfo) error {
 	// Allocate endpoints and recreate the group (anchor + services).
 	for attempt := 0; attempt < maxInstallPortRetries; attempt++ {
@@ -880,19 +1276,24 @@ func (m *AppManager) recreateMissingMultiContainer(ctx context.Context, state *F
 		}
 		m.configureOIDCAuthorizePaths(appInst.InstanceID, def)
 
-		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs)
+		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs, true, false)
 		if err == nil {
-			// Preserve timestamps and recovery tracking after successful recovery.
-			newInst.CreatedAt = appInst.CreatedAt
-			newInst.UpdatedAt = time.Now()
-			appInst.PrimaryService = newInst.PrimaryService
-			appInst.NetworkAnchorID = newInst.NetworkAnchorID
-			appInst.Containers = newInst.Containers
-			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
-			if err := state.StoreAppMetadata(appInst); err != nil {
-				log.Printf("WARN: reconcile app %s: failed to persist recovered state: %v", appInst.InstanceID, err)
+			if err := commitRecreatedAppMetadata(state, appInst, newInst); err != nil {
+				commitErr := fmt.Errorf("persist recovered container state for %s: %w", appInst.InstanceID, err)
+				return m.abortUncommittedContainerGroup(
+					commitErr,
+					state,
+					appInst,
+					newInst,
+					def,
+					runtime,
+				)
 			}
+			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 			return nil
+		}
+		if uncommittedContainerGroupMaySurvive(err) {
+			return err
 		}
 
 		var portErr *container.PortInUseError
@@ -933,17 +1334,19 @@ func (m *AppManager) recreateMissingMultiContainerPrepared(ctx context.Context, 
 		}
 		m.configureOIDCAuthorizePaths(appInst.InstanceID, def)
 
-		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs)
+		newInst, err := m.installContainerGroup(ctx, def, appInst.InstanceID, layout, runtime, endpoints, prebuiltRootfs, true, false)
 		if err == nil {
-			// Preserve timestamps and recovery tracking after successful recovery.
-			newInst.CreatedAt = appInst.CreatedAt
-			newInst.UpdatedAt = time.Now()
-			appInst.PrimaryService = newInst.PrimaryService
-			appInst.NetworkAnchorID = newInst.NetworkAnchorID
-			appInst.Containers = newInst.Containers
-			if err := state.StoreAppMetadata(appInst); err != nil {
+			if err := commitRecreatedAppMetadata(state, appInst, newInst); err != nil {
 				listenerPlan.Release()
-				return fmt.Errorf("persist recovered container state for %s: %w", appInst.InstanceID, err)
+				commitErr := fmt.Errorf("persist recovered container state for %s: %w", appInst.InstanceID, err)
+				return m.abortUncommittedContainerGroup(
+					commitErr,
+					state,
+					appInst,
+					newInst,
+					def,
+					runtime,
+				)
 			}
 			publicationCtx := pressure.WithTransitionContinuation(ctx)
 			if _, _, err := listenerPlan.PublishWithResumeTokenContext(publicationCtx, publicationResumeToken); err != nil {
@@ -953,6 +1356,10 @@ func (m *AppManager) recreateMissingMultiContainerPrepared(ctx context.Context, 
 			m.serviceManager.SetAppContainerID(appInst.InstanceID, appInst.NetworkAnchorID)
 			m.updateStatusWithEvent(appInst.InstanceID, StatusRunning)
 			return nil
+		}
+		if uncommittedContainerGroupMaySurvive(err) {
+			listenerPlan.Release()
+			return err
 		}
 
 		var portErr *container.PortInUseError

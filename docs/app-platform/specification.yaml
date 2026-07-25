@@ -8,9 +8,8 @@
 # - Fields that must exist in a runnable manifest are marked "REQUIRED".
 # - All examples are safe to delete; the schema only cares about the YAML keys/values.
 # - This documentation is aligned with the parser in `internal/app/parser.go`, and incorporates RFCs where noted.
-# - Fields covered by `capability_bindings_v1` and `artifact_bindings_v1` are an
-#   ACCEPTED contract from RFC 20260722; the current parser/runtime does not yet
-#   implement those feature gates.
+# - Fields covered by `capability_bindings_v1` and `artifact_bindings_v1` are
+#   implemented behind those required feature gates (RFC 20260722).
 #
 # Templating (install-time):
 # - The manifest is rendered as a Go template. You can reference:
@@ -137,17 +136,21 @@
 # base_path itself or a segment-descendant, then preserves the accepted
 # normalized path and query; other paths receive HTTP 404. Piccolod does not
 # define a capability-specific response body. Authorization and forwarding use
-# the same canonical path segments; ambiguous encoded separators, backslashes,
+# the same canonical path segments. Each segment must be terminal after one
+# percent-decode; residual percent escaping, encoded separators, backslashes,
 # empty segments, and dot segments are rejected before proxying. `base_path: /`
 # intentionally makes the provider's whole listener available through the
 # private binding; Piccolod does not classify the provider's endpoint purposes.
 # Binding target names must not collide with service.environment,
 # service.oidc_client.env, or another binding target.
 # V1 supplies no provider credential; a conforming local provider accepts this
-# private capability path using the base URL alone. A provider must start and
-# bind this listener without capability-derived accelerator devices; it may
-# remain idle or return HTTP 503 until selected. Piccolod applies grant changes
-# by container recreation and never grants devices to a pre-commit candidate.
+# private capability path using the base URL alone. An unselected provider must
+# start and bind this listener without capability-derived accelerator devices;
+# it may remain idle or return HTTP 503 until selected. A fresh install or
+# different-provider switching candidate receives no provisional grant. A
+# replacement generation of the already-selected app inherits the app's grant
+# after the previous generation is absent. Stop/start does not revoke the
+# selected app's host device-node permission.
 # See the RFC for provider selection, locality, switching, and recovery.
 #
 # -----------------------------------------------------------------------------
@@ -336,9 +339,11 @@ services:
         # read-only; `host`, `read_only`, `size_limit`, subpaths, and replication
         # controls are not fields in this contract. Its normalized target may
         # not equal, contain, or be contained by any other mount-producing
-        # target in this service. One top-level artifact may be mounted by
-        # multiple services, but every declaration must be mounted at least
-        # once. Unknown fields and duplicate keys are rejected.
+        # target in this service. For an ai.inference.openai.v1 provider, an
+        # artifact target also cannot overlap the capability-owned accelerator
+        # device families `/dev/dri` or `/dev/accel`. One top-level artifact may
+        # be mounted by multiple services, but every declaration must be
+        # mounted at least once. Unknown fields and duplicate keys are rejected.
         model:
           container: /models/model
 
@@ -461,14 +466,16 @@ listeners:
     # ai.inference.openai.v1 requires flow: tcp + protocol: http. Piccolod checks
     # only structural compatibility; base_path is required, absolute, has no
     # query/fragment, and has no trailing slash unless it is `/`. Piccolod
-    # rejects non-canonical/ambiguous path representations, including encoded
-    # separators, backslashes, empty segments, and dot segments. It uses the
-    # same canonical segments for subtree authorization and forwarding,
+    # rejects non-canonical/ambiguous path representations: after one
+    # percent-decode, every segment must contain no residual percent escaping,
+    # separator, backslash, NUL, or dot-segment meaning. It uses the same
+    # canonical segments for subtree authorization and forwarding,
     # composes base_path into consumer base_url, and does not certify OpenAI API
     # behavior. `base_path: /` intentionally exposes the whole listener through
-    # the private binding. A provider must bind this listener without
-    # capability-derived accelerator devices; selection later recreates it with
-    # the grant.
+    # the private binding. An unselected provider must bind this listener
+    # without capability-derived accelerator devices. A replacement generation
+    # of the already-selected app may inherit its existing grant after the
+    # previous generation is absent.
     # The capability ID's `.v1` versions Piccolo's contract; it does not require
     # the provider HTTP path itself to be /v1.
     provides:

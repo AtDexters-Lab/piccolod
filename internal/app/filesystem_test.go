@@ -103,6 +103,66 @@ func TestStoreAppMetadata(t *testing.T) {
 	})
 }
 
+func TestRemoveIncompleteAppCleansOneFileStoreAppPublication(t *testing.T) {
+	state, err := NewFilesystemStateManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystemStateManager: %v", err)
+	}
+	app := &AppInstance{
+		InstanceID: "partial",
+		Definition: &api.AppDefinition{
+			Services: map[string]api.AppService{
+				"main": {Image: "example.invalid/app:latest"},
+			},
+		},
+	}
+	injected := errors.New("injected metadata publication failure")
+	state.storeAppMetadataHook = func(string, *AppInstance) error { return injected }
+	if err := state.StoreApp(app); !errors.Is(err, injected) {
+		t.Fatalf("StoreApp error = %v, want injected metadata failure", err)
+	}
+	appDir := filepath.Join(state.appsDir, app.InstanceID)
+	publication, err := inspectAppPublication(appDir)
+	if err != nil {
+		t.Fatalf("inspectAppPublication: %v", err)
+	}
+	if publication != appPublicationIncomplete {
+		t.Fatalf("publication = %v, want incomplete", publication)
+	}
+	if err := state.removeIncompleteApp(app.InstanceID); err != nil {
+		t.Fatalf("removeIncompleteApp: %v", err)
+	}
+	if _, err := os.Stat(appDir); !os.IsNotExist(err) {
+		t.Fatalf("one-file StoreApp debris survived: %v", err)
+	}
+}
+
+func TestRemoveIncompleteAppRefusesCompletePublication(t *testing.T) {
+	state, err := NewFilesystemStateManager(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewFilesystemStateManager: %v", err)
+	}
+	app := &AppInstance{
+		InstanceID: "installed",
+		Definition: &api.AppDefinition{
+			Services: map[string]api.AppService{
+				"main": {Image: "example.invalid/app:latest"},
+			},
+		},
+	}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("StoreApp: %v", err)
+	}
+	if err := state.removeIncompleteApp(app.InstanceID); err == nil {
+		t.Fatal("complete publication was removed as debris")
+	}
+	for _, name := range []string{"app.yaml", "metadata.json"} {
+		if _, err := os.Stat(filepath.Join(state.appsDir, app.InstanceID, name)); err != nil {
+			t.Fatalf("complete publication file %s was damaged: %v", name, err)
+		}
+	}
+}
+
 func TestUpdateAppEnabledCommitsDiskBeforeCache(t *testing.T) {
 	tmpDir := t.TempDir()
 	fsm, err := NewFilesystemStateManager(tmpDir)

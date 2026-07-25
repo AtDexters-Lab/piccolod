@@ -114,6 +114,18 @@ type AppInstance struct {
 	// nil = legacy install (use ServiceRootfsVolumeID without digest).
 	// Updated during image update to point to the new versioned rootfs.
 	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
+	// ArtifactReferences maps manifest artifact names to durable golden-content
+	// reference IDs. Ordinary start reattaches these exact resolved identities
+	// without re-resolving mutable upstream declarations.
+	ArtifactReferences map[string]string `json:"artifact_references,omitempty"`
+	// AcceleratorDevices records the exact capability-derived device set
+	// mapped into the committed container generation. The selected app owns the
+	// host permission independently; reconciliation compares this generation's
+	// mappings with current desired access.
+	AcceleratorDevices []string `json:"accelerator_devices,omitempty"`
+	// CapabilityBindings records the base URL inputs injected into this
+	// committed consumer generation.
+	CapabilityBindings map[string]string `json:"capability_bindings,omitempty"`
 
 	// ClonedFrom tracks the origin instance ID this app was cloned from (RFC 20260302).
 	ClonedFrom string `json:"cloned_from,omitempty"`

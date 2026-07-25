@@ -153,12 +153,101 @@ type RootfsVolumeManager interface {
 	ResizeApplication(ctx context.Context, volumeID string, newSizeBytes int64) error
 }
 
+// GoldenContentManager extends the block-native rootfs owner with generic
+// reconstructible content and direct read-only artifact references. Keeping it
+// interface-segregated avoids forcing non-artifact test doubles to implement
+// behavior they never exercise.
+type GoldenContentManager interface {
+	EnsureGoldenContent(ctx context.Context, req GoldenContentRequest) (GoldenContentHandle, error)
+	CreateArtifactReference(ctx context.Context, req ArtifactReferenceRequest) (ArtifactHandle, error)
+	AttachArtifactReference(ctx context.Context, referenceID string) (ArtifactHandle, error)
+	DetachArtifactReference(ctx context.Context, referenceID string) error
+	DestroyArtifactReference(ctx context.Context, referenceID string) error
+	GarbageCollectArtifactReferences(ctx context.Context, retained map[string]struct{}) error
+}
+
+// GoldenContentIdentity is the complete durable identity used for Ready reuse.
+// Consumption mode is intentionally absent: the same OCI image projection can
+// back a rootfs snapshot or a read-only artifact attachment.
+type GoldenContentIdentity struct {
+	SourceKind       string `json:"source_kind"`
+	ResolvedIdentity string `json:"resolved_identity"`
+	Projection       string `json:"projection"`
+}
+
+const (
+	GoldenSourceOCI         = "oci"
+	GoldenSourceHuggingFace = "huggingface"
+
+	GoldenProjectionOCIImageRootfs = "oci-image-rootfs"
+	GoldenProjectionOCIArtifact    = "oci-artifact-root"
+	GoldenProjectionHuggingFace    = "huggingface-path"
+)
+
+// GoldenMaterializationResult carries optional OCI image configuration. Raw
+// artifacts do not populate ImageConfig.
+type GoldenMaterializationResult struct {
+	ImageConfig *GoldenImageConfig
+}
+
+// GoldenContentRequest describes one source-specific adapter invocation. The
+// caller resolves and verifies source semantics; persistence owns staging,
+// publication, reuse, references, and GC.
+type GoldenContentRequest struct {
+	Identity          GoldenContentIdentity
+	SourceRef         string
+	SizeHint          int64
+	PreferredGoldenID string
+	Materialize       func(ctx context.Context, targetDir string) (GoldenMaterializationResult, error)
+}
+
+// GoldenContentHandle identifies verified Ready content.
+type GoldenContentHandle struct {
+	GoldenID string
+	Identity GoldenContentIdentity
+}
+
+// ArtifactReferenceRequest creates a durable app-owned reference before its
+// live attachment. ReferenceID must be stable for the app/artifact generation.
+type ArtifactReferenceRequest struct {
+	ReferenceID string
+	GoldenID    string
+	IDMap       IDMapConfig
+}
+
+// ArtifactHandle identifies one app-private read-only view of a golden LV.
+type ArtifactHandle struct {
+	MountPath string
+	Created   bool
+}
+
+// ArtifactContentMissingError preserves the exact recorded identity when a
+// durable reference survives loss of its local golden LV. App lifecycle code
+// can reconstruct that identity without following a mutable source.
+type ArtifactContentMissingError struct {
+	ReferenceID string
+	GoldenID    string
+	Identity    GoldenContentIdentity
+}
+
+func (e *ArtifactContentMissingError) Error() string {
+	return "artifact reference " + e.ReferenceID + " is missing local golden content " + e.GoldenID
+}
+
 // GoldenLVRequest describes the image for a golden LV.
 type GoldenLVRequest struct {
 	ImageDigest   string
 	ImageRef      string
 	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
 	PrePulledDir  string // when non-empty, podman root dir with the image already pulled — flattenFn reuses it
+
+	// Generic fields are populated by EnsureGoldenContent. Existing image
+	// callers leave them empty and receive the canonical OCI image identity.
+	Identity          *GoldenContentIdentity
+	SourceRef         string
+	ContentSizeHint   int64
+	PreferredGoldenID string
+	Materialize       func(ctx context.Context, targetDir string) (GoldenMaterializationResult, error)
 }
 
 // WorkspaceRootfsRequest describes a workspace rootfs creation request.

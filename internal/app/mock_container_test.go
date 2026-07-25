@@ -16,6 +16,7 @@ import (
 
 type MockContainerManager struct {
 	stopMu                   sync.Mutex
+	execMu                   sync.Mutex
 	containers               map[string]*mockContainer
 	nextID                   int
 	createError              error
@@ -24,6 +25,7 @@ type MockContainerManager struct {
 	stopError                error
 	resolveErrorForName      map[string]error
 	inspectErrorForContainer map[string]error
+	inspectStateForContainer map[string]container.ContainerState
 	listError                error
 	inspectPortsError        error
 	removeError              error
@@ -35,6 +37,7 @@ type MockContainerManager struct {
 	reloadedContainers       []string
 	reloadErr                error
 	inspectImageHook         func(imageName string) (*container.ImageConfig, error)
+	execScriptCalls          int
 }
 
 type mockContainer struct {
@@ -204,6 +207,9 @@ func (m *MockContainerManager) InspectContainerState(ctx context.Context, runtim
 	if err := m.inspectErrorForContainer[containerID]; err != nil {
 		return container.ContainerState{}, err
 	}
+	if state, ok := m.inspectStateForContainer[containerID]; ok {
+		return state, nil
+	}
 	c, ok := m.containers[containerID]
 	if !ok {
 		return container.ContainerState{Exists: false, Running: false}, nil
@@ -344,7 +350,16 @@ func (m *MockContainerManager) ExecShellCmd(runtime container.PodmanRuntime, con
 }
 
 func (m *MockContainerManager) ExecScript(ctx context.Context, runtime container.PodmanRuntime, containerID string, opts container.ExecScriptOptions) (int, string, error) {
+	m.execMu.Lock()
+	m.execScriptCalls++
+	m.execMu.Unlock()
 	return 0, "mock exec script", nil
+}
+
+func (m *MockContainerManager) execScriptCallCount() int {
+	m.execMu.Lock()
+	defer m.execMu.Unlock()
+	return m.execScriptCalls
 }
 
 func generateMockContainerID(id int) string {

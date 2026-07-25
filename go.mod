@@ -10,6 +10,7 @@ require (
 	github.com/coreos/go-systemd/v22 v22.7.0
 	github.com/cosmos/go-bip39 v1.0.0
 	github.com/creack/pty v1.1.24
+	github.com/distribution/reference v0.6.0
 	github.com/gin-contrib/gzip v1.2.6
 	github.com/go-jose/go-jose/v4 v4.1.4
 	github.com/go-webauthn/webauthn v0.17.3
@@ -43,6 +44,7 @@ require (
 	github.com/ncruces/go-strftime v1.0.0 // indirect
 	github.com/oasdiff/yaml v0.0.9 // indirect
 	github.com/oasdiff/yaml3 v0.0.12 // indirect
+	github.com/opencontainers/go-digest v1.0.0 // indirect
 	github.com/philhofer/fwd v1.2.0 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
 	github.com/quic-go/quic-go v0.59.1 // indirect

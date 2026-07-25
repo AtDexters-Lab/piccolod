@@ -44,6 +44,24 @@ const (
 	cloneWorkspaceTimeout   = 10 * time.Minute // LV snapshot + anchor pull + container create
 )
 
+func artifactAwareDefinitionTimeout(def *api.AppDefinition, fallback time.Duration) time.Duration {
+	if def != nil && len(def.Artifacts) > 0 {
+		return app.ArtifactOperationTimeout
+	}
+	return fallback
+}
+
+func (s *GinServer) artifactAwareInstalledAppTimeout(
+	instanceID string,
+	fallback time.Duration,
+) time.Duration {
+	def, err := s.appManager.GetAppDefinition(s.serverContext(), instanceID)
+	if err != nil {
+		return fallback
+	}
+	return artifactAwareDefinitionTimeout(def, fallback)
+}
+
 var (
 	cachedHostTimezone string
 	hostTimezoneOnce   sync.Once
@@ -483,7 +501,9 @@ func (s *GinServer) handleGinAppManifestUpdate(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
 		return
 	}
-	updateCtx, cancel := s.opContext(c, serviceAppUpdateTimeout)
+	// The confirmed candidate is opaque at this boundary and may introduce an
+	// artifact, so use the bounded artifact-capable lifecycle ceiling.
+	updateCtx, cancel := s.opContext(c, app.ArtifactOperationTimeout)
 	defer cancel()
 	result, err := s.appManager.ApplyCustomManifestUpdate(updateCtx, app.ManifestUpdateRequest{
 		InstanceID:         appName,
@@ -547,7 +567,10 @@ func (s *GinServer) handleGinAppConfigApply(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid JSON body; expected dry_run_token")
 		return
 	}
-	updateCtx, cancel := s.opContext(c, serviceAppUpdateTimeout)
+	updateCtx, cancel := s.opContext(
+		c,
+		app.ArtifactOperationTimeout,
+	)
 	defer cancel()
 	result, err := s.appManager.ApplyInstalledConfigUpdate(updateCtx, appName, req)
 	if err != nil {
@@ -725,7 +748,10 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 
 	// Install a new app instance.
 	// Decouple from HTTP request context — installs must survive connection drops.
-	installCtx, cancelInstall := s.opContext(c, installTimeout)
+	installCtx, cancelInstall := s.opContext(
+		c,
+		artifactAwareDefinitionTimeout(appDef, installTimeout),
+	)
 	defer cancelInstall()
 	if catalogSource != "" {
 		installCtx = app.WithCatalogSource(installCtx, catalogSource)
@@ -772,13 +798,20 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	// resolvable after StoreApp completes. Init scripts should store the
 	// credentials for the app to use after install (like Immich does).
 	appInstance, err := s.appManager.Install(installCtx, appDef)
+	capabilityReconcilePending := false
 	if err != nil {
-		cleanupProxyOIDC()
-		if handleAppManagerError(c, err, "install app") {
+		var pending *app.CapabilitySelectionReconcilePendingError
+		if errors.As(err, &pending) && appInstance != nil {
+			capabilityReconcilePending = true
+			log.Printf("WARN: app %s installed with capability reconciliation pending: %v", appInstance.InstanceID, err)
+		} else {
+			cleanupProxyOIDC()
+			if handleAppManagerError(c, err, "install app") {
+				return
+			}
+			writeGinError(c, http.StatusInternalServerError, "Failed to install app: "+err.Error())
 			return
 		}
-		writeGinError(c, http.StatusInternalServerError, "Failed to install app: "+err.Error())
-		return
 	}
 
 	// Persist OIDC client if generated
@@ -844,6 +877,11 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	response := GinAppResponse{
 		Data:    appInstance,
 		Message: "App '" + appInstance.InstanceID + "' installed successfully",
+	}
+	if capabilityReconcilePending {
+		response.Message = "App '" + appInstance.InstanceID + "' installed; capability reconciliation pending"
+		c.JSON(http.StatusAccepted, response)
+		return
 	}
 	c.JSON(http.StatusCreated, response)
 }
@@ -1053,7 +1091,10 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 
 	// Decouple from HTTP request context — listener updates trigger nexus adapter
 	// restarts (port claims change), which can sever the connection carrying this request.
-	ctx, cancel := s.opContext(c, 2*time.Minute)
+	ctx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(appName, 2*time.Minute),
+	)
 	defer cancel()
 	_, err = s.appManager.UpdateListeners(ctx, appName, req.Listeners)
 	if err != nil {
@@ -1117,17 +1158,33 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 
 	ctx, cancel := s.opContext(c, 2*time.Minute)
 	defer cancel()
-	err := s.appManager.Uninstall(ctx, appName)
+	err := s.appManager.UninstallAcknowledged(
+		ctx,
+		appName,
+		strings.EqualFold(strings.TrimSpace(c.Query("acknowledge_provider_change")), "true"),
+	)
+	reconcilePending := false
 	if err != nil {
-		if handleAppManagerError(c, err, "uninstall app") {
+		var pending *app.CapabilitySelectionReconcilePendingError
+		if errors.As(err, &pending) {
+			reconcilePending = true
+			log.Printf("WARN: app %s uninstalled with capability reconciliation pending: %v", appName, err)
+		} else {
+			var confirmationRequired *app.CapabilityProviderChangeConfirmationRequiredError
+			if errors.As(err, &confirmationRequired) {
+				writeGinError(c, http.StatusConflict, err.Error())
+				return
+			}
+			if handleAppManagerError(c, err, "uninstall app") {
+				return
+			}
+			if strings.Contains(err.Error(), "not found") {
+				writeGinError(c, http.StatusNotFound, err.Error())
+			} else {
+				writeGinError(c, http.StatusInternalServerError, "Failed to uninstall app: "+err.Error())
+			}
 			return
 		}
-		if strings.Contains(err.Error(), "not found") {
-			writeGinError(c, http.StatusNotFound, err.Error())
-		} else {
-			writeGinError(c, http.StatusInternalServerError, "Failed to uninstall app: "+err.Error())
-		}
-		return
 	}
 
 	// Delete all OIDC clients (passthrough + proxy) for this app on uninstall (best-effort).
@@ -1137,6 +1194,10 @@ func (s *GinServer) handleGinAppUninstall(c *gin.Context) {
 		}
 	}
 
+	if reconcilePending {
+		c.Status(http.StatusAccepted)
+		return
+	}
 	writeGinSuccess(c, nil, "App '"+appName+"' uninstalled successfully")
 }
 
@@ -1149,7 +1210,10 @@ func (s *GinServer) handleGinAppStart(c *gin.Context) {
 		return
 	}
 
-	ctx, cancel := s.opContext(c, 2*time.Minute)
+	ctx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(appName, 2*time.Minute),
+	)
 	defer cancel()
 	err := s.appManager.Start(ctx, appName)
 	if err != nil {
@@ -1200,7 +1264,10 @@ func (s *GinServer) handleGinAppStop(c *gin.Context) {
 func (s *GinServer) handleGinAppUpdate(c *gin.Context) {
 	appName := c.Param("name")
 
-	updateCtx, cancel := s.opContext(c, 30*time.Minute)
+	updateCtx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(appName, 30*time.Minute),
+	)
 	defer cancel()
 
 	err := s.appManager.UpdateImage(updateCtx, appName)
@@ -1239,7 +1306,10 @@ func (s *GinServer) handleGinAppTransitionMetadataRetry(c *gin.Context) {
 
 func (s *GinServer) handleGinAppTransitionFollowUp(c *gin.Context, action app.TransitionActionKind, label string) {
 	appName := c.Param("name")
-	followUpCtx, cancel := s.opContext(c, 5*time.Minute)
+	followUpCtx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(appName, 5*time.Minute),
+	)
 	defer cancel()
 
 	if err := s.appManager.RetryTransitionFollowUp(followUpCtx, appName, action); err != nil {
@@ -1258,7 +1328,10 @@ func (s *GinServer) handleGinAppTransitionFollowUp(c *gin.Context, action app.Tr
 func (s *GinServer) handleGinAppRollback(c *gin.Context) {
 	appName := c.Param("name")
 
-	rollbackCtx, cancel := s.opContext(c, 5*time.Minute)
+	rollbackCtx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(appName, 5*time.Minute),
+	)
 	defer cancel()
 
 	err := s.appManager.RollbackToSnapshot(rollbackCtx, appName)
@@ -1294,7 +1367,10 @@ func (s *GinServer) handleGinAppClone(c *gin.Context) {
 	}
 	cloneName := strings.TrimSpace(body.Name)
 
-	ctx, cancel := s.opContext(c, cloneWorkspaceTimeout)
+	ctx, cancel := s.opContext(
+		c,
+		s.artifactAwareInstalledAppTimeout(originName, cloneWorkspaceTimeout),
+	)
 	defer cancel()
 	inst, err := s.appManager.CloneWorkspace(ctx, originName, cloneName)
 	if err != nil {

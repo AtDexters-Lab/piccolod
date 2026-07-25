@@ -29,7 +29,6 @@ const (
 	goldenLVPrefix      = "golden-"
 	workspaceLVPrefix   = "ws-"
 	svcRootfsLVPrefix   = "svc-rootfs-"
-	flattenSentinelFile = ".piccolo_flatten_incomplete"
 	imageConfigFile     = "image-config.json"
 	defaultGoldenLVSize = 10 << 30 // 10 GiB
 
@@ -118,42 +117,124 @@ func (m *luksVolumeManager) checkThinPoolCapacity(ctx context.Context) error {
 	return nil
 }
 
-// EnsureGoldenLV creates or reuses a golden LV for the given image.
-func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequest) (string, error) {
-	digestShort := ShortDigest(req.ImageDigest)
-	goldenID := goldenLVPrefix + digestShort
-
-	// Per-image-digest lock (avoids holding global mu during 30s+ flatten).
-	mu := m.goldenMutex(digestShort)
-	mu.Lock()
-	defer mu.Unlock()
-
-	// Fast path: cached + flatten complete.
+// resetGoldenStorageBeforePublication removes any stale physical LV and only
+// then clears its incomplete metadata. The caller must invoke this before
+// publishing the next incomplete marker: after that marker exists, failures
+// must leave it behind as durable retry evidence.
+func (m *luksVolumeManager) resetGoldenStorageBeforePublication(ctx context.Context, goldenID string) error {
 	m.mu.Lock()
-	if cached, ok := m.goldenLVs[digestShort]; ok && cached.FlattenComplete != "" {
+	delete(m.goldenLVs, goldenID)
+	m.mu.Unlock()
+
+	lvs, err := m.lvMgr.ListLVs(ctx)
+	if err != nil {
+		return fmt.Errorf("inspect stale golden LV %s: %w", goldenID, err)
+	}
+	exists := false
+	for _, lv := range lvs {
+		if lv.Name == goldenID {
+			exists = true
+			break
+		}
+	}
+	if exists {
+		mapper := volMapperName(goldenID)
+		_ = m.run.Run(ctx, "umount", paths.MountDir(goldenID))
+		_ = m.run.Run(ctx, "cryptsetup", "close", mapper)
+		_ = m.lvMgr.DeactivateLV(ctx, goldenID)
+		removeErr := m.lvMgr.RemoveThinLV(ctx, goldenID)
+
+		lvs, verifyErr := m.lvMgr.ListLVs(ctx)
+		if verifyErr != nil {
+			verifyErr = fmt.Errorf("verify stale golden LV %s removal: %w", goldenID, verifyErr)
+			if removeErr != nil {
+				return errors.Join(
+					fmt.Errorf("remove stale golden LV %s: %w", goldenID, removeErr),
+					verifyErr,
+				)
+			}
+			return verifyErr
+		}
+		for _, lv := range lvs {
+			if lv.Name != goldenID {
+				continue
+			}
+			if removeErr != nil {
+				return fmt.Errorf("remove stale golden LV %s: %w", goldenID, removeErr)
+			}
+			return fmt.Errorf("stale golden LV %s still exists after removal", goldenID)
+		}
+	}
+
+	if err := os.RemoveAll(paths.VolumeMetaDir(goldenID)); err != nil {
+		return fmt.Errorf("remove stale golden metadata %s: %w", goldenID, err)
+	}
+	if err := os.RemoveAll(paths.MountDir(goldenID)); err != nil {
+		return fmt.Errorf("remove stale golden mount directory %s: %w", goldenID, err)
+	}
+	return nil
+}
+
+// EnsureGoldenLV creates or reuses a verified golden LV. Existing image
+// callers are normalized into the generic OCI-image identity; source adapters
+// call it through EnsureGoldenContent.
+func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequest) (string, error) {
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: req.ImageDigest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	if req.Identity != nil {
+		identity = *req.Identity
+	}
+	if err := validateGoldenIdentity(identity); err != nil {
+		return "", err
+	}
+	sourceRef := req.SourceRef
+	if sourceRef == "" {
+		sourceRef = req.ImageRef
+	}
+	materialize := req.Materialize
+	if materialize == nil {
+		if m.flattenFn == nil {
+			return "", fmt.Errorf("flattenFn not configured")
+		}
+		materialize = func(ctx context.Context, targetDir string) (GoldenMaterializationResult, error) {
+			imgConfig, err := m.flattenFn(ctx, req.ImageRef, targetDir, req.PrePulledDir)
+			if err != nil {
+				return GoldenMaterializationResult{}, err
+			}
+			return GoldenMaterializationResult{ImageConfig: &imgConfig}, nil
+		}
+	}
+
+	// Lock the preferred shortened storage key so unequal identities that
+	// collide are disambiguated serially.
+	unlockIdentity, err := m.lockGoldenIdentity(identity)
+	if err != nil {
+		return "", err
+	}
+	defer unlockIdentity()
+
+	selection, err := m.selectGoldenStorage(ctx, identity, req.ImageDigest, req.PreferredGoldenID)
+	if err != nil {
+		return "", err
+	}
+	goldenID := selection.goldenID
+	if selection.ready {
+		m.mu.Lock()
+		m.goldenLVs[goldenID] = selection.meta
 		m.mu.Unlock()
 		return goldenID, nil
 	}
-	m.mu.Unlock()
 
 	metaDir := paths.VolumeMetaDir(goldenID)
 	metaPath := filepath.Join(metaDir, metadataV2File)
-
-	// Check disk: metadata exists and no sentinel → return.
-	if meta, err := readVolumeMetaV3(metaPath); err == nil {
-		if meta.FlattenComplete != "" {
-			m.mu.Lock()
-			m.goldenLVs[digestShort] = meta
-			m.mu.Unlock()
-			return goldenID, nil
-		}
-		// Sentinel or incomplete — destroy and recreate.
-		log.Printf("golden LV %s incomplete (no flatten_complete), recreating", goldenID)
-		m.destroyGoldenLVUnsafe(ctx, goldenID)
+	if selection.meta != nil {
+		log.Printf("golden LV %s incomplete, recreating", goldenID)
 	}
-
-	if m.flattenFn == nil {
-		return "", fmt.Errorf("flattenFn not configured")
+	if err := m.resetGoldenStorageBeforePublication(ctx, goldenID); err != nil {
+		return "", err
 	}
 
 	// Check thin pool capacity.
@@ -163,21 +244,49 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	lvName := goldenID
 	sizeBytes := int64(defaultGoldenLVSize)
-	if req.ImageSizeHint > 0 {
-		// Caller already inspected the image — skip the separate imageSizeFn pull.
-		sizeBytes = goldenLVSizeForImage(req.ImageSizeHint)
+	sizeHint := req.ContentSizeHint
+	if sizeHint <= 0 {
+		sizeHint = req.ImageSizeHint
+	}
+	if sizeHint > 0 {
+		sizeBytes = goldenLVSizeForImage(sizeHint)
 	} else if m.imageSizeFn != nil {
-		if imgSize, err := m.imageSizeFn(ctx, req.ImageRef); err == nil && imgSize > 0 {
+		if imgSize, err := m.imageSizeFn(ctx, sourceRef); err == nil && imgSize > 0 {
 			sizeBytes = goldenLVSizeForImage(imgSize)
 		} else if err != nil {
-			log.Printf("WARN: imageSizeFn failed for %s, using default LV size: %v", req.ImageRef, err)
+			log.Printf("WARN: imageSizeFn failed for %s, using default LV size: %v", sourceRef, err)
 		} else if imgSize <= 0 {
-			log.Printf("WARN: imageSizeFn returned non-positive size %d for %s, using default LV size", imgSize, req.ImageRef)
+			log.Printf("WARN: imageSizeFn returned non-positive size %d for %s, using default LV size", imgSize, sourceRef)
 		}
 	}
 
 	mapper := volMapperName(goldenID)
 	mountDir := paths.MountDir(goldenID)
+
+	// Persist ownership before allocating the LV. A crash anywhere after this
+	// point leaves an explicitly incomplete volume record that ordinary rootfs
+	// reconciliation can destroy; an unrecorded thin LV must never be the only
+	// evidence of an interrupted materialization.
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		return "", fmt.Errorf("mkdir golden metadata: %w", err)
+	}
+	incompleteMeta := &volumeMetaV3{
+		Version:              metadataV3Version,
+		Type:                 volumeTypeGolden,
+		LVName:               lvName,
+		VGName:               lvm.DefaultVGName,
+		SizeBytes:            sizeBytes,
+		FSType:               "btrfs",
+		ReadOnly:             true,
+		BaseImageDigest:      req.ImageDigest,
+		BaseImageRef:         sourceRef,
+		GoldenIdentity:       &identity,
+		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+	}
+	if err := writeVolumeMetaV3(metaPath, incompleteMeta); err != nil {
+		return "", fmt.Errorf("write incomplete golden metadata: %w", err)
+	}
 
 	// Track which layers have been set up for deferred cleanup.
 	var (
@@ -212,10 +321,6 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		}
 	}()
 
-	// Ensure clean slate — previous crashed run may have left active mounts/mappings.
-	if m.lvMgr.LVExists(ctx, lvName) {
-		m.destroyGoldenLVUnsafe(ctx, goldenID)
-	}
 	if err := m.lvMgr.CreateThinLV(ctx, lvName, sizeBytes); err != nil {
 		return "", fmt.Errorf("create golden LV: %w", err)
 	}
@@ -251,70 +356,55 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	}
 	mounted = true
 
-	// Write sentinel.
-	sentinelPath := filepath.Join(mountDir, flattenSentinelFile)
-	if err := os.WriteFile(sentinelPath, []byte("incomplete"), 0o600); err != nil {
-		return "", fmt.Errorf("write sentinel: %w", err)
-	}
-
-	// Flatten: extract OCI image to mount point and get image config.
-	imgConfig, err := m.flattenFn(ctx, req.ImageRef, mountDir, req.PrePulledDir)
+	// Run the source-specific adapter inside the staging golden filesystem.
+	result, err := materialize(ctx, mountDir)
 	if err != nil {
-		return "", fmt.Errorf("flatten image: %w", err)
+		return "", fmt.Errorf("materialize golden content: %w", err)
 	}
 
-	// syncfs: ensure all flattened data is durable on disk before marking complete.
+	// syncfs ensures payload data is durable before the metadata commit marks
+	// this exact identity Ready.
 	if err := syncfsPath(mountDir); err != nil {
 		return "", fmt.Errorf("syncfs golden: %w", err)
 	}
 
-	// Ensure metadata dir exists.
-	if err := os.MkdirAll(metaDir, 0o700); err != nil {
-		return "", fmt.Errorf("mkdir meta: %w", err)
+	// OCI image projections retain their config for --rootfs consumers. Other
+	// artifacts have no image execution metadata.
+	if result.ImageConfig != nil {
+		imgConfigData, err := json.Marshal(*result.ImageConfig)
+		if err != nil {
+			return "", fmt.Errorf("marshal image config: %w", err)
+		}
+		configPath := filepath.Join(metaDir, imageConfigFile)
+		if err := fsutil.AtomicWriteFile(configPath, imgConfigData, 0o600); err != nil {
+			return "", fmt.Errorf("write image config: %w", err)
+		}
 	}
 
-	// Write image config alongside golden LV metadata.
-	imgConfigData, err := json.Marshal(imgConfig)
-	if err != nil {
-		return "", fmt.Errorf("marshal image config: %w", err)
-	}
-	configPath := filepath.Join(metaDir, imageConfigFile)
-	if err := fsutil.AtomicWriteFile(configPath, imgConfigData, 0o600); err != nil {
-		return "", fmt.Errorf("write image config: %w", err)
-	}
-
-	// Write v3 metadata WITH flatten_complete — atomic commit point.
+	// Write v3 metadata WITH materialize_complete — atomic commit point.
 	// On crash before this write: metadata absent/incomplete → reconcile destroys.
-	// On crash after this write: FlattenComplete set → reconcile caches (correct).
-	meta := &volumeMetaV3{
-		Version:              metadataV3Version,
-		Type:                 volumeTypeGolden,
-		LVName:               lvName,
-		VGName:               lvm.DefaultVGName,
-		SizeBytes:            sizeBytes,
-		FSType:               "btrfs",
-		BaseImageDigest:      req.ImageDigest,
-		BaseImageRef:         req.ImageRef,
-		FlattenComplete:      time.Now().UTC().Format(time.RFC3339),
-		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
-		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
+	// On crash after this write: Ready evidence is durable and reusable.
+	completedAt := time.Now().UTC().Format(time.RFC3339)
+	meta := incompleteMeta
+	meta.MaterializeComplete = completedAt
+	if identity.SourceKind == GoldenSourceOCI && identity.Projection == GoldenProjectionOCIImageRootfs {
+		// Preserve the legacy marker for mixed-version metadata readers.
+		meta.FlattenComplete = completedAt
 	}
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
 		return "", fmt.Errorf("write golden metadata: %w", err)
 	}
-
-	// Remove sentinel (cleanup only — reconcile checks FlattenComplete, not sentinel).
-	_ = os.Remove(sentinelPath)
 
 	// Mark success so deferred cleanup preserves the LV.
 	success = true
 
 	// Cache.
 	m.mu.Lock()
-	m.goldenLVs[digestShort] = meta
+	m.goldenLVs[goldenID] = meta
 	m.mu.Unlock()
 
-	log.Printf("golden LV created: %s (image=%s, digest=%s, size=%d)", goldenID, req.ImageRef, req.ImageDigest, sizeBytes)
+	log.Printf("golden LV created: %s (source=%s identity=%s projection=%s size=%d)",
+		goldenID, sourceRef, identity.ResolvedIdentity, identity.Projection, sizeBytes)
 	return goldenID, nil
 }
 
@@ -353,17 +443,50 @@ func (m *luksVolumeManager) CreateServiceRootfs(ctx context.Context, req Service
 	return m.createRootfsFromGolden(ctx, goldenID, volumeID, volumeTypeServiceRootfs, true, &req.IDMap)
 }
 
+func readReadyGoldenMeta(goldenID string) (*volumeMetaV3, GoldenContentIdentity, error) {
+	metaPath := filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File)
+	meta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return nil, GoldenContentIdentity{}, fmt.Errorf("read golden metadata: %w", err)
+	}
+	if meta.Type != volumeTypeGolden || goldenReadyTimestamp(meta) == "" {
+		return nil, GoldenContentIdentity{}, fmt.Errorf("golden LV %s is not verified Ready content", goldenID)
+	}
+	identity, err := goldenIdentityFromMeta(meta)
+	if err != nil {
+		return nil, GoldenContentIdentity{}, fmt.Errorf("read golden identity: %w", err)
+	}
+	return meta, identity, nil
+}
+
 // createRootfsFromGolden creates a rootfs from a golden LV via snapshot.
 func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID, volumeID, volType string, readOnly bool, idmap *IDMapConfig) (RootfsHandle, error) {
 	if err := m.checkThinPoolCapacity(ctx); err != nil {
 		return RootfsHandle{}, err
 	}
 
-	// Read golden LV metadata.
-	goldenMetaPath := filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File)
-	goldenMeta, err := readVolumeMetaV3(goldenMetaPath)
+	// The first read identifies the per-content lock. GC may have acted before
+	// that lock is acquired, so this read is never treated as proof that the
+	// golden still exists.
+	_, identity, err := readReadyGoldenMeta(goldenID)
 	if err != nil {
-		return RootfsHandle{}, fmt.Errorf("read golden metadata: %w", err)
+		return RootfsHandle{}, err
+	}
+	unlockIdentity, err := m.lockGoldenIdentity(identity)
+	if err != nil {
+		return RootfsHandle{}, err
+	}
+	defer unlockIdentity()
+
+	// Re-read under the identity lock immediately before snapshot creation.
+	// Holding the lock through the rootfs metadata commit makes the new
+	// GoldenLV reference and GC destruction mutually exclusive.
+	goldenMeta, lockedIdentity, err := readReadyGoldenMeta(goldenID)
+	if err != nil {
+		return RootfsHandle{}, err
+	}
+	if lockedIdentity != identity {
+		return RootfsHandle{}, fmt.Errorf("golden LV %s identity changed before snapshot creation", goldenID)
 	}
 
 	snapshotName := volumeID
@@ -456,6 +579,47 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 
 	m.nudgeVolumeCreation()
 	return handle, nil
+}
+
+func goldenHasRootfsReference(goldenID string) (bool, error) {
+	volumeIDs, err := listVolumeIDs()
+	if err != nil {
+		return false, err
+	}
+	for _, volumeID := range volumeIDs {
+		metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
+		version, err := readVolumeMetaVersion(metaPath)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("read volume %s metadata version: %w", volumeID, err)
+		}
+		if version != metadataV3Version {
+			continue
+		}
+		meta, err := readVolumeMetaV3(metaPath)
+		if err != nil {
+			return false, fmt.Errorf("read volume %s metadata: %w", volumeID, err)
+		}
+		if meta.GoldenLV == goldenID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func goldenHasArtifactReference(goldenID string) (bool, error) {
+	references, err := listArtifactReferences()
+	if err != nil {
+		return false, err
+	}
+	for _, reference := range references {
+		if reference.GoldenID == goldenID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // CloneWorkspace creates a clone of an existing workspace.
@@ -858,7 +1022,7 @@ func deriveRootfsHandle(volumeID string, meta *volumeMetaV3) RootfsHandle {
 	return RootfsHandle{
 		VolumeID:  volumeID,
 		MountPath: resultPath,
-		ReadOnly:  meta.ReadOnly,
+		ReadOnly:  meta.ReadOnly || meta.Type == volumeTypeGolden,
 		GoldenLV:  meta.GoldenLV,
 	}
 }
@@ -889,8 +1053,8 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	case volumeTypeWorkspace:
 		// Workspace: ThinLV → NBD → DRBD
 		stack, err = m.buildStack(volumeID, lvName, meta.SizeBytes)
-	case volumeTypeServiceRootfs:
-		// Service rootfs: ThinLV only (not replicated)
+	case volumeTypeServiceRootfs, volumeTypeGolden:
+		// Service rootfs and golden content: ThinLV only (not replicated).
 		thinDev := blockdev.NewThinLVDevice(m.lvMgr, lvName, meta.SizeBytes)
 		stack, err = blockdev.NewDeviceStack(volumeID, thinDev)
 	default:
@@ -960,7 +1124,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	// it does not need to create them. Workspaces: read-write for user data.
 	// Skip when already mounted (PartialMapperOnly recovery may find raw mount present).
 	mountOpts := btrfsRootfsMountOpts
-	if meta.ReadOnly {
+	if meta.ReadOnly || meta.Type == volumeTypeGolden {
 		mountOpts = "ro," + mountOpts
 	}
 	mounted, entry, _ := mountAtPath(mountDir)
@@ -1019,7 +1183,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 	handle := RootfsHandle{
 		VolumeID:  volumeID,
 		MountPath: resultPath,
-		ReadOnly:  meta.ReadOnly,
+		ReadOnly:  meta.ReadOnly || meta.Type == volumeTypeGolden,
 		GoldenLV:  meta.GoldenLV,
 	}
 
@@ -1119,6 +1283,13 @@ func (m *luksVolumeManager) destroyRootfsLocked(ctx context.Context, volumeID st
 
 // destroyGoldenLVUnsafe destroys a golden LV without lock. Called under goldenMu.
 func (m *luksVolumeManager) destroyGoldenLVUnsafe(ctx context.Context, goldenID string) {
+	// Ready cache is derived from durable metadata and physical storage. Evict
+	// it before best-effort teardown so any cleanup failure leaves an unproven
+	// orphan, never cache-valid content.
+	m.mu.Lock()
+	delete(m.goldenLVs, goldenID)
+	m.mu.Unlock()
+
 	mapper := volMapperName(goldenID)
 
 	// Best-effort teardown of any active state.
@@ -1161,6 +1332,13 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 			referencedGoldens[meta.GoldenLV] = true
 		}
 	}
+	artifactReferences, err := listArtifactReferences()
+	if err != nil {
+		return fmt.Errorf("list artifact golden references: %w", err)
+	}
+	for _, reference := range artifactReferences {
+		referencedGoldens[reference.GoldenID] = true
+	}
 
 	// Remove unreferenced golden LVs.
 	for goldenID := range goldenIDs {
@@ -1168,18 +1346,54 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 			continue
 		}
 		log.Printf("GC: removing unreferenced golden LV %s", goldenID)
-		digestShort := strings.TrimPrefix(goldenID, goldenLVPrefix)
-		mu := m.goldenMutex(digestShort)
-		mu.Lock()
+		meta, err := readVolumeMetaV3(filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File))
+		if err != nil {
+			continue
+		}
+		identity, err := goldenIdentityFromMeta(meta)
+		if err != nil {
+			continue
+		}
+		unlockIdentity, err := m.lockGoldenIdentity(identity)
+		if err != nil {
+			continue
+		}
+
+		// The metadata used to choose the lock was read before lock acquisition.
+		// Re-read it now and abandon this pass if the Ready identity changed or
+		// disappeared; the old read is not destruction authority.
+		lockedMeta, lockedIdentity, lockedErr := readReadyGoldenMeta(goldenID)
+		if lockedErr != nil || lockedIdentity != identity || !goldenMetaMatchesIdentity(lockedMeta, identity) {
+			unlockIdentity()
+			continue
+		}
+
+		// References may have been published after the inventory above. Recheck
+		// both rootfs metadata and artifact records under the same identity lock
+		// used by their attachment paths immediately before destruction.
+		rootfsReferenced, refErr := goldenHasRootfsReference(goldenID)
+		if refErr != nil {
+			unlockIdentity()
+			return fmt.Errorf("recheck rootfs golden references: %w", refErr)
+		}
+		if rootfsReferenced {
+			unlockIdentity()
+			continue
+		}
+		artifactReferenced, refErr := goldenHasArtifactReference(goldenID)
+		if refErr != nil {
+			unlockIdentity()
+			return fmt.Errorf("recheck artifact golden references: %w", refErr)
+		}
+		if artifactReferenced {
+			unlockIdentity()
+			continue
+		}
 		m.destroyGoldenLVUnsafe(ctx, goldenID)
 		m.mu.Lock()
-		delete(m.goldenLVs, digestShort)
+		delete(m.goldenLVs, goldenID)
 		m.mu.Unlock()
-		// Remove from goldenMu map.
-		m.goldenMuLock.Lock()
-		delete(m.goldenMu, digestShort)
-		m.goldenMuLock.Unlock()
-		mu.Unlock()
+		unlockIdentity()
 	}
 
 	return nil
@@ -1209,16 +1423,16 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 
 		switch meta.Type {
 		case volumeTypeGolden:
-			digestShort := strings.TrimPrefix(volID, goldenLVPrefix)
-			if meta.FlattenComplete != "" {
-				// Fast path: flatten complete, cache and skip.
+			storageKey := strings.TrimPrefix(volID, goldenLVPrefix)
+			if goldenReadyTimestamp(meta) != "" {
+				// Fast path: materialization complete, cache and skip.
 				m.mu.Lock()
-				m.goldenLVs[digestShort] = meta
+				m.goldenLVs[volID] = meta
 				m.mu.Unlock()
 			} else {
 				// Incomplete golden LV: destroy.
 				log.Printf("reconcile: destroying incomplete golden LV %s", volID)
-				mu := m.goldenMutex(digestShort)
+				mu := m.goldenMutex(storageKey)
 				mu.Lock()
 				m.destroyGoldenLVUnsafe(ctx, volID)
 				mu.Unlock()
@@ -1262,26 +1476,40 @@ func (m *luksVolumeManager) RootfsVolumeID(mode string, instanceID string) strin
 }
 
 // FindGoldenByImageRef scans the in-memory golden LV cache for a completed
-// entry matching imageRef. Linear scan — fine for the expected scale (10-30
-// golden LVs). When multiple entries match (mutable tag pulled at different
-// times), returns the most recently flattened one.
+// image-rootfs projection matching imageRef. Linear scan — fine for the
+// expected scale (10-30 golden LVs). When multiple entries match (mutable tag
+// pulled at different times), returns the most recently materialized one.
 func (m *luksVolumeManager) FindGoldenByImageRef(imageRef string) (digest string, goldenID string, found bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
 	var bestTime time.Time
-	for digestShort, meta := range m.goldenLVs {
-		if meta.BaseImageRef != imageRef || meta.FlattenComplete == "" {
+	for candidateID, meta := range m.goldenLVs {
+		if meta == nil || meta.BaseImageRef != imageRef || strings.TrimSpace(meta.BaseImageDigest) == "" {
 			continue
 		}
-		t, err := time.Parse(time.RFC3339, meta.FlattenComplete)
+		legacyImage := meta.GoldenIdentity == nil && meta.FlattenComplete != ""
+		typedImage := meta.GoldenIdentity != nil &&
+			meta.GoldenIdentity.SourceKind == GoldenSourceOCI &&
+			meta.GoldenIdentity.Projection == GoldenProjectionOCIImageRootfs
+		if !legacyImage && !typedImage {
+			continue
+		}
+		readyAt := goldenReadyTimestamp(meta)
+		if readyAt == "" {
+			continue
+		}
+		if _, err := m.ReadGoldenImageConfig(context.Background(), candidateID); err != nil {
+			continue
+		}
+		t, err := time.Parse(time.RFC3339, readyAt)
 		if err != nil {
 			continue
 		}
 		if !found || t.After(bestTime) {
 			bestTime = t
 			digest = meta.BaseImageDigest
-			goldenID = goldenLVPrefix + digestShort
+			goldenID = candidateID
 			found = true
 		}
 	}

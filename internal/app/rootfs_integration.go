@@ -34,6 +34,8 @@ func (m *AppManager) makeImagePullProgressCallback(
 	image string,
 	progressRange imagePullProgressRange,
 ) func(container.ImagePullReport) {
+	taskType, _ := m.inheritedTaskProgress(ctx, taskTypeInstallApp, progressRange.Min)
+
 	// Strip @sha256:... digest from display name — it's noise in the UI.
 	displayImage := image
 	if idx := strings.Index(displayImage, "@sha256:"); idx > 0 {
@@ -71,7 +73,7 @@ func (m *AppManager) makeImagePullProgressCallback(
 
 		m.emitProgressWithMetadata(
 			ctx,
-			taskTypeInstallApp,
+			taskType,
 			instanceID,
 			taskPhasePullingImage,
 			progress,
@@ -163,7 +165,7 @@ func (m *AppManager) prepareRootfsStorage(
 	}
 
 	// Get image config from the golden LV.
-	imgConfig, err := m.readImageConfigForRootfs(ctx, rootfs, imageDigest)
+	imgConfig, err := m.readImageConfigForGoldenRootfs(ctx, rootfs, handle.GoldenLV, imageDigest)
 	if err != nil {
 		log.Printf("WARN: rootfs %s: failed to read image config: %v", instanceID, err)
 		imgConfig = persistence.GoldenImageConfig{}
@@ -175,12 +177,25 @@ func (m *AppManager) prepareRootfsStorage(
 	}, nil
 }
 
-// readImageConfigForRootfs reads the golden image config by deriving the golden LV ID.
-func (m *AppManager) readImageConfigForRootfs(ctx context.Context, rootfs persistence.RootfsVolumeManager, imageDigest string) (persistence.GoldenImageConfig, error) {
+// readImageConfigForGoldenRootfs prefers the actual golden LV recorded on the
+// rootfs handle. Digest-derived candidates remain as a compatibility fallback
+// for callers that predate collision-disambiguated golden identities.
+func (m *AppManager) readImageConfigForGoldenRootfs(
+	ctx context.Context,
+	rootfs persistence.RootfsVolumeManager,
+	goldenID,
+	imageDigest string,
+) (persistence.GoldenImageConfig, error) {
 	canonical := canonicalImageDigestKey(imageDigest)
-	candidates := make([]string, 0, 2)
+	candidates := make([]string, 0, 3)
+	if strings.TrimSpace(goldenID) != "" {
+		candidates = append(candidates, strings.TrimSpace(goldenID))
+	}
 	if canonical != "" {
-		candidates = append(candidates, "golden-"+persistence.ShortDigest(canonical))
+		candidate := "golden-" + persistence.ShortDigest(canonical)
+		if candidate != goldenID {
+			candidates = append(candidates, candidate)
+		}
 	}
 	trimmed := strings.TrimSpace(imageDigest)
 	if trimmed != "" && trimmed != canonical {

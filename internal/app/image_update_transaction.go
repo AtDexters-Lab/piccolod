@@ -322,16 +322,24 @@ func (m *AppManager) abortV2OnlyImageUpdateTransition(ctx context.Context, state
 		if err != nil {
 			return fmt.Errorf("attach previous rootfs: %w", err)
 		}
-		restored, err := m.installContainerGroup(ctx, def, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+		restored, err := m.installContainerGroup(ctx, def, instanceID, layout, runtime, endpoints, prebuiltRootfs, true, false)
 		if err != nil {
 			return fmt.Errorf("recreate previous runtime: %w", err)
 		}
-		appInst.PrimaryService = restored.PrimaryService
-		appInst.NetworkAnchorID = restored.NetworkAnchorID
-		appInst.Containers = cloneStringMap(restored.Containers)
-		appInst.Definition = def
-		if err := state.StoreApp(appInst); err != nil {
-			return fmt.Errorf("store restored previous runtime: %w", err)
+		candidate, err := recreatedAppCandidate(appInst, restored)
+		if err != nil {
+			return m.abortUncommittedContainerGroup(err, state, appInst, restored, def, runtime)
+		}
+		candidate.Definition = def
+		if err := commitDetachedApp(state, appInst, candidate); err != nil {
+			return m.abortUncommittedContainerGroup(
+				fmt.Errorf("store restored previous runtime: %w", err),
+				state,
+				appInst,
+				restored,
+				def,
+				runtime,
+			)
 		}
 		m.setObservedStatus(instanceID, StatusRunning)
 	} else {
@@ -345,7 +353,6 @@ func (m *AppManager) abortV2OnlyImageUpdateTransition(ctx context.Context, state
 }
 
 func (m *AppManager) forwardCompleteV2OnlyImageUpdateTransition(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, record *TransitionRecord) error {
-	_ = ctx
 	instanceID := appInst.InstanceID
 	def, err := state.GetAppDefinition(instanceID)
 	if err != nil {
@@ -355,24 +362,28 @@ func (m *AppManager) forwardCompleteV2OnlyImageUpdateTransition(ctx context.Cont
 	if len(candidateActiveRootfs) == 0 {
 		candidateActiveRootfs = transitionCandidateActiveRootfs(record, appInst)
 	}
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return err
+	}
 	if len(candidateActiveRootfs) > 0 {
-		appInst.ActiveRootfs = candidateActiveRootfs
+		candidate.ActiveRootfs = candidateActiveRootfs
 	}
 	if len(record.Resources.CandidateContainers) > 0 {
-		appInst.Containers = cloneStringMap(record.Resources.CandidateContainers)
+		candidate.Containers = cloneStringMap(record.Resources.CandidateContainers)
 	}
 	if strings.TrimSpace(record.Resources.CandidateNetworkAnchorID) != "" {
-		appInst.NetworkAnchorID = record.Resources.CandidateNetworkAnchorID
+		candidate.NetworkAnchorID = record.Resources.CandidateNetworkAnchorID
 		if m.serviceManager != nil {
 			m.serviceManager.SetAppContainerID(instanceID, record.Resources.CandidateNetworkAnchorID)
 		}
 	}
 	if strings.TrimSpace(record.Resources.CandidatePrimaryService) != "" {
-		appInst.PrimaryService = record.Resources.CandidatePrimaryService
+		candidate.PrimaryService = record.Resources.CandidatePrimaryService
 	}
-	appInst.Definition = def
-	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst); err != nil {
+	candidate.Definition = def
+	candidate.UpdatedAt = time.Now()
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		return fmt.Errorf("store forward-completed image update metadata: %w", err)
 	}
 	if err := state.ClearTransitionRecord(instanceID); err != nil {
@@ -656,6 +667,10 @@ func (m *AppManager) forwardCompleteImageUpdate(ctx context.Context, state *File
 		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
 		return err
 	}
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return err
+	}
 	candidateMetadataAlreadyStored := len(txn.CandidateActiveRootfs) > 0 && mapsEqual(appInst.ActiveRootfs, txn.CandidateActiveRootfs)
 	if len(txn.CandidateContainers) == 0 && txn.CandidateNetworkAnchorID == "" {
 		if !candidateMetadataAlreadyStored {
@@ -664,23 +679,23 @@ func (m *AppManager) forwardCompleteImageUpdate(ctx context.Context, state *File
 					log.Printf("WARN: image update recovery %s: remove pre-commit containers: %v", instanceID, err)
 				}
 			}
-			appInst.Containers = nil
-			appInst.NetworkAnchorID = ""
+			candidate.Containers = nil
+			candidate.NetworkAnchorID = ""
 		}
 	} else {
-		appInst.Containers = cloneStringMap(txn.CandidateContainers)
-		appInst.NetworkAnchorID = txn.CandidateNetworkAnchorID
-		appInst.PrimaryService = txn.CandidatePrimaryService
+		candidate.Containers = cloneStringMap(txn.CandidateContainers)
+		candidate.NetworkAnchorID = txn.CandidateNetworkAnchorID
+		candidate.PrimaryService = txn.CandidatePrimaryService
 	}
 	if len(txn.CandidateActiveRootfs) > 0 {
-		appInst.ActiveRootfs = cloneStringMap(txn.CandidateActiveRootfs)
+		candidate.ActiveRootfs = cloneStringMap(txn.CandidateActiveRootfs)
 	}
-	appInst.Definition = def
-	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst); err != nil {
+	candidate.Definition = def
+	candidate.UpdatedAt = time.Now()
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		txn.Phase = imageUpdatePhaseForwardRepairFailed
 		txn.LastError = fmt.Sprintf("store app metadata: %v", err)
-		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, appInst)
+		_ = storeImageUpdateTransactionAndTransition(state, instanceID, txn, candidate)
 		return fmt.Errorf("store app metadata: %w", err)
 	}
 	if err := ensureImageUpdateActiveGeneration(state, appInst); err != nil {
@@ -825,14 +840,18 @@ func (m *AppManager) restorePreCommitImageUpdate(ctx context.Context, state *Fil
 			}
 		}
 	}
-	if len(txn.PreviousActiveRootfs) > 0 {
-		appInst.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
+	candidate, err := detachedAppCandidate(appInst)
+	if err != nil {
+		return err
 	}
-	appInst.Containers = nil
-	appInst.NetworkAnchorID = ""
-	appInst.Definition = def
-	appInst.UpdatedAt = time.Now()
-	if err := state.StoreApp(appInst); err != nil {
+	if len(txn.PreviousActiveRootfs) > 0 {
+		candidate.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
+	}
+	candidate.Containers = nil
+	candidate.NetworkAnchorID = ""
+	candidate.Definition = def
+	candidate.UpdatedAt = time.Now()
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		return m.markImageUpdateRestoreFailed(state, instanceID, txn, fmt.Errorf("store previous app state: %w", err))
 	}
 	if err := state.ClearTransitionRecord(instanceID); err != nil {

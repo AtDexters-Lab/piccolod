@@ -1,6 +1,6 @@
 **Problem:** Piccolo apps cannot declaratively publish a platform-known capability, consume the selected provider without provider-specific discovery, receive capability-derived accelerator access, or mount large reconstructible content outside ordinary app data.
 **In scope:** Versioned provider and consumer declarations; one device default per capability; app-private local binding; accelerator discovery and exclusive grant for `ai.inference.openai.v1`; OCI and Hugging Face sources; generic encrypted golden-content materialization; observable lifecycle, failure, and security contracts.
-**Out of scope:** An inference runtime; OpenAI semantic conformance testing; provider model, batching, residency, or memory policy; provider-state migration; a general service mesh; private source credentials; automatic mutable-reference refresh policy; multi-node capability execution or artifact activation; peer golden-LV transport implementation; and an implementation work plan.
+**Out of scope:** An inference runtime; OpenAI semantic conformance testing; provider model, batching, residency, or memory policy; provider-state migration; a general service mesh; private source credentials; automatic mutable-reference refresh policy; an artifact-specific incomplete-install healer; new artifact inventory or storage-diagnostics API fields; multi-node capability execution or artifact activation; peer golden-LV transport implementation; and an implementation work plan.
 
 # RFC: Capability Bindings and Reconstructible Artifacts
 
@@ -35,8 +35,9 @@ grant.
 The provider image owns OpenVINO, OVMS, vLLM, llama.cpp, or any other userspace
 runtime. Piccolod neither chooses that runtime nor manages models, batching, or
 inference memory. A provider cannot assume that declaring a capability grants
-accelerator devices: it must start and bind its declared listener without them,
-and may report the capability unavailable until it is selected.
+accelerator devices: an unselected provider must start and bind its declared
+listener without them and may report the capability unavailable until it is
+selected.
 
 ## 2. Architecture and invariants
 
@@ -134,7 +135,9 @@ Validation is structural:
 - a service cannot consume the same capability more than once;
 - binding environment-variable names must be valid and cannot collide with an
   explicit service variable, generated OIDC variable, or another binding; and
-- `base_path` must be a canonical absolute path without query or fragment.
+- `base_path` must be a canonical absolute path without query or fragment; each
+  segment must be terminal after one percent-decode, with no residual escaping,
+  separator, backslash, NUL, or dot-segment meaning.
 
 Piccolod does not probe model availability, OpenAI resources, request/response
 schemas, streaming, backend support, performance, or output quality.
@@ -198,9 +201,11 @@ new resolution occurs is deferred.
 
 Artifact mounts are always read-only. A declaration must be referenced by at
 least one service, and a mount must reference a declaration. Paths must not
-overlap another mount target in the same service. Host paths, writable mode,
-subpaths, artifact-specific replication settings, and manifest storage quotas
-are not part of this contract.
+overlap another mount target in the same service. An
+`ai.inference.openai.v1` provider's artifact targets also cannot overlap the
+capability-owned `/dev/dri` or `/dev/accel` device families. Host paths,
+writable mode, subpaths, artifact-specific replication settings, and manifest
+storage quotas are not part of this contract.
 
 ## 4. Capability behavior
 
@@ -220,11 +225,12 @@ Piccolod stores one selected provider per capability:
   capability declaration, invalidates the selection and chooses a deterministic
   remaining provider when one exists, otherwise the capability becomes
   unavailable;
-- a manual Stop or temporary failure retains the selected identity and does not
-  silently switch to another provider; Stop withdraws its accelerator grant and
-  leaves consumers on HTTP 503 until that provider starts again; and
-- every effective binding change restarts affected consumer app groups, even
-  when the old and new bindings declare the same path.
+- a manual Stop or temporary failure retains both the selected identity and its
+  host device-node permission; no running container is present to exercise that
+  permission, and consumers receive HTTP 503 until the provider is usable; and
+- an affected consumer app group restarts only when its injected binding
+  environment changes. A provider or route retarget that preserves the
+  injected value does not restart the consumer.
 
 Candidate eligibility and existing-selection validity are distinct. An app is
 eligible to become a new default when its committed installed manifest declares
@@ -242,10 +248,11 @@ this before a user-initiated switch or removal.
 
 Provider selection is by app instance. The listener and `base_path` are derived
 from the installed manifest because one app cannot publish the same capability
-from multiple listeners. An effective binding change includes selecting a
-different app instance or committing an update to the selected app that changes
-its capability listener or `base_path`. Exact management API wire shapes and UI
-text belong to the API specification and implementation plan, not this RFC.
+from multiple listeners. Selecting a different app retargets the private route.
+A consumer restart is needed only when the resulting injected `base_url`
+changes, such as when the selected `base_path` changes. Exact management API
+wire shapes and UI text belong to the API specification and implementation
+plan, not this RFC.
 
 ### 4.2 Private local binding
 
@@ -287,9 +294,9 @@ path.
 
 The private origin remains stable for the installed binding until that binding
 is removed. When no provider has yet supplied a path, the consumer receives the
-private origin alone and every request returns HTTP 503. Selecting the first
-provider or changing the effective binding reconciles the consumer and injects
-the origin composed with the newly selected path.
+private origin alone and every request returns HTTP 503. Piccolod recreates the
+consumer only when the composed injected value changes; otherwise it retargets
+the existing private route without changing the consumer environment.
 
 The private route targets the selected provider's ordinary listener backend but
 does not traverse its public listener authentication flow. V1 injects no
@@ -341,7 +348,10 @@ For `ai.inference.openai.v1`:
 - all service containers in that provider app receive those device families;
 - a non-default provider receives none merely because it declares the
   capability;
-- an installing or switching candidate receives no provisional grant;
+- a fresh install or different-provider switching candidate receives no
+  provisional grant;
+- a replacement generation of the already-selected app inherits that app's
+  grant after the previous generation is proven absent;
 - when no default exists, no app receives the capability-derived devices; and
 - a selected provider's temporary failure does not transfer the grant.
 
@@ -349,14 +359,21 @@ An unselected provider must remain startable and listener-capable without these
 devices; it may stay idle or return HTTP 503 for inference requests. Initial
 install therefore completes without accelerator authority. If the committed
 app becomes the default, Piccolod recreates its containers with the grant.
-Grant acquisition and loss use ordinary container recreation rather than
-device hot-plug.
+
+Accelerator entitlement and host device-node permission belong to the selected
+app instance, not to a particular container generation. Stop, start, crash, and
+same-app replacement do not revoke that permission. Running containers receive
+the device mappings when they are created; a stopped app has no process or
+mapping that can exercise the retained permission. Same-app replacement proves
+the previous generation absent and creates the replacement with the inherited
+grant, without a device-free intermediate generation or a second recreation.
 
 The grant includes whatever host permission is necessary for the provider's
-configured container user to open the mapped nodes. Device mapping and host
-permission grant/revocation are one ownership boundary. Before a different
-provider starts with those devices, Piccolod must establish that the old
-provider's mapped containers and access grant are absent.
+configured container user to open the mapped nodes. Before a different provider
+starts with those devices, Piccolod must establish that the old provider's
+mapped containers are absent, revoke the old app's host device-node permission,
+and grant the new selected app. Uninstall or removal of the selected capability
+declaration follows the same ownership-transfer boundary.
 
 This grant follows from the registered capability and current default. Catalog
 provenance, maintainer identity, a system-app label, and the broad legacy
@@ -475,17 +492,26 @@ Each existing lifecycle path remains responsible for applying and releasing its
 own capability bindings, accelerator effects, and golden references. Small
 shared helpers may implement repeated mechanics.
 
-Stopping the selected provider withdraws its accelerator grant and makes its
-binding unavailable without changing the selected identity; starting it
-restores that selection. Uninstall or a committed update that removes the
-selected capability declaration invalidates the selection and runs the ordinary
-deterministic replacement rule.
+Ordinary app lifecycle commits do not independently publish an automatic
+capability default and leave its effects for later. Existing app reconciliation
+derives that default and applies the resulting provider and consumer effects as
+one convergence step. Explicit administrator selection remains a synchronous
+cross-app operation with post-commit repair semantics.
+
+Stopping the selected provider makes its binding unavailable without changing
+its selected identity or host device-node permission; starting it reuses both.
+Uninstall or a committed update that removes the selected capability declaration
+invalidates the selection and runs the ordinary deterministic replacement rule,
+including revocation before another app receives the devices.
 
 A provider install starts and proves listener readiness without
 capability-derived devices. Only after the install commits may automatic
 selection trigger recreation with the grant. A provider that cannot bind its
-listener without devices fails the ordinary install/update readiness check; it
-does not receive pre-commit candidate authority.
+listener while unselected fails the ordinary install readiness check; it does
+not receive pre-commit candidate authority. This rule does not make a new
+generation of the already-selected app a new authority candidate: after the old
+generation is absent, the replacement starts with the selected app's existing
+grant.
 
 Artifact work has no capability authority. A provider materializing content
 does not reserve or freeze a default, binding, or accelerator grant. At
@@ -499,13 +525,16 @@ runtime effects before releasing the final golden references.
 
 ### 7.2 Provider and binding changes
 
-An effective binding change, including a selected-provider update that changes
-its capability listener or `base_path`, has two externally observable phases:
+Switching to a different provider has two externally observable phases:
 
-1. consumer ingresses become unavailable for the changing binding; and
-2. after the old accelerator ownership is absent, the new selected provider is
-   recreated with devices and affected consumers are recreated against its
-   binding.
+1. consumer ingresses become unavailable for the changing route; and
+2. after the old provider's processes and host permission are absent, the new
+   selected provider starts with devices and Piccolod retargets the ingresses.
+
+Affected consumers are recreated only if their injected binding environment
+changes. A selected app's ordinary replacement retains its authority: after the
+old generation is absent, the replacement starts once with devices. It does not
+commit a device-free generation and then recreate it.
 
 Requests already in flight may be interrupted. Failure and rollback use the
 existing app lifecycle; this RFC adds no independent capability transaction or
@@ -518,6 +547,13 @@ Partial materialization remains non-mountable and is resumed or cleaned by the
 existing golden lifecycle. Capability defaults are reconstructed from their
 ordinary durable state; private ingresses and device grants are reconciled as
 effects.
+
+If a fresh app install fails and cleanup cannot prove that all candidate
+processes are absent, Piccolod retains the candidate-owned resources fail
+closed. It does not publish an installed app and does not run a new
+artifact-specific background orphan healer. An explicit retry or ordinary
+restart recovery may prove absence and clean or reuse those resources; unrelated
+installed apps continue through their existing lifecycle.
 
 Retrying an explicitly pinned source must continue to satisfy its pin. Retrying
 recorded Ready content does not silently follow a mutable tag or branch.
@@ -544,10 +580,10 @@ The following table records outcomes, not an implementation state machine:
 
 | Canonical event | Owner and required outcome |
 |---|---|
-| Start or activation | The existing app lifecycle requests bindings, grants, and golden references. A provider candidate starts and binds its listener without capability-derived devices; only a committed selected default is recreated with them. No artifact mount is created before Ready. |
+| Start or activation | The existing app lifecycle requests bindings, grants, and golden references. A fresh or unselected provider starts without capability-derived devices. The already-selected app starts or replaces its stopped generation with its retained host permission and mapped devices. No artifact mount is created before Ready. |
 | Normal completion or commit | The ordinary app transition publishes the new runtime and then releases superseded golden references. A provider handoff publishes usable new access only after old accelerator ownership is absent. |
 | Failure before visible effect | Candidate work fails without changing the committed runtime, default, or existing golden references. |
-| Pause or suspension | This feature adds no manual pause state. Ordinary app stop may make a binding unavailable while retaining its selected provider and durable golden references. |
+| Pause or suspension | This feature adds no manual pause state. Ordinary app stop may make a binding unavailable while retaining its selected provider, host device-node permission, and durable golden references. |
 | Resume or reacquisition | Existing app reconciliation restores private ingress, Ready attachments, and the selected provider's grant from authoritative app/default/reference state. |
 | Cancellation, interruption, or abort | Existing shutdown, update, uninstall, and app-lifecycle cancellation rules own cleanup. V1 adds no user-facing active-download cancellation contract. |
 | Supersession, handoff, or owner change | Current capability state wins independently of pending artifact work. Accelerator ownership cannot overlap during a provider handoff. |
@@ -561,7 +597,8 @@ Effect ordering is constrained only where an invariant requires it:
 
 - verified Ready state precedes artifact attachment;
 - an app reference precedes its live attachment and outlives that attachment;
-- old accelerator mapping and host access are absent before the new grant;
+- old accelerator mapping and host access are absent before a different app
+  receives the new grant;
 - a changed binding is unavailable until its selected provider and route are
   usable; and
 - superseded golden references are released only after the corresponding old
@@ -606,9 +643,9 @@ cases here.
 | Condition | Observable behavior |
 |---|---|
 | No usable selected provider | Consumer private ingress returns HTTP 503 |
-| Selected provider is stopped or temporarily fails | Selection is retained; accelerator access is absent while stopped; consumers receive HTTP 503; no implicit provider switch |
-| Selected provider is uninstalled or its committed manifest removes the capability | Select the deterministic eligible replacement, or become unavailable; affected consumers restart |
-| Effective binding changes | Affected consumers restart; in-flight requests may be interrupted |
+| Selected provider is stopped or temporarily fails | Selection and host device-node permission are retained; no stopped container can exercise them; consumers receive HTTP 503; no implicit provider switch |
+| Selected provider is uninstalled or its committed manifest removes the capability | Revoke its permission, select the deterministic eligible replacement or become unavailable, and restart consumers only if their injected binding changes |
+| Provider route or binding changes | Retarget the private ingress; restart affected consumers only if their injected binding environment changes; in-flight requests may be interrupted |
 | Old accelerator access cannot be revoked | New provider does not receive the devices |
 | Provider cannot bind its listener without accelerator devices | Its install/update candidate fails without changing the committed default or grant |
 | Source resolution, download, or verification fails | Candidate is not published; committed runtime remains |

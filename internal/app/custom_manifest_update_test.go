@@ -78,6 +78,295 @@ func TestEvaluateCustomManifestUpdatePolicy_EnvWithPersistentStorageRequiresData
 	}
 }
 
+func TestEvaluateCustomManifestUpdatePolicy_CapabilityConsumesRequiresAccessReview(t *testing.T) {
+	oldDef := customManifestPolicyBaseDef()
+	newDef := customManifestPolicyClone(t, oldDef)
+	svc := newDef.Services["main"]
+	svc.Consumes = []api.CapabilityConsumer{{
+		Capability: api.CapabilityAIInferenceOpenAIV1,
+		Env: map[string]string{
+			"OPENAI_BASE_URL": api.CapabilityBindingBaseURL,
+		},
+	}}
+	newDef.Services["main"] = svc
+
+	policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+	if policy.Allowed {
+		t.Fatalf("capability access change must require operator review")
+	}
+	decision := findManifestDecision(policy.Classification.Decisions, "capability_consumes_changed")
+	if decision == nil || decision.Outcome != "operator_review" {
+		t.Fatalf("expected operator_review capability decision, got %+v", decision)
+	}
+	if !slices.Contains(policy.Classification.OperationRiskFlags, "capability_access_changed") {
+		t.Fatalf("capability access risk flag missing: %v", policy.Classification.OperationRiskFlags)
+	}
+	if len(policy.Classification.ExposureReview) != 1 {
+		t.Fatalf("capability exposure review = %+v, want one row", policy.Classification.ExposureReview)
+	}
+	review := policy.Classification.ExposureReview[0]
+	if review.Kind != "capability_access" ||
+		review.Old != "none" ||
+		!strings.Contains(review.New, api.CapabilityAIInferenceOpenAIV1) ||
+		!strings.Contains(review.New, "OPENAI_BASE_URL") {
+		t.Fatalf("capability exposure review = %+v, want explicit old/new access", review)
+	}
+	if !slices.Contains(policy.Classification.RequiredConfirmations, review.Confirmation) {
+		t.Fatalf("capability exposure confirmation %q missing from %v", review.Confirmation, policy.Classification.RequiredConfirmations)
+	}
+}
+
+func TestEvaluateCustomManifestUpdatePolicy_CapabilityProvidesRequiresAuthorityReview(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		oldPath string
+		newPath string
+	}{
+		{name: "adds provider authority", newPath: "/v1"},
+		{name: "widens provider authority", oldPath: "/v1", newPath: "/"},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			oldDef := customManifestPolicyBaseDef()
+			newDef := customManifestPolicyClone(t, oldDef)
+			if test.oldPath != "" {
+				oldDef.Listeners[0].Provides = []api.CapabilityProvider{{
+					Capability: api.CapabilityAIInferenceOpenAIV1,
+					BasePath:   test.oldPath,
+				}}
+			}
+			newDef.Listeners[0].Provides = []api.CapabilityProvider{{
+				Capability: api.CapabilityAIInferenceOpenAIV1,
+				BasePath:   test.newPath,
+			}}
+
+			policy, _ := evaluateCustomManifestUpdatePolicy(oldDef, newDef)
+			if policy.Allowed {
+				t.Fatal("provider authority change must require operator review")
+			}
+			decision := findManifestDecision(policy.Classification.Decisions, "capability_provides_changed")
+			if decision == nil || decision.Outcome != "operator_review" {
+				t.Fatalf("expected provider-authority operator review, got %+v", decision)
+			}
+			if !slices.Contains(policy.Classification.OperationRiskFlags, "capability_provider_authority_changed") {
+				t.Fatalf("provider authority risk flag missing: %v", policy.Classification.OperationRiskFlags)
+			}
+			if len(policy.Classification.ExposureReview) != 1 {
+				t.Fatalf("provides-only exposure review = %+v, want one provider-authority row", policy.Classification.ExposureReview)
+			}
+			var review *ManifestUpdateReviewItem
+			for index := range policy.Classification.ExposureReview {
+				item := &policy.Classification.ExposureReview[index]
+				if item.Kind == "capability_provider_authority" {
+					review = item
+					break
+				}
+			}
+			if review == nil ||
+				!strings.Contains(review.New, api.CapabilityAIInferenceOpenAIV1) ||
+				!strings.Contains(review.New, test.newPath) ||
+				(test.oldPath == "" && review.Old != "none") ||
+				(test.oldPath != "" && !strings.Contains(review.Old, test.oldPath)) {
+				t.Fatalf("provider authority review = %+v, want exact old/new capability and base path", review)
+			}
+			if !slices.Contains(policy.Classification.RequiredConfirmations, review.Confirmation) {
+				t.Fatalf("provider authority confirmation %q missing from %v", review.Confirmation, policy.Classification.RequiredConfirmations)
+			}
+		})
+	}
+}
+
+func TestCustomManifestUpdate_SelectedProviderRemovalRequiresDisclosureAcknowledgement(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mgr, err := NewAppManagerForTest(NewMockContainerManager(), tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	mgr.SetMountVerifier(func(string) error { return nil })
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+
+	oldDef := customManifestPolicyBaseDef()
+	oldDef.Extensions["requires_features"] = []string{api.FeatureCapabilityBindingsV1}
+	mainService := oldDef.Services["main"]
+	mainService.Storage = nil
+	oldDef.Services["main"] = mainService
+	oldDef.Listeners[0].Provides = []api.CapabilityProvider{{
+		Capability: api.CapabilityAIInferenceOpenAIV1,
+		BasePath:   "/v1",
+	}}
+	rootfs := newStubRootfsManager(tempDir)
+	rootfs.exists = map[string]bool{
+		"rootfs-main":   true,
+		"rootfs-anchor": true,
+	}
+	rootfs.identities = map[string]persistence.RootfsImageIdentity{
+		"rootfs-main": {
+			VolumeID:        "rootfs-main",
+			BaseImageRef:    "docker.io/example/piclu:stable",
+			BaseImageDigest: "sha256:mockdigest",
+		},
+		"rootfs-anchor": {
+			VolumeID:        "rootfs-anchor",
+			BaseImageRef:    networkAnchorImage(),
+			BaseImageDigest: "sha256:mockdigest",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	now := time.Now().UTC()
+	appInst := &AppInstance{
+		InstanceID:      "piclu",
+		Enabled:         true,
+		PrimaryService:  "main",
+		NetworkAnchorID: "cid-anchor",
+		Containers:      map[string]string{"main": "cid-main"},
+		ActiveRootfs: map[string]string{
+			"main":                   "rootfs-main",
+			networkAnchorServiceName: "rootfs-anchor",
+		},
+		CreatedAt:  now,
+		UpdatedAt:  now,
+		Definition: oldDef,
+	}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store app: %v", err)
+	}
+	durable := newCapabilityState()
+	durable.Defaults[api.CapabilityAIInferenceOpenAIV1] = appInst.InstanceID
+	if err := state.storeCapabilityState(durable); err != nil {
+		t.Fatalf("store selected provider: %v", err)
+	}
+
+	candidateDef := customManifestPolicyClone(t, oldDef)
+	candidateDef.Listeners[0].Provides = nil
+	candidateDef.Listeners[0].Name = "__primary"
+	candidateDef.Listeners[0].Primary = false
+	rawTemplate, err := SerializeAppDefinition(candidateDef)
+	if err != nil {
+		t.Fatalf("serialize candidate: %v", err)
+	}
+	result, err := mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    appInst.InstanceID,
+		RawTemplate:   rawTemplate,
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("dry run: %v", err)
+	}
+	if !result.Applicable {
+		t.Fatalf("selected provider removal should be reviewable: %s", result.BlockingReason)
+	}
+	if !slices.Contains(result.RequiredConfirmations, selectedProviderRemovalReviewConfirmation) {
+		t.Fatalf(
+			"required confirmations %v missing %q",
+			result.RequiredConfirmations,
+			selectedProviderRemovalReviewConfirmation,
+		)
+	}
+	if !slices.Contains(result.Summary.ExpectedInterruption, CapabilityProviderChangeDisclosure) {
+		t.Fatalf(
+			"expected interruption %v missing provider disclosure %q",
+			result.Summary.ExpectedInterruption,
+			CapabilityProviderChangeDisclosure,
+		)
+	}
+
+	confirmations := make([]string, 0, len(result.RequiredConfirmations))
+	for _, confirmation := range result.RequiredConfirmations {
+		if confirmation != selectedProviderRemovalReviewConfirmation {
+			confirmations = append(confirmations, confirmation)
+		}
+	}
+	_, err = mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         appInst.InstanceID,
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		TransitionPlanHash: result.TransitionPlanHash,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      confirmations,
+	})
+	if !errors.Is(err, ErrManifestUpdateRejected) ||
+		!strings.Contains(err.Error(), selectedProviderRemovalReviewConfirmation) {
+		t.Fatalf("apply err = %v, want missing selected-provider removal acknowledgement", err)
+	}
+	current, err := state.GetAppDefinition(appInst.InstanceID)
+	if err != nil {
+		t.Fatalf("current definition: %v", err)
+	}
+	if _, _, ok := providedCapability(current, api.CapabilityAIInferenceOpenAIV1); !ok {
+		t.Fatal("provider declaration changed before selected-provider removal acknowledgement")
+	}
+
+	result, err = mgr.DryRunCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:    appInst.InstanceID,
+		RawTemplate:   rawTemplate,
+		SystemContext: InstallSystemContext{Domain: "local", Architecture: "amd64", Timezone: "Etc/UTC"},
+	})
+	if err != nil {
+		t.Fatalf("second dry run: %v", err)
+	}
+	finalizeErr := errors.New("injected capability finalization failure")
+	failFinalization := true
+	state.storeCapabilityStateHook = func(*capabilityState) error {
+		if failFinalization {
+			return finalizeErr
+		}
+		return nil
+	}
+	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+		InstanceID:         appInst.InstanceID,
+		BaseManifestHash:   result.BaseManifestHash,
+		RuntimeFingerprint: result.RuntimeFingerprint,
+		TransitionPlanHash: result.TransitionPlanHash,
+		DryRunToken:        result.DryRunToken,
+		Confirmations:      result.RequiredConfirmations,
+	})
+	if err != nil {
+		t.Fatalf("acknowledged apply: %v", err)
+	}
+	if !applied.AccessRepairPending || !strings.Contains(applied.AccessRepairMessage, finalizeErr.Error()) {
+		t.Fatalf(
+			"acknowledged apply repair state = pending:%v message:%q, want injected capability failure",
+			applied.AccessRepairPending,
+			applied.AccessRepairMessage,
+		)
+	}
+	current, err = state.GetAppDefinition(appInst.InstanceID)
+	if err != nil {
+		t.Fatalf("updated definition: %v", err)
+	}
+	if _, _, ok := providedCapability(current, api.CapabilityAIInferenceOpenAIV1); ok {
+		t.Fatal("acknowledged apply retained provider declaration")
+	}
+	storedCapability, err := state.loadCapabilityState()
+	if err != nil {
+		t.Fatalf("load capability state before repair: %v", err)
+	}
+	if got := storedCapability.Defaults[api.CapabilityAIInferenceOpenAIV1]; got != appInst.InstanceID {
+		t.Fatalf("failed capability finalization changed default to %q", got)
+	}
+
+	failFinalization = false
+	if blocked := mgr.recoverPendingManifestUpdates(context.Background(), state); blocked[appInst.InstanceID] {
+		t.Fatalf("capability access repair remained blocked: %v", blocked)
+	}
+	storedCapability, err = state.loadCapabilityState()
+	if err != nil {
+		t.Fatalf("load capability state after repair: %v", err)
+	}
+	if got := storedCapability.Defaults[api.CapabilityAIInferenceOpenAIV1]; got != "" {
+		t.Fatalf("capability access repair retained stale default %q", got)
+	}
+	if _, err := state.LoadManifestUpdateTransaction(appInst.InstanceID); !os.IsNotExist(err) {
+		t.Fatalf("capability access repair retained transaction: %v", err)
+	}
+}
+
 func TestCleanupCommittedManifestUpdateKeepsLegacyJournalWhenTransitionClearFails(t *testing.T) {
 	tmp, err := os.MkdirTemp("", "manifest_committed_cleanup_v2_clear")
 	if err != nil {
@@ -5811,6 +6100,90 @@ func TestRestorePrecommitDataSnapshotRefusesRollbackWithoutQuiescenceProof(t *te
 	}
 	if len(volumes.rollbacks) != 0 {
 		t.Fatalf("rollback attempts = %v, want none without quiescence proof", volumes.rollbacks)
+	}
+}
+
+func TestRestoreInstalledAppApplyFailureRetainsCandidateWithoutProcessAbsenceProof(t *testing.T) {
+	tempDir := t.TempDir()
+	paths.SetCoreRootForTest(t, tempDir)
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	mgr.ForceLockState(false)
+	state, err := mgr.ensureStateManager()
+	if err != nil {
+		t.Fatalf("state manager: %v", err)
+	}
+	prevDef := customManifestPolicyBaseDef()
+	failedDef := customManifestPolicyClone(t, prevDef)
+	failedDef.Services["main"] = api.AppService{Image: "candidate:latest"}
+	app := &AppInstance{
+		InstanceID:         "piclu",
+		Enabled:            true,
+		PrimaryService:     "main",
+		Definition:         failedDef,
+		ArtifactReferences: map[string]string{"model": "ref-candidate"},
+	}
+	if err := state.StoreApp(app); err != nil {
+		t.Fatalf("store candidate app: %v", err)
+	}
+	txn := &ManifestUpdateTransaction{
+		OperationID:           "op-candidate-survivor",
+		OperationKind:         "modify_app",
+		Phase:                 "runtime_touched",
+		RuntimeSwitchStarted:  true,
+		RuntimeTouched:        true,
+		PreviousArtifactRefs:  map[string]string{"model": "ref-previous"},
+		CandidateArtifactRefs: map[string]string{"model": "ref-candidate"},
+	}
+	if err := state.StoreManifestUpdateTransaction(app.InstanceID, txn); err != nil {
+		t.Fatalf("store manifest transaction: %v", err)
+	}
+	rootfs := &compensationRootfsManager{
+		stubRootfsManager: newStubRootfsManager(t.TempDir()),
+	}
+	mgr.SetRootfsManager(rootfs)
+	quiesceErr := errors.New("injected candidate absence-proof failure")
+	mgr.userSessionQuiescer = func(context.Context, string) error { return quiesceErr }
+
+	err = mgr.restoreInstalledAppApplyFailure(
+		context.Background(),
+		state,
+		app,
+		prevDef,
+		failedDef,
+		txn,
+		taskTypeUpdateManifest,
+		"manifest update",
+		services.PublicationResumeToken{},
+		errors.New("candidate install failed"),
+	)
+	if !errors.Is(err, quiesceErr) {
+		t.Fatalf("restore error = %v, want process-absence failure", err)
+	}
+	if len(mock.containers) != 0 {
+		t.Fatalf("rollback started a competing runtime: %+v", mock.containers)
+	}
+	if len(rootfs.artifactDetached) != 0 || len(rootfs.artifactDestroyed) != 0 || len(rootfs.detached) != 0 {
+		t.Fatalf(
+			"rollback released candidate ownership without absence proof: artifact_detached=%v artifact_destroyed=%v rootfs=%v",
+			rootfs.artifactDetached,
+			rootfs.artifactDestroyed,
+			rootfs.detached,
+		)
+	}
+	storedTxn, err := state.LoadManifestUpdateTransaction(app.InstanceID)
+	if err != nil {
+		t.Fatalf("load retained transaction: %v", err)
+	}
+	if storedTxn.Phase != "restore_failed" || !strings.Contains(storedTxn.LastError, quiesceErr.Error()) {
+		t.Fatalf("retained transaction = %+v", storedTxn)
+	}
+	stored, ok := state.GetApp(app.InstanceID)
+	if !ok || stored.Definition.Services["main"].Image != "candidate:latest" {
+		t.Fatalf("rollback published previous state without absence proof: %+v", stored)
 	}
 }
 

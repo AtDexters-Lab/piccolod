@@ -2,6 +2,8 @@ package persistence
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
@@ -13,6 +15,75 @@ import (
 	"piccolod/internal/storage/lvm"
 	"piccolod/internal/testutil"
 )
+
+type goldenRecreateOrderRunner struct {
+	metaPath          string
+	goldenID          string
+	physicalExists    bool
+	removeFailures    int
+	removeFailure     error
+	createFailure     error
+	publicationEvents []string
+}
+
+func (r *goldenRecreateOrderRunner) recordPublicationEvent(operation string) {
+	meta, err := readVolumeMetaV3(r.metaPath)
+	if err != nil {
+		r.publicationEvents = append(r.publicationEvents, operation+":metadata-unavailable")
+		return
+	}
+	r.publicationEvents = append(
+		r.publicationEvents,
+		fmt.Sprintf("%s:%d", operation, meta.SizeBytes),
+	)
+}
+
+func (r *goldenRecreateOrderRunner) Run(_ context.Context, name string, args ...string) error {
+	switch name {
+	case "lvs":
+		if r.physicalExists {
+			return nil
+		}
+		return errors.New("LV not found")
+	case "lvremove":
+		r.recordPublicationEvent("remove")
+		if r.removeFailures > 0 {
+			r.removeFailures--
+			return r.removeFailure
+		}
+		r.physicalExists = false
+		return nil
+	case "lvcreate":
+		r.recordPublicationEvent("create")
+		return r.createFailure
+	default:
+		return nil
+	}
+}
+
+func (r *goldenRecreateOrderRunner) RunWithOutput(
+	_ context.Context,
+	name string,
+	_ ...string,
+) ([]byte, error) {
+	if name == "lvs" && r.physicalExists {
+		return []byte(fmt.Sprintf(
+			"%s 1073741824 Vwi-a-tz-- %s\n",
+			r.goldenID,
+			lvm.DefaultThinPoolName,
+		)), nil
+	}
+	return nil, nil
+}
+
+func (r *goldenRecreateOrderRunner) RunWithStdin(
+	ctx context.Context,
+	_ []byte,
+	name string,
+	args ...string,
+) error {
+	return r.Run(ctx, name, args...)
+}
 
 func TestServiceRootfsVolumeID(t *testing.T) {
 	tests := []struct {
@@ -149,6 +220,101 @@ func TestGoldenLVSizeForImage(t *testing.T) {
 				t.Errorf("goldenLVSizeForImage(%d) = %d, want %d", tt.imageSizeBytes, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestEnsureGoldenLVRecreatePublishesOnlyAfterVerifiedStaleTeardown(t *testing.T) {
+	root := t.TempDir()
+	paths.SetCoreRootForTest(t, root)
+
+	digest := "sha256:" + strings.Repeat("a", 64)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	candidates, err := candidateGoldenIDs(identity, digest)
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	metaPath := filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File)
+	const staleSize = int64(12345)
+	if err := os.MkdirAll(paths.VolumeMetaDir(goldenID), 0o700); err != nil {
+		t.Fatalf("create stale golden metadata directory: %v", err)
+	}
+	if err := writeVolumeMetaV3(metaPath, &volumeMetaV3{
+		Version:        metadataV3Version,
+		Type:           volumeTypeGolden,
+		LVName:         goldenID,
+		VGName:         lvm.DefaultVGName,
+		SizeBytes:      staleSize,
+		GoldenIdentity: &identity,
+	}); err != nil {
+		t.Fatalf("write stale golden metadata: %v", err)
+	}
+
+	removeFailure := errors.New("injected stale LV removal failure")
+	createFailure := errors.New("injected replacement LV creation failure")
+	run := &goldenRecreateOrderRunner{
+		metaPath:       metaPath,
+		goldenID:       goldenID,
+		physicalExists: true,
+		removeFailures: 1,
+		removeFailure:  removeFailure,
+		createFailure:  createFailure,
+	}
+	manager, err := NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+		Run:   run,
+		LVMgr: lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		FlattenFn: func(context.Context, string, string, string) (GoldenImageConfig, error) {
+			return GoldenImageConfig{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewLUKSVolumeManager: %v", err)
+	}
+	req := GoldenLVRequest{
+		ImageDigest:   digest,
+		ImageRef:      "registry.example/provider:latest",
+		ImageSizeHint: 64 << 20,
+	}
+
+	if _, err := manager.EnsureGoldenLV(context.Background(), req); !errors.Is(err, removeFailure) {
+		t.Fatalf("first EnsureGoldenLV error = %v, want stale removal failure", err)
+	}
+	staleMeta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatalf("read retained stale metadata: %v", err)
+	}
+	if staleMeta.SizeBytes != staleSize {
+		t.Fatalf("stale marker was replaced before teardown: size=%d want=%d", staleMeta.SizeBytes, staleSize)
+	}
+
+	if _, err := manager.EnsureGoldenLV(context.Background(), req); !errors.Is(err, createFailure) {
+		t.Fatalf("retry EnsureGoldenLV error = %v, want replacement creation failure", err)
+	}
+	retryMeta, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		t.Fatalf("read retry metadata: %v", err)
+	}
+	retrySize := goldenLVSizeForImage(req.ImageSizeHint)
+	if retryMeta.SizeBytes != retrySize || goldenReadyTimestamp(retryMeta) != "" {
+		t.Fatalf("retry marker = %+v, want incomplete size %d", retryMeta, retrySize)
+	}
+
+	wantEvents := []string{
+		fmt.Sprintf("remove:%d", staleSize),
+		fmt.Sprintf("remove:%d", staleSize),
+		fmt.Sprintf("create:%d", retrySize),
+	}
+	if len(run.publicationEvents) != len(wantEvents) {
+		t.Fatalf("publication events = %v, want %v", run.publicationEvents, wantEvents)
+	}
+	for index := range wantEvents {
+		if run.publicationEvents[index] != wantEvents[index] {
+			t.Fatalf("publication events = %v, want %v", run.publicationEvents, wantEvents)
+		}
 	}
 }
 

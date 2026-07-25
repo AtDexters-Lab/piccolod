@@ -232,8 +232,9 @@ type AppDefinition struct {
 	// Inputs definition for dynamic configuration
 	Inputs map[string]AppInput `yaml:"inputs,omitempty" json:"inputs,omitempty"`
 	// Compose-style multi-container apps (service mode only)
-	PrimaryService string                `yaml:"primary_service,omitempty" json:"primary_service,omitempty"`
-	Services       map[string]AppService `yaml:"services,omitempty" json:"services,omitempty"`
+	PrimaryService string                 `yaml:"primary_service,omitempty" json:"primary_service,omitempty"`
+	Services       map[string]AppService  `yaml:"services,omitempty" json:"services,omitempty"`
+	Artifacts      map[string]AppArtifact `yaml:"artifacts,omitempty" json:"artifacts,omitempty"`
 	// Service-oriented listener configuration (v1)
 	Listeners   []AppListener          `yaml:"listeners,omitempty" json:"listeners,omitempty"`
 	Storage     *AppStorage            `yaml:"storage,omitempty" json:"storage,omitempty"`
@@ -254,6 +255,19 @@ const (
 	// ignore unknown nested connection_auth fields, so manifests using mTLS must
 	// declare this capability explicitly.
 	FeatureConnectionAuthMTLSV1 = "connection_auth_mtls_v1"
+
+	// FeatureCapabilityBindingsV1 gates provider and consumer declarations for
+	// Piccolod-registered capabilities.
+	FeatureCapabilityBindingsV1 = "capability_bindings_v1"
+
+	// FeatureArtifactBindingsV1 gates reconstructible golden-content
+	// declarations and read-only service attachments.
+	FeatureArtifactBindingsV1 = "artifact_bindings_v1"
+)
+
+const (
+	CapabilityAIInferenceOpenAIV1 = "ai.inference.openai.v1"
+	CapabilityBindingBaseURL      = "base_url"
 )
 
 // AppListener defines a named service exposed by the app (service-oriented model)
@@ -268,6 +282,7 @@ type AppListener struct {
 	Auth           *ListenerAuth           `yaml:"auth,omitempty" json:"auth,omitempty"`
 	ConnectionAuth *ConnectionAuth         `yaml:"connection_auth,omitempty" json:"connection_auth,omitempty"`
 	PortClaim      *int                    `yaml:"port_claim,omitempty" json:"port_claim,omitempty"`
+	Provides       []CapabilityProvider    `yaml:"provides,omitempty" json:"provides,omitempty"`
 	// TLSWrap opts a flow:tcp + protocol:raw listener into TLS-mux hostname
 	// routing on :443 (stunnel-style — piccolod terminates TLS, backend
 	// sees plaintext). Invalid on any other flow/protocol (parser-enforced).
@@ -446,14 +461,47 @@ type ServiceOIDCClient struct {
 // via kernel-level reclaim + OOM scorer, which correctly attributes pressure to
 // the actual offender without manifest-level per-service knobs.
 type AppService struct {
-	Image       string             `yaml:"image" json:"image"`
-	Init        string             `yaml:"init,omitempty" json:"init,omitempty"`
-	After       []string           `yaml:"after,omitempty" json:"after,omitempty"`
-	BindPorts   []int              `yaml:"bind_ports" json:"bind_ports"`
-	Environment map[string]string  `yaml:"environment,omitempty" json:"environment,omitempty"`
-	Storage     *AppStorage        `yaml:"storage,omitempty" json:"storage,omitempty"`
-	OIDCClient  *ServiceOIDCClient `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
-	InitScript  *ServiceInitScript `yaml:"init_script,omitempty" json:"init_script,omitempty"`
+	Image       string               `yaml:"image" json:"image"`
+	Init        string               `yaml:"init,omitempty" json:"init,omitempty"`
+	After       []string             `yaml:"after,omitempty" json:"after,omitempty"`
+	BindPorts   []int                `yaml:"bind_ports" json:"bind_ports"`
+	Environment map[string]string    `yaml:"environment,omitempty" json:"environment,omitempty"`
+	Storage     *AppStorage          `yaml:"storage,omitempty" json:"storage,omitempty"`
+	OIDCClient  *ServiceOIDCClient   `yaml:"oidc_client,omitempty" json:"oidc_client,omitempty"`
+	InitScript  *ServiceInitScript   `yaml:"init_script,omitempty" json:"init_script,omitempty"`
+	Consumes    []CapabilityConsumer `yaml:"consumes,omitempty" json:"consumes,omitempty"`
+}
+
+// CapabilityProvider publishes a registered capability from one existing app
+// listener. BasePath is the provider-owned private surface exposed to bound
+// consumers.
+type CapabilityProvider struct {
+	Capability string `yaml:"capability" json:"capability"`
+	BasePath   string `yaml:"base_path" json:"base_path"`
+}
+
+// CapabilityConsumer maps registered binding properties to explicit
+// environment-variable names for one service.
+type CapabilityConsumer struct {
+	Capability string            `yaml:"capability" json:"capability"`
+	Env        map[string]string `yaml:"env" json:"env"`
+}
+
+// AppArtifact declares one reconstructible source. Consumption is expressed
+// separately through services[].storage.artifacts.
+type AppArtifact struct {
+	Source ArtifactSource `yaml:"source" json:"source"`
+}
+
+// ArtifactSource is the closed union of source adapters supported by V1.
+// Source-specific validation rejects fields belonging to the other variant.
+type ArtifactSource struct {
+	Type       string `yaml:"type" json:"type"`
+	Repository string `yaml:"repository,omitempty" json:"repository,omitempty"`
+	Revision   string `yaml:"revision,omitempty" json:"revision,omitempty"`
+	Path       string `yaml:"path,omitempty" json:"path,omitempty"`
+	Reference  string `yaml:"reference,omitempty" json:"reference,omitempty"`
+	Digest     string `yaml:"digest,omitempty" json:"digest,omitempty"`
 }
 
 // ServiceInitScript defines a post-start init script for a service container.
@@ -476,8 +524,15 @@ type ServiceInitScript struct {
 
 // AppStorage defines storage configuration
 type AppStorage struct {
-	Persistent map[string]AppVolume `yaml:"persistent,omitempty" json:"persistent,omitempty"`
-	Temporary  map[string]AppVolume `yaml:"temporary,omitempty" json:"temporary,omitempty"`
+	Persistent map[string]AppVolume        `yaml:"persistent,omitempty" json:"persistent,omitempty"`
+	Temporary  map[string]AppVolume        `yaml:"temporary,omitempty" json:"temporary,omitempty"`
+	Artifacts  map[string]AppArtifactMount `yaml:"artifacts,omitempty" json:"artifacts,omitempty"`
+}
+
+// AppArtifactMount attaches the complete Ready artifact root read-only at the
+// declared container path.
+type AppArtifactMount struct {
+	Container string `yaml:"container" json:"container"`
 }
 
 // AppPermissions defines security permissions

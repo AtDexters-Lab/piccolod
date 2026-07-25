@@ -5,12 +5,14 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 	"piccolod/internal/resources/pressure"
 )
 
@@ -201,6 +203,648 @@ func createRunningReconcileGroup(t *testing.T, mock *MockContainerManager, state
 		t.Fatalf("store app: %v", err)
 	}
 	return appInst
+}
+
+func TestReconcileContainerGroupDoesNotAttachArtifactsForHealthyRuntime(t *testing.T) {
+	mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+	def.Artifacts = map[string]api.AppArtifact{
+		"model": {
+			Source: api.ArtifactSource{
+				Type:       "huggingface",
+				Repository: "example/model",
+				Revision:   "commit",
+				Path:       ".",
+			},
+		},
+	}
+	mainService := def.Services["main"]
+	mainService.Storage = &api.AppStorage{
+		Artifacts: map[string]api.AppArtifactMount{
+			"model": {Container: "/models/model"},
+		},
+	}
+	def.Services["main"] = mainService
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	appInst.ArtifactReferences = map[string]string{"model": "ref-model"}
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store artifact app: %v", err)
+	}
+	endpoints, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
+	if err != nil {
+		t.Fatalf("allocate steady-state publication: %v", err)
+	}
+	if len(endpoints) != 1 {
+		t.Fatalf("publication endpoints = %+v, want one", endpoints)
+	}
+	mock.containers[appInst.NetworkAnchorID].Spec.Ports = []container.PortMapping{{
+		Host:      endpoints[0].HostBind,
+		Container: endpoints[0].GuestPort,
+		Protocol:  "tcp",
+	}}
+	mgr.serviceManager.SetAppContainerID(appInst.InstanceID, appInst.NetworkAnchorID)
+	rootfs := &compensationRootfsManager{
+		stubRootfsManager: newStubRootfsManager(t.TempDir()),
+	}
+	mgr.SetRootfsManager(rootfs)
+
+	if err := mgr.reconcileContainerGroup(
+		context.Background(),
+		state,
+		appInst,
+		def,
+		layout,
+		runtime,
+		true,
+	); err != nil {
+		t.Fatalf("steady-state reconcile: %v", err)
+	}
+	if len(rootfs.artifactAttached) != 0 {
+		t.Fatalf("steady-state reconcile attached artifacts: %v", rootfs.artifactAttached)
+	}
+
+	missingServiceID := appInst.Containers["side"]
+	if err := mock.RemoveContainer(context.Background(), runtime, missingServiceID); err != nil {
+		t.Fatalf("remove service for repair: %v", err)
+	}
+	if err := mgr.reconcileContainerGroup(
+		context.Background(),
+		state,
+		appInst,
+		def,
+		layout,
+		runtime,
+		true,
+	); err != nil {
+		t.Fatalf("missing-service reconcile: %v", err)
+	}
+	if !reflect.DeepEqual(rootfs.artifactAttached, []string{"ref-model"}) {
+		t.Fatalf("missing-service reconcile artifact attachments = %v, want one recorded reference", rootfs.artifactAttached)
+	}
+}
+
+func TestCommitRecreatedAppMetadataPublishesOnlyAfterDurableWrite(t *testing.T) {
+	state := newCapabilityTestState(t)
+	current := &AppInstance{
+		InstanceID:         "consumer",
+		Enabled:            true,
+		Definition:         capabilityConsumerDefinition("OPENAI_BASE_URL"),
+		NetworkAnchorID:    "old-anchor",
+		Containers:         map[string]string{"main": "old-container"},
+		CapabilityBindings: map[string]string{api.CapabilityAIInferenceOpenAIV1: "provider-a"},
+		CreatedAt:          time.Now().Add(-time.Hour),
+		UpdatedAt:          time.Now().Add(-time.Minute),
+	}
+	if err := state.StoreApp(current); err != nil {
+		t.Fatalf("store current app: %v", err)
+	}
+	recreated := &AppInstance{
+		InstanceID:         "consumer",
+		PrimaryService:     "main",
+		NetworkAnchorID:    "new-anchor",
+		Containers:         map[string]string{"main": "new-container"},
+		CapabilityBindings: map[string]string{api.CapabilityAIInferenceOpenAIV1: "provider-b"},
+	}
+
+	writeErr := errors.New("injected metadata write failure")
+	state.storeAppMetadataHook = func(string, *AppInstance) error { return writeErr }
+	if err := commitRecreatedAppMetadata(state, current, recreated); !errors.Is(err, writeErr) {
+		t.Fatalf("commit error = %v, want injected write failure", err)
+	}
+	cached, ok := state.GetApp("consumer")
+	if !ok {
+		t.Fatal("current app disappeared after failed metadata write")
+	}
+	if got := cached.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1]; got != "provider-a" {
+		t.Fatalf("failed write published cache binding %q", got)
+	}
+	if current.NetworkAnchorID != "old-anchor" ||
+		current.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] != "provider-a" {
+		t.Fatalf("failed write mutated caller state: %+v", current)
+	}
+
+	state.storeAppMetadataHook = nil
+	if err := commitRecreatedAppMetadata(state, current, recreated); err != nil {
+		t.Fatalf("retry commit: %v", err)
+	}
+	cached, ok = state.GetApp("consumer")
+	if !ok {
+		t.Fatal("recreated app missing after successful retry")
+	}
+	if got := cached.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1]; got != "provider-b" {
+		t.Fatalf("successful retry binding = %q, want provider-b", got)
+	}
+	if cached.NetworkAnchorID != "new-anchor" || current.NetworkAnchorID != "new-anchor" {
+		t.Fatalf("successful retry did not publish replacement: cached=%+v current=%+v", cached, current)
+	}
+	current.Containers["main"] = "caller-only-mutation"
+	current.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] = "caller-only-provider"
+	if got := cached.Containers["main"]; got != "new-container" {
+		t.Fatalf("successful commit retained caller container-map alias: %q", got)
+	}
+	if got := cached.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1]; got != "provider-b" {
+		t.Fatalf("successful commit retained caller binding-map alias: %q", got)
+	}
+}
+
+func TestCommitRemovedContainerGroupPublishesOnlyAfterDurableWrite(t *testing.T) {
+	mgr, _, state, def, _, _ := newReconcileTestEnv(t)
+	current := &AppInstance{
+		InstanceID:         "testapp",
+		Enabled:            true,
+		Definition:         def,
+		NetworkAnchorID:    "old-anchor",
+		Containers:         map[string]string{"main": "old-main"},
+		AcceleratorDevices: []string{"/dev/dri/renderD128"},
+		CapabilityBindings: map[string]string{api.CapabilityAIInferenceOpenAIV1: "provider"},
+	}
+	if err := state.StoreApp(current); err != nil {
+		t.Fatalf("store current app: %v", err)
+	}
+	injected := errors.New("injected cleared metadata failure")
+	state.storeAppMetadataHook = func(string, *AppInstance) error { return injected }
+
+	if err := mgr.commitRemovedContainerGroup(state, current); !errors.Is(err, injected) {
+		t.Fatalf("commit removed error = %v, want injected failure", err)
+	}
+	stored, ok := state.GetApp(current.InstanceID)
+	if !ok || stored.NetworkAnchorID != "old-anchor" || stored.Containers["main"] != "old-main" {
+		t.Fatalf("failed cleared commit published candidate: %+v", stored)
+	}
+	if current.NetworkAnchorID != "old-anchor" ||
+		len(current.AcceleratorDevices) != 1 ||
+		current.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] != "provider" {
+		t.Fatalf("failed cleared commit mutated caller: %+v", current)
+	}
+}
+
+func prebuiltReconcileRootfs(t *testing.T, def *api.AppDefinition) map[string]*rootfsMountInfo {
+	t.Helper()
+	mountPath := t.TempDir()
+	result := make(map[string]*rootfsMountInfo, 1+len(def.Services))
+	for serviceName := range def.Services {
+		result[serviceName] = &rootfsMountInfo{handle: persistence.RootfsHandle{
+			VolumeID:  persistence.ServiceRootfsVolumeID("testapp", serviceName),
+			MountPath: mountPath,
+			ReadOnly:  true,
+		}}
+	}
+	result[networkAnchorServiceName] = &rootfsMountInfo{handle: persistence.RootfsHandle{
+		VolumeID:  persistence.ServiceRootfsVolumeID("testapp", networkAnchorServiceName),
+		MountPath: mountPath,
+		ReadOnly:  true,
+	}}
+	return result
+}
+
+func newMissingReconcileApp(
+	t *testing.T,
+) (*AppManager, *MockContainerManager, *FilesystemStateManager, *api.AppDefinition, appVolumeLayout, container.PodmanRuntime, *AppInstance) {
+	t.Helper()
+	mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+	mgr.serviceManager.UseInMemoryNetworkForTest()
+	mgr.SetRootfsManager(newStubRootfsManager(t.TempDir()))
+	now := time.Now()
+	current := &AppInstance{
+		InstanceID:     "testapp",
+		Enabled:        true,
+		PrimaryService: "main",
+		Definition:     def,
+		CreatedAt:      now,
+		UpdatedAt:      now,
+	}
+	if err := state.StoreApp(current); err != nil {
+		t.Fatalf("store missing app: %v", err)
+	}
+	return mgr, mock, state, def, layout, runtime, current
+}
+
+type compensationRootfsManager struct {
+	*stubRootfsManager
+	artifactAttached   []string
+	artifactDetached   []string
+	artifactDestroyed  []string
+	artifactGCRetained []map[string]struct{}
+}
+
+func (m *compensationRootfsManager) EnsureGoldenContent(
+	_ context.Context,
+	req persistence.GoldenContentRequest,
+) (persistence.GoldenContentHandle, error) {
+	return persistence.GoldenContentHandle{
+		GoldenID: "golden-candidate-model",
+		Identity: req.Identity,
+	}, nil
+}
+
+func (m *compensationRootfsManager) CreateArtifactReference(
+	_ context.Context,
+	req persistence.ArtifactReferenceRequest,
+) (persistence.ArtifactHandle, error) {
+	return persistence.ArtifactHandle{
+		MountPath: m.baseDir,
+		Created:   true,
+	}, nil
+}
+
+func (m *compensationRootfsManager) AttachArtifactReference(
+	_ context.Context,
+	referenceID string,
+) (persistence.ArtifactHandle, error) {
+	m.artifactAttached = append(m.artifactAttached, referenceID)
+	return persistence.ArtifactHandle{
+		MountPath: m.baseDir,
+	}, nil
+}
+
+func (m *compensationRootfsManager) DetachArtifactReference(_ context.Context, referenceID string) error {
+	m.artifactDetached = append(m.artifactDetached, referenceID)
+	return nil
+}
+
+func (m *compensationRootfsManager) DestroyArtifactReference(_ context.Context, referenceID string) error {
+	m.artifactDestroyed = append(m.artifactDestroyed, referenceID)
+	return nil
+}
+
+func (m *compensationRootfsManager) GarbageCollectArtifactReferences(
+	_ context.Context,
+	retained map[string]struct{},
+) error {
+	copied := make(map[string]struct{}, len(retained))
+	for referenceID := range retained {
+		copied[referenceID] = struct{}{}
+	}
+	m.artifactGCRetained = append(m.artifactGCRetained, copied)
+	return nil
+}
+
+func compensationCandidate(
+	t *testing.T,
+) (*AppManager, *MockContainerManager, *FilesystemStateManager, *api.AppDefinition, container.PodmanRuntime, *AppInstance, *AppInstance, *compensationRootfsManager) {
+	t.Helper()
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	mgr.serviceManager.UseInMemoryNetworkForTest()
+	candidate := createRunningReconcileGroup(t, mock, state, def, runtime)
+	candidate.ArtifactReferences = map[string]string{
+		"shared": "ref-shared",
+		"new":    "ref-new",
+	}
+	candidate.AcceleratorDevices = []string{"/dev/dri/renderD128"}
+	candidate.ActiveRootfs = map[string]string{
+		networkAnchorServiceName: "rootfs-anchor",
+		"main":                   "rootfs-main",
+		"side":                   "rootfs-side",
+	}
+	committed, err := detachedAppCandidate(candidate)
+	if err != nil {
+		t.Fatalf("clone committed app: %v", err)
+	}
+	committed.NetworkAnchorID = ""
+	committed.Containers = nil
+	committed.ArtifactReferences = map[string]string{"shared": "ref-shared"}
+	committed.AcceleratorDevices = nil
+	committed.ActiveRootfs = nil
+	if err := state.StoreApp(committed); err != nil {
+		t.Fatalf("store committed app: %v", err)
+	}
+	if _, err := mgr.serviceManager.AllocateForApp(candidate.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("allocate candidate publication: %v", err)
+	}
+	mgr.serviceManager.SetAppContainerID(candidate.InstanceID, candidate.NetworkAnchorID)
+	durable := newCapabilityState()
+	durable.Defaults[api.CapabilityAIInferenceOpenAIV1] = candidate.InstanceID
+	durable.AcceleratorGrant = &acceleratorGrantRecord{
+		Owner:   candidate.InstanceID,
+		UIDs:    []uint32{1000},
+		Devices: append([]string(nil), candidate.AcceleratorDevices...),
+	}
+	if err := state.storeCapabilityState(durable); err != nil {
+		t.Fatalf("store accelerator grant: %v", err)
+	}
+	rootfs := &compensationRootfsManager{
+		stubRootfsManager: newStubRootfsManager(t.TempDir()),
+	}
+	mgr.SetRootfsManager(rootfs)
+	return mgr, mock, state, def, runtime, committed, candidate, rootfs
+}
+
+func TestCompensateUncommittedContainerGroupRetainsSelectedAcceleratorPermission(t *testing.T) {
+	mgr, mock, state, def, runtime, committed, candidate, rootfs := compensationCandidate(t)
+	mgr.acceleratorPermission = func(context.Context, uint32, []string, bool) error {
+		t.Fatal("candidate compensation changed selected-app accelerator permission")
+		return nil
+	}
+
+	if err := mgr.compensateUncommittedContainerGroup(state, committed, candidate, def, runtime); err != nil {
+		t.Fatalf("compensate candidate: %v", err)
+	}
+	if len(mock.containers) != 0 {
+		t.Fatalf("candidate containers survived compensation: %+v", mock.containers)
+	}
+	if mgr.serviceManager.AppPublicationActive(candidate.InstanceID) {
+		t.Fatal("candidate publication survived compensation")
+	}
+	durable, err := state.loadCapabilityState()
+	if err != nil {
+		t.Fatalf("load capability state: %v", err)
+	}
+	if durable.AcceleratorGrant == nil || durable.AcceleratorGrant.Owner != candidate.InstanceID {
+		t.Fatalf("selected-app accelerator grant was not retained: %+v", durable.AcceleratorGrant)
+	}
+	if !reflect.DeepEqual(rootfs.artifactDetached, []string{"ref-new", "ref-shared"}) {
+		t.Fatalf("detached artifact refs = %v", rootfs.artifactDetached)
+	}
+	if !reflect.DeepEqual(rootfs.artifactDestroyed, []string{"ref-new"}) {
+		t.Fatalf("destroyed artifact refs = %v", rootfs.artifactDestroyed)
+	}
+	for _, volumeID := range []string{"rootfs-anchor", "rootfs-main", "rootfs-side"} {
+		if !slices.Contains(rootfs.detached, volumeID) {
+			t.Fatalf("candidate rootfs %s was not detached: %v", volumeID, rootfs.detached)
+		}
+	}
+}
+
+func TestCompensateUncommittedContainerGroupRemovalFailureStaysFailClosed(t *testing.T) {
+	mgr, mock, state, def, runtime, committed, candidate, rootfs := compensationCandidate(t)
+	mock.removeError = errors.New("injected remove failure")
+	mgr.userSessionQuiescer = func(context.Context, string) error {
+		return errors.New("injected quiesce failure")
+	}
+
+	err := mgr.compensateUncommittedContainerGroup(state, committed, candidate, def, runtime)
+	if err == nil || !strings.Contains(err.Error(), "injected remove failure") {
+		t.Fatalf("compensation error = %v, want removal failure", err)
+	}
+	if mgr.serviceManager.AppPublicationActive(candidate.InstanceID) {
+		t.Fatal("failed compensation left candidate publication active")
+	}
+	if len(rootfs.artifactDetached) != 0 || len(rootfs.artifactDestroyed) != 0 || len(rootfs.detached) != 0 {
+		t.Fatalf(
+			"failed removal detached live mounts: artifact_detached=%v artifact_destroyed=%v rootfs=%v",
+			rootfs.artifactDetached,
+			rootfs.artifactDestroyed,
+			rootfs.detached,
+		)
+	}
+	durable, loadErr := state.loadCapabilityState()
+	if loadErr != nil {
+		t.Fatalf("load capability state: %v", loadErr)
+	}
+	if durable.AcceleratorGrant == nil || durable.AcceleratorGrant.Owner != candidate.InstanceID {
+		t.Fatalf("failed removal dropped live-process accelerator fence: %+v", durable.AcceleratorGrant)
+	}
+}
+
+func TestCompensateUncommittedContainerGroupUsesUserSessionAbsenceProofAndRetainsSelectedPermission(t *testing.T) {
+	mgr, mock, state, def, runtime, committed, candidate, rootfs := compensationCandidate(t)
+	mock.removeError = errors.New("injected remove failure")
+	var quiesced string
+	mgr.userSessionQuiescer = func(_ context.Context, instanceID string) error {
+		quiesced = instanceID
+		return nil
+	}
+	mgr.acceleratorPermission = func(_ context.Context, _ uint32, _ []string, grant bool) error {
+		t.Fatalf("candidate compensation changed selected-app accelerator permission (grant=%v)", grant)
+		return nil
+	}
+
+	if err := mgr.compensateUncommittedContainerGroup(
+		state,
+		committed,
+		candidate,
+		def,
+		runtime,
+	); err != nil {
+		t.Fatalf("compensate after user-session quiescence: %v", err)
+	}
+	if quiesced != candidate.InstanceID {
+		t.Fatalf("quiesced instance = %q, want %q", quiesced, candidate.InstanceID)
+	}
+	if mgr.serviceManager.AppPublicationActive(candidate.InstanceID) {
+		t.Fatal("candidate publication survived user-session quiescence")
+	}
+	durable, err := state.loadCapabilityState()
+	if err != nil {
+		t.Fatalf("load capability state: %v", err)
+	}
+	if durable.AcceleratorGrant == nil || durable.AcceleratorGrant.Owner != candidate.InstanceID {
+		t.Fatalf("selected-app accelerator permission was not retained: %+v", durable.AcceleratorGrant)
+	}
+	if len(rootfs.artifactDetached) == 0 || len(rootfs.detached) == 0 {
+		t.Fatalf(
+			"mount ownership survived authoritative process quiescence: artifacts=%v rootfs=%v",
+			rootfs.artifactDetached,
+			rootfs.detached,
+		)
+	}
+}
+
+func TestRecreateMissingMultiContainerMetadataFailureCompensatesCandidate(t *testing.T) {
+	mgr, mock, state, def, layout, runtime, current := newMissingReconcileApp(t)
+	prebuilt := prebuiltReconcileRootfs(t, def)
+	injected := errors.New("injected recovered metadata failure")
+	state.storeAppMetadataHook = func(_ string, candidate *AppInstance) error {
+		if candidate.NetworkAnchorID != "" {
+			return injected
+		}
+		return nil
+	}
+
+	err := mgr.recreateMissingMultiContainer(
+		context.Background(),
+		state,
+		current,
+		def,
+		layout,
+		runtime,
+		prebuilt,
+	)
+	if !errors.Is(err, injected) {
+		t.Fatalf("recreate error = %v, want injected metadata failure", err)
+	}
+	if len(mock.containers) != 0 {
+		t.Fatalf("uncommitted candidate containers survived: %+v", mock.containers)
+	}
+	if mgr.serviceManager.AppPublicationActive(current.InstanceID) {
+		t.Fatal("uncommitted candidate publication remained active")
+	}
+	if id, ok := mgr.serviceManager.GetAppContainerID(current.InstanceID); ok && id != "" {
+		t.Fatalf("uncommitted backend ID remained published: %q", id)
+	}
+	stored, ok := state.GetApp(current.InstanceID)
+	if !ok || stored.NetworkAnchorID != "" || len(stored.Containers) != 0 {
+		t.Fatalf("failed metadata commit changed committed app: %+v", stored)
+	}
+
+	state.storeAppMetadataHook = nil
+	if err := mgr.recreateMissingMultiContainer(
+		context.Background(),
+		state,
+		current,
+		def,
+		layout,
+		runtime,
+		prebuilt,
+	); err != nil {
+		t.Fatalf("retry recreate: %v", err)
+	}
+	if current.NetworkAnchorID == "" || len(current.Containers) != len(def.Services) {
+		t.Fatalf("retry did not commit recreated group: %+v", current)
+	}
+	if !mgr.serviceManager.AppPublicationActive(current.InstanceID) {
+		t.Fatal("successful retry did not publish services")
+	}
+}
+
+func TestPreparedRecreateMetadataFailureKeepsPublicationSuspended(t *testing.T) {
+	mgr, mock, state, def, layout, runtime, current := newMissingReconcileApp(t)
+	prebuilt := prebuiltReconcileRootfs(t, def)
+	if _, err := mgr.serviceManager.AllocateForApp(current.InstanceID, def.Listeners); err != nil {
+		t.Fatalf("allocate existing publication: %v", err)
+	}
+	resumeToken := mgr.serviceManager.SuspendAppPublication(current.InstanceID)
+	plan, err := mgr.serviceManager.PrepareReconcile(current.InstanceID, def.Listeners)
+	if err != nil {
+		t.Fatalf("prepare recreate listeners: %v", err)
+	}
+	injected := errors.New("injected prepared metadata failure")
+	state.storeAppMetadataHook = func(_ string, candidate *AppInstance) error {
+		if candidate.NetworkAnchorID != "" {
+			return injected
+		}
+		return nil
+	}
+
+	err = mgr.recreateMissingMultiContainerPrepared(
+		context.Background(),
+		state,
+		current,
+		def,
+		layout,
+		runtime,
+		prebuilt,
+		plan,
+		resumeToken,
+	)
+	if !errors.Is(err, injected) {
+		t.Fatalf("prepared recreate error = %v, want injected metadata failure", err)
+	}
+	if len(mock.containers) != 0 {
+		t.Fatalf("prepared candidate containers survived: %+v", mock.containers)
+	}
+	if mgr.serviceManager.AppPublicationActive(current.InstanceID) {
+		t.Fatal("failed prepared candidate reactivated suspended publication")
+	}
+	if id, ok := mgr.serviceManager.GetAppContainerID(current.InstanceID); ok && id != "" {
+		t.Fatalf("failed prepared candidate retained backend ID: %q", id)
+	}
+
+	state.storeAppMetadataHook = nil
+	resumeToken = mgr.serviceManager.SuspendAppPublication(current.InstanceID)
+	plan, err = mgr.serviceManager.PrepareReconcile(current.InstanceID, def.Listeners)
+	if err != nil {
+		t.Fatalf("prepare retry listeners: %v", err)
+	}
+	if err := mgr.recreateMissingMultiContainerPrepared(
+		context.Background(),
+		state,
+		current,
+		def,
+		layout,
+		runtime,
+		prebuilt,
+		plan,
+		resumeToken,
+	); err != nil {
+		t.Fatalf("prepared recreate retry: %v", err)
+	}
+	if !mgr.serviceManager.AppPublicationActive(current.InstanceID) {
+		t.Fatal("successful prepared retry did not publish services")
+	}
+}
+
+func TestDetachedCommitHelpersDoNotPublishCallerAliases(t *testing.T) {
+	tests := []struct {
+		name       string
+		commit     func(*FilesystemStateManager, *AppInstance, *AppInstance) error
+		injectFail func(*FilesystemStateManager, error)
+		clearFail  func(*FilesystemStateManager)
+	}{
+		{
+			name:   "definition and metadata",
+			commit: commitDetachedApp,
+			injectFail: func(state *FilesystemStateManager, injected error) {
+				state.storeAppDefinitionHook = func(string, *AppInstance) error { return injected }
+			},
+			clearFail: func(state *FilesystemStateManager) {
+				state.storeAppDefinitionHook = nil
+			},
+		},
+		{
+			name:   "metadata only",
+			commit: commitDetachedAppMetadata,
+			injectFail: func(state *FilesystemStateManager, injected error) {
+				state.storeAppMetadataHook = func(string, *AppInstance) error { return injected }
+			},
+			clearFail: func(state *FilesystemStateManager) {
+				state.storeAppMetadataHook = nil
+			},
+		},
+	}
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			state := newCapabilityTestState(t)
+			current := &AppInstance{
+				InstanceID:         "consumer",
+				Enabled:            true,
+				Definition:         capabilityConsumerDefinition("OPENAI_BASE_URL"),
+				Containers:         map[string]string{"main": "old-container"},
+				CapabilityBindings: map[string]string{api.CapabilityAIInferenceOpenAIV1: "provider-a"},
+			}
+			if err := state.StoreApp(current); err != nil {
+				t.Fatalf("store current app: %v", err)
+			}
+			candidate, err := detachedAppCandidate(current)
+			if err != nil {
+				t.Fatalf("detached candidate: %v", err)
+			}
+			candidate.Containers["main"] = "new-container"
+			candidate.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] = "provider-b"
+
+			injected := errors.New("injected durable write failure")
+			test.injectFail(state, injected)
+			if err := test.commit(state, current, candidate); !errors.Is(err, injected) {
+				t.Fatalf("commit error = %v, want injected failure", err)
+			}
+			cached, ok := state.GetApp("consumer")
+			if !ok {
+				t.Fatal("current app disappeared after failed write")
+			}
+			if got := cached.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1]; got != "provider-a" {
+				t.Fatalf("failed write published binding %q", got)
+			}
+
+			test.clearFail(state)
+			if err := test.commit(state, current, candidate); err != nil {
+				t.Fatalf("retry commit: %v", err)
+			}
+			cached, ok = state.GetApp("consumer")
+			if !ok {
+				t.Fatal("candidate missing after successful retry")
+			}
+			candidate.Containers["main"] = "candidate-only-mutation"
+			candidate.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] = "candidate-only-provider"
+			current.Containers["main"] = "current-only-mutation"
+			current.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1] = "current-only-provider"
+			if got := cached.Containers["main"]; got != "new-container" {
+				t.Fatalf("cache retained caller container-map alias: %q", got)
+			}
+			if got := cached.CapabilityBindings[api.CapabilityAIInferenceOpenAIV1]; got != "provider-b" {
+				t.Fatalf("cache retained caller binding-map alias: %q", got)
+			}
+		})
+	}
 }
 
 func TestReconcileUnknownObservationPreservesRunningProjectionRoutesAndAttemptBudget(t *testing.T) {
@@ -488,6 +1132,178 @@ func TestDesiredStoppedReconcileStillWithdrawsPublicationUnderWarning(t *testing
 	}
 	if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusStopped {
 		t.Fatalf("observed status = %q, want %q", got, StatusStopped)
+	}
+}
+
+func seedDesiredStoppedAcceleratorGrant(
+	t *testing.T,
+	state *FilesystemStateManager,
+	appInst *AppInstance,
+) {
+	t.Helper()
+	appInst.AcceleratorDevices = []string{"/dev/dri/renderD128"}
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		t.Fatalf("store accelerator generation: %v", err)
+	}
+	durable := newCapabilityState()
+	durable.Defaults[api.CapabilityAIInferenceOpenAIV1] = appInst.InstanceID
+	durable.AcceleratorGrant = &acceleratorGrantRecord{
+		Owner:   appInst.InstanceID,
+		UIDs:    []uint32{1000},
+		Devices: append([]string(nil), appInst.AcceleratorDevices...),
+	}
+	if err := state.storeCapabilityState(durable); err != nil {
+		t.Fatalf("store accelerator grant: %v", err)
+	}
+}
+
+func TestDesiredStoppedReconcileRetainsSelectedAcceleratorPermission(t *testing.T) {
+	for _, recordedAnchor := range []bool{true, false} {
+		name := "recorded-anchor"
+		if !recordedAnchor {
+			name = "missing-anchor"
+		}
+		t.Run(name, func(t *testing.T) {
+			mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+			mgr.serviceManager.UseInMemoryNetworkForTest()
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			if !recordedAnchor {
+				appInst.NetworkAnchorID = ""
+			}
+			mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+			if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+				t.Fatalf("publish route: %v", err)
+			}
+			seedDesiredStoppedAcceleratorGrant(t, state, appInst)
+
+			stopErr := errors.New("injected graceful stop failure")
+			mock.stopError = stopErr
+			quiesceCalls := 0
+			mgr.userSessionQuiescer = func(_ context.Context, instanceID string) error {
+				quiesceCalls++
+				if instanceID != appInst.InstanceID {
+					t.Fatalf("quiesced instance = %q, want %q", instanceID, appInst.InstanceID)
+				}
+				if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusRunning {
+					t.Fatalf("status before process-absence proof = %q, want %q", got, StatusRunning)
+				}
+				if !mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+					t.Fatal("follower publication withdrawn before process-absence proof")
+				}
+				durable, err := state.loadCapabilityState()
+				if err != nil {
+					t.Fatalf("load grant before process-absence proof: %v", err)
+				}
+				if durable.AcceleratorGrant == nil {
+					t.Fatal("accelerator fence withdrawn before process-absence proof")
+				}
+				return nil
+			}
+			revokeCalls := 0
+			mgr.acceleratorPermission = func(_ context.Context, _ uint32, _ []string, grant bool) error {
+				revokeCalls++
+				t.Fatalf("desired-stopped reconcile changed selected-app accelerator permission (grant=%v)", grant)
+				return nil
+			}
+
+			if err := mgr.reconcileContainerGroup(
+				context.Background(),
+				state,
+				appInst,
+				def,
+				layout,
+				runtime,
+				false,
+			); err != nil {
+				t.Fatalf("desired-stopped reconcile: %v", err)
+			}
+			if quiesceCalls != 1 {
+				t.Fatalf("PID 1 quiesce calls = %d, want 1", quiesceCalls)
+			}
+			if revokeCalls != 0 {
+				t.Fatalf("accelerator permission calls = %d, want zero", revokeCalls)
+			}
+			if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusStopped {
+				t.Fatalf("observed status = %q, want %q", got, StatusStopped)
+			}
+			durable, err := state.loadCapabilityState()
+			if err != nil {
+				t.Fatalf("load accelerator state: %v", err)
+			}
+			if durable.AcceleratorGrant == nil || durable.AcceleratorGrant.Owner != appInst.InstanceID {
+				t.Fatalf("selected-app accelerator grant was not retained: %+v", durable.AcceleratorGrant)
+			}
+		})
+	}
+}
+
+func TestDesiredStoppedReconcileDoubleFailureRetainsAcceleratorFence(t *testing.T) {
+	for _, recordedAnchor := range []bool{true, false} {
+		name := "recorded-anchor"
+		if !recordedAnchor {
+			name = "missing-anchor"
+		}
+		t.Run(name, func(t *testing.T) {
+			mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+			mgr.serviceManager.UseInMemoryNetworkForTest()
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			appInst.Enabled = false
+			if !recordedAnchor {
+				appInst.NetworkAnchorID = ""
+			}
+			mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+			if _, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners); err != nil {
+				t.Fatalf("publish route: %v", err)
+			}
+			seedDesiredStoppedAcceleratorGrant(t, state, appInst)
+
+			stopErr := errors.New("injected graceful stop failure")
+			proofErr := errors.New("injected PID 1 proof failure")
+			mock.stopError = stopErr
+			mgr.userSessionQuiescer = func(context.Context, string) error {
+				if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusRunning {
+					t.Fatalf("status before failed process-absence proof = %q, want %q", got, StatusRunning)
+				}
+				if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+					t.Fatal("manual-disable publication retained during failed process-absence proof")
+				}
+				return proofErr
+			}
+			revokeCalls := 0
+			mgr.acceleratorPermission = func(context.Context, uint32, []string, bool) error {
+				revokeCalls++
+				return nil
+			}
+
+			err := mgr.reconcileContainerGroup(
+				context.Background(),
+				state,
+				appInst,
+				def,
+				layout,
+				runtime,
+				false,
+			)
+			if !errors.Is(err, stopErr) || !errors.Is(err, proofErr) {
+				t.Fatalf("desired-stopped error = %v, want stop and PID 1 proof failures", err)
+			}
+			if revokeCalls != 0 {
+				t.Fatalf("accelerator ACL revoke calls = %d, want zero without absence proof", revokeCalls)
+			}
+			if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusRunning {
+				t.Fatalf("observed status = %q, want retained %q", got, StatusRunning)
+			}
+			if mgr.serviceManager.AppPublicationActive(appInst.InstanceID) {
+				t.Fatal("manual-disable publication retained after failed process-absence proof")
+			}
+			durable, loadErr := state.loadCapabilityState()
+			if loadErr != nil {
+				t.Fatalf("load accelerator state: %v", loadErr)
+			}
+			if durable.AcceleratorGrant == nil || durable.AcceleratorGrant.Owner != appInst.InstanceID {
+				t.Fatalf("accelerator fence dropped without process-absence proof: %+v", durable.AcceleratorGrant)
+			}
+		})
 	}
 }
 

@@ -289,6 +289,8 @@ type TransitionResources struct {
 	RetainedReservations     []string          `json:"retained_reservations,omitempty"`
 	GeneratedOIDCClients     map[string]string `json:"generated_oidc_clients,omitempty"`
 	CandidateActiveRootfs    map[string]string `json:"candidate_active_rootfs,omitempty"`
+	PreviousArtifactRefs     map[string]string `json:"previous_artifact_references,omitempty"`
+	CandidateArtifactRefs    map[string]string `json:"candidate_artifact_references,omitempty"`
 	CandidatePrimaryService  string            `json:"candidate_primary_service,omitempty"`
 	CandidateNetworkAnchorID string            `json:"candidate_network_anchor_id,omitempty"`
 	CandidateContainers      map[string]string `json:"candidate_containers,omitempty"`

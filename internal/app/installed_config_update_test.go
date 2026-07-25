@@ -744,6 +744,96 @@ func TestCatalogSyncStoresPendingServiceAppReviewForImageChange(t *testing.T) {
 	}
 }
 
+func TestCatalogSyncStoresPendingServiceAppReviewForCapabilityAccessChange(t *testing.T) {
+	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
+	oldRaw := bytes.Replace(
+		raw,
+		[]byte("x-piccolo:\n  mode: service\n"),
+		[]byte("x-piccolo:\n  mode: service\n  requires_features:\n    - capability_bindings_v1\n"),
+		1,
+	)
+	oldResult, err := RunInstallPipeline(context.Background(), InstallPipelineInput{
+		RawTemplate:   oldRaw,
+		UserInputs:    inputs,
+		SystemContext: systemCtx,
+		InstanceID:    "piclu",
+	}, nil, nil)
+	if err != nil {
+		t.Fatalf("render capability-enabled installed manifest: %v", err)
+	}
+	appInst, exists := state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found")
+	}
+	appInst.Definition = oldResult.Definition
+	appInst.CatalogManifestHash = Sha256Hex(oldRaw)
+	if err := state.StoreApp(appInst); err != nil {
+		t.Fatalf("store capability-enabled app: %v", err)
+	}
+	if err := state.StoreInstallState("piclu", NewV2InstallState(
+		"piclu",
+		InstallSourceKindCatalog,
+		"piclu",
+		oldRaw,
+		inputs,
+		systemCtx,
+		nil,
+		false,
+	)); err != nil {
+		t.Fatalf("store capability-enabled install state: %v", err)
+	}
+
+	newRaw := bytes.Replace(
+		oldRaw,
+		[]byte("    bind_ports: [8080]\n"),
+		[]byte(`    bind_ports: [8080]
+    consumes:
+      - capability: ai.inference.openai.v1
+        env:
+          OPENAI_BASE_URL: base_url
+`),
+		1,
+	)
+	newHash := Sha256Hex(newRaw)
+	mgr.SetSyncHost(installedConfigSyncHost{templates: map[string][]byte{"piclu": newRaw}})
+
+	err = mgr.SyncManifest(context.Background(), "piclu")
+	if err == nil {
+		t.Fatalf("expected capability access change to require operator review")
+	}
+	if !strings.Contains(err.Error(), "operator review") || !strings.Contains(err.Error(), "capability access changed") {
+		t.Fatalf("unexpected sync error: %v", err)
+	}
+	st, err := state.LoadInstallState("piclu")
+	if err != nil {
+		t.Fatalf("load install state: %v", err)
+	}
+	if st.PendingRawTemplateHash != newHash ||
+		!bytes.Equal(st.PendingRawTemplate, newRaw) ||
+		st.PendingReviewFlow != pendingCatalogReviewFlowManifest {
+		t.Fatalf(
+			"pending capability review = hash %q flow %q raw %q",
+			st.PendingRawTemplateHash,
+			st.PendingReviewFlow,
+			string(st.PendingRawTemplate),
+		)
+	}
+	appInst, exists = state.GetApp("piclu")
+	if !exists {
+		t.Fatalf("app not found after rejected sync")
+	}
+	if appInst.CatalogManifestHash != Sha256Hex(oldRaw) {
+		t.Fatalf("catalog hash advanced to %q", appInst.CatalogManifestHash)
+	}
+	storedDef, err := state.GetAppDefinition("piclu")
+	if err != nil {
+		t.Fatalf("get stored definition: %v", err)
+	}
+	if got := storedDef.Services["main"].Consumes; len(got) != 0 {
+		t.Fatalf("candidate capability access was auto-applied: %+v", got)
+	}
+}
+
 func TestCatalogSyncStoresPendingServiceAppReviewForRenderedOnlyTemplate(t *testing.T) {
 	mgr, state, raw, inputs, systemCtx := installedConfigTestApp(t)
 	oldHash := Sha256Hex(raw)

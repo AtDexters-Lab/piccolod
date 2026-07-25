@@ -111,6 +111,31 @@ func TestValidateContainerName(t *testing.T) {
 	}
 }
 
+func TestValidateImageReference(t *testing.T) {
+	tests := []struct {
+		name        string
+		input       string
+		expectError bool
+	}{
+		{"uppercase tag", "ghcr.io/acme/model:Q4_K_M", false},
+		{"registry port", "localhost:5000/example/model:latest", false},
+		{"digest reference", "ghcr.io/acme/model@sha256:45b23dee08af5e43a7fea6c4cf9c25ccf269ee113168c19722f87876677c5cb2", false},
+		{"double separator", "ghcr.io/acme//model:latest", true},
+		{"multiple digest delimiters", "ghcr.io/acme/model@sha256:abc@sha256:def", true},
+		{"URL scheme", "https://ghcr.io/acme/model:latest", true},
+		{"surrounding whitespace", " ghcr.io/acme/model:latest", true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateImageReference(tt.input)
+			if (err != nil) != tt.expectError {
+				t.Fatalf("ValidateImageReference(%q) error = %v, expectError %t", tt.input, err, tt.expectError)
+			}
+		})
+	}
+}
+
 // TestValidatePort tests port validation
 func TestValidatePort(t *testing.T) {
 	tests := []struct {

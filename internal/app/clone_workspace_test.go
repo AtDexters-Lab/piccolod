@@ -33,6 +33,34 @@ func TestCloneWorkspace_OriginNotFound(t *testing.T) {
 	}
 }
 
+func TestCloneWorkspaceSeedsTruthfulTaskLifecycle(t *testing.T) {
+	state := newCapabilityTestState(t)
+	manager, err := NewAppManagerForTest(NewMockContainerManager(), state.stateDir)
+	if err != nil {
+		t.Fatalf("NewAppManagerForTest: %v", err)
+	}
+	manager.stateManager = state
+	reporter := &recordingArtifactProgressReporter{}
+	manager.SetProgressReporter(reporter)
+
+	ctx := WithTaskID(context.Background(), "clone-task")
+	if _, err := manager.CloneWorkspace(ctx, "missing", "clone"); err == nil {
+		t.Fatal("CloneWorkspace succeeded with missing origin")
+	}
+	events := reporter.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("clone events = %d, want start and completion", len(events))
+	}
+	for _, event := range events {
+		if event.TaskType != taskTypeCloneApp {
+			t.Fatalf("clone event task type = %q, want %q", event.TaskType, taskTypeCloneApp)
+		}
+	}
+	if events[0].Phase != taskPhaseValidating || !events[1].IsComplete || events[1].Error == "" {
+		t.Fatalf("unexpected clone task lifecycle: %#v", events)
+	}
+}
+
 func TestCloneWorkspace_OriginNotWorkspace(t *testing.T) {
 	tmp, err := os.MkdirTemp("", "clone_not_ws")
 	if err != nil {

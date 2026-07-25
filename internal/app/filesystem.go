@@ -45,6 +45,9 @@ type FilesystemStateManager struct {
 	storeTransitionRecordHook func(instanceID string, record *TransitionRecord) error
 	clearTransitionRecordHook func(instanceID string) error
 
+	// Test hook for fault-injecting capability-state writes.
+	storeCapabilityStateHook func(state *capabilityState) error
+
 	// Test hook for fault-injecting tuple generation writes.
 	storeTupleStateHook func(instanceID string, state *TupleState) error
 
@@ -52,6 +55,14 @@ type FilesystemStateManager struct {
 	storeAppDefinitionHook func(instanceID string, app *AppInstance) error
 	storeAppMetadataHook   func(instanceID string, app *AppInstance) error
 }
+
+type appPublicationState uint8
+
+const (
+	appPublicationAbsent appPublicationState = iota
+	appPublicationIncomplete
+	appPublicationComplete
+)
 
 // AppMetadata represents runtime metadata stored separately from app.yaml.
 type AppMetadata struct {
@@ -69,6 +80,11 @@ type AppMetadata struct {
 	// ActiveRootfs tracks the active rootfs volume ID per service (RFC 20260302).
 	// nil = legacy install (use ServiceRootfsVolumeID without digest).
 	ActiveRootfs map[string]string `json:"active_rootfs,omitempty"`
+	// ArtifactReferences records the exact Ready content selected at install or
+	// committed update time.
+	ArtifactReferences map[string]string `json:"artifact_references,omitempty"`
+	AcceleratorDevices []string          `json:"accelerator_devices,omitempty"`
+	CapabilityBindings map[string]string `json:"capability_bindings,omitempty"`
 	// ClonedFrom tracks the origin instance ID this app was cloned from.
 	ClonedFrom string `json:"cloned_from,omitempty"`
 	// Init tracks per-service init script execution state.
@@ -110,6 +126,9 @@ func instanceToMetadata(app *AppInstance) AppMetadata {
 		UpdatedAt:           app.UpdatedAt,
 		CatalogSource:       app.CatalogSource,
 		ActiveRootfs:        app.ActiveRootfs,
+		ArtifactReferences:  app.ArtifactReferences,
+		AcceleratorDevices:  append([]string(nil), app.AcceleratorDevices...),
+		CapabilityBindings:  cloneStringMap(app.CapabilityBindings),
 		ClonedFrom:          app.ClonedFrom,
 		Init:                app.Init,
 		CatalogManifestHash: app.CatalogManifestHash,
@@ -132,6 +151,9 @@ func metadataIntoInstance(meta AppMetadata, app *AppInstance) {
 	app.UpdatedAt = meta.UpdatedAt
 	app.CatalogSource = meta.CatalogSource
 	app.ActiveRootfs = meta.ActiveRootfs
+	app.ArtifactReferences = meta.ArtifactReferences
+	app.AcceleratorDevices = append([]string(nil), meta.AcceleratorDevices...)
+	app.CapabilityBindings = cloneStringMap(meta.CapabilityBindings)
 	app.ClonedFrom = meta.ClonedFrom
 	app.Init = meta.Init
 	app.CatalogManifestHash = meta.CatalogManifestHash
@@ -144,6 +166,17 @@ func metadataIntoInstance(meta AppMetadata, app *AppInstance) {
 // InitState tracks init script execution across services.
 type InitState struct {
 	Services map[string]ServiceInitState `json:"services"`
+}
+
+func cloneInitState(state *InitState) *InitState {
+	if state == nil {
+		return nil
+	}
+	cloned := &InitState{Services: make(map[string]ServiceInitState, len(state.Services))}
+	for service, serviceState := range state.Services {
+		cloned.Services[service] = serviceState
+	}
+	return cloned
 }
 
 // InitStatus constants for ServiceInitState.Status.
@@ -614,6 +647,20 @@ func (fsm *FilesystemStateManager) ListApps() []*AppInstance {
 	return apps
 }
 
+func (fsm *FilesystemStateManager) listAppDirectoryIDs() ([]string, error) {
+	entries, err := os.ReadDir(fsm.appsDir)
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() {
+			ids = append(ids, entry.Name())
+		}
+	}
+	return ids, nil
+}
+
 const generationsFile = "generations.json"
 
 // LoadTupleState reads the tuple generation state for an app instance.
@@ -683,4 +730,53 @@ func (fsm *FilesystemStateManager) RemoveApp(instanceID string) error {
 	fsm.cacheMu.Unlock()
 
 	return nil
+}
+
+// removeIncompleteApp removes a split-file StoreApp publication only after
+// the caller has proved that no candidate process remains. Rechecking under
+// fsMu prevents a concurrent successful StoreApp from being removed as debris.
+func (fsm *FilesystemStateManager) removeIncompleteApp(instanceID string) error {
+	fsm.fsMu.Lock()
+	defer fsm.fsMu.Unlock()
+
+	appDir := filepath.Join(fsm.appsDir, instanceID)
+	publication, err := inspectAppPublication(appDir)
+	if err != nil {
+		return err
+	}
+	switch publication {
+	case appPublicationAbsent:
+		return nil
+	case appPublicationComplete:
+		return fmt.Errorf("refusing to remove complete app publication for %s", instanceID)
+	}
+	if err := os.RemoveAll(appDir); err != nil {
+		return fmt.Errorf("remove incomplete app directory: %w", err)
+	}
+	fsm.cacheMu.Lock()
+	delete(fsm.cache, instanceID)
+	fsm.cacheMu.Unlock()
+	return nil
+}
+
+func inspectAppPublication(appDir string) (appPublicationState, error) {
+	var present int
+	for _, name := range []string{"app.yaml", "metadata.json"} {
+		_, err := os.Stat(filepath.Join(appDir, name))
+		switch {
+		case err == nil:
+			present++
+		case os.IsNotExist(err):
+		default:
+			return appPublicationAbsent, err
+		}
+	}
+	switch present {
+	case 0:
+		return appPublicationAbsent, nil
+	case 1:
+		return appPublicationIncomplete, nil
+	default:
+		return appPublicationComplete, nil
+	}
 }

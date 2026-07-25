@@ -27,12 +27,13 @@ import (
 )
 
 const (
-	manifestUpdateTokenTTL       = 30 * time.Minute
-	manifestUpdateTxnFilename    = "manifest_update_transaction.json"
-	manifestUpdateBackupFilename = "app.manifest-update.prev.yaml"
-	installStateBackupFilename   = "install_state.manifest-update.prev.json"
-	exposureReviewConfirmation   = "exposure_review"
-	inputUsageScanSentinelPrefix = "__PICCOLO_INPUT_USAGE_SCAN_SENTINEL_"
+	manifestUpdateTokenTTL                    = 30 * time.Minute
+	manifestUpdateTxnFilename                 = "manifest_update_transaction.json"
+	manifestUpdateBackupFilename              = "app.manifest-update.prev.yaml"
+	installStateBackupFilename                = "install_state.manifest-update.prev.json"
+	exposureReviewConfirmation                = "exposure_review"
+	selectedProviderRemovalReviewConfirmation = "selected_provider_removal_review"
+	inputUsageScanSentinelPrefix              = "__PICCOLO_INPUT_USAGE_SCAN_SENTINEL_"
 
 	manifestUpdateImageEntryAppService    = "app_service"
 	manifestUpdateImageEntryRuntimeAnchor = "runtime_anchor"
@@ -210,6 +211,8 @@ type ManifestUpdateTransaction struct {
 	BackupInstallStatePath    string                        `json:"backup_install_state_path,omitempty"`
 	PreviousActiveRootfs      map[string]string             `json:"previous_active_rootfs,omitempty"`
 	CandidateActiveRootfs     map[string]string             `json:"candidate_active_rootfs,omitempty"`
+	PreviousArtifactRefs      map[string]string             `json:"previous_artifact_references,omitempty"`
+	CandidateArtifactRefs     map[string]string             `json:"candidate_artifact_references,omitempty"`
 	RemovedRootfs             []string                      `json:"removed_rootfs,omitempty"`
 	StagedRootfs              []string                      `json:"staged_rootfs,omitempty"`
 	CreatedRootfs             []string                      `json:"created_rootfs,omitempty"`
@@ -626,6 +629,14 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	if req.TransitionPlanHash != "" && req.TransitionPlanHash != cand.TransitionPlanHash {
 		return nil, fmt.Errorf("%w: transition plan hash does not match dry run", ErrManifestUpdateConflict)
 	}
+	if removed, err := selectedCapabilityRemovedByDefinition(state, req.InstanceID, cand.Definition); err != nil {
+		return nil, err
+	} else if removed && !slices.Contains(
+		cand.Classification.RequiredConfirmations,
+		selectedProviderRemovalReviewConfirmation,
+	) {
+		return nil, fmt.Errorf("%w: capability selection changed after dry run; run dry run again", ErrManifestUpdateConflict)
+	}
 	if missing := missingManifestUpdateConfirmations(cand.Classification.RequiredConfirmations, req.Confirmations); len(missing) > 0 {
 		return nil, fmt.Errorf("%w: missing required confirmation(s): %s", ErrManifestUpdateRejected, strings.Join(missing, ", "))
 	}
@@ -739,12 +750,19 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 		}
 	}
 	accessRepairMessage := ""
-	if err := applyTxn.publishAccess(); err != nil {
+	accessRepairErr := applyTxn.publishAccess()
+	if accessRepairErr == nil &&
+		slices.Contains(cand.Classification.OperationRiskFlags, "capability_provider_authority_changed") {
+		if err := m.finalizeCommittedCapabilityRuntime(ctx, state, req.InstanceID); err != nil {
+			accessRepairErr = fmt.Errorf("reconcile committed capability change: %w", err)
+		}
+	}
+	if accessRepairErr != nil {
 		accessRepairPending = true
 		if catalogMetadataErr != nil {
-			err = errors.Join(err, catalogMetadataErr)
+			accessRepairErr = errors.Join(accessRepairErr, catalogMetadataErr)
 		}
-		accessRepairMessage = applyTxn.markAccessRepairPending(err)
+		accessRepairMessage = applyTxn.markAccessRepairPending(accessRepairErr)
 	} else if catalogMetadataErr != nil {
 		applyTxn.markCatalogMetadataPending(catalogMetadataErr)
 	} else {
@@ -776,6 +794,15 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	}, nil
 }
 
+func (m *AppManager) quiesceManifestRollbackProcesses(instanceID string) error {
+	cleanupCtx, cancel := context.WithTimeout(
+		pressure.WithTransitionContinuation(context.Background()),
+		cleanupBudget,
+	)
+	defer cancel()
+	return m.quiesceAppUserSession(cleanupCtx, instanceID)
+}
+
 func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance, prevDef, failedDef *api.AppDefinition, txn *ManifestUpdateTransaction, taskType, operationKind string, publicationResumeToken services.PublicationResumeToken, cause error) error {
 	instanceID := appInst.InstanceID
 	txn.Phase = "restoring_previous"
@@ -784,14 +811,43 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 	_ = state.StoreManifestUpdateTransaction(instanceID, txn)
 	_ = storeTransitionRecordForManifestTransaction(state, instanceID, txn, appInst, TransitionPhaseRestoringPrevious)
 	m.emitProgress(ctx, taskType, instanceID, taskPhaseRestoringManifest, 75, "Restoring previous manifest", false, nil)
+	if manifestTransactionRuntimeSwitchStarted(txn) {
+		if err := m.quiesceManifestRollbackProcesses(instanceID); err != nil {
+			txn.Phase = "restore_failed"
+			txn.LastError = fmt.Sprintf("apply failed: %v; prove process absence before restore: %v", cause, err)
+			txn.UpdatedAt = time.Now().UTC()
+			_ = state.StoreManifestUpdateTransaction(instanceID, txn)
+			_ = storeTransitionRecordForManifestTransaction(
+				state,
+				instanceID,
+				txn,
+				appInst,
+				TransitionPhaseRestoreFailed,
+			)
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf(
+				"%s failed and process absence before rollback is unproven: %w",
+				operationKind,
+				errors.Join(cause, err),
+			)
+		}
+	}
 
 	var rollbackErrs []error
-	appInst.Definition = prevDef
-	if txn.PreviousActiveRootfs != nil || txn.CandidateActiveRootfs != nil {
-		appInst.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
-	}
-	if err := state.StoreApp(appInst); err != nil {
-		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore manifest failed: %w", err))
+	candidate, candidateErr := detachedAppCandidate(appInst)
+	if candidateErr != nil {
+		rollbackErrs = append(rollbackErrs, candidateErr)
+	} else {
+		candidate.Definition = prevDef
+		if txn.PreviousActiveRootfs != nil || txn.CandidateActiveRootfs != nil {
+			candidate.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
+		}
+		if txn.PreviousArtifactRefs != nil || txn.CandidateArtifactRefs != nil {
+			candidate.ArtifactReferences = cloneStringMap(txn.PreviousArtifactRefs)
+		}
+		if err := commitDetachedApp(state, appInst, candidate); err != nil {
+			rollbackErrs = append(rollbackErrs, fmt.Errorf("restore manifest failed: %w", err))
+		}
 	}
 	if err := state.RestoreInstallStateForTransaction(instanceID, txn); err != nil {
 		rollbackErrs = append(rollbackErrs, fmt.Errorf("restore install state failed: %w", err))
@@ -808,7 +864,7 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 	}
 	runtimePublicationReady := !manifestTransactionRuntimeSwitchStarted(txn)
 	if manifestTransactionRuntimeSwitchStarted(txn) {
-		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, publicationResumeToken); err != nil {
+		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, nil, publicationResumeToken, true); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers failed: %w", err))
 		} else {
 			runtimePublicationReady = true
@@ -827,6 +883,9 @@ func (m *AppManager) restoreInstalledAppApplyFailure(ctx context.Context, state 
 	}
 	if err := m.cleanupManifestUpdateStagedRootfs(ctx, txn); err != nil {
 		rollbackErrs = append(rollbackErrs, err)
+	}
+	if err := m.destroyArtifactReferences(ctx, subtractArtifactReferences(txn.CandidateArtifactRefs, txn.PreviousArtifactRefs)); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("release candidate artifact references: %w", err))
 	}
 	if restoreErr := errors.Join(rollbackErrs...); restoreErr != nil {
 		txn.Phase = "restore_failed"
@@ -892,6 +951,7 @@ func (m *AppManager) cleanupCommittedManifestUpdateTransaction(ctx context.Conte
 	if err := errors.Join(
 		m.cleanupPrecommitDataSnapshot(ctx, txn),
 		m.cleanupManifestUpdateRemovedRootfs(ctx, txn),
+		m.destroyArtifactReferences(ctx, subtractArtifactReferences(txn.PreviousArtifactRefs, txn.CandidateArtifactRefs)),
 	); err != nil {
 		txn.Phase = "committed_cleanup_pending"
 		txn.LastError = err.Error()
@@ -981,6 +1041,14 @@ func (m *AppManager) repairCommittedManifestUpdateAccess(ctx context.Context, st
 		proxyDeltaApplied = true
 	}
 	m.configureOIDCAuthorizePaths(instanceID, candidateDef)
+	if !listenerCapabilityProvidersEqual(prevDef.Listeners, candidateDef.Listeners) {
+		if err := m.finalizeCommittedCapabilityRuntime(ctx, state, instanceID); err != nil {
+			txn.LastError = err.Error()
+			txn.UpdatedAt = time.Now().UTC()
+			_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
+			return fmt.Errorf("manifest update recovery %s: repair capability effects: %w", instanceID, err)
+		}
+	}
 	txn.AccessSuspended = false
 	txn.AccessPublished = true
 	if proxyDeltaApplied {
@@ -1590,6 +1658,17 @@ func (m *AppManager) renderCustomManifestUpdateCandidate(ctx context.Context, re
 			summary.WillPreserve = append(summary.WillPreserve, fmt.Sprintf("current value for input %s after review", item.Field))
 		}
 	}
+	if !policy.Classification.HasRejected {
+		if err := addSelectedProviderRemovalReview(
+			state,
+			req.InstanceID,
+			res.Definition,
+			&policy.Classification,
+			&summary,
+		); err != nil {
+			return nil, nil, err
+		}
+	}
 	if policy.Classification.HasRejected {
 		policy.Stageable = false
 		if policy.Reason == "" {
@@ -1789,6 +1868,37 @@ func addManifestUpdateRiskFlag(classification *manifestUpdateClassification, val
 		return
 	}
 	classification.OperationRiskFlags = append(classification.OperationRiskFlags, value)
+}
+
+func selectedCapabilityRemovedByDefinition(
+	state *FilesystemStateManager,
+	instanceID string,
+	candidate *api.AppDefinition,
+) (bool, error) {
+	capability, selected, err := capabilitySelectedByProvider(state, instanceID)
+	if err != nil || !selected {
+		return false, err
+	}
+	_, _, stillProvided := providedCapability(candidate, capability)
+	return !stillProvided, nil
+}
+
+func addSelectedProviderRemovalReview(
+	state *FilesystemStateManager,
+	instanceID string,
+	candidate *api.AppDefinition,
+	classification *manifestUpdateClassification,
+	summary *ManifestUpdateSummary,
+) error {
+	removed, err := selectedCapabilityRemovedByDefinition(state, instanceID, candidate)
+	if err != nil || !removed {
+		return err
+	}
+	addManifestUpdateRequiredConfirmation(classification, selectedProviderRemovalReviewConfirmation)
+	if summary != nil && !slices.Contains(summary.ExpectedInterruption, CapabilityProviderChangeDisclosure) {
+		summary.ExpectedInterruption = append(summary.ExpectedInterruption, CapabilityProviderChangeDisclosure)
+	}
+	return nil
 }
 
 func applyManifestUpdateImagePlanClassification(classification *manifestUpdateClassification, summary *ManifestUpdateSummary, previousDef *api.AppDefinition, imagePlan []ManifestUpdateImagePlanItem) {
@@ -2470,7 +2580,14 @@ func evaluateCustomManifestUpdatePolicy(oldDef, newDef *api.AppDefinition) (cust
 		addDecision("listener_topology_changed", "listeners", "operator_review", "listener topology, routing, or auth changed", "")
 		addRiskFlag("listener_or_auth_changed")
 		classification.ListenerRoutingAuth = append(classification.ListenerRoutingAuth, "listener endpoint/routing/auth changes require prepared routing and explicit review")
-		addListenerExposureReviewItems(oldCmp.Listeners, newCmp.Listeners, addExposureReview)
+		if addListenerExposureReviewItems(oldCmp.Listeners, newCmp.Listeners, addExposureReview) {
+			addDecision("capability_provides_changed", "listeners.provides", "operator_review", "provider capability or private base path changed", "")
+			addRiskFlag("capability_provider_authority_changed")
+			classification.ListenerRoutingAuth = append(
+				classification.ListenerRoutingAuth,
+				"provider capability authority and exact private base path require explicit review",
+			)
+		}
 	}
 	if !reflect.DeepEqual(oldCmp.Permissions, newCmp.Permissions) {
 		addRejected("permissions_changed", "permissions", "permission changes require reinstall or a future flow")
@@ -2590,6 +2707,21 @@ func evaluateCustomManifestUpdatePolicy(oldDef, newDef *api.AppDefinition) (cust
 			} else {
 				addRejected("oidc_client_changed", path+".oidc_client", fmt.Sprintf("service %q OIDC client lifecycle or credential material changed; first v2 implementation rejects this", name))
 			}
+		}
+		if !reflect.DeepEqual(oldSvc.Consumes, newSvc.Consumes) {
+			classification.UpdateClass = "service_app_update_v2"
+			addDecision("capability_consumes_changed", path+".consumes", "operator_review", fmt.Sprintf("service %q capability access changed", name), "")
+			addExposureReview(
+				path+".consumes",
+				"capability_access",
+				capabilityConsumerSummary(oldSvc.Consumes),
+				capabilityConsumerSummary(newSvc.Consumes),
+			)
+			addRiskFlag("capability_access_changed")
+			classification.ListenerRoutingAuth = append(
+				classification.ListenerRoutingAuth,
+				fmt.Sprintf("service %s private capability access requires explicit review", name),
+			)
 		}
 		for _, key := range changedStringMapKeys(oldSvc.Environment, newSvc.Environment) {
 			if appHasPersistentStorage(oldCmp) {
@@ -2775,7 +2907,24 @@ func listenerSummary(listeners []api.AppListener) string {
 	return strings.Join(parts, ", ")
 }
 
-func addListenerExposureReviewItems(oldListeners, newListeners []api.AppListener, add func(path, kind, oldValue, newValue string)) {
+func capabilityConsumerSummary(consumers []api.CapabilityConsumer) string {
+	if len(consumers) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(consumers))
+	for _, consumer := range consumers {
+		env := make([]string, 0, len(consumer.Env))
+		for binding, target := range consumer.Env {
+			env = append(env, binding+"="+target)
+		}
+		slices.Sort(env)
+		parts = append(parts, consumer.Capability+"{"+strings.Join(env, ",")+"}")
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, ", ")
+}
+
+func addListenerExposureReviewItems(oldListeners, newListeners []api.AppListener, add func(path, kind, oldValue, newValue string)) bool {
 	oldByName := make(map[string]api.AppListener, len(oldListeners))
 	newByName := make(map[string]api.AppListener, len(newListeners))
 	names := make([]string, 0, len(oldListeners)+len(newListeners))
@@ -2792,10 +2941,21 @@ func addListenerExposureReviewItems(oldListeners, newListeners []api.AppListener
 	slices.Sort(names)
 
 	added := false
+	providerAuthorityChanged := false
 	for _, name := range names {
 		oldL, oldExists := oldByName[name]
 		newL, newExists := newByName[name]
 		path := "listeners." + name
+		if !reflect.DeepEqual(oldL.Provides, newL.Provides) {
+			add(
+				path+".provides",
+				"capability_provider_authority",
+				capabilityProviderSummary(oldL.Provides),
+				capabilityProviderSummary(newL.Provides),
+			)
+			added = true
+			providerAuthorityChanged = true
+		}
 		switch {
 		case oldExists && !newExists:
 			add(path, "listener_removed", listenerDetailSummary(oldL), "none")
@@ -2804,6 +2964,13 @@ func addListenerExposureReviewItems(oldListeners, newListeners []api.AppListener
 			add(path, "listener_added", "none", listenerDetailSummary(newL))
 			added = true
 		case oldExists && newExists && !reflect.DeepEqual(oldL, newL):
+			oldWithoutProvides := oldL
+			newWithoutProvides := newL
+			oldWithoutProvides.Provides = nil
+			newWithoutProvides.Provides = nil
+			if reflect.DeepEqual(oldWithoutProvides, newWithoutProvides) {
+				continue
+			}
 			add(path, "listener_changed", listenerDetailSummary(oldL), listenerDetailSummary(newL))
 			added = true
 		}
@@ -2811,6 +2978,19 @@ func addListenerExposureReviewItems(oldListeners, newListeners []api.AppListener
 	if !added {
 		add("listeners", "listener_order_or_duplicate_shape", listenerSummary(oldListeners), listenerSummary(newListeners))
 	}
+	return providerAuthorityChanged
+}
+
+func capabilityProviderSummary(providers []api.CapabilityProvider) string {
+	if len(providers) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(providers))
+	for _, provider := range providers {
+		parts = append(parts, provider.Capability+"{base_path="+provider.BasePath+"}")
+	}
+	slices.Sort(parts)
+	return strings.Join(parts, ", ")
 }
 
 func exposureReviewConfirmationID(path string) string {
@@ -3309,7 +3489,7 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 			}
 			createdRootfs = append(createdRootfs, volID)
 		}
-		goldenCfg, cfgErr := m.readImageConfigForRootfs(ctx, rootfs, canonicalDigest)
+		goldenCfg, cfgErr := m.readImageConfigForGoldenRootfs(ctx, rootfs, handle.GoldenLV, canonicalDigest)
 		if cfgErr != nil {
 			log.Printf("WARN: manifest update %s: read image config for %s: %v", instanceID, svcName, cfgErr)
 		}
@@ -3495,10 +3675,10 @@ func (m *AppManager) manifestUpdateRuntimeEndpoints(instanceID string, candidate
 }
 
 func (m *AppManager) recreateContainersInPlaceWithPreparedListeners(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, listenerPlan *services.PreparedReconcile) error {
-	return m.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, listenerPlan, nil)
+	return m.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, listenerPlan, nil, nil)
 }
 
-func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, listenerPlan *services.PreparedReconcile, beforeInstall func() error) error {
+func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, listenerPlan *services.PreparedReconcile, beforeInstall func() error, beforeCandidatePublish func(*AppInstance) error) error {
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -3533,19 +3713,30 @@ func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx c
 			return fmt.Errorf("attach existing rootfs: %w", err)
 		}
 	}
-	result, err := m.installContainerGroup(ctx, candidateDef, instanceID, layout, runtime, endpoints, prebuiltRootfs)
+	reuseArtifacts := reflect.DeepEqual(candidateDef.Artifacts, removeDef.Artifacts)
+	result, err := m.installContainerGroup(ctx, candidateDef, instanceID, layout, runtime, endpoints, prebuiltRootfs, reuseArtifacts, false)
 	if err != nil {
 		return fmt.Errorf("install container group: %w", err)
 	}
-	appInst.NetworkAnchorID = result.NetworkAnchorID
-	appInst.Containers = result.Containers
-	appInst.PrimaryService = result.PrimaryService
-	appInst.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, candidateDef)
-	if err := state.StoreApp(appInst); err != nil {
-		if rmErr := m.removeContainersForMultiApp(ctx, result, candidateDef, runtime); rmErr != nil {
-			log.Printf("WARN: manifest update %s: cleanup after persist failure: %v", instanceID, rmErr)
+	if beforeCandidatePublish != nil {
+		if err := beforeCandidatePublish(result); err != nil {
+			return m.abortUncommittedContainerGroup(err, state, appInst, result, candidateDef, runtime)
 		}
-		return fmt.Errorf("persist container ids: %w", err)
+	}
+	candidate, err := recreatedAppCandidate(appInst, result)
+	if err != nil {
+		return m.abortUncommittedContainerGroup(err, state, appInst, result, candidateDef, runtime)
+	}
+	candidate.ActiveRootfs = activeRootfsForDefinition(appInst.ActiveRootfs, candidateDef)
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
+		return m.abortUncommittedContainerGroup(
+			fmt.Errorf("persist container ids: %w", err),
+			state,
+			appInst,
+			result,
+			candidateDef,
+			runtime,
+		)
 	}
 	if appInst.Enabled {
 		m.setObservedStatus(instanceID, StatusRunning)
@@ -3554,12 +3745,12 @@ func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx c
 }
 
 func (m *AppManager) recreateContainersFromStagedRootfs(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, stage *manifestUpdateRuntimeStage, listenerPlan *services.PreparedReconcile) error {
-	return m.recreateContainersFromStagedRootfsWithHook(ctx, instanceID, candidateDef, removeDef, appInst, stage, listenerPlan, nil)
+	return m.recreateContainersFromStagedRootfsWithHook(ctx, instanceID, candidateDef, removeDef, appInst, stage, listenerPlan, nil, nil)
 }
 
-func (m *AppManager) recreateContainersFromStagedRootfsWithHook(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, stage *manifestUpdateRuntimeStage, listenerPlan *services.PreparedReconcile, beforeInstall func() error) error {
+func (m *AppManager) recreateContainersFromStagedRootfsWithHook(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance, stage *manifestUpdateRuntimeStage, listenerPlan *services.PreparedReconcile, beforeInstall func() error, beforeCandidatePublish func(*AppInstance) error) error {
 	if stage == nil || len(stage.prebuiltRootfs) == 0 {
-		return m.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, listenerPlan, beforeInstall)
+		return m.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, listenerPlan, beforeInstall, beforeCandidatePublish)
 	}
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -3588,19 +3779,30 @@ func (m *AppManager) recreateContainersFromStagedRootfsWithHook(ctx context.Cont
 		}
 	}
 
-	result, err := m.installContainerGroup(ctx, candidateDef, instanceID, layout, runtime, endpoints, stage.prebuiltRootfs)
+	reuseArtifacts := reflect.DeepEqual(candidateDef.Artifacts, removeDef.Artifacts)
+	result, err := m.installContainerGroup(ctx, candidateDef, instanceID, layout, runtime, endpoints, stage.prebuiltRootfs, reuseArtifacts, false)
 	if err != nil {
 		return fmt.Errorf("install container group: %w", err)
 	}
-	appInst.NetworkAnchorID = result.NetworkAnchorID
-	appInst.Containers = result.Containers
-	appInst.PrimaryService = result.PrimaryService
-	appInst.ActiveRootfs = cloneStringMap(stage.candidateActiveRootfs)
-	if err := state.StoreApp(appInst); err != nil {
-		if rmErr := m.removeContainersForMultiApp(ctx, result, candidateDef, runtime); rmErr != nil {
-			log.Printf("WARN: manifest update %s: cleanup after persist failure: %v", instanceID, rmErr)
+	if beforeCandidatePublish != nil {
+		if err := beforeCandidatePublish(result); err != nil {
+			return m.abortUncommittedContainerGroup(err, state, appInst, result, candidateDef, runtime)
 		}
-		return fmt.Errorf("persist container ids: %w", err)
+	}
+	candidate, err := recreatedAppCandidate(appInst, result)
+	if err != nil {
+		return m.abortUncommittedContainerGroup(err, state, appInst, result, candidateDef, runtime)
+	}
+	candidate.ActiveRootfs = cloneStringMap(stage.candidateActiveRootfs)
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
+		return m.abortUncommittedContainerGroup(
+			fmt.Errorf("persist container ids: %w", err),
+			state,
+			appInst,
+			result,
+			candidateDef,
+			runtime,
+		)
 	}
 	if appInst.Enabled {
 		m.setObservedStatus(instanceID, StatusRunning)
@@ -4405,12 +4607,33 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	failedDef := appInst.Definition
 	txn.Phase = "restoring_previous"
 	_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
-	appInst.Definition = prevDef
+	if manifestTransactionRuntimeSwitchStarted(txn) {
+		if err := m.quiesceManifestRollbackProcesses(instanceID); err != nil {
+			txn.Phase = "restore_failed"
+			txn.LastError = fmt.Sprintf("prove process absence before restore: %v", err)
+			txn.UpdatedAt = time.Now().UTC()
+			_ = storeManifestUpdateTransactionAndTransition(state, instanceID, txn, appInst)
+			m.setObservedStatus(instanceID, StatusError)
+			return fmt.Errorf(
+				"manifest update recovery %s: prove process absence before restore: %w",
+				instanceID,
+				err,
+			)
+		}
+	}
+	candidate, candidateErr := detachedAppCandidate(appInst)
+	if candidateErr != nil {
+		return candidateErr
+	}
+	candidate.Definition = prevDef
 	if txn.PreviousActiveRootfs != nil || txn.CandidateActiveRootfs != nil {
-		appInst.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
+		candidate.ActiveRootfs = cloneStringMap(txn.PreviousActiveRootfs)
+	}
+	if txn.PreviousArtifactRefs != nil || txn.CandidateArtifactRefs != nil {
+		candidate.ArtifactReferences = cloneStringMap(txn.PreviousArtifactRefs)
 	}
 	var rollbackErrs []error
-	if err := state.StoreApp(appInst); err != nil {
+	if err := commitDetachedApp(state, appInst, candidate); err != nil {
 		rollbackErrs = append(rollbackErrs, fmt.Errorf("store backup manifest: %w", err))
 	}
 	if err := state.RestoreInstallStateForTransaction(instanceID, txn); err != nil {
@@ -4435,7 +4658,7 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	}
 	runtimePublicationReady := !manifestTransactionRuntimeSwitchStarted(txn) || !appInst.Enabled
 	if manifestTransactionRuntimeSwitchStarted(txn) && appInst.Enabled {
-		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, publicationResumeToken); err != nil {
+		if err := m.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, prevDef, failedDef, appInst, nil, nil, publicationResumeToken, true); err != nil {
 			rollbackErrs = append(rollbackErrs, fmt.Errorf("recreate previous containers: %w", err))
 		} else {
 			runtimePublicationReady = true
@@ -4454,6 +4677,9 @@ func (m *AppManager) recoverOneManifestUpdate(ctx context.Context, state *Filesy
 	}
 	if err := m.cleanupManifestUpdateStagedRootfs(ctx, txn); err != nil {
 		rollbackErrs = append(rollbackErrs, err)
+	}
+	if err := m.destroyArtifactReferences(ctx, subtractArtifactReferences(txn.CandidateArtifactRefs, txn.PreviousArtifactRefs)); err != nil {
+		rollbackErrs = append(rollbackErrs, fmt.Errorf("release candidate artifact references: %w", err))
 	}
 	if restoreErr := errors.Join(rollbackErrs...); restoreErr != nil {
 		txn.Phase = "restore_failed"

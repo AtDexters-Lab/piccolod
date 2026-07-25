@@ -83,6 +83,10 @@ var (
 	// We target complete expressions (not bare {{ or }}) to avoid breaking
 	// legitimate YAML flow mappings like {key: {nested: val}}.
 	tplExprRegex = regexp.MustCompile(`\{\{.*?\}\}`)
+
+	capabilityEnvNameRegex = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+	canonicalSHA256Regex   = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	huggingFaceRepoPartRE  = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?$`)
 )
 
 // neutralizeTemplates replaces Go template delimiters within {{ ... }} expressions
@@ -250,6 +254,7 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 		"environment": {},
 		"storage":     {},
 		"oidc_client": {},
+		"consumes":    {},
 	}
 
 	for i := 0; i+1 < len(services.Content); i += 2 {
@@ -276,6 +281,203 @@ func validateRawServicesBlocks(root *yaml.Node) error {
 			}
 			if _, ok := allowedServiceKeys[field]; !ok {
 				return fmt.Errorf("services.%s contains unsupported field '%s'", name, field)
+			}
+		}
+	}
+
+	return nil
+}
+
+func rawMappingFields(node *yaml.Node, location string) (map[string]*yaml.Node, error) {
+	if node == nil || node.Kind != yaml.MappingNode {
+		return nil, fmt.Errorf("%s must be a mapping", location)
+	}
+	fields := make(map[string]*yaml.Node, len(node.Content)/2)
+	for i := 0; i+1 < len(node.Content); i += 2 {
+		keyNode := node.Content[i]
+		if keyNode == nil || keyNode.Kind != yaml.ScalarNode {
+			return nil, fmt.Errorf("%s contains a non-string field name", location)
+		}
+		key := keyNode.Value
+		if _, exists := fields[key]; exists {
+			return nil, fmt.Errorf("%s contains duplicate field %q", location, key)
+		}
+		fields[key] = node.Content[i+1]
+	}
+	return fields, nil
+}
+
+func validateRawClosedMapping(node *yaml.Node, location string, allowed ...string) (map[string]*yaml.Node, error) {
+	fields, err := rawMappingFields(node, location)
+	if err != nil {
+		return nil, err
+	}
+	allowedSet := make(map[string]struct{}, len(allowed))
+	for _, key := range allowed {
+		allowedSet[key] = struct{}{}
+	}
+	for key := range fields {
+		if _, ok := allowedSet[key]; !ok {
+			return nil, fmt.Errorf("%s contains unsupported field %q", location, key)
+		}
+	}
+	return fields, nil
+}
+
+func requireRawField(fields map[string]*yaml.Node, location, field string) (*yaml.Node, error) {
+	node, ok := fields[field]
+	if !ok {
+		return nil, fmt.Errorf("%s.%s is required", location, field)
+	}
+	return node, nil
+}
+
+func validateRawCapabilityAndArtifactBlocks(root *yaml.Node) error {
+	if artifacts := topLevelValue(root, "artifacts"); artifacts != nil {
+		artifactEntries, err := rawMappingFields(artifacts, "artifacts")
+		if err != nil {
+			return err
+		}
+		if len(artifactEntries) == 0 {
+			return fmt.Errorf("artifacts must not be empty")
+		}
+		for name, artifactNode := range artifactEntries {
+			location := fmt.Sprintf("artifacts.%s", name)
+			fields, err := validateRawClosedMapping(artifactNode, location, "source")
+			if err != nil {
+				return err
+			}
+			sourceNode, err := requireRawField(fields, location, "source")
+			if err != nil {
+				return err
+			}
+			sourceLocation := location + ".source"
+			sourceFields, err := rawMappingFields(sourceNode, sourceLocation)
+			if err != nil {
+				return err
+			}
+			typeNode, err := requireRawField(sourceFields, sourceLocation, "type")
+			if err != nil {
+				return err
+			}
+			if typeNode.Kind != yaml.ScalarNode {
+				return fmt.Errorf("%s.type must be a string", sourceLocation)
+			}
+			var allowed []string
+			switch strings.TrimSpace(typeNode.Value) {
+			case "huggingface":
+				allowed = []string{"type", "repository", "revision", "path", "digest"}
+			case "oci":
+				allowed = []string{"type", "reference", "digest"}
+			default:
+				return fmt.Errorf("%s.type %q is not supported", sourceLocation, typeNode.Value)
+			}
+			if _, err := validateRawClosedMapping(sourceNode, sourceLocation, allowed...); err != nil {
+				return err
+			}
+		}
+	}
+
+	services := topLevelValue(root, "services")
+	if services != nil && services.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(services.Content); i += 2 {
+			serviceName := services.Content[i].Value
+			serviceNode := services.Content[i+1]
+			serviceFields, err := rawMappingFields(serviceNode, "services."+serviceName)
+			if err != nil {
+				continue // Existing decode/validation owns malformed legacy shapes.
+			}
+
+			if consumes := serviceFields["consumes"]; consumes != nil {
+				location := "services." + serviceName + ".consumes"
+				if consumes.Kind != yaml.SequenceNode {
+					return fmt.Errorf("%s must be a list", location)
+				}
+				if len(consumes.Content) == 0 {
+					return fmt.Errorf("%s must not be empty", location)
+				}
+				for index, item := range consumes.Content {
+					itemLocation := fmt.Sprintf("%s[%d]", location, index)
+					fields, err := validateRawClosedMapping(item, itemLocation, "capability", "env")
+					if err != nil {
+						return err
+					}
+					if _, err := requireRawField(fields, itemLocation, "capability"); err != nil {
+						return err
+					}
+					envNode, err := requireRawField(fields, itemLocation, "env")
+					if err != nil {
+						return err
+					}
+					if _, err := rawMappingFields(envNode, itemLocation+".env"); err != nil {
+						return err
+					}
+				}
+			}
+
+			storage := serviceFields["storage"]
+			if storage == nil || storage.Kind != yaml.MappingNode {
+				continue
+			}
+			storageFields, err := rawMappingFields(storage, "services."+serviceName+".storage")
+			if err != nil {
+				return err
+			}
+			mounts := storageFields["artifacts"]
+			if mounts == nil {
+				continue
+			}
+			location := "services." + serviceName + ".storage.artifacts"
+			mountEntries, err := rawMappingFields(mounts, location)
+			if err != nil {
+				return err
+			}
+			if len(mountEntries) == 0 {
+				return fmt.Errorf("%s must not be empty", location)
+			}
+			for name, mountNode := range mountEntries {
+				mountLocation := location + "." + name
+				fields, err := validateRawClosedMapping(mountNode, mountLocation, "container")
+				if err != nil {
+					return err
+				}
+				if _, err := requireRawField(fields, mountLocation, "container"); err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	listeners := topLevelValue(root, "listeners")
+	if listeners != nil && listeners.Kind == yaml.SequenceNode {
+		for listenerIndex, listenerNode := range listeners.Content {
+			listenerFields, err := rawMappingFields(listenerNode, fmt.Sprintf("listeners[%d]", listenerIndex))
+			if err != nil {
+				continue // Existing decode/validation owns malformed legacy shapes.
+			}
+			provides := listenerFields["provides"]
+			if provides == nil {
+				continue
+			}
+			location := fmt.Sprintf("listeners[%d].provides", listenerIndex)
+			if provides.Kind != yaml.SequenceNode {
+				return fmt.Errorf("%s must be a list", location)
+			}
+			if len(provides.Content) == 0 {
+				return fmt.Errorf("%s must not be empty", location)
+			}
+			for index, item := range provides.Content {
+				itemLocation := fmt.Sprintf("%s[%d]", location, index)
+				fields, err := validateRawClosedMapping(item, itemLocation, "capability", "base_path")
+				if err != nil {
+					return err
+				}
+				if _, err := requireRawField(fields, itemLocation, "capability"); err != nil {
+					return err
+				}
+				if _, err := requireRawField(fields, itemLocation, "base_path"); err != nil {
+					return err
+				}
 			}
 		}
 	}
@@ -461,6 +663,9 @@ func ParseAppSchema(content []byte) (*api.AppDefinition, error) {
 		return nil, err
 	}
 	if err := validateRawServicesNoResources(&root); err != nil {
+		return nil, err
+	}
+	if err := validateRawCapabilityAndArtifactBlocks(&root); err != nil {
 		return nil, err
 	}
 
@@ -723,6 +928,9 @@ func ParseAppDefinition(content []byte) (*api.AppDefinition, error) {
 	if err := validateRawServicesBlocks(&root); err != nil {
 		return nil, err
 	}
+	if err := validateRawCapabilityAndArtifactBlocks(&root); err != nil {
+		return nil, err
+	}
 	if err := validateRawResourcesShape(&root); err != nil {
 		return nil, err
 	}
@@ -876,6 +1084,15 @@ func ValidateAppDefinition(app *api.AppDefinition) error {
 	if err := validateListenerPortOwnership(app.Services, app.Listeners); err != nil {
 		return err
 	}
+	if err := validateCapabilityAndArtifactFeatureGates(app); err != nil {
+		return err
+	}
+	if err := validateCapabilityDeclarations(app); err != nil {
+		return err
+	}
+	if err := validateArtifactDeclarations(app); err != nil {
+		return err
+	}
 
 	// Validate storage
 	if err := validateStorage(app.Storage); err != nil {
@@ -1014,11 +1231,354 @@ func validateRequiredFeatures(app *api.AppDefinition) error {
 	}
 	for _, f := range features {
 		switch f {
-		case api.FeatureConnectionAuthMTLSV1:
+		case api.FeatureConnectionAuthMTLSV1,
+			api.FeatureCapabilityBindingsV1,
+			api.FeatureArtifactBindingsV1:
 			// supported by this binary
 		default:
 			return fmt.Errorf("x-piccolo.requires_features contains unsupported feature %q", f)
 		}
+	}
+	return nil
+}
+
+func validateCapabilityAndArtifactFeatureGates(app *api.AppDefinition) error {
+	if app == nil {
+		return nil
+	}
+	usesCapabilities := false
+	for _, listener := range app.Listeners {
+		if listener.Provides != nil {
+			usesCapabilities = true
+			break
+		}
+	}
+	if !usesCapabilities {
+		for _, service := range app.Services {
+			if service.Consumes != nil {
+				usesCapabilities = true
+				break
+			}
+		}
+	}
+	if usesCapabilities && !hasRequiredFeature(app, api.FeatureCapabilityBindingsV1) {
+		return newValidationError(
+			"MISSING_REQUIRED_FEATURE",
+			fmt.Sprintf("capability provides/consumes require x-piccolo.requires_features to include %q", api.FeatureCapabilityBindingsV1),
+		)
+	}
+
+	usesArtifacts := app.Artifacts != nil
+	if !usesArtifacts {
+		for _, service := range app.Services {
+			if service.Storage != nil && service.Storage.Artifacts != nil {
+				usesArtifacts = true
+				break
+			}
+		}
+	}
+	if usesArtifacts && !hasRequiredFeature(app, api.FeatureArtifactBindingsV1) {
+		return newValidationError(
+			"MISSING_REQUIRED_FEATURE",
+			fmt.Sprintf("artifact declarations/mounts require x-piccolo.requires_features to include %q", api.FeatureArtifactBindingsV1),
+		)
+	}
+	return nil
+}
+
+func validateCapabilityDeclarations(app *api.AppDefinition) error {
+	if app == nil {
+		return nil
+	}
+
+	provided := make(map[string]string)
+	for _, listener := range app.Listeners {
+		if listener.Provides != nil && len(listener.Provides) == 0 {
+			return fmt.Errorf("listener %q provides must not be empty", listener.Name)
+		}
+		for index, provider := range listener.Provides {
+			location := fmt.Sprintf("listener %q provides[%d]", listener.Name, index)
+			if provider.Capability != api.CapabilityAIInferenceOpenAIV1 {
+				return fmt.Errorf("%s capability %q is not registered", location, provider.Capability)
+			}
+			if previous, exists := provided[provider.Capability]; exists {
+				return fmt.Errorf("capability %q is provided by both listeners %q and %q", provider.Capability, previous, listener.Name)
+			}
+			if listener.Flow != api.FlowTCP || listener.Protocol != api.ListenerProtocolHTTP {
+				return fmt.Errorf("%s requires listener flow: tcp and protocol: http", location)
+			}
+			if err := validateCapabilityBasePath(provider.BasePath); err != nil {
+				return fmt.Errorf("%s base_path invalid: %w", location, err)
+			}
+			provided[provider.Capability] = listener.Name
+		}
+	}
+
+	for serviceName, service := range app.Services {
+		if service.Consumes != nil && len(service.Consumes) == 0 {
+			return fmt.Errorf("services.%s.consumes must not be empty", serviceName)
+		}
+		consumed := make(map[string]struct{})
+		bindingEnv := make(map[string]struct{})
+		for index, consumer := range service.Consumes {
+			location := fmt.Sprintf("services.%s.consumes[%d]", serviceName, index)
+			if consumer.Capability != api.CapabilityAIInferenceOpenAIV1 {
+				return fmt.Errorf("%s capability %q is not registered", location, consumer.Capability)
+			}
+			if _, exists := consumed[consumer.Capability]; exists {
+				return fmt.Errorf("services.%s consumes capability %q more than once", serviceName, consumer.Capability)
+			}
+			consumed[consumer.Capability] = struct{}{}
+			if len(consumer.Env) == 0 {
+				return fmt.Errorf("%s.env must not be empty", location)
+			}
+			for envName, property := range consumer.Env {
+				if !capabilityEnvNameRegex.MatchString(envName) {
+					return fmt.Errorf("%s.env target %q is not a valid environment-variable name", location, envName)
+				}
+				if property != api.CapabilityBindingBaseURL {
+					return fmt.Errorf("%s.env property %q is not registered for capability %q", location, property, consumer.Capability)
+				}
+				if _, exists := service.Environment[envName]; exists {
+					return fmt.Errorf("%s.env target %q collides with services.%s.environment", location, envName, serviceName)
+				}
+				if service.OIDCClient != nil {
+					if _, exists := service.OIDCClient.Env[envName]; exists {
+						return fmt.Errorf("%s.env target %q collides with services.%s.oidc_client.env", location, envName, serviceName)
+					}
+				}
+				if _, exists := bindingEnv[envName]; exists {
+					return fmt.Errorf("%s.env target %q collides with another capability binding", location, envName)
+				}
+				bindingEnv[envName] = struct{}{}
+			}
+		}
+	}
+	return nil
+}
+
+func validateCapabilityBasePath(raw string) error {
+	_, err := canonicalCapabilityPath(raw)
+	return err
+}
+
+// canonicalCapabilityPath validates one canonical escaped URL path and returns
+// its once-decoded form. A decoded segment must be terminal: retaining a
+// percent sign would let a provider apply another decoding policy after
+// Piccolod has authorized the path.
+func canonicalCapabilityPath(raw string) (string, error) {
+	if raw == "" {
+		return "", fmt.Errorf("must not be empty")
+	}
+	if strings.TrimSpace(raw) != raw {
+		return "", fmt.Errorf("must not have surrounding whitespace")
+	}
+	if !strings.HasPrefix(raw, "/") {
+		return "", fmt.Errorf("must be an absolute path")
+	}
+	if strings.ContainsAny(raw, "?#\\\x00") {
+		return "", fmt.Errorf("must not contain a query, fragment, backslash, or NUL")
+	}
+	if raw != "/" && strings.HasSuffix(raw, "/") {
+		return "", fmt.Errorf("must not have a trailing slash")
+	}
+	if raw == "/" {
+		return raw, nil
+	}
+	decodedSegments := make([]string, 0, strings.Count(raw, "/"))
+	for _, segment := range strings.Split(strings.TrimPrefix(raw, "/"), "/") {
+		if segment == "" {
+			return "", fmt.Errorf("must not contain empty path segments")
+		}
+		decoded, err := url.PathUnescape(segment)
+		if err != nil {
+			return "", fmt.Errorf("contains invalid path escaping")
+		}
+		if err := validateCapabilityPathSegmentDecodings(decoded); err != nil {
+			return "", err
+		}
+		if url.PathEscape(decoded) != segment {
+			return "", fmt.Errorf("must use canonical path-segment escaping")
+		}
+		decodedSegments = append(decodedSegments, decoded)
+	}
+	return "/" + strings.Join(decodedSegments, "/"), nil
+}
+
+func validateCapabilityPathSegmentDecodings(segment string) error {
+	if segment == "." || segment == ".." {
+		return fmt.Errorf("must not contain dot path segments")
+	}
+	if strings.ContainsAny(segment, "/\\\x00") {
+		return fmt.Errorf("must not contain encoded separators")
+	}
+	if strings.Contains(segment, "%") {
+		return fmt.Errorf("must not contain residual percent escaping")
+	}
+	return nil
+}
+
+func validateArtifactDeclarations(app *api.AppDefinition) error {
+	if app == nil {
+		return nil
+	}
+	if app.Artifacts != nil && len(app.Artifacts) == 0 {
+		return fmt.Errorf("artifacts must not be empty")
+	}
+
+	for name, artifact := range app.Artifacts {
+		if err := validateServiceName(name); err != nil {
+			return fmt.Errorf("artifact name %q invalid: %w", name, err)
+		}
+		if err := validateArtifactSource(name, artifact.Source); err != nil {
+			return err
+		}
+	}
+
+	references := make(map[string]int, len(app.Artifacts))
+	for serviceName, service := range app.Services {
+		if service.Storage == nil {
+			continue
+		}
+		for artifactName := range service.Storage.Artifacts {
+			if _, exists := app.Artifacts[artifactName]; !exists {
+				return fmt.Errorf("services.%s.storage.artifacts.%s references undeclared artifact", serviceName, artifactName)
+			}
+			references[artifactName]++
+		}
+	}
+	for name := range app.Artifacts {
+		if references[name] == 0 {
+			return fmt.Errorf("artifact %q must be mounted by at least one service", name)
+		}
+	}
+	if _, _, provider := providedCapability(app, api.CapabilityAIInferenceOpenAIV1); provider {
+		for serviceName, service := range app.Services {
+			if service.Storage == nil {
+				continue
+			}
+			for artifactName, mount := range service.Storage.Artifacts {
+				for _, deviceFamily := range []string{"/dev/dri", "/dev/accel"} {
+					if containerPathsOverlap(mount.Container, deviceFamily) {
+						return fmt.Errorf(
+							"services.%s.storage.artifacts.%s container path %s overlaps accelerator device family %s",
+							serviceName,
+							artifactName,
+							mount.Container,
+							deviceFamily,
+						)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func validateArtifactSource(name string, source api.ArtifactSource) error {
+	location := fmt.Sprintf("artifacts.%s.source", name)
+	switch source.Type {
+	case "huggingface":
+		if strings.TrimSpace(source.Repository) == "" {
+			return fmt.Errorf("%s.repository is required", location)
+		}
+		if strings.TrimSpace(source.Revision) == "" {
+			return fmt.Errorf("%s.revision is required", location)
+		}
+		if strings.TrimSpace(source.Path) == "" {
+			return fmt.Errorf("%s.path is required", location)
+		}
+		if source.Reference != "" {
+			return fmt.Errorf("%s.reference is not valid for type huggingface", location)
+		}
+		if err := validateHuggingFaceRepository(source.Repository); err != nil {
+			return fmt.Errorf("%s.repository invalid: %w", location, err)
+		}
+		if strings.ContainsRune(source.Revision, '\x00') {
+			return fmt.Errorf("%s.revision must not contain NUL", location)
+		}
+		if err := validateHuggingFaceRevision(source.Revision); err != nil {
+			return fmt.Errorf("%s.revision invalid: %w", location, err)
+		}
+		if err := validateArtifactRelativePath(source.Path); err != nil {
+			return fmt.Errorf("%s.path invalid: %w", location, err)
+		}
+	case "oci":
+		if strings.TrimSpace(source.Reference) == "" {
+			return fmt.Errorf("%s.reference is required", location)
+		}
+		if source.Repository != "" || source.Revision != "" || source.Path != "" {
+			return fmt.Errorf("%s contains Hugging Face fields for type oci", location)
+		}
+		if err := validateOCIReference(source.Reference); err != nil {
+			return fmt.Errorf("%s.reference invalid: %w", location, err)
+		}
+	default:
+		return fmt.Errorf("%s.type %q is not supported", location, source.Type)
+	}
+	if source.Digest != "" && !canonicalSHA256Regex.MatchString(source.Digest) {
+		return fmt.Errorf("%s.digest must be sha256 followed by 64 lowercase hexadecimal characters", location)
+	}
+	return nil
+}
+
+func validateHuggingFaceRevision(revision string) error {
+	if strings.TrimSpace(revision) != revision ||
+		strings.Contains(revision, "\\") ||
+		strings.HasPrefix(revision, "/") {
+		return fmt.Errorf("must be a clean repository revision")
+	}
+	for _, segment := range strings.Split(revision, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("must not contain empty or dot path segments")
+		}
+	}
+	return nil
+}
+
+func validateHuggingFaceRepository(repository string) error {
+	if strings.TrimSpace(repository) != repository || strings.ContainsAny(repository, "?#\\\x00") {
+		return fmt.Errorf("must be a repository ID, not a URL")
+	}
+	parts := strings.Split(repository, "/")
+	if len(parts) < 1 || len(parts) > 2 {
+		return fmt.Errorf("must be repo_name or namespace/repo_name")
+	}
+	for _, part := range parts {
+		if !huggingFaceRepoPartRE.MatchString(part) || strings.Contains(part, "..") || strings.Contains(part, "--") {
+			return fmt.Errorf("contains an invalid repository component")
+		}
+	}
+	return nil
+}
+
+func validateArtifactRelativePath(candidate string) error {
+	if candidate == "." {
+		return nil
+	}
+	if strings.TrimSpace(candidate) != candidate || strings.HasPrefix(candidate, "/") {
+		return fmt.Errorf("must be a clean relative POSIX path")
+	}
+	if strings.ContainsAny(candidate, "\\\x00") || path.Clean(candidate) != candidate {
+		return fmt.Errorf("must be a clean relative POSIX path")
+	}
+	for _, segment := range strings.Split(candidate, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("must not contain empty or dot path segments")
+		}
+	}
+	return nil
+}
+
+func validateOCIReference(reference string) error {
+	if strings.TrimSpace(reference) != reference || reference == "" {
+		return fmt.Errorf("must be a non-empty reference")
+	}
+	if strings.Contains(reference, "://") {
+		return fmt.Errorf("must be an OCI registry reference without a URL scheme")
+	}
+	if err := container.ValidateImageReference(reference); err != nil {
+		return err
 	}
 	return nil
 }
@@ -1731,6 +2291,17 @@ func validateStorage(storage *api.AppStorage) error {
 	if err := validateStorageVolumes(storage.Temporary, "temporary"); err != nil {
 		return err
 	}
+	if storage.Artifacts != nil && len(storage.Artifacts) == 0 {
+		return fmt.Errorf("artifact storage mounts must not be empty")
+	}
+	for name, mount := range storage.Artifacts {
+		if err := validateServiceName(name); err != nil {
+			return fmt.Errorf("artifact storage mount name %q invalid: %w", name, err)
+		}
+		if err := validateArtifactContainerPath(mount.Container); err != nil {
+			return fmt.Errorf("artifact storage mount %q container path invalid: %w", name, err)
+		}
+	}
 
 	// Prevent conflicting mountpoints inside the container.
 	seen := make(map[string]string)
@@ -1752,8 +2323,54 @@ func validateStorage(storage *api.AppStorage) error {
 		}
 		seen[vol.Container] = fmt.Sprintf("temporary.%s", name)
 	}
+	for artifactName, mount := range storage.Artifacts {
+		artifactPath := mount.Container
+		for name, vol := range storage.Persistent {
+			if containerPathsOverlap(artifactPath, path.Clean(vol.Container)) {
+				return fmt.Errorf("artifact storage mount %q container path %s overlaps persistent.%s", artifactName, artifactPath, name)
+			}
+		}
+		for name, vol := range storage.Temporary {
+			if containerPathsOverlap(artifactPath, path.Clean(vol.Container)) {
+				return fmt.Errorf("artifact storage mount %q container path %s overlaps temporary.%s", artifactName, artifactPath, name)
+			}
+		}
+		for otherName, otherMount := range storage.Artifacts {
+			if artifactName >= otherName {
+				continue
+			}
+			if containerPathsOverlap(artifactPath, otherMount.Container) {
+				return fmt.Errorf("artifact storage mounts %q and %q have overlapping container paths", artifactName, otherName)
+			}
+		}
+	}
 
 	return nil
+}
+
+func validateArtifactContainerPath(candidate string) error {
+	if candidate == "" || candidate == "/" {
+		return fmt.Errorf("must be an absolute path other than /")
+	}
+	if strings.TrimSpace(candidate) != candidate || !strings.HasPrefix(candidate, "/") {
+		return fmt.Errorf("must be an absolute clean POSIX path")
+	}
+	if strings.ContainsAny(candidate, "\\\x00") || path.Clean(candidate) != candidate {
+		return fmt.Errorf("must be an absolute clean POSIX path")
+	}
+	for _, segment := range strings.Split(strings.TrimPrefix(candidate, "/"), "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return fmt.Errorf("must not contain empty or dot path segments")
+		}
+	}
+	return nil
+}
+
+func containerPathsOverlap(left, right string) bool {
+	if left == right {
+		return true
+	}
+	return strings.HasPrefix(left, right+"/") || strings.HasPrefix(right, left+"/")
 }
 
 // validateStorageVolumes validates a map of storage volumes

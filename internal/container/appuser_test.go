@@ -980,6 +980,44 @@ func TestDestroyAppUser_UID0_guard_with_mock(t *testing.T) {
 	}
 }
 
+func TestDestroyAppUserRequiresCompleteUserSessionQuiescence(t *testing.T) {
+	oldResolver := defaultResolver
+	oldExecutor := defaultExecutor
+	defer func() {
+		defaultResolver = oldResolver
+		defaultExecutor = oldExecutor
+	}()
+
+	const uid = uint32(475)
+	defaultResolver = &mockResolver{
+		users: map[string]*user.User{
+			"pa-namek": {
+				Uid: strconv.FormatUint(uint64(uid), 10), Gid: strconv.FormatUint(uint64(uid), 10),
+				Username: "pa-namek", HomeDir: "/home/pa-namek",
+			},
+		},
+	}
+	proofErr := errors.New("PID 1 state unavailable")
+	exec := &mockExecutor{results: map[string]mockResult{
+		userSessionShowKey(uid): {err: proofErr},
+	}}
+	defaultExecutor = exec
+
+	err := destroyAppUserByName("pa-namek")
+	if !errors.Is(err, proofErr) {
+		t.Fatalf("destroy error = %v, want quiescence proof failure", err)
+	}
+	for _, forbidden := range [][]string{
+		{"loginctl", "disable-linger", "pa-namek"},
+		{"systemctl", "stop", "user-runtime-dir@475.service"},
+		{"userdel", "--remove", "pa-namek"},
+	} {
+		if hasExecutorCall(exec.calls, forbidden...) {
+			t.Fatalf("destructive command ran without quiescence proof: %v", exec.calls)
+		}
+	}
+}
+
 func TestPodmanRuntime_Validate(t *testing.T) {
 	tests := []struct {
 		name    string

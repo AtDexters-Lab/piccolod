@@ -48,6 +48,18 @@ import (
 // Nexus remote tunnel).
 const testLANAddr = "192.168.1.100:54321"
 
+func TestArtifactAwareDefinitionTimeout(t *testing.T) {
+	if got := artifactAwareDefinitionTimeout(&api.AppDefinition{}, time.Minute); got != time.Minute {
+		t.Fatalf("ordinary definition timeout = %s", got)
+	}
+	withArtifact := &api.AppDefinition{
+		Artifacts: map[string]api.AppArtifact{"model": {}},
+	}
+	if got := artifactAwareDefinitionTimeout(withArtifact, time.Minute); got != app.ArtifactOperationTimeout {
+		t.Fatalf("artifact definition timeout = %s, want %s", got, app.ArtifactOperationTimeout)
+	}
+}
+
 func requireMountBypassAllowed(t *testing.T) {
 	t.Helper()
 	if os.Getenv("PICCOLO_ALLOW_UNMOUNTED_TESTS") != "1" {
@@ -1283,6 +1295,15 @@ func (c *testOIDCControl) QuickCheck(context.Context) (persistence.ControlHealth
 // createGinTestServer creates a Gin test server instance with filesystem state management
 func createGinTestServer(t *testing.T, tempDir string) *GinServer {
 	t.Helper()
+	server, _ := createGinTestServerWithContainerManager(t, tempDir)
+	return server
+}
+
+func createGinTestServerWithContainerManager(
+	t *testing.T,
+	tempDir string,
+) (*GinServer, *GinMockContainerManager) {
+	t.Helper()
 	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
 	t.Setenv("PICCOLO_REMOTE_FAKE_ACME", "1")
 	paths.SetCoreRootForTest(t, tempDir)
@@ -1449,7 +1470,7 @@ x-piccolo:
 		}
 	})
 
-	return server
+	return server, mockContainer
 }
 
 func TestLeadership_FollowerStopsApp(t *testing.T) {

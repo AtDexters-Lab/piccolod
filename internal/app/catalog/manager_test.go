@@ -26,6 +26,15 @@ func unlockEvent() events.Event {
 }
 
 func TestGetApps_FiltersUnsupportedRequiredFeatures(t *testing.T) {
+	oldArtifactFeatureAvailable := artifactFeatureAvailable
+	artifactFeatureAvailable = func() bool { return true }
+	oldCapabilityFeatureAvailable := capabilityFeatureAvailable
+	capabilityFeatureAvailable = func() bool { return true }
+	t.Cleanup(func() {
+		artifactFeatureAvailable = oldArtifactFeatureAvailable
+		capabilityFeatureAvailable = oldCapabilityFeatureAvailable
+	})
+
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/index.yaml" {
 			w.Header().Set("Content-Type", "application/x-yaml")
@@ -38,6 +47,14 @@ func TestGetApps_FiltersUnsupportedRequiredFeatures(t *testing.T) {
     description: Uses future feature
     required_features:
       - imaginary_future_feature
+  - name: capability
+    description: Provides a capability
+    required_features:
+      - capability_bindings_v1
+  - name: artifact
+    description: Uses reconstructible content
+    required_features:
+      - artifact_bindings_v1
   - name: ordinary
     description: No special feature
 `))
@@ -52,16 +69,57 @@ func TestGetApps_FiltersUnsupportedRequiredFeatures(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetApps: %v", err)
 	}
-	if resp.Total != 2 {
-		t.Fatalf("Total = %d, want 2", resp.Total)
+	if resp.Total != 4 {
+		t.Fatalf("Total = %d, want 4", resp.Total)
 	}
 	got := map[string]bool{}
 	for _, app := range resp.Apps {
 		got[app.Name] = true
 	}
-	if !got["supported"] || !got["ordinary"] || got["future"] {
+	if !got["supported"] || !got["capability"] || !got["artifact"] || !got["ordinary"] || got["future"] {
 		t.Fatalf("unexpected app set: %#v", got)
 	}
+}
+
+func TestRequiredPodmanArtifactCommandsAvailable(t *testing.T) {
+	t.Run("all required commands", func(t *testing.T) {
+		var got [][]string
+		if !requiredPodmanArtifactCommandsAvailable(func(args ...string) error {
+			got = append(got, append([]string(nil), args...))
+			return nil
+		}) {
+			t.Fatal("requiredPodmanArtifactCommandsAvailable() = false, want true")
+		}
+		want := [][]string{
+			{"artifact", "pull", "--help"},
+			{"artifact", "inspect", "--help"},
+			{"artifact", "extract", "--help"},
+		}
+		if len(got) != len(want) {
+			t.Fatalf("commands = %#v, want %#v", got, want)
+		}
+		for i := range want {
+			if strings.Join(got[i], "\x00") != strings.Join(want[i], "\x00") {
+				t.Fatalf("command %d = %#v, want %#v", i, got[i], want[i])
+			}
+		}
+	})
+
+	t.Run("missing command", func(t *testing.T) {
+		var calls int
+		if requiredPodmanArtifactCommandsAvailable(func(args ...string) error {
+			calls++
+			if len(args) > 1 && args[1] == "inspect" {
+				return errors.New("unsupported")
+			}
+			return nil
+		}) {
+			t.Fatal("requiredPodmanArtifactCommandsAvailable() = true, want false")
+		}
+		if calls != 2 {
+			t.Fatalf("calls = %d, want 2", calls)
+		}
+	})
 }
 
 func TestIsBlockedIP(t *testing.T) {

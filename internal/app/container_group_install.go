@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -22,7 +23,9 @@ import (
 // All containers use --rootfs from golden LV snapshots (block-native architecture).
 // For workspace mode, workspace disks are prepared via golden LVs.
 // When prebuiltRootfs is non-nil, services with entries skip image pull + rootfs creation (used by clone).
-func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo) (*AppInstance, error) {
+// runInitScripts is true only for the first ordinary install. Every recreation
+// reuses the already-initialized persistent state and must not repeat init side effects.
+func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo, reuseRecordedArtifacts, runInitScripts bool) (*AppInstance, error) {
 	if m.serviceManager == nil {
 		return nil, fmt.Errorf("app manager: service manager not configured")
 	}
@@ -86,12 +89,17 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		return createBaseProgress + (createSpanProgress*done)/totalContainers
 	}
 	emitCreateProgress := func(message string) {
-		m.emitProgressWithMetadata(
+		taskType, progress := m.inheritedTaskProgress(
 			ctx,
 			taskTypeInstallApp,
+			overallProgress(doneContainers),
+		)
+		m.emitProgressWithMetadata(
+			ctx,
+			taskType,
 			instanceID,
 			taskPhaseCreatingContainer,
-			overallProgress(doneContainers),
+			progress,
 			message,
 			false,
 			map[string]any{"subtasks": cloneSubtasks(subtasks)},
@@ -141,22 +149,32 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
 
 	// Build IDMap config once (shared across all services — same per-app user).
-	var idmap persistence.IDMapConfig
-	if runtime.Credential != nil {
-		idmap = persistence.IDMapConfig{
-			AppUID: runtime.Credential.Uid,
-			AppGID: runtime.Credential.Gid,
-		}
-		username := container.AppUsername(instanceID)
-		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
-			idmap.SubUIDStart = subStart
-			idmap.SubUIDCount = subCount
-			idmap.SubGIDStart = subStart // same range for GID
-			idmap.SubGIDCount = subCount
-		} else {
-			log.Printf("WARN: install %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
-		}
+	idmap := idMapForRuntime(instanceID, runtime)
+	state, err := m.ensureStateManager()
+	if err != nil {
+		return nil, err
 	}
+
+	artifacts, err := m.prepareArtifactAttachments(ctx, appDef, instanceID, idmap, reuseRecordedArtifacts)
+	if err != nil {
+		return nil, err
+	}
+	artifactCandidateAccepted := false
+	artifactCleanupHandled := false
+	defer func() {
+		if artifactCandidateAccepted || artifactCleanupHandled || len(artifacts.CreatedByCall) == 0 {
+			return
+		}
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
+		defer cancel()
+		created := make(map[string]string, len(artifacts.CreatedByCall))
+		for _, referenceID := range artifacts.CreatedByCall {
+			created[referenceID] = referenceID
+		}
+		if err := m.destroyArtifactReferences(cleanupCtx, created); err != nil {
+			log.Printf("WARN: install %s: clean candidate artifact references: %v", instanceID, err)
+		}
+	}()
 
 	serviceIdx := 0
 	for svcName := range appDef.Services {
@@ -292,26 +310,77 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		blockNativeRootfsMap[networkAnchorServiceName] = rInfo
 	}
 
-	created := make([]string, 0, 1+len(appDef.Services))
-	cleanup := func() {
-		for i := len(created) - 1; i >= 0; i-- {
-			cid := created[i]
-			_ = m.containerManager.StopContainer(ctx, runtime, cid)
-			_ = m.containerManager.RemoveContainer(ctx, runtime, cid)
+	anchorID := ""
+	containers := make(map[string]string, len(appDef.Services))
+	var acceleratorDevices []string
+	cleanup := func() (bool, error) {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
+		defer cancel()
+
+		candidate := &AppInstance{
+			InstanceID:      instanceID,
+			PrimaryService:  primary,
+			NetworkAnchorID: anchorID,
+			Containers:      cloneStringMap(containers),
 		}
+		if err := m.removeUncommittedContainerGroup(cleanupCtx, candidate, appDef, runtime); err != nil {
+			// The candidate may still have open device descriptors or mount
+			// references. Leave all authority and attachment records in place
+			// so a later bounded retry can prove absence before releasing them.
+			artifactCleanupHandled = true
+			return false, err
+		}
+
+		var cleanupErrs []error
 		// Detach only locally-created rootfs volumes, not prebuilt ones
 		// (the caller owns those handles and is responsible for their lifecycle).
 		if rootfs := m.currentRootfsManager(); rootfs != nil {
-			for svcName := range blockNativeRootfsMap {
+			for svcName, info := range blockNativeRootfsMap {
 				if prebuiltRootfs != nil {
 					if _, isPrebuilt := prebuiltRootfs[svcName]; isPrebuilt {
 						continue
 					}
 				}
-				volID := persistence.ServiceRootfsVolumeID(instanceID, svcName)
-				_ = rootfs.DetachRootfs(ctx, volID)
+				volID := ""
+				if info != nil {
+					volID = strings.TrimSpace(info.handle.VolumeID)
+				}
+				if volID == "" {
+					volID = persistence.ServiceRootfsVolumeID(instanceID, svcName)
+				}
+				if err := rootfs.DetachRootfs(cleanupCtx, volID); err != nil {
+					cleanupErrs = append(cleanupErrs, fmt.Errorf("detach candidate rootfs %s: %w", volID, err))
+				}
 			}
 		}
+		artifactCleanupHandled = true
+		if err := m.detachArtifactReferences(cleanupCtx, artifacts.References); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("detach candidate artifacts: %w", err))
+		}
+		createdArtifacts := make(map[string]string, len(artifacts.CreatedByCall))
+		for _, referenceID := range artifacts.CreatedByCall {
+			createdArtifacts[referenceID] = referenceID
+		}
+		if err := m.destroyArtifactReferences(cleanupCtx, createdArtifacts); err != nil {
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("destroy candidate artifact references: %w", err))
+		}
+		return true, errors.Join(cleanupErrs...)
+	}
+	abortCandidate := func(cause error) (*AppInstance, error) {
+		absenceProven, cleanupErr := cleanup()
+		if !absenceProven {
+			return nil, &uncommittedContainerGroupMaySurviveError{
+				cause:   cause,
+				cleanup: cleanupErr,
+			}
+		}
+		if cleanupErr != nil {
+			return nil, errors.Join(
+				cause,
+				fmt.Errorf("clean uncommitted container group: %w", cleanupErr),
+			)
+		}
+		return nil, cause
 	}
 
 	// 1) Create + start the network anchor (owns published ports + shared netns).
@@ -347,48 +416,78 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		anchorSpec.ExtraHosts = append(anchorSpec.ExtraHosts, entries...)
 	}
 	if err := container.ValidateContainerSpec(anchorSpec); err != nil {
-		return nil, fmt.Errorf("invalid network anchor spec: %w", err)
+		return abortCandidate(fmt.Errorf("invalid network anchor spec: %w", err))
 	}
 
 	updateSubtask(networkAnchorServiceName, 10, "Creating")
 	emitCreateProgress(fmt.Sprintf("Creating container (1/%d): network", totalContainers))
-	anchorID, err := m.createContainerWithRetry(ctx, runtime, anchorSpec,
+	anchorID, err = m.createContainerWithRetry(ctx, runtime, anchorSpec,
 		fmt.Sprintf("install %s network-anchor", instanceID))
 	if err != nil {
-		return nil, fmt.Errorf("failed to create network anchor: %w", err)
+		return abortCandidate(fmt.Errorf("failed to create network anchor: %w", err))
 	}
 	updateSubtask(networkAnchorServiceName, 50, "Created")
-	created = append(created, anchorID)
 
 	updateSubtask(networkAnchorServiceName, 70, "Starting")
 	if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
 		updateSubtask(networkAnchorServiceName, 70, "Error")
 		emitCreateProgress("Failed to start network container")
-		cleanup()
-		return nil, fmt.Errorf("failed to start network anchor: %w", err)
+		return abortCandidate(fmt.Errorf("failed to start network anchor: %w", err))
 	}
 	updateSubtask(networkAnchorServiceName, 100, "Running")
 	doneContainers++
 	emitCreateProgress(fmt.Sprintf("Created container (1/%d): network", totalContainers))
 
+	bindingEnvironment, err := m.ensureCapabilityBindingEnvironment(
+		ctx,
+		state,
+		&AppInstance{InstanceID: instanceID},
+		appDef,
+		anchorID,
+		runtime,
+	)
+	if err != nil {
+		return abortCandidate(fmt.Errorf("prepare capability bindings: %w", err))
+	}
+	capabilityBindings, err := desiredCapabilityBindings(state, instanceID, appDef)
+	if err != nil {
+		return abortCandidate(fmt.Errorf("record capability bindings: %w", err))
+	}
+	acceleratorUIDs, uidErr := m.desiredAcceleratorHostUIDs(
+		state,
+		instanceID,
+		runtime,
+		appDef,
+		blockNativeRootfsMap,
+	)
+	if uidErr != nil {
+		return abortCandidate(fmt.Errorf("resolve accelerator principals: %w", uidErr))
+	}
+	acceleratorDevices, err = m.ensureAcceleratorAccess(ctx, state, instanceID, runtime, appDef, acceleratorUIDs)
+	if err != nil {
+		return abortCandidate(fmt.Errorf("prepare accelerator grant: %w", err))
+	}
+
 	// 2) Create + start all service containers attached to the anchor netns.
 	// Init scripts run inline after each container starts, before its dependents
 	// are created. This ensures dependent services see fully initialized state.
 	var initState *InitState
-	containers := make(map[string]string, len(appDef.Services))
 	for _, svcName := range startOrder {
 		updateSubtask(svcName, 10, "Creating")
 		emitCreateProgress(fmt.Sprintf("Creating container (%d/%d): %s", doneContainers+1, totalContainers, svcName))
 
 		// Build container spec, with workspace info if available
 		opts := serviceContainerOptions{
-			layout:     layout,
-			appDef:     appDef,
-			instanceID: instanceID,
-			primary:    primary,
-			svcName:    svcName,
-			anchorID:   anchorID,
-			credential: runtime.Credential,
+			layout:             layout,
+			appDef:             appDef,
+			instanceID:         instanceID,
+			primary:            primary,
+			svcName:            svcName,
+			anchorID:           anchorID,
+			credential:         runtime.Credential,
+			artifactHandles:    artifacts.Handles,
+			bindingEnvironment: bindingEnvironment[svcName],
+			acceleratorDevices: acceleratorDevices,
 		}
 		if svcRootfs, ok := blockNativeRootfsMap[svcName]; ok {
 			opts.rootfsHandle = &svcRootfs.handle
@@ -396,8 +495,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		}
 		spec, err := m.buildServiceContainerSpec(opts)
 		if err != nil {
-			cleanup()
-			return nil, err
+			return abortCandidate(err)
 		}
 		// Per-app runtimes must never pull: service containers use --rootfs
 		// from golden LV snapshots.
@@ -410,47 +508,41 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		if err != nil {
 			updateSubtask(svcName, 50, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to create container: %s", svcName))
-			cleanup()
-			return nil, fmt.Errorf("failed to create service container '%s': %w", svcName, err)
+			return abortCandidate(fmt.Errorf("failed to create service container '%s': %w", svcName, err))
 		}
 		updateSubtask(svcName, 50, "Created")
-		created = append(created, cid)
+		containers[svcName] = cid
 
 		updateSubtask(svcName, 70, "Starting")
 		if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 			log.Printf("ERROR: install %s: start service container '%s' (cid=%s) failed: %v", instanceID, svcName, cid, err)
 			updateSubtask(svcName, 70, "Error")
 			emitCreateProgress(fmt.Sprintf("Failed to start container: %s", svcName))
-			cleanup()
-			return nil, fmt.Errorf("failed to start service container '%s': %w", svcName, err)
+			return abortCandidate(fmt.Errorf("failed to start service container '%s': %w", svcName, err))
 		}
 
 		updateSubtask(svcName, 100, "Running")
 		doneContainers++
 		emitCreateProgress(fmt.Sprintf("Created container (%d/%d): %s", doneContainers, totalContainers, svcName))
 
-		containers[svcName] = cid
-
 		// Run init script for this service BEFORE starting dependent services,
 		// so dependents see fully initialized state (e.g., db schema/users).
 		svc := appDef.Services[svcName]
-		if svc.InitScript != nil && len(svc.InitScript.FileContent) > 0 {
+		if runInitScripts && svc.InitScript != nil && len(svc.InitScript.FileContent) > 0 {
 			if initState == nil {
 				initState = &InitState{Services: make(map[string]ServiceInitState)}
 				m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseRunningInit, 88,
 					fmt.Sprintf("Running init script: %s", svcName), false, nil)
 			}
 			if err := m.runServiceInit(ctx, runtime, instanceID, svcName, cid, &svc, layout, initState); err != nil {
-				cleanup()
-				return nil, err
+				return abortCandidate(err)
 			}
 		}
 	}
 
 	primaryCID := containers[primary]
 	if primaryCID == "" {
-		cleanup()
-		return nil, fmt.Errorf("primary service container ID missing for '%s'", primary)
+		return abortCandidate(fmt.Errorf("primary service container ID missing for '%s'", primary))
 	}
 
 	// Record container ID used for service proxy reconciliation (publishes live on the anchor).
@@ -471,19 +563,24 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	now := time.Now()
-	return &AppInstance{
-		InstanceID:      instanceID,
-		Enabled:         true,
-		PrimaryService:  primary,
-		NetworkAnchorID: anchorID,
-		Containers:      containers,
-		CreatedAt:       now,
-		UpdatedAt:       now,
-		Definition:      appDef,
-		CatalogSource:   CatalogSourceFromContext(ctx),
-		ActiveRootfs:    activeRootfs,
-		Init:            initState,
-	}, nil
+	result := &AppInstance{
+		InstanceID:         instanceID,
+		Enabled:            true,
+		PrimaryService:     primary,
+		NetworkAnchorID:    anchorID,
+		Containers:         containers,
+		CreatedAt:          now,
+		UpdatedAt:          now,
+		Definition:         appDef,
+		CatalogSource:      CatalogSourceFromContext(ctx),
+		ActiveRootfs:       activeRootfs,
+		ArtifactReferences: artifacts.References,
+		AcceleratorDevices: append([]string(nil), acceleratorDevices...),
+		CapabilityBindings: cloneStringMap(capabilityBindings),
+		Init:               initState,
+	}
+	artifactCandidateAccepted = true
+	return result, nil
 }
 
 // resolveRemoteDigest queries the registry for the current digest of an image

@@ -111,8 +111,11 @@ type serviceContainerOptions struct {
 	credential *syscall.Credential
 
 	// Block-native rootfs fields (optional, used when rootfsMgr is available)
-	rootfsHandle    *persistence.RootfsHandle      // Mounted rootfs from RootfsVolumeManager
-	goldenImgConfig *persistence.GoldenImageConfig // Image config from golden LV
+	rootfsHandle       *persistence.RootfsHandle      // Mounted rootfs from RootfsVolumeManager
+	goldenImgConfig    *persistence.GoldenImageConfig // Image config from golden LV
+	artifactHandles    map[string]persistence.ArtifactHandle
+	bindingEnvironment map[string]string
+	acceleratorDevices []string
 }
 
 // buildOriginalCmdFromSlices reconstructs the original command from entrypoint and cmd slices.
@@ -322,12 +325,69 @@ func (m *AppManager) buildServiceContainerSpec(opts serviceContainerOptions) (co
 		}
 	}
 
+	spec.Environment = mergeEnvMaps(spec.Environment, opts.bindingEnvironment)
+	spec.Devices = append(spec.Devices, opts.acceleratorDevices...)
 	m.applyOIDCClientInjection(&spec, svc.OIDCClient)
+	if svc.Storage != nil {
+		for artifactName, mount := range svc.Storage.Artifacts {
+			handle, ok := opts.artifactHandles[artifactName]
+			if !ok || strings.TrimSpace(handle.MountPath) == "" {
+				return container.ContainerCreateSpec{}, fmt.Errorf("artifact %q is not attached for service %q", artifactName, opts.svcName)
+			}
+			if owner, overlaps := artifactMountConflict(spec, mount.Container); overlaps {
+				return container.ContainerCreateSpec{}, fmt.Errorf(
+					"artifact %q container path %s overlaps %s",
+					artifactName,
+					mount.Container,
+					owner,
+				)
+			}
+			spec.Volumes = append(spec.Volumes, container.VolumeMapping{
+				Host:      handle.MountPath,
+				Container: mount.Container,
+				Options:   "ro",
+			})
+		}
+	}
 	if err := container.ValidateContainerSpec(spec); err != nil {
 		return container.ContainerCreateSpec{}, fmt.Errorf("invalid service container spec for '%s': %w", opts.svcName, err)
 	}
 
 	return spec, nil
+}
+
+func artifactMountConflict(spec container.ContainerCreateSpec, target string) (string, bool) {
+	for _, volume := range spec.Volumes {
+		if containerPathsOverlap(target, volume.Container) {
+			return "volume target " + volume.Container, true
+		}
+	}
+	for _, mount := range spec.Tmpfs {
+		if containerPathsOverlap(target, mount.Container) {
+			return "tmpfs target " + mount.Container, true
+		}
+	}
+	for _, mount := range spec.CAMounts {
+		if containerPathsOverlap(target, mount.ContainerPath) {
+			return "CA target " + mount.ContainerPath, true
+		}
+	}
+	for _, device := range spec.Devices {
+		if containerPathsOverlap(target, device) {
+			return "device target " + device, true
+		}
+	}
+	if spec.ReadOnly {
+		for _, implicit := range []string{"/tmp", "/run", "/var/tmp"} {
+			if containerPathsOverlap(target, implicit) {
+				return "read-only tmpfs target " + implicit, true
+			}
+		}
+	}
+	if spec.UseInit && containerPathsOverlap(target, "/run/podman-init") {
+		return "Podman init target /run/podman-init", true
+	}
+	return "", false
 }
 
 func (m *AppManager) applyServiceStorageAndTmpfs(spec *container.ContainerCreateSpec, storage *api.AppStorage, layout appVolumeLayout, extensions map[string]interface{}, cred *syscall.Credential) error {

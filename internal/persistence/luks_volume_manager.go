@@ -98,8 +98,8 @@ type luksVolumeManager struct {
 	volumeCreationNudge func() // RFC 20260510 — invoked after a v3 volume reaches stable creation success
 
 	// Golden LV management.
-	goldenLVs    map[string]*volumeMetaV3 // imageDigestShort → meta cache
-	goldenMu     map[string]*sync.Mutex   // per-image-digest lock
+	goldenLVs    map[string]*volumeMetaV3 // golden volume ID → Ready metadata
+	goldenMu     map[string]*sync.Mutex   // identity/storage-key transition lock
 	goldenMuLock sync.Mutex               // protects goldenMu map
 
 	// Workspace resize monitor.
@@ -1760,6 +1760,11 @@ type volumeMetaV3 struct {
 	CloneOf         string     `json:"clone_of,omitempty"`
 	IDMap           *IDMapMeta `json:"idmap,omitempty"`
 	FlattenComplete string     `json:"flatten_complete,omitempty"` // RFC3339 timestamp
+	// GoldenIdentity is the complete source+resolved-content+projection identity
+	// for generic golden content. Legacy image goldens without this field are
+	// matched through BaseImageDigest and backfilled only when rewritten.
+	GoldenIdentity      *GoldenContentIdentity `json:"golden_identity,omitempty"`
+	MaterializeComplete string                 `json:"materialize_complete,omitempty"` // RFC3339 timestamp
 
 	// IDMapFingerprint is the lowercase hex BLAKE2b-256 of canonicalIDMapBytes(*IDMap).
 	// Empty for volumes without IDMap. Once non-empty, mutations to the IDMap

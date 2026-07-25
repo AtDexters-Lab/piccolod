@@ -135,6 +135,8 @@ func (m *AppManager) beginInstalledAppApplyTransaction(ctx context.Context, stat
 		BackupPath:                backupPath,
 		BackupInstallStatePath:    backupInstallStatePath,
 		PreviousActiveRootfs:      cloneStringMap(spec.AppInst.ActiveRootfs),
+		PreviousArtifactRefs:      cloneStringMap(spec.AppInst.ArtifactReferences),
+		CandidateArtifactRefs:     cloneStringMap(spec.AppInst.ArtifactReferences),
 		RemovedRootfs:             manifestUpdateRemovedActiveRootfs(spec.InstanceID, spec.AppInst.ActiveRootfs, spec.PreviousDefinition, spec.CandidateDefinition),
 		ResolvedImages:            cloneManifestUpdateImagePlan(spec.ImagePlan),
 		CreatedAt:                 time.Now().UTC(),
@@ -162,15 +164,20 @@ func (t *installedAppApplyTransaction) persistCandidateManifest() error {
 	if t.spec.ApplyPhase != "" || t.spec.ApplyMessage != "" {
 		t.manager.emitProgress(t.ctx, t.spec.TaskType, t.spec.InstanceID, t.spec.ApplyPhase, 20, t.spec.ApplyMessage, false, nil)
 	}
-	var previous *api.AppDefinition
-	if t.spec.AppInst.Definition != nil {
-		copy := *t.spec.AppInst.Definition
-		previous = &copy
+	if err := t.storePhase("candidate_persisting"); err != nil {
+		cause := fmt.Errorf("persist candidate visibility fence: %w", err)
+		if restoreErr := t.rollback(cause); restoreErr != nil {
+			return restoreErr
+		}
+		return cause
 	}
-	t.spec.AppInst.Definition = t.spec.CandidateDefinition
-	t.spec.AppInst.UpdatedAt = time.Now()
-	if err := t.state.StoreApp(t.spec.AppInst); err != nil {
-		t.spec.AppInst.Definition = previous
+	candidate, err := detachedAppCandidate(t.spec.AppInst)
+	if err != nil {
+		return err
+	}
+	candidate.Definition = t.spec.CandidateDefinition
+	candidate.UpdatedAt = time.Now()
+	if err := commitDetachedApp(t.state, t.spec.AppInst, candidate); err != nil {
 		cause := fmt.Errorf("persist candidate manifest: %w", err)
 		if restoreErr := t.rollback(cause); restoreErr != nil {
 			return restoreErr
@@ -298,18 +305,21 @@ func (t *installedAppApplyTransaction) recreateRuntimeIfNeeded() error {
 	beforeInstall := func() error {
 		return t.markRuntimeTouched()
 	}
+	beforeCandidatePublish := func(candidate *AppInstance) error {
+		return t.persistCandidateArtifactReferences(candidate)
+	}
 	recreate := t.manager.recreateContainersInPlace
 	if t.runtimeStage != nil {
 		recreate = func(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance) error {
-			return t.manager.recreateContainersFromStagedRootfsWithHook(ctx, instanceID, candidateDef, removeDef, appInst, t.runtimeStage, t.listenerPlan, beforeInstall)
+			return t.manager.recreateContainersFromStagedRootfsWithHook(ctx, instanceID, candidateDef, removeDef, appInst, t.runtimeStage, t.listenerPlan, beforeInstall, beforeCandidatePublish)
 		}
 	} else if t.listenerPlan != nil {
 		recreate = func(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance) error {
-			return t.manager.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, t.listenerPlan, beforeInstall)
+			return t.manager.recreateContainersInPlaceWithPreparedListenersAndHook(ctx, instanceID, candidateDef, removeDef, appInst, t.listenerPlan, beforeInstall, beforeCandidatePublish)
 		}
 	} else {
 		recreate = func(ctx context.Context, instanceID string, candidateDef, removeDef *api.AppDefinition, appInst *AppInstance) error {
-			return t.manager.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, candidateDef, removeDef, appInst, beforeInstall, t.publicationResumeToken)
+			return t.manager.recreateContainersInPlaceWithHookAndPublicationResumeToken(ctx, instanceID, candidateDef, removeDef, appInst, beforeInstall, beforeCandidatePublish, t.publicationResumeToken, false)
 		}
 	}
 	if err := recreate(t.ctx, t.spec.InstanceID, t.spec.CandidateDefinition, t.spec.PreviousDefinition, t.spec.AppInst); err != nil {
@@ -558,6 +568,17 @@ func (t *installedAppApplyTransaction) markRuntimeTouched() error {
 	return nil
 }
 
+func (t *installedAppApplyTransaction) persistCandidateArtifactReferences(candidate *AppInstance) error {
+	if candidate == nil {
+		return fmt.Errorf("persist candidate artifact references: candidate runtime is required")
+	}
+	t.txn.CandidateArtifactRefs = cloneStringMap(candidate.ArtifactReferences)
+	if err := t.storePhase("runtime_touched"); err != nil {
+		return fmt.Errorf("persist candidate artifact references: %w", err)
+	}
+	return nil
+}
+
 func (t *installedAppApplyTransaction) commitLedger(nextState *InstallState) error {
 	if nextState == nil {
 		return nil
@@ -734,7 +755,7 @@ func transitionPhaseForManifestPhase(phase string) TransitionPhase {
 		return TransitionPhaseSwitchingRuntime
 	case "runtime_touched":
 		return TransitionPhaseCandidateTouched
-	case "candidate_persisted", "ledger_committing":
+	case "candidate_persisting", "candidate_persisted", "ledger_committing":
 		return TransitionPhaseSourceCommitting
 	case "ledger_committed":
 		return TransitionPhaseSourceCommitted
@@ -796,6 +817,8 @@ func transitionResourcesFromManifestTransaction(txn *ManifestUpdateTransaction, 
 	if appInst != nil && len(appInst.Containers) > 0 {
 		resources.CandidateContainers = cloneStringMap(appInst.Containers)
 	}
+	resources.PreviousArtifactRefs = cloneStringMap(txn.PreviousArtifactRefs)
+	resources.CandidateArtifactRefs = cloneStringMap(txn.CandidateArtifactRefs)
 	return resources
 }
 

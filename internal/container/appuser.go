@@ -209,8 +209,16 @@ func destroyAppUserByName(username string) error {
 		return fmt.Errorf("destroy user %s: UID is 0, refusing to proceed", username)
 	}
 
-	if err := killUserProcesses(username, uint32(uid)); err != nil {
-		return fmt.Errorf("destroy user %s: terminate UID-owned processes: %w", username, err)
+	instanceID := strings.TrimPrefix(username, AppUserPrefix)
+	if instanceID == "" || instanceID == username {
+		return fmt.Errorf("destroy user %s: invalid per-app username", username)
+	}
+	// User deletion can release both the outer UID and subordinate ID ranges.
+	// Prove the complete dedicated user cgroup inactive and empty first; a
+	// best-effort kill of only the outer UID would miss rootless workloads
+	// executing under mapped subordinate UIDs.
+	if err := QuiesceAppUserSession(context.Background(), instanceID); err != nil {
+		return fmt.Errorf("destroy user %s: prove app user session quiescent: %w", username, err)
 	}
 	if err := disableLinger(username); err != nil {
 		return fmt.Errorf("destroy user %s: disable linger: %w", username, err)
@@ -936,21 +944,6 @@ func terminateUserProcesses(ctx context.Context, uid uint32) error {
 // killUserProcesses terminates all processes owned by the given UID.
 // Required before userdel — lingering user sessions and helpers outside the
 // user cgroup can otherwise prevent deletion (userdel exit code 8).
-func killUserProcesses(username string, uid uint32) error {
-	// Stop the systemd user service first (graceful).
-	svcName := fmt.Sprintf("user@%d.service", uid)
-	if out, err := defaultExecutor.Run("systemctl", "stop", svcName); err != nil {
-		log.Printf("DEBUG: systemctl stop %s: %v: %s", svcName, err, strings.TrimSpace(string(out)))
-	}
-	// Kill any remaining processes (belt and suspenders).
-	if out, err := defaultExecutor.Run("loginctl", "kill-user", username); err != nil {
-		log.Printf("DEBUG: loginctl kill-user %s: %v: %s", username, err, strings.TrimSpace(string(out)))
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), userSessionReadyTimeout)
-	defer cancel()
-	return terminateUserProcesses(ctx, uid)
-}
-
 // releaseUserRuntime asks systemd's existing per-UID runtime-dir owner to stop,
 // then removes any directory left by Piccolo's own EnsureXDGRuntimeDir fallback.
 // The caller has already proven the nonzero UID has no processes, so no live

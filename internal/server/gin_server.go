@@ -2724,6 +2724,8 @@ func (s *GinServer) setupGinRoutes() {
 		// set-timezone` and is admin-gated.
 		admin.GET("/system/timezone", s.handleSystemTimezoneGet)
 		admin.PUT("/system/timezone", s.requireUnlocked(), s.handleSystemTimezonePut)
+		admin.GET("/capabilities", s.requireUnlocked(), s.handleGinCapabilityList)
+		admin.PUT("/capabilities/:capability/default", s.requireUnlocked(), s.handleGinCapabilityDefault)
 
 		// App management endpoints
 		apps := authed.Group("/apps")
