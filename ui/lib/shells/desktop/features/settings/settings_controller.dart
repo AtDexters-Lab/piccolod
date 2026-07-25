@@ -10,7 +10,17 @@ import 'package:piccolo_os/core/services/api_client.dart';
 import 'package:piccolo_os/core/services/network_service.dart';
 import 'package:piccolo_os/core/utils/downloader/downloader.dart' as downloader;
 
+typedef OSUpdateStatusFetcher = Future<dynamic> Function();
+
+enum OSUpdateStatusFetchResult { success, busy, failed }
+
 class SettingsController extends ChangeNotifier {
+  SettingsController({OSUpdateStatusFetcher? osUpdateStatusFetcher})
+    : _osUpdateStatusFetcher =
+          osUpdateStatusFetcher ??
+          (() => ApiClient().get('/api/v1/updates/os'));
+
+  final OSUpdateStatusFetcher _osUpdateStatusFetcher;
   bool _disposed = false;
 
   @override
@@ -34,6 +44,12 @@ class SettingsController extends ChangeNotifier {
 
   OSUpdate? _osUpdate;
   OSUpdate? get osUpdate => _osUpdate;
+
+  bool _isOSUpdateLoading = false;
+  bool get isOSUpdateLoading => _isOSUpdateLoading;
+
+  String? _osUpdateError;
+  String? get osUpdateError => _osUpdateError;
 
   Session? _session;
   Session? get session => _session;
@@ -144,36 +160,47 @@ class SettingsController extends ChangeNotifier {
     return error.toString().contains('429');
   }
 
-  Future<void> fetchOSUpdate({bool silent = false}) async {
-    if (_disposed) return;
-    if (!silent) _setLoading(true);
+  Future<OSUpdateStatusFetchResult> fetchOSUpdate({
+    bool silent = false,
+  }) async {
+    if (_disposed) return OSUpdateStatusFetchResult.failed;
+    if (!silent) {
+      _isOSUpdateLoading = true;
+      _osUpdateError = null;
+      notifyListeners();
+    }
     try {
-      final response = await ApiClient().get('/api/v1/updates/os');
-      if (_disposed) return;
+      final response = await _osUpdateStatusFetcher();
+      if (_disposed) return OSUpdateStatusFetchResult.failed;
       final update = OSUpdate.fromJson(response as Map<String, dynamic>);
       _osUpdate = update;
+      _osUpdateError = null;
       _error = null;
-      _isBackendBusy = update.isUncertain;
-      if (_isBackendBusy && !_isUpdateInProgress) {
-        unawaited(_pollWhileBusy());
-      }
+      // A successful status response means no update operation is currently
+      // holding the backend. Stale/degraded enrichment is uncertainty, not
+      // operation progress, and the status card presents it separately.
+      _isBackendBusy = false;
+      return OSUpdateStatusFetchResult.success;
     } on Object catch (e) {
-      if (_disposed) return;
+      if (_disposed) return OSUpdateStatusFetchResult.failed;
       if (_isBackendBusyError(e)) {
         // Backend is busy (Preparing update)
         _isBackendBusy = true;
+        _osUpdateError = null;
         _error = null;
         if (!_isUpdateInProgress) {
           unawaited(_pollWhileBusy());
         }
         // We keep the old _osUpdate if available, or null
+        return OSUpdateStatusFetchResult.busy;
       } else {
-        _error = e.toString();
+        _osUpdateError = 'Unable to refresh update status.';
         _isBackendBusy = false;
+        return OSUpdateStatusFetchResult.failed;
       }
     } finally {
       if (!_disposed) {
-        if (!silent) _setLoading(false);
+        if (!silent) _isOSUpdateLoading = false;
         notifyListeners(); // Notify changes to busy state
       }
     }
@@ -387,23 +414,42 @@ class SettingsController extends ChangeNotifier {
 
   Future<void> _pollForCompletion() async {
     var idleCount = 0;
+    var failureCount = 0;
     const maxIdleChecks = 3;
+    const maxFailureChecks = 3;
 
     while (!_disposed) {
-      await fetchOSUpdate(silent: true);
+      final fetchResult = await fetchOSUpdate(silent: true);
       if (_disposed) break;
 
-      if (_isBackendBusy || (_osUpdate?.isUncertain ?? false)) {
+      if (fetchResult == OSUpdateStatusFetchResult.busy) {
         idleCount = 0;
+        failureCount = 0;
         await Future<void>.delayed(const Duration(seconds: 5));
         continue;
       }
 
+      if (fetchResult == OSUpdateStatusFetchResult.failed) {
+        idleCount = 0;
+        failureCount++;
+        if (failureCount >= maxFailureChecks) {
+          _osUpdateError =
+              'Unable to confirm whether the system update finished. '
+              'Refresh System settings to check the current state.';
+          return;
+        }
+        await Future<void>.delayed(const Duration(seconds: 5));
+        continue;
+      }
+
+      failureCount = 0;
       if (_osUpdate?.pending ?? false) {
         break;
       }
 
-      // If we are here, status is fresh 200 OK + Pending=False.
+      // A 200 response proves the operation is no longer busy. Snapshot
+      // readiness remains authoritative even if optional enrichment is stale
+      // or degraded, so uncertainty must not reset this bounded idle counter.
       idleCount++;
       if (idleCount >= maxIdleChecks) {
         break;

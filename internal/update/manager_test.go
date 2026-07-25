@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -912,7 +913,7 @@ func TestStatusBackoffOnQuickEnrichmentFailures(t *testing.T) {
 		reason        string
 	}{
 		{name: "snapper", fail: "snapper", command: "snapper", argSubstrings: []string{"--json", "list"}, reason: "Config is locked"},
-		{name: "zypper", fail: "zypper", command: "zypper", argSubstrings: []string{"--xmlout", "lu"}, reason: "zypp lock"},
+		{name: "zypper", fail: "zypper", command: "zypper", argSubstrings: []string{"--no-refresh", "--xmlout", "lu"}, reason: "zypp lock"},
 		{name: "rpm", fail: "rpm", command: "rpm", argSubstrings: []string{"-q", "piccolod"}, reason: "rpmdb is locked"},
 	}
 	for _, tc := range cases {
@@ -966,6 +967,25 @@ func TestStatusBackoffOnQuickEnrichmentFailures(t *testing.T) {
 				t.Fatalf("refresh during backoff should publish backoff metadata, got %v", cached.Meta)
 			}
 		})
+	}
+}
+
+func TestRPMUpdateCountUsesCachedRepositoryMetadata(t *testing.T) {
+	r := &quickEnrichmentFailureRunner{}
+	m := &microOSBackend{runner: r}
+
+	count, ok, err := m.rpmUpdateCount(context.Background())
+	if err != nil {
+		t.Fatalf("rpmUpdateCount: %v", err)
+	}
+	if !ok || count != 1 {
+		t.Fatalf("rpmUpdateCount = (%d, %v), want (1, true)", count, ok)
+	}
+	if len(r.calls) != 1 {
+		t.Fatalf("runner calls = %#v, want one zypper call", r.calls)
+	}
+	if got := strings.Join(r.calls[0].args, " "); got != "--no-refresh --xmlout lu" {
+		t.Fatalf("zypper args = %q, want cached metadata read", got)
 	}
 }
 
@@ -1777,7 +1797,7 @@ func TestStatusDegradesWhenInProgressProbeTimesOut(t *testing.T) {
 	}
 }
 
-func TestStatusInProgressTimeoutDoesNotRemoveMarker(t *testing.T) {
+func TestStatusInProgressTimeoutFailsClosedWithoutRemovingMarker(t *testing.T) {
 	tmp := t.TempDir()
 	runDir := filepath.Join(tmp, "run")
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
@@ -1803,11 +1823,173 @@ func TestStatusInProgressTimeoutDoesNotRemoveMarker(t *testing.T) {
 	}
 	r.enabled.Store(true)
 
-	if _, err := m.Status(context.Background()); err != nil {
-		t.Fatalf("Status should degrade instead of erroring: %v", err)
+	if _, err := m.Status(context.Background()); !errors.Is(err, ErrInProgress) {
+		t.Fatalf("Status should fail closed with ErrInProgress, got %v", err)
 	}
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatalf("in-progress marker should remain after timeout, got %v", err)
+	}
+}
+
+type markerActivityRunner struct {
+	code int
+	err  error
+}
+
+func (r markerActivityRunner) Run(_ context.Context, name string, args ...string) (string, string, int, error) {
+	if name != "systemctl" || len(args) == 0 {
+		return "", "", 0, nil
+	}
+	if args[0] == "list-units" {
+		return "", "", 0, nil
+	}
+	if args[0] == "is-active" {
+		unit := args[len(args)-1]
+		if unit == transactionalUpdateUnit {
+			return "", "", 3, nil
+		}
+		return "", "", r.code, r.err
+	}
+	return "", "", 0, nil
+}
+
+func TestIsInProgressMarkerProbeOutcomes(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		code       int
+		err        error
+		wantBusy   bool
+		wantMarker bool
+	}{
+		{name: "inactive", code: 3, err: &exec.ExitError{}},
+		{name: "missing", code: 4, err: &exec.ExitError{}},
+		{name: "uncertain", code: 1, err: errors.New("failed to connect to bus"), wantBusy: true, wantMarker: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			marker := filepath.Join(runDir, "update.inprogress")
+			if err := os.WriteFile(marker, []byte("apply piccolo-tu-stale.service"), 0o600); err != nil {
+				t.Fatalf("write marker: %v", err)
+			}
+			m := &microOSBackend{
+				runner:     markerActivityRunner{code: tc.code, err: tc.err},
+				runtimeDir: runDir,
+			}
+
+			if got := m.isInProgress(context.Background()); got != tc.wantBusy {
+				t.Fatalf("isInProgress = %v, want %v", got, tc.wantBusy)
+			}
+			_, statErr := os.Stat(marker)
+			if tc.wantMarker && statErr != nil {
+				t.Fatalf("marker should remain: %v", statErr)
+			}
+			if !tc.wantMarker && !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("stale marker still present: %v", statErr)
+			}
+		})
+	}
+}
+
+type markerLaunchRaceRunner struct {
+	staleProbeStarted chan struct{}
+	releaseStaleProbe chan struct{}
+	systemdRunStarted chan struct{}
+	releaseSystemdRun chan struct{}
+}
+
+func (r markerLaunchRaceRunner) Run(_ context.Context, name string, args ...string) (string, string, int, error) {
+	switch name {
+	case "systemctl":
+		if len(args) == 0 {
+			return "", "", 0, nil
+		}
+		switch args[0] {
+		case "list-units":
+			return "", "", 0, nil
+		case "is-active":
+			unit := args[len(args)-1]
+			if unit == "piccolo-tu-stale.service" {
+				select {
+				case r.staleProbeStarted <- struct{}{}:
+				default:
+				}
+				<-r.releaseStaleProbe
+				return "", "", 3, &exec.ExitError{}
+			}
+			if unit == transactionalUpdateUnit {
+				return "", "", 3, &exec.ExitError{}
+			}
+			return "", "", 4, &exec.ExitError{}
+		}
+	case "systemd-run":
+		r.systemdRunStarted <- struct{}{}
+		<-r.releaseSystemdRun
+		return "started", "", 0, nil
+	}
+	return "", "", 0, nil
+}
+
+func TestMarkerCleanupIsSerializedWithOperationLaunch(t *testing.T) {
+	runDir := t.TempDir()
+	marker := filepath.Join(runDir, "update.inprogress")
+	if err := os.WriteFile(marker, []byte("apply piccolo-tu-stale.service"), 0o600); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	r := markerLaunchRaceRunner{
+		staleProbeStarted: make(chan struct{}, 1),
+		releaseStaleProbe: make(chan struct{}),
+		systemdRunStarted: make(chan struct{}, 1),
+		releaseSystemdRun: make(chan struct{}),
+	}
+	m, err := newMicroOSBackend(
+		WithRunner(r),
+		WithClock(func() time.Time { return time.Unix(1700000000, 0) }),
+		WithStateDir(t.TempDir()),
+		WithRuntimeDir(runDir),
+		WithSupportOverride(true),
+		WithFreeBytesFn(func(string) (uint64, error) { return 10 << 30, nil }),
+	)
+	if err != nil {
+		t.Fatalf("backend: %v", err)
+	}
+
+	staleResult := make(chan bool, 1)
+	go func() {
+		staleResult <- m.isInProgress(context.Background())
+	}()
+	<-r.staleProbeStarted
+
+	updateResult := make(chan error, 1)
+	go func() {
+		updateResult <- m.runTransactionalUpdate(
+			context.Background(),
+			[]string{"transactional-update", "dup"},
+			"apply",
+			"2472",
+			false,
+		)
+	}()
+
+	close(r.releaseStaleProbe)
+	if inProgress := <-staleResult; inProgress {
+		t.Fatal("stale operation reported in progress")
+	}
+	<-r.systemdRunStarted
+
+	const liveMarker = "apply piccolo-tu-apply-1700000000"
+	if data, err := os.ReadFile(marker); err != nil || string(data) != liveMarker {
+		t.Fatalf("live marker = %q, %v; want %q", data, err, liveMarker)
+	}
+	if !m.isInProgress(context.Background()) {
+		t.Fatal("launching operation reported idle before its unit became visible")
+	}
+	if data, err := os.ReadFile(marker); err != nil || string(data) != liveMarker {
+		t.Fatalf("launch probe removed live marker: %q, %v", data, err)
+	}
+
+	close(r.releaseSystemdRun)
+	if err := <-updateResult; err != nil {
+		t.Fatalf("runTransactionalUpdate: %v", err)
 	}
 }
 
