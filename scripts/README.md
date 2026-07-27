@@ -148,3 +148,42 @@ five-attempt recovery budget, and waits through the ten-minute continuous
 running probation window. The alpha deploy installs the Piccolo OS global
 user-manager OOM policy and the dev service uses the production piccolod OOM
 score so this stage can verify the live hierarchy.
+
+### Known alpha VM cleanup gap
+
+`dev-vm-alpha.sh start` and `fresh` currently leave the VM running for
+interactive follow-up. Separately, validation has observed an orphaned
+`VBoxHeadless` backend consuming host CPU after its VM was powered off. The
+backend's exact internal cause was not established. This is test-harness
+cleanup debt, not a Piccolod product workload.
+
+The bounded harness fix belongs to a disposable one-shot validation workflow,
+not to the persistent `start` or `fresh` commands. On success, failure, or
+interruption, that workflow should:
+
+- power off its test VM by default, with `KEEP_VM=1` as the explicit opt-in for
+  interactive follow-up;
+- try graceful shutdown first and use hard power-off only as a fallback;
+- verify both the VM power state and absence of a UUID-associated
+  `VBoxHeadless` process;
+- report cleanup timeouts as test failures; and
+- detect an orphaned backend before starting or cloning another test VM.
+
+Until that workflow exists:
+
+1. Record the VM name and UUID.
+2. Request guest shutdown (for example,
+   `VBoxManage controlvm <vm> acpipowerbutton`) and wait until
+   `VBoxManage showvminfo <vm> --machinereadable` reports
+   `VMState="poweroff"`.
+3. Confirm that `<vm>` still resolves to the recorded UUID, then run
+   `./scripts/alpha/dev-vm-alpha.sh destroy <vm>` to unregister and delete the
+   powered-off VM. If graceful shutdown times out, use that explicit `destroy`
+   command only as the hard power-off fallback.
+4. Independently verify that the VM is absent and that no UUID-associated
+   `VBoxHeadless` process remains. The current `destroy` command suppresses
+   VirtualBox cleanup failures, so its success message is not proof.
+
+Treat failed verification as a cleanup failure. Do not use a VM with cancelled
+disk-I/O history as trusted release-validation evidence; destroy and reclone it
+first.
