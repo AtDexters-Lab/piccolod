@@ -210,6 +210,23 @@ class App {
       catalogUpdatePendingFlow.toLowerCase() == 'config';
   bool get hasActiveTransition => transitionActive;
 
+  Set<String> get providedCapabilities {
+    final result = <String>{};
+    final rawListeners = definition['listeners'];
+    if (rawListeners is! List<dynamic>) return result;
+
+    for (final rawListener in rawListeners.whereType<Map<dynamic, dynamic>>()) {
+      final rawProviders = rawListener['provides'];
+      if (rawProviders is! List<dynamic>) continue;
+      for (final rawProvider
+          in rawProviders.whereType<Map<dynamic, dynamic>>()) {
+        final capability = (rawProvider['capability'] ?? '').toString().trim();
+        if (capability.isNotEmpty) result.add(capability);
+      }
+    }
+    return result;
+  }
+
   Map<String, String> environmentForService(String? serviceName) {
     final svc = serviceName?.trim();
     if (svc == null || svc.isEmpty) return environment;

@@ -4,6 +4,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:piccolo_os/core/models/app_models.dart';
 import 'package:piccolo_os/core/models/app_status_event.dart';
+import 'package:piccolo_os/core/models/capability_models.dart';
 import 'package:piccolo_os/core/models/listener_health.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
@@ -14,6 +15,7 @@ import 'package:piccolo_os/features/apps/app_launcher.dart';
 import 'package:piccolo_os/features/apps/app_operation_lifecycle.dart';
 import 'package:piccolo_os/features/apps/installed_config_wizard.dart';
 import 'package:piccolo_os/features/apps/manifest_update_wizard.dart';
+import 'package:piccolo_os/features/apps/widgets/capability_provider_card.dart';
 import 'package:piccolo_os/features/apps/widgets/edit_listeners_dialog.dart';
 import 'package:piccolo_os/features/apps/widgets/health_banner.dart';
 import 'package:piccolo_os/features/apps/widgets/local_fallback_overlay.dart';
@@ -255,6 +257,10 @@ class _AppDetailViewState extends State<AppDetailView>
   String? _selectedService;
   bool _isLoading = true;
   String? _error;
+  List<CapabilityStatus> _capabilities = const [];
+  bool _capabilitiesLoading = true;
+  bool _capabilitiesHidden = false;
+  String? _capabilitiesError;
 
   bool _snapshotAvailable = false;
   String _imageUpdateBlockedReason = '';
@@ -297,8 +303,14 @@ class _AppDetailViewState extends State<AppDetailView>
       const Duration(seconds: 10),
       (_) => unawaited(_syncActiveOperationFromServer()),
     );
+    widget.desktopController.addAppChangeListener(_handleAppsChanged);
     _connectStatusStream();
     _connectHealthStream();
+  }
+
+  void _handleAppsChanged() {
+    if (!mounted || _activeOperation != null) return;
+    unawaited(_loadCapabilities());
   }
 
   void _connectStatusStream() {
@@ -343,6 +355,7 @@ class _AppDetailViewState extends State<AppDetailView>
   void dispose() {
     unawaited(_statusSub?.cancel());
     unawaited(_healthSub?.cancel());
+    widget.desktopController.removeAppChangeListener(_handleAppsChanged);
     _noProgressTimer?.cancel();
     _readinessTimer?.cancel();
     _activeTaskPollTimer?.cancel();
@@ -353,6 +366,7 @@ class _AppDetailViewState extends State<AppDetailView>
   Future<void> _initialLoad() async {
     await _loadData();
     await _syncActiveOperationFromServer();
+    await _loadCapabilities();
   }
 
   Future<Object?> _loadData({bool showLoading = true}) async {
@@ -396,6 +410,80 @@ class _AppDetailViewState extends State<AppDetailView>
       }
       return e;
     }
+  }
+
+  Future<void> _loadCapabilities() async {
+    if (!mounted || !(_app?.providedCapabilities.isNotEmpty ?? false)) return;
+    _markCapabilitiesLoading();
+    try {
+      final capabilities = await widget.appService.getCapabilities();
+      if (!mounted) return;
+      setState(() {
+        _capabilities = capabilities;
+        _capabilitiesLoading = false;
+        _capabilitiesHidden = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _capabilitiesLoading = false;
+        if (e.statusCode == 403) {
+          _capabilitiesHidden = true;
+          _capabilitiesError = null;
+        } else {
+          _capabilitiesError = 'Could not load provider status.';
+        }
+      });
+    } on Object {
+      if (!mounted) return;
+      setState(() {
+        _capabilitiesLoading = false;
+        _capabilitiesError = 'Could not load provider status.';
+      });
+    }
+  }
+
+  void _markCapabilitiesLoading() {
+    if (!mounted || !(_app?.providedCapabilities.isNotEmpty ?? false)) return;
+    setState(() {
+      _capabilitiesLoading = true;
+      _capabilitiesError = null;
+    });
+  }
+
+  CapabilityStatus? _capabilityStatus(String capability) {
+    for (final status in _capabilities) {
+      if (status.capability == capability) return status;
+    }
+    return null;
+  }
+
+  Future<void> _selectCapabilityProvider(CapabilityStatus status) async {
+    CapabilityProviderSelectionOutcome? outcome;
+    final result = await _handleActionWithProgress(
+      type: AppOperationType.selectCapabilityProvider,
+      displayLabel: 'Changing default provider',
+      action: (taskId) async {
+        outcome = await widget.appService.selectCapabilityProvider(
+          capability: status.capability,
+          appInstance: widget.appId,
+          acknowledgeProviderChange: true,
+          taskId: taskId,
+        );
+      },
+    );
+    if (!mounted) return;
+    if (!result.accepted || outcome == null) return;
+    final pending = outcome == CapabilityProviderSelectionOutcome.repairPending;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(
+          pending
+              ? 'Default provider changed. Runtime setup is pending.'
+              : 'Default provider updated.',
+        ),
+      ),
+    );
   }
 
   Future<_OperationSubmitResult> _handleActionWithProgress({
@@ -589,17 +677,19 @@ class _AppDetailViewState extends State<AppDetailView>
       displayLabel: displayLabel,
       displaySource: displaySource,
     );
-    _writeRecentSubmission(
-      RecentAppOperation(
-        appId: widget.appId,
-        taskId: taskId,
-        type: type,
-        displayLabel: displayLabel,
-        displaySource: displaySource,
-        submittedAt: now,
-        expiresAt: now.add(_recentSubmissionTtl),
-      ),
-    );
+    if (type.policy.persistRecentSubmission) {
+      _writeRecentSubmission(
+        RecentAppOperation(
+          appId: widget.appId,
+          taskId: taskId,
+          type: type,
+          displayLabel: displayLabel,
+          displaySource: displaySource,
+          submittedAt: now,
+          expiresAt: now.add(_recentSubmissionTtl),
+        ),
+      );
+    }
     _adoptOperation(
       taskId: operation.taskId,
       type: operation.type,
@@ -860,22 +950,40 @@ class _AppDetailViewState extends State<AppDetailView>
       _closeOperationDialog();
     }
     if (settlement.clearActiveOperation) {
+      _markCapabilitiesLoading();
       _clearActiveOperation(removeRecentSubmission: false);
     }
 
+    final readiness = settlement.readiness;
+    if (readiness != null && mounted) {
+      _startReadinessObservation(
+        updateCompleted: readiness.updateCompleted,
+        refreshImmediately: false,
+      );
+    }
+
+    var detailReloaded = false;
     if (settlement.detailAction == AppOperationDetailAction.refresh) {
       await _loadData(showLoading: false);
+      detailReloaded = true;
     } else if (settlement.detailAction ==
         AppOperationDetailAction.clearDeletedApp) {
       _clearDeletedAppDetail(operation);
     } else if (settlement.detailAction ==
         AppOperationDetailAction.verifyDeletedApp) {
       await _verifyDeletedAppDetail(operation);
+      detailReloaded = true;
     }
 
-    final readiness = settlement.readiness;
-    if (readiness != null && mounted) {
-      _startReadinessObservation(updateCompleted: readiness.updateCompleted);
+    // Capability availability derives from app definition, enabled state, and
+    // the selected default. Refresh at the common operation-settlement
+    // boundary so new operation types cannot omit that invalidation.
+    if (operation != null &&
+        settlement.clearActiveOperation &&
+        mounted &&
+        _app != null) {
+      if (!detailReloaded) await _loadData(showLoading: false);
+      await _loadCapabilities();
     }
     return true;
   }
@@ -923,7 +1031,10 @@ class _AppDetailViewState extends State<AppDetailView>
     setState(() => _activeOperation = null);
   }
 
-  void _startReadinessObservation({required bool updateCompleted}) {
+  void _startReadinessObservation({
+    required bool updateCompleted,
+    bool refreshImmediately = true,
+  }) {
     _readinessTimer?.cancel();
     final now = DateTime.now();
     setState(() {
@@ -933,7 +1044,7 @@ class _AppDetailViewState extends State<AppDetailView>
         updateCompleted: updateCompleted,
       );
     });
-    unawaited(_loadData(showLoading: false));
+    if (refreshImmediately) unawaited(_loadData(showLoading: false));
     _readinessTimer = Timer(_readinessWindow, () {
       if (mounted) setState(() {});
     });
@@ -2503,9 +2614,15 @@ class _AppDetailViewState extends State<AppDetailView>
   }
 
   Widget _buildOverviewTab() {
+    final providedCapabilities = _app!.providedCapabilities.toList()..sort();
     return ListView(
       padding: const EdgeInsets.all(Spacing.lg),
       children: [
+        if (!_capabilitiesHidden && providedCapabilities.isNotEmpty) ...[
+          _buildSectionTitle('Provider Capabilities'),
+          ...providedCapabilities.map(_buildCapabilityProviderStatus),
+          const SizedBox(height: Spacing.lg),
+        ],
         _buildSectionTitle('Storage Volumes'),
         if (_app!.volumes.isEmpty)
           const Text('No persistent volumes configured.')
@@ -2576,6 +2693,24 @@ class _AppDetailViewState extends State<AppDetailView>
             ),
           ),
       ],
+    );
+  }
+
+  Widget _buildCapabilityProviderStatus(String capability) {
+    return Padding(
+      padding: const EdgeInsets.only(bottom: Spacing.sm),
+      child: CapabilityProviderCard(
+        capability: capability,
+        status: _capabilityStatus(capability),
+        appInstance: widget.appId,
+        loading: _capabilitiesLoading,
+        error: _capabilitiesError,
+        isSelecting:
+            _activeOperation?.type == AppOperationType.selectCapabilityProvider,
+        actionsPaused: _mutatingActionsPaused,
+        onSetDefault: _selectCapabilityProvider,
+        onRetry: () => unawaited(_loadCapabilities()),
+      ),
     );
   }
 

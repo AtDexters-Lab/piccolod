@@ -13,6 +13,10 @@ void main() {
         appOperationTypeFromTaskType('uninstall_app'),
         AppOperationType.uninstall,
       );
+      expect(
+        appOperationTypeFromTaskType('select_capability_provider'),
+        AppOperationType.selectCapabilityProvider,
+      );
       expect(appOperationTypeFromTaskType('unknown'), isNull);
     });
 
@@ -136,6 +140,8 @@ void main() {
           .settleAfterHttpSuccess(isStillTracked: false);
       final rollbackStillTracked = AppOperationType.rollback.policy
           .settleAfterHttpSuccess(isStillTracked: true);
+      final providerSelection = AppOperationType.selectCapabilityProvider.policy
+          .settleAfterHttpSuccess(isStillTracked: true);
 
       expect(listenerSuccess, isNotNull);
       expect(listenerSuccess!.isTerminal, isTrue);
@@ -144,6 +150,20 @@ void main() {
 
       expect(updateStillTracked, isNull);
       expect(rollbackStillTracked, isNull);
+
+      expect(providerSelection, isNotNull);
+      expect(
+        providerSelection!.detailAction,
+        AppOperationDetailAction.refresh,
+      );
+      expect(providerSelection.notifyAppsChanged, isTrue);
+      expect(
+        AppOperationType
+            .selectCapabilityProvider
+            .policy
+            .persistRecentSubmission,
+        isFalse,
+      );
 
       expect(updateDetached, isNotNull);
       expect(updateDetached!.isTerminal, isTrue);

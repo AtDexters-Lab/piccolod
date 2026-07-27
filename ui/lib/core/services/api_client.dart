@@ -251,6 +251,31 @@ class ApiClient {
     });
   }
 
+  Future<int> putStatus(
+    String path, {
+    Object? body,
+    Map<String, String>? headers,
+  }) async {
+    if (_csrfToken == null) {
+      await fetchCsrfToken();
+    }
+
+    final uri = _buildUri(path);
+    final response = await _withReauthRaw(path, () async {
+      final mergedHeaders = _getHeaders(contentType: 'application/json');
+      if (headers != null) mergedHeaders.addAll(headers);
+      return _client.put(
+        uri,
+        headers: mergedHeaders,
+        body: body != null ? jsonEncode(body) : null,
+      );
+    });
+    if (response.statusCode >= 200 && response.statusCode < 300) {
+      return response.statusCode;
+    }
+    throw ApiException(response.statusCode, response.body);
+  }
+
   Future<dynamic> patch(
     String path, {
     Object? body,

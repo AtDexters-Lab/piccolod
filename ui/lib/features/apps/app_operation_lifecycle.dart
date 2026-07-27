@@ -8,6 +8,7 @@ enum AppOperationType {
   updateConfig,
   updateManifest,
   updateListeners,
+  selectCapabilityProvider,
   transitionFollowUp,
   start,
   stop,
@@ -112,6 +113,7 @@ class AppOperationPolicy {
     this.observesReadiness = false,
     this.clearsAppDetail = false,
     this.httpSuccessCompletesOperation = false,
+    this.persistRecentSubmission = true,
   });
 
   final AppOperationType type;
@@ -120,6 +122,7 @@ class AppOperationPolicy {
   final bool observesReadiness;
   final bool clearsAppDetail;
   final bool httpSuccessCompletesOperation;
+  final bool persistRecentSubmission;
 
   AppOperationSettlement? settleAfterHttpSuccess({
     required bool isStillTracked,
@@ -359,6 +362,13 @@ const appOperationPolicies = <AppOperationType, AppOperationPolicy>{
     taskType: 'update_listeners',
     label: 'Updating listeners',
     httpSuccessCompletesOperation: true,
+  ),
+  AppOperationType.selectCapabilityProvider: AppOperationPolicy(
+    type: AppOperationType.selectCapabilityProvider,
+    taskType: 'select_capability_provider',
+    label: 'Changing default provider',
+    httpSuccessCompletesOperation: true,
+    persistRecentSubmission: false,
   ),
   AppOperationType.transitionFollowUp: AppOperationPolicy(
     type: AppOperationType.transitionFollowUp,
