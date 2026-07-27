@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/foundation.dart';
 import 'package:http/http.dart' show ClientException;
 import 'package:piccolo_os/core/models/app_models.dart';
+import 'package:piccolo_os/core/models/capability_models.dart';
 import 'package:piccolo_os/core/models/task_progress.dart';
 import 'package:piccolo_os/core/services/api_client.dart';
 
@@ -165,6 +166,42 @@ class AppService {
     } on Exception catch (_) {
       return [];
     }
+  }
+
+  // --- Capability providers ---
+
+  Future<List<CapabilityStatus>> getCapabilities() async {
+    final data = await _client.get('/api/v1/capabilities');
+    if (data is! Map<dynamic, dynamic>) return [];
+
+    final rawCapabilities = data['capabilities'];
+    if (rawCapabilities is! List<dynamic>) return [];
+
+    return rawCapabilities
+        .whereType<Map<dynamic, dynamic>>()
+        .map(
+          (capability) =>
+              CapabilityStatus.fromJson(Map<String, dynamic>.from(capability)),
+        )
+        .toList();
+  }
+
+  Future<CapabilityProviderSelectionOutcome> selectCapabilityProvider({
+    required String capability,
+    required String appInstance,
+    required bool acknowledgeProviderChange,
+    String? taskId,
+  }) async {
+    final encodedCapability = Uri.encodeComponent(capability);
+    final statusCode = await _client.putStatus(
+      '/api/v1/capabilities/$encodedCapability/default',
+      body: {
+        'app_instance': appInstance,
+        'acknowledge_provider_change': acknowledgeProviderChange,
+      },
+      headers: _taskHeaders(taskId),
+    );
+    return CapabilityProviderSelectionOutcome.fromHttpStatus(statusCode);
   }
 
   // --- Lifecycle ---

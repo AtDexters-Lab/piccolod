@@ -99,4 +99,24 @@ void main() {
     expect(configure.fields.single.currentValueSensitive, isTrue);
     expect(configure.fields.single.currentValueDisplay, isEmpty);
   });
+
+  test('app exposes listener capability-provider declarations', () {
+    final app = App.fromJson(const {
+      'instance_id': 'piccolo-ai',
+      'status': 'running',
+      'definition': {
+        'listeners': [
+          {
+            'name': 'inference',
+            'guest_port': 8000,
+            'provides': [
+              {'capability': 'ai.inference.openai.v1', 'base_path': '/v1'},
+            ],
+          },
+        ],
+      },
+    });
+
+    expect(app.providedCapabilities, {'ai.inference.openai.v1'});
+  });
 }
