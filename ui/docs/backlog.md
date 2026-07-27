@@ -32,3 +32,17 @@ This document tracks features, technical debt, and architectural decisions.
 ## 5. Asset Management
 *   **Icons:** We are using `Icons.search` etc. standard Material icons. Eventually should import the custom icon set from `ui-next` or use Phosphor icons as per design brief.
 *   **Logo:** Currently using a `CustomPainter` for the logo. Evaluate using `flutter_svg` if asset complexity grows.
+
+## 6. Capability Default Provider
+*   **Current State:** Piccolod exposes capability inventory and acknowledged
+    default-provider selection, but the UI has no affordance for changing the
+    selected provider.
+*   **Task:** On a provider's App Details surface, show whether it is the
+    current default and offer **Set as default** only for enabled, non-default
+    providers. For a disabled provider, explain that it must be enabled first.
+    Reuse `GET /api/v1/capabilities` and
+    `PUT /api/v1/capabilities/:capability/default`; show the server-provided
+    interruption/state-migration disclosure before acknowledging a switch,
+    and surface the existing selection task progress. Keep first-provider
+    selection automatic and do not add a separate capability settings page
+    for V1.

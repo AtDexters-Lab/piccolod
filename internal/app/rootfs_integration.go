@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"piccolod/internal/api"
@@ -19,10 +20,75 @@ import (
 	"piccolod/internal/state/paths"
 )
 
-// imagePullProgressRange defines the progress percentage range for an image pull.
-type imagePullProgressRange struct {
+// transferProgressRange defines the lifecycle progress range assigned to one
+// content transfer, regardless of whether the source is an image or artifact.
+type transferProgressRange struct {
 	Min int // Starting progress percentage
 	Max int // Ending progress percentage
+}
+
+type transferByteHighWater struct {
+	mu         sync.Mutex
+	downloaded int64
+	total      int64
+}
+
+func (h *transferByteHighWater) observe(downloaded, total int64) (int64, int64) {
+	if downloaded < 0 {
+		downloaded = 0
+	}
+	if total < 0 {
+		total = 0
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if downloaded > h.downloaded {
+		h.downloaded = downloaded
+	}
+	if total > h.total {
+		h.total = total
+	}
+	if h.total > 0 && h.downloaded > h.total {
+		h.total = h.downloaded
+	}
+	return h.downloaded, h.total
+}
+
+func (h *transferByteHighWater) snapshot() (int64, int64) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.downloaded, h.total
+}
+
+func progressRangeForUnit(minimum, maximum, index, total int) transferProgressRange {
+	if total <= 0 {
+		return transferProgressRange{Min: minimum, Max: maximum}
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= total {
+		index = total - 1
+	}
+	span := maximum - minimum
+	return transferProgressRange{
+		Min: minimum + (span*index)/total,
+		Max: minimum + (span*(index+1))/total,
+	}
+}
+
+func mapTransferProgress(progressRange transferProgressRange, rawPercent int) int {
+	if progressRange.Max < progressRange.Min {
+		progressRange.Max = progressRange.Min
+	}
+	if rawPercent < 0 {
+		return progressRange.Min
+	}
+	if rawPercent > 100 {
+		rawPercent = 100
+	}
+	return progressRange.Min +
+		(rawPercent*(progressRange.Max-progressRange.Min))/100
 }
 
 // makeImagePullProgressCallback builds a progress callback that maps pull
@@ -32,9 +98,25 @@ func (m *AppManager) makeImagePullProgressCallback(
 	instanceID string,
 	svcName string,
 	image string,
-	progressRange imagePullProgressRange,
+	progressRange transferProgressRange,
 ) func(container.ImagePullReport) {
-	taskType, _ := m.inheritedTaskProgress(ctx, taskTypeInstallApp, progressRange.Min)
+	taskType, inheritedProgress := m.inheritedTaskProgress(
+		ctx,
+		taskTypeInstallApp,
+		progressRange.Min,
+	)
+	if inheritedProgress > progressRange.Min {
+		progressRange.Min = inheritedProgress
+	}
+	if progressRange.Max < progressRange.Min {
+		progressRange.Max = progressRange.Min
+	}
+	var lifecycleProgress atomic.Int64
+	lifecycleProgress.Store(int64(progressRange.Min))
+	var reportedPercent atomic.Int64
+	reportedPercent.Store(-1)
+	var byteHighWater transferByteHighWater
+	started := time.Now()
 
 	// Strip @sha256:... digest from display name — it's noise in the UI.
 	displayImage := image
@@ -43,13 +125,34 @@ func (m *AppManager) makeImagePullProgressCallback(
 	}
 
 	return func(report container.ImagePullReport) {
-		var progress int
-		if report.OverallPercent < 0 {
-			progress = (progressRange.Min + progressRange.Max) / 2
-		} else {
-			rangeSpan := progressRange.Max - progressRange.Min
-			progress = progressRange.Min + (report.OverallPercent*rangeSpan)/100
+		displayedDownloaded, displayedTotal := byteHighWater.observe(
+			report.DownloadedBytes,
+			report.TotalBytes,
+		)
+		rawPercent := report.OverallPercent
+		if report.Phase == "complete" {
+			rawPercent = 100
 		}
+		for {
+			current := reportedPercent.Load()
+			if int64(rawPercent) <= current ||
+				reportedPercent.CompareAndSwap(current, int64(rawPercent)) {
+				break
+			}
+		}
+
+		mapped := mapTransferProgress(progressRange, report.OverallPercent)
+		if report.Phase == "complete" {
+			mapped = progressRange.Max
+		}
+		for {
+			current := lifecycleProgress.Load()
+			if int64(mapped) <= current ||
+				lifecycleProgress.CompareAndSwap(current, int64(mapped)) {
+				break
+			}
+		}
+		progress := int(lifecycleProgress.Load())
 
 		layers := make([]map[string]any, 0, len(report.Layers))
 		for _, layer := range report.Layers {
@@ -64,11 +167,22 @@ func (m *AppManager) makeImagePullProgressCallback(
 		message := fmt.Sprintf("Pulling image %s", displayImage)
 		if report.Phase == "complete" {
 			message = fmt.Sprintf("Image %s pulled successfully", displayImage)
-			progress = progressRange.Max
-		} else if report.TotalBytes > 0 {
-			downloaded := formatBytes(report.DownloadedBytes)
-			total := formatBytes(report.TotalBytes)
-			message = fmt.Sprintf("Pulling %s: %s / %s", displayImage, downloaded, total)
+		} else if displayedTotal > 0 {
+			downloaded := formatBytes(displayedDownloaded)
+			total := formatBytes(displayedTotal)
+			message = fmt.Sprintf(
+				"Pulling %s: %s / %s (%ds elapsed)",
+				displayImage,
+				downloaded,
+				total,
+				int64(time.Since(started)/time.Second),
+			)
+		} else {
+			message = fmt.Sprintf(
+				"Pulling image %s (%ds elapsed)",
+				displayImage,
+				int64(time.Since(started)/time.Second),
+			)
 		}
 
 		m.emitProgressWithMetadata(
@@ -83,9 +197,9 @@ func (m *AppManager) makeImagePullProgressCallback(
 				"service":          svcName,
 				"image":            image,
 				"phase":            report.Phase,
-				"overall_percent":  report.OverallPercent,
-				"total_bytes":      report.TotalBytes,
-				"downloaded_bytes": report.DownloadedBytes,
+				"overall_percent":  reportedPercent.Load(),
+				"total_bytes":      displayedTotal,
+				"downloaded_bytes": displayedDownloaded,
 				"layers":           layers,
 			},
 			nil,

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -264,8 +265,10 @@ func TestAppManager_Install(t *testing.T) {
 	}
 	allowHostStorage(t, manager)
 	manager.ForceLockState(false)
+	progressReporter := &recordingArtifactProgressReporter{}
+	manager.SetProgressReporter(progressReporter)
 
-	ctx := context.Background()
+	ctx := WithTaskID(context.Background(), "install-testapp")
 
 	// Test app definition - RFC 20260130: instanceID derived from primary listener name
 	appDef := &api.AppDefinition{
@@ -311,6 +314,26 @@ func TestAppManager_Install(t *testing.T) {
 	// Verify containers were created (network anchor + main service)
 	if len(mockContainer.containers) != 2 {
 		t.Errorf("Expected 2 containers created, got %d", len(mockContainer.containers))
+	}
+	if !slices.Contains(mockContainer.progressPulledImages, networkAnchorImage()) {
+		t.Fatalf(
+			"network-anchor image did not use shared progress pull: %v",
+			mockContainer.progressPulledImages,
+		)
+	}
+	var sawAnchorRangeCompletion bool
+	for _, event := range progressReporter.snapshot() {
+		if event.Phase == taskPhasePullingImage &&
+			event.Metadata["service"] == networkAnchorServiceName &&
+			event.Progress == 55 {
+			sawAnchorRangeCompletion = true
+		}
+	}
+	if !sawAnchorRangeCompletion {
+		t.Fatalf(
+			"network-anchor pull did not complete its caller-assigned lifecycle range: %#v",
+			progressReporter.snapshot(),
+		)
 	}
 
 	// Verify filesystem structure was created

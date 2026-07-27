@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"piccolod/internal/api"
+	"piccolod/internal/container"
 	"piccolod/internal/events"
 	"piccolod/internal/persistence"
 )
@@ -61,6 +63,71 @@ func (r *recordingArtifactProgressReporter) snapshot() []events.TaskProgressEven
 	return append([]events.TaskProgressEvent(nil), r.events...)
 }
 
+type blockingArtifactProgressReporter struct {
+	mu                sync.Mutex
+	events            []events.TaskProgressEvent
+	blockNext         bool
+	active            int
+	firstEntered      chan struct{}
+	releaseFirst      chan struct{}
+	concurrentEntered chan struct{}
+	concurrentOnce    sync.Once
+}
+
+func newBlockingArtifactProgressReporter() *blockingArtifactProgressReporter {
+	return &blockingArtifactProgressReporter{
+		firstEntered:      make(chan struct{}),
+		releaseFirst:      make(chan struct{}),
+		concurrentEntered: make(chan struct{}),
+	}
+}
+
+func (r *blockingArtifactProgressReporter) Report(event events.TaskProgressEvent) {
+	r.mu.Lock()
+	r.active++
+	if r.active > 1 {
+		r.concurrentOnce.Do(func() { close(r.concurrentEntered) })
+	}
+	block := r.blockNext
+	if block {
+		r.blockNext = false
+	}
+	r.mu.Unlock()
+
+	if block {
+		close(r.firstEntered)
+		<-r.releaseFirst
+	}
+
+	r.mu.Lock()
+	r.events = append(r.events, event)
+	r.active--
+	r.mu.Unlock()
+}
+
+func (r *blockingArtifactProgressReporter) Last(taskID string) (events.TaskProgressEvent, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for index := len(r.events) - 1; index >= 0; index-- {
+		if r.events[index].TaskID == taskID {
+			return r.events[index], true
+		}
+	}
+	return events.TaskProgressEvent{}, false
+}
+
+func (r *blockingArtifactProgressReporter) armNextReport() {
+	r.mu.Lock()
+	r.blockNext = true
+	r.mu.Unlock()
+}
+
+func (r *blockingArtifactProgressReporter) snapshot() []events.TaskProgressEvent {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]events.TaskProgressEvent(nil), r.events...)
+}
+
 func TestArtifactProgressInheritsLifecycleAndKeepsTaskFresh(t *testing.T) {
 	reporter := &recordingArtifactProgressReporter{}
 	manager := &AppManager{}
@@ -77,7 +144,7 @@ func TestArtifactProgressInheritsLifecycleAndKeepsTaskFresh(t *testing.T) {
 		nil,
 	)
 
-	finish := manager.beginArtifactProgress(
+	progressCtx, finish := manager.beginArtifactProgress(
 		ctx,
 		"provider",
 		"model",
@@ -85,7 +152,19 @@ func TestArtifactProgressInheritsLifecycleAndKeepsTaskFresh(t *testing.T) {
 		1,
 		2,
 		10*time.Millisecond,
+		transferProgressRange{Min: 40, Max: 80},
 	)
+	callback := artifactTransferCallback(progressCtx)
+	callback(container.ImagePullReport{
+		OverallPercent: 0,
+		Phase:          "pulling",
+	})
+	callback(container.ImagePullReport{
+		DownloadedBytes: 50,
+		TotalBytes:      100,
+		OverallPercent:  50,
+		Phase:           "pulling",
+	})
 	time.Sleep(25 * time.Millisecond)
 	finish(nil)
 
@@ -119,11 +198,267 @@ func TestArtifactProgressInheritsLifecycleAndKeepsTaskFresh(t *testing.T) {
 	if stage := artifactEvents[len(artifactEvents)-1].Metadata["stage"]; stage != "ready" {
 		t.Fatalf("final artifact stage = %v, want ready", stage)
 	}
+	var sawByteProgress bool
+	for _, event := range artifactEvents {
+		if event.Metadata["stage"] == "downloading" &&
+			event.Metadata["downloaded_bytes"] == int64(50) &&
+			event.Metadata["total_bytes"] == int64(100) &&
+			event.Metadata["overall_percent"] == 50 &&
+			event.Progress == 60 {
+			sawByteProgress = true
+		}
+	}
+	if !sawByteProgress {
+		t.Fatalf("artifact events did not expose byte progress: %#v", artifactEvents)
+	}
 
 	countAfterFinish := len(got)
 	time.Sleep(25 * time.Millisecond)
 	if count := len(reporter.snapshot()); count != countAfterFinish {
 		t.Fatalf("heartbeat continued after completion: before=%d after=%d", countAfterFinish, count)
+	}
+}
+
+func TestArtifactProgressSerializesTransferPublications(t *testing.T) {
+	reporter := newBlockingArtifactProgressReporter()
+	manager := &AppManager{}
+	manager.SetProgressReporter(reporter)
+	ctx := WithTaskID(context.Background(), "artifact-serialized")
+
+	progressCtx, finish := manager.beginArtifactProgress(
+		ctx,
+		"provider",
+		"model",
+		"oci",
+		1,
+		1,
+		time.Hour,
+		transferProgressRange{Min: 15, Max: 55},
+	)
+	callback := artifactTransferCallback(progressCtx)
+	reporter.armNextReport()
+
+	firstDone := make(chan struct{})
+	go func() {
+		callback(container.ImagePullReport{
+			DownloadedBytes: 25,
+			TotalBytes:      100,
+			OverallPercent:  25,
+			Phase:           "pulling",
+		})
+		close(firstDone)
+	}()
+	<-reporter.firstEntered
+
+	secondStarted := make(chan struct{})
+	secondDone := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		callback(container.ImagePullReport{
+			DownloadedBytes: 75,
+			TotalBytes:      100,
+			OverallPercent:  75,
+			Phase:           "pulling",
+		})
+		close(secondDone)
+	}()
+	<-secondStarted
+
+	select {
+	case <-reporter.concurrentEntered:
+		t.Fatal("second artifact update published while the first was still in flight")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	close(reporter.releaseFirst)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first artifact update did not finish")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second artifact update did not finish")
+	}
+	finish(nil)
+
+	lastProgress := 0
+	var lastBytes int64
+	for _, event := range reporter.snapshot() {
+		if event.Phase != taskPhaseMaterializingArtifact {
+			continue
+		}
+		if event.Progress < lastProgress {
+			t.Fatalf("artifact progress regressed from %d to %d", lastProgress, event.Progress)
+		}
+		lastProgress = event.Progress
+		if downloaded, ok := event.Metadata["downloaded_bytes"].(int64); ok {
+			if downloaded < lastBytes {
+				t.Fatalf("artifact bytes regressed from %d to %d", lastBytes, downloaded)
+			}
+			lastBytes = downloaded
+		}
+	}
+}
+
+func TestTransferProgressRangeMapping(t *testing.T) {
+	progressRange := transferProgressRange{Min: 15, Max: 55}
+	for _, test := range []struct {
+		raw  int
+		want int
+	}{
+		{raw: -1, want: 15},
+		{raw: 0, want: 15},
+		{raw: 25, want: 25},
+		{raw: 100, want: 55},
+		{raw: 125, want: 55},
+	} {
+		if got := mapTransferProgress(progressRange, test.raw); got != test.want {
+			t.Fatalf("mapTransferProgress(%d) = %d, want %d", test.raw, got, test.want)
+		}
+	}
+
+	first := progressRangeForUnit(15, 55, 0, 2)
+	second := progressRangeForUnit(15, 55, 1, 2)
+	if first != (transferProgressRange{Min: 15, Max: 35}) ||
+		second != (transferProgressRange{Min: 35, Max: 55}) {
+		t.Fatalf("unit ranges = %+v, %+v; want contiguous 15-35 and 35-55", first, second)
+	}
+
+	declaredImage := progressRangeForUnit(15, 55, 0, 2)
+	networkAnchor := progressRangeForUnit(15, 55, 1, 2)
+	if declaredImage.Max != networkAnchor.Min || networkAnchor.Max != 55 {
+		t.Fatalf(
+			"network-anchor range = %+v after declared image %+v; want contiguous final unit ending at 55",
+			networkAnchor,
+			declaredImage,
+		)
+	}
+}
+
+func TestArtifactProgressHeartbeatAndBytesRemainCoherent(t *testing.T) {
+	reporter := &recordingArtifactProgressReporter{}
+	manager := &AppManager{}
+	manager.SetProgressReporter(reporter)
+	ctx := WithTaskID(context.Background(), "artifact-coherence")
+
+	progressCtx, finish := manager.beginArtifactProgress(
+		ctx,
+		"provider",
+		"model",
+		"oci",
+		1,
+		1,
+		5*time.Millisecond,
+		transferProgressRange{Min: 15, Max: 55},
+	)
+	report := artifactTransferCallback(progressCtx)
+	report(container.ImagePullReport{
+		DownloadedBytes: 60,
+		TotalBytes:      100,
+		OverallPercent:  60,
+		Phase:           "pulling",
+	})
+	report(container.ImagePullReport{
+		DownloadedBytes: 20,
+		TotalBytes:      100,
+		OverallPercent:  20,
+		Phase:           "pulling",
+	})
+	time.Sleep(15 * time.Millisecond)
+	finish(nil)
+
+	var sawHeartbeat bool
+	for _, event := range reporter.snapshot() {
+		if event.Phase != taskPhaseMaterializingArtifact {
+			continue
+		}
+		if got, ok := event.Metadata["downloaded_bytes"].(int64); ok && got > 0 && got < 60 {
+			t.Fatalf("artifact byte detail regressed to %d: %#v", got, event)
+		}
+		if strings.Contains(event.Message, "Still pulling artifact") {
+			sawHeartbeat = true
+		}
+	}
+	if !sawHeartbeat {
+		t.Fatal("artifact heartbeat did not produce visibly changing liveness copy")
+	}
+}
+
+func TestIndeterminateArtifactHeartbeatStaysHonestAndVisible(t *testing.T) {
+	reporter := &recordingArtifactProgressReporter{}
+	manager := &AppManager{}
+	manager.SetProgressReporter(reporter)
+	ctx := WithTaskID(context.Background(), "artifact-indeterminate")
+
+	progressCtx, finish := manager.beginArtifactProgress(
+		ctx,
+		"provider",
+		"model",
+		"oci",
+		1,
+		1,
+		5*time.Millisecond,
+		transferProgressRange{Min: 15, Max: 55},
+	)
+	artifactTransferCallback(progressCtx)(container.ImagePullReport{
+		OverallPercent: -1,
+		Phase:          "pulling",
+	})
+	time.Sleep(15 * time.Millisecond)
+	finish(errors.New("stop test"))
+
+	var heartbeat events.TaskProgressEvent
+	for _, event := range reporter.snapshot() {
+		if event.Phase == taskPhaseMaterializingArtifact &&
+			event.Metadata["stage"] == "processing" {
+			heartbeat = event
+		}
+	}
+	if heartbeat.TaskID == "" || !strings.Contains(heartbeat.Message, "Still processing artifact") {
+		t.Fatalf("indeterminate heartbeat = %#v, want visible honest processing copy", heartbeat)
+	}
+	if heartbeat.Progress != 15 || heartbeat.Metadata["overall_percent"] != -1 {
+		t.Fatalf("indeterminate heartbeat fabricated progress: %#v", heartbeat)
+	}
+}
+
+func TestArtifactProgressReadyWithoutTransferRemainsIndeterminate(t *testing.T) {
+	reporter := &recordingArtifactProgressReporter{}
+	manager := &AppManager{}
+	manager.SetProgressReporter(reporter)
+	ctx := WithTaskID(context.Background(), "reuse-provider")
+
+	_, finish := manager.beginArtifactProgress(
+		ctx,
+		"provider",
+		"model",
+		"huggingface",
+		1,
+		1,
+		time.Hour,
+		transferProgressRange{Min: 10, Max: 50},
+	)
+	finish(nil)
+
+	var ready events.TaskProgressEvent
+	for _, event := range reporter.snapshot() {
+		if event.Phase == taskPhaseMaterializingArtifact &&
+			event.Metadata["stage"] == "ready" {
+			ready = event
+		}
+	}
+	if ready.TaskID == "" {
+		t.Fatal("ready artifact event missing")
+	}
+	if ready.Progress != 50 {
+		t.Fatalf("ready lifecycle progress = %d, want assigned range maximum 50", ready.Progress)
+	}
+	if ready.Metadata["overall_percent"] != -1 ||
+		ready.Metadata["downloaded_bytes"] != int64(0) ||
+		ready.Metadata["total_bytes"] != int64(0) {
+		t.Fatalf("ready event fabricated transfer progress: %#v", ready.Metadata)
 	}
 }
 
@@ -180,8 +515,27 @@ func TestResolveAndDownloadHuggingFaceDirectoryProjection(t *testing.T) {
 	}
 
 	target := t.TempDir()
-	if err := downloadHuggingFaceProjection(context.Background(), client, "https://huggingface.test", source, resolved, target); err != nil {
+	var latestDownloaded, latestTotal int64
+	if err := downloadHuggingFaceProjection(
+		context.Background(),
+		client,
+		"https://huggingface.test",
+		source,
+		resolved,
+		target,
+		func(downloaded, total int64) {
+			latestDownloaded = downloaded
+			latestTotal = total
+		},
+	); err != nil {
 		t.Fatalf("download: %v", err)
+	}
+	if latestDownloaded != 18 || latestTotal != 18 {
+		t.Fatalf(
+			"aggregate download progress = %d/%d, want 18/18",
+			latestDownloaded,
+			latestTotal,
+		)
 	}
 	for relative, want := range map[string]string{
 		"config.json": "{" + `"ok":true}`,
@@ -233,7 +587,7 @@ func TestDownloadHuggingFaceSelectedFileVerifiesDigest(t *testing.T) {
 		t.Fatalf("resolve: %v", err)
 	}
 	target := t.TempDir()
-	if err := downloadHuggingFaceProjection(context.Background(), client, "https://huggingface.test", source, resolved, target); err != nil {
+	if err := downloadHuggingFaceProjection(context.Background(), client, "https://huggingface.test", source, resolved, target, nil); err != nil {
 		t.Fatalf("download: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(target, "model.gguf")); err != nil {
@@ -242,7 +596,7 @@ func TestDownloadHuggingFaceSelectedFileVerifiesDigest(t *testing.T) {
 
 	source.Digest = "sha256:" + strings.Repeat("0", 64)
 	second := t.TempDir()
-	if err := downloadHuggingFaceProjection(context.Background(), client, "https://huggingface.test", source, resolved, second); err == nil {
+	if err := downloadHuggingFaceProjection(context.Background(), client, "https://huggingface.test", source, resolved, second, nil); err == nil {
 		t.Fatalf("expected digest mismatch")
 	}
 }
@@ -295,6 +649,7 @@ func TestDownloadHuggingFaceFileEnforcesResolvedSize(t *testing.T) {
 				target,
 				test.expectedSize,
 				"",
+				nil,
 			)
 			if err == nil {
 				t.Fatal("size mismatch was accepted")
@@ -331,6 +686,7 @@ func TestDownloadHuggingFaceFileStopsStalledTransfer(t *testing.T) {
 		"",
 		50*time.Millisecond,
 		time.Second,
+		nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "stalled") {
 		t.Fatalf("stalled download error = %v", err)
@@ -374,6 +730,7 @@ func TestDownloadHuggingFaceFileStopsTrickleTransferAtAttemptDeadline(t *testing
 		"",
 		50*time.Millisecond,
 		75*time.Millisecond,
+		nil,
 	)
 	if err == nil || !strings.Contains(err.Error(), "attempt deadline") {
 		t.Fatalf("trickle download error = %v", err)

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -1108,4 +1109,169 @@ func TestPullProgressParser_ShouldCallback(t *testing.T) {
 	if !parser.shouldCallback() {
 		t.Error("shouldCallback() after waiting should return true")
 	}
+}
+
+type testCloser func() error
+
+func (close testCloser) Close() error {
+	return close()
+}
+
+type secondAttemptLocker struct {
+	mu            sync.Mutex
+	attemptMu     sync.Mutex
+	attempts      int
+	secondAttempt chan struct{}
+}
+
+func (l *secondAttemptLocker) Lock() {
+	l.attemptMu.Lock()
+	l.attempts++
+	if l.attempts == 2 {
+		close(l.secondAttempt)
+	}
+	l.attemptMu.Unlock()
+	l.mu.Lock()
+}
+
+func (l *secondAttemptLocker) Unlock() {
+	l.mu.Unlock()
+}
+
+func TestStopAndJoinPullProgressWorkerFencesTerminalEvent(t *testing.T) {
+	done := make(chan struct{})
+	stopped := make(chan struct{})
+	callbackStarted := make(chan struct{})
+	releaseCallback := make(chan struct{})
+	events := make([]string, 0, 2)
+
+	go func() {
+		defer close(stopped)
+		close(callbackStarted)
+		<-releaseCallback
+		events = append(events, "watchdog")
+		<-done
+	}()
+	<-callbackStarted
+
+	terminalDone := make(chan struct{})
+	go func() {
+		stopAndJoinPullProgressWorker(done, stopped)
+		events = append(events, "terminal")
+		close(terminalDone)
+	}()
+
+	select {
+	case <-terminalDone:
+		t.Fatal("terminal event passed a watchdog callback still in flight")
+	case <-time.After(10 * time.Millisecond):
+	}
+
+	close(releaseCallback)
+	select {
+	case <-terminalDone:
+	case <-time.After(time.Second):
+		t.Fatal("terminal event did not resume after watchdog callback completed")
+	}
+	if got := strings.Join(events, ","); got != "watchdog,terminal" {
+		t.Fatalf("event order = %q, want watchdog,terminal", got)
+	}
+}
+
+func TestPublishImagePullProgressSerializesSnapshotAndCallback(t *testing.T) {
+	firstSnapshotEntered := make(chan struct{})
+	releaseFirstSnapshot := make(chan struct{})
+	secondSnapshotEntered := make(chan struct{})
+	var calls []int
+	callback := func(report ImagePullReport) {
+		calls = append(calls, report.OverallPercent)
+	}
+	publishLock := &secondAttemptLocker{secondAttempt: make(chan struct{})}
+
+	firstDone := make(chan struct{})
+	go func() {
+		publishImagePullProgress(publishLock, callback, func() ImagePullReport {
+			close(firstSnapshotEntered)
+			<-releaseFirstSnapshot
+			return ImagePullReport{OverallPercent: 10}
+		})
+		close(firstDone)
+	}()
+	<-firstSnapshotEntered
+
+	secondDone := make(chan struct{})
+	go func() {
+		publishImagePullProgress(publishLock, callback, func() ImagePullReport {
+			close(secondSnapshotEntered)
+			return ImagePullReport{OverallPercent: 20}
+		})
+		close(secondDone)
+	}()
+	<-publishLock.secondAttempt
+
+	select {
+	case <-secondSnapshotEntered:
+		t.Fatal("second publisher captured a snapshot while the first publication was in flight")
+	default:
+	}
+
+	close(releaseFirstSnapshot)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("first publisher did not finish")
+	}
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("second publisher did not finish")
+	}
+	if got := fmt.Sprint(calls); got != "[10 20]" {
+		t.Fatalf("callback order = %s, want [10 20]", got)
+	}
+}
+
+func TestDrainPullProgressReaderIsBounded(t *testing.T) {
+	t.Run("already drained does not close reader", func(t *testing.T) {
+		readDone := make(chan struct{})
+		close(readDone)
+		closed := false
+		err := drainPullProgressReader(testCloser(func() error {
+			closed = true
+			return nil
+		}), readDone, time.Millisecond)
+		if err != nil {
+			t.Fatalf("drainPullProgressReader: %v", err)
+		}
+		if closed {
+			t.Fatal("reader was closed after it had already drained")
+		}
+	})
+
+	t.Run("timeout closes reader and unblocks", func(t *testing.T) {
+		readDone := make(chan struct{})
+		closed := false
+		err := drainPullProgressReader(testCloser(func() error {
+			closed = true
+			close(readDone)
+			return nil
+		}), readDone, time.Millisecond)
+		if err != nil {
+			t.Fatalf("drainPullProgressReader: %v", err)
+		}
+		if !closed {
+			t.Fatal("timed-out reader was not closed")
+		}
+	})
+
+	t.Run("reader that survives close returns error", func(t *testing.T) {
+		readDone := make(chan struct{})
+		if err := drainPullProgressReader(
+			testCloser(func() error { return nil }),
+			readDone,
+			time.Millisecond,
+		); err == nil {
+			t.Fatal("drainPullProgressReader waited indefinitely after close")
+		}
+	})
 }

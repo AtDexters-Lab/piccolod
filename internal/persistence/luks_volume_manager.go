@@ -342,6 +342,18 @@ func (m *luksVolumeManager) ReconcileOrphanLVs(ctx context.Context) error {
 		}
 
 		log.Printf("WARN: removing orphan LV %s (no metadata found)", lv.Name)
+		if strings.HasPrefix(lv.Name, goldenLVPrefix) {
+			storageKey := strings.TrimPrefix(lv.Name, goldenLVPrefix)
+			mu := m.goldenMutex(storageKey)
+			mu.Lock()
+			destroyErr := m.destroyGoldenLVLocked(ctx, lv.Name)
+			mu.Unlock()
+			if destroyErr != nil {
+				log.Printf("WARN: failed to remove orphan golden LV %s: %v", lv.Name, destroyErr)
+				errs = append(errs, fmt.Errorf("remove golden %s: %w", lv.Name, destroyErr))
+			}
+			continue
+		}
 		if lv.Active {
 			_ = m.lvMgr.DeactivateLV(ctx, lv.Name)
 		}
@@ -616,6 +628,16 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 		lock.Unlock()
 	}()
 
+	// The golden namespace is durable ownership evidence even when metadata is
+	// missing or unreadable. Generic stale-volume cleanup must never infer that
+	// a golden-shaped ID is an ordinary app or ephemeral volume.
+	if strings.HasPrefix(id, goldenLVPrefix) {
+		return fmt.Errorf(
+			"refuse generic destruction of golden content %s; use reference-aware garbage collection",
+			id,
+		)
+	}
+
 	metaDir := paths.VolumeMetaDir(id)
 	metaPath := filepath.Join(metaDir, metadataV2File)
 	mountDir := paths.MountDir(id)
@@ -658,7 +680,12 @@ func (m *luksVolumeManager) DestroyVolume(ctx context.Context, id string) error 
 			return fmt.Errorf("read v3 metadata: %w", err)
 		}
 		switch meta.Type {
-		case volumeTypeGolden, volumeTypeWorkspace, volumeTypeServiceRootfs:
+		case volumeTypeGolden:
+			return fmt.Errorf(
+				"refuse generic destruction of golden content %s; use reference-aware garbage collection",
+				id,
+			)
+		case volumeTypeWorkspace, volumeTypeServiceRootfs:
 			// Rootfs destroy needs its own per-volume lock; we hold it. Use
 			// the lock-already-held variant to avoid re-entry deadlock.
 			return m.destroyRootfsLocked(ctx, id)

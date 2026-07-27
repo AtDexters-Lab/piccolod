@@ -218,7 +218,13 @@ func (m *luksVolumeManager) selectGoldenStorage(
 				// the complete identity and expected storage ID. Under every
 				// candidate-identity lock, replace this unproven orphan rather
 				// than disambiguating away from the durable reference.
-				m.destroyGoldenLVUnsafe(ctx, goldenID)
+				if err := m.destroyGoldenLVLocked(ctx, goldenID); err != nil {
+					return goldenStorageSelection{}, fmt.Errorf(
+						"replace unproven golden LV %s: %w",
+						goldenID,
+						err,
+					)
+				}
 				return goldenStorageSelection{goldenID: goldenID}, nil
 			}
 			continue

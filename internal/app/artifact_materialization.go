@@ -47,7 +47,12 @@ const ArtifactOperationTimeout = huggingFaceMaxAttempt + time.Hour
 // Podman adapter. Keeping it separate avoids widening every image-only
 // ContainerManager test double.
 type ociArtifactRuntime interface {
-	PullArtifact(ctx context.Context, runtime container.PodmanRuntime, reference string) error
+	PullArtifactWithProgress(
+		ctx context.Context,
+		runtime container.PodmanRuntime,
+		reference string,
+		callback container.ImagePullCallback,
+	) error
 	InspectArtifact(ctx context.Context, runtime container.PodmanRuntime, reference string) (*container.ArtifactInfo, error)
 	ExtractArtifact(ctx context.Context, runtime container.PodmanRuntime, reference, targetDir string) error
 }
@@ -63,6 +68,44 @@ type resolvedHuggingFaceSource struct {
 	SelectedFile bool
 	Files        []huggingFaceFile
 	Size         int64
+}
+
+type artifactTransferProgressKey struct{}
+
+type artifactTransferProgressFunc func(downloaded, total int64)
+
+func reportArtifactTransferProgress(ctx context.Context, downloaded, total int64) {
+	report, _ := ctx.Value(artifactTransferProgressKey{}).(artifactTransferProgressFunc)
+	if report != nil {
+		report(downloaded, total)
+	}
+}
+
+func artifactTransferCallback(ctx context.Context) container.ImagePullCallback {
+	return func(report container.ImagePullReport) {
+		// Podman emits an initial report before it knows blob sizes. Keep the
+		// lifecycle at its assigned minimum until byte progress is measurable.
+		// Like an ordinary image pull, completed transport may reach the
+		// content unit's range maximum; stage metadata distinguishes subsequent
+		// materialization from the final Ready event.
+		if report.TotalBytes <= 0 {
+			return
+		}
+		reportArtifactTransferProgress(ctx, report.DownloadedBytes, report.TotalBytes)
+	}
+}
+
+func artifactTransferPercent(downloaded, total int64) int {
+	if total <= 0 {
+		return -1
+	}
+	if downloaded <= 0 {
+		return 0
+	}
+	if downloaded >= total {
+		return 100
+	}
+	return int((float64(downloaded) / float64(total)) * 100)
 }
 
 func (m *AppManager) currentGoldenContentManager() persistence.GoldenContentManager {
@@ -112,37 +155,140 @@ func (m *AppManager) beginArtifactProgress(
 	instanceID, artifactName, sourceKind string,
 	index, total int,
 	heartbeat time.Duration,
-) func(error) {
+	progressRange transferProgressRange,
+) (context.Context, func(error)) {
 	if TaskIDFromContext(ctx) == "" || m.currentProgressReporter() == nil {
-		return func(error) {}
+		return ctx, func(error) {}
 	}
-	taskType, progress := m.inheritedTaskProgress(ctx, taskTypeInstallApp, 60)
+	taskType, inheritedProgress := m.inheritedTaskProgress(
+		ctx,
+		taskTypeInstallApp,
+		progressRange.Min,
+	)
+	if inheritedProgress > progressRange.Min {
+		progressRange.Min = inheritedProgress
+	}
+	if progressRange.Max < progressRange.Min {
+		progressRange.Max = progressRange.Min
+	}
 	started := time.Now()
-	emit := func(stage, message string, opErr error) {
+
+	var byteHighWater transferByteHighWater
+	var lastPercent atomic.Int64
+	var lifecycleProgress atomic.Int64
+	var emitMu sync.Mutex
+	lastPercent.Store(-2)
+	lifecycleProgress.Store(int64(progressRange.Min))
+
+	emitLocked := func(stage, message string, opErr error) {
+		downloaded, totalSize := byteHighWater.snapshot()
+		overallPercent := artifactTransferPercent(downloaded, totalSize)
 		m.emitProgressWithMetadata(
 			ctx,
 			taskType,
 			instanceID,
 			taskPhaseMaterializingArtifact,
-			progress,
+			int(lifecycleProgress.Load()),
 			message,
 			false,
 			map[string]any{
-				"artifact":        artifactName,
-				"artifact_index":  index,
-				"artifact_total":  total,
-				"source_type":     sourceKind,
-				"stage":           stage,
-				"elapsed_seconds": int64(time.Since(started) / time.Second),
+				"artifact":         artifactName,
+				"artifact_index":   index,
+				"artifact_total":   total,
+				"source_type":      sourceKind,
+				"stage":            stage,
+				"elapsed_seconds":  int64(time.Since(started) / time.Second),
+				"overall_percent":  overallPercent,
+				"total_bytes":      totalSize,
+				"downloaded_bytes": downloaded,
 			},
 			opErr,
 		)
+	}
+	emit := func(stage, message string, opErr error) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+		emitLocked(stage, message, opErr)
 	}
 	emit(
 		"preparing",
 		fmt.Sprintf("Preparing artifact %s (%d/%d)", artifactName, index, total),
 		nil,
 	)
+	downloadMessage := func(downloaded, totalSize int64, heartbeat bool) string {
+		elapsed := int64(time.Since(started) / time.Second)
+		if totalSize <= 0 {
+			if heartbeat {
+				if downloaded > 0 {
+					return fmt.Sprintf(
+						"Still processing artifact %s: %s downloaded (%d/%d, %ds elapsed)",
+						artifactName,
+						formatBytes(downloaded),
+						index,
+						total,
+						elapsed,
+					)
+				}
+				return fmt.Sprintf(
+					"Still processing artifact %s (%d/%d, %ds elapsed)",
+					artifactName,
+					index,
+					total,
+					elapsed,
+				)
+			}
+			return fmt.Sprintf(
+				"Pulling artifact %s (%d/%d)",
+				artifactName,
+				index,
+				total,
+			)
+		}
+		verb := "Pulling"
+		if heartbeat {
+			verb = "Still pulling"
+		}
+		return fmt.Sprintf(
+			"%s artifact %s: %s / %s (%d/%d, %ds elapsed)",
+			verb,
+			artifactName,
+			formatBytes(downloaded),
+			formatBytes(totalSize),
+			index,
+			total,
+			elapsed,
+		)
+	}
+
+	transferProgress := artifactTransferProgressFunc(func(downloaded, totalSize int64) {
+		emitMu.Lock()
+		defer emitMu.Unlock()
+
+		if downloaded < 0 {
+			downloaded = 0
+		}
+		if totalSize < 0 {
+			totalSize = 0
+		}
+		if totalSize > 0 && downloaded > totalSize {
+			downloaded = totalSize
+		}
+		downloaded, totalSize = byteHighWater.observe(downloaded, totalSize)
+		percent := artifactTransferPercent(downloaded, totalSize)
+		if lastPercent.Swap(int64(percent)) == int64(percent) {
+			return
+		}
+		mapped := int64(mapTransferProgress(progressRange, percent))
+		for {
+			current := lifecycleProgress.Load()
+			if mapped <= current || lifecycleProgress.CompareAndSwap(current, mapped) {
+				break
+			}
+		}
+
+		emitLocked("downloading", downloadMessage(downloaded, totalSize, false), nil)
+	})
+	progressCtx := context.WithValue(ctx, artifactTransferProgressKey{}, transferProgress)
 
 	if heartbeat <= 0 {
 		heartbeat = artifactProgressHeartbeat
@@ -156,11 +302,31 @@ func (m *AppManager) beginArtifactProgress(
 		for {
 			select {
 			case <-ticker.C:
-				emit(
-					"materializing",
-					fmt.Sprintf("Materializing artifact %s (%d/%d)", artifactName, index, total),
-					nil,
-				)
+				func() {
+					emitMu.Lock()
+					defer emitMu.Unlock()
+
+					downloaded, totalSize := byteHighWater.snapshot()
+					if totalSize > 0 && downloaded < totalSize {
+						emitLocked("downloading", downloadMessage(downloaded, totalSize, true), nil)
+						return
+					}
+					if totalSize <= 0 {
+						emitLocked("processing", downloadMessage(downloaded, totalSize, true), nil)
+						return
+					}
+					emitLocked(
+						"materializing",
+						fmt.Sprintf(
+							"Materializing artifact %s (%d/%d, %ds elapsed)",
+							artifactName,
+							index,
+							total,
+							int64(time.Since(started)/time.Second),
+						),
+						nil,
+					)
+				}()
 			case <-stop:
 				return
 			}
@@ -168,7 +334,7 @@ func (m *AppManager) beginArtifactProgress(
 	}()
 
 	var once sync.Once
-	return func(opErr error) {
+	return progressCtx, func(opErr error) {
 		once.Do(func() {
 			close(stop)
 			<-stopped
@@ -180,6 +346,7 @@ func (m *AppManager) beginArtifactProgress(
 				)
 				return
 			}
+			lifecycleProgress.Store(int64(progressRange.Max))
 			emit(
 				"ready",
 				fmt.Sprintf("Artifact %s ready (%d/%d)", artifactName, index, total),
@@ -199,6 +366,7 @@ func (m *AppManager) prepareArtifactAttachments(
 	instanceID string,
 	idmap persistence.IDMapConfig,
 	reuseRecorded bool,
+	progressRange transferProgressRange,
 ) (preparedArtifactAttachments, error) {
 	result := preparedArtifactAttachments{
 		Handles:    make(map[string]persistence.ArtifactHandle),
@@ -239,7 +407,13 @@ func (m *AppManager) prepareArtifactAttachments(
 	}
 	for index, name := range names {
 		source := def.Artifacts[name].Source
-		finishProgress := m.beginArtifactProgress(
+		unitProgressRange := progressRangeForUnit(
+			progressRange.Min,
+			progressRange.Max,
+			index,
+			len(names),
+		)
+		progressCtx, finishProgress := m.beginArtifactProgress(
 			ctx,
 			instanceID,
 			name,
@@ -247,14 +421,15 @@ func (m *AppManager) prepareArtifactAttachments(
 			index+1,
 			len(names),
 			artifactProgressHeartbeat,
+			unitProgressRange,
 		)
 		prepareErr := func() error {
 			if referenceID := recorded[name]; referenceID != "" {
-				handle, err := manager.AttachArtifactReference(ctx, referenceID)
+				handle, err := manager.AttachArtifactReference(progressCtx, referenceID)
 				var missing *persistence.ArtifactContentMissingError
 				if errors.As(err, &missing) {
 					if rebuildErr := m.reconstructRecordedArtifactContent(
-						ctx,
+						progressCtx,
 						source,
 						missing,
 					); rebuildErr != nil {
@@ -264,7 +439,7 @@ func (m *AppManager) prepareArtifactAttachments(
 							rebuildErr,
 						)
 					}
-					handle, err = manager.AttachArtifactReference(ctx, referenceID)
+					handle, err = manager.AttachArtifactReference(progressCtx, referenceID)
 				}
 				if err != nil {
 					return fmt.Errorf("attach recorded artifact %q: %w", name, err)
@@ -274,12 +449,12 @@ func (m *AppManager) prepareArtifactAttachments(
 				return nil
 			}
 
-			content, err := m.ensureArtifactContent(ctx, source)
+			content, err := m.ensureArtifactContent(progressCtx, source)
 			if err != nil {
 				return fmt.Errorf("materialize artifact %q: %w", name, err)
 			}
 			referenceID := artifactReferenceID(instanceID, name, content.GoldenID)
-			handle, err := manager.CreateArtifactReference(ctx, persistence.ArtifactReferenceRequest{
+			handle, err := manager.CreateArtifactReference(progressCtx, persistence.ArtifactReferenceRequest{
 				ReferenceID: referenceID,
 				GoldenID:    content.GoldenID,
 				IDMap:       idmap,
@@ -363,7 +538,19 @@ func (m *AppManager) ensureAppArtifactAttachments(
 	if app == nil {
 		return nil, fmt.Errorf("app state is required to attach artifacts")
 	}
-	prepared, err := m.prepareArtifactAttachments(ctx, def, app.InstanceID, idMapForRuntime(app.InstanceID, runtime), true)
+	_, progress := m.inheritedTaskProgress(ctx, taskTypeStartApp, 60)
+	progressMax := 90
+	if progress > progressMax {
+		progressMax = progress
+	}
+	prepared, err := m.prepareArtifactAttachments(
+		ctx,
+		def,
+		app.InstanceID,
+		idMapForRuntime(app.InstanceID, runtime),
+		true,
+		transferProgressRange{Min: progress, Max: progressMax},
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -593,7 +780,12 @@ func (m *AppManager) ensureOCIArtifactContent(
 	}
 	defer cleanup()
 
-	pullErr := m.containerManager.PullImage(ctx, runtime, source.Reference)
+	pullErr := m.containerManager.PullImageWithProgress(
+		ctx,
+		runtime,
+		source.Reference,
+		artifactTransferCallback(ctx),
+	)
 	if pullErr == nil {
 		info, err := m.containerManager.InspectImage(ctx, runtime, source.Reference)
 		if err != nil {
@@ -638,7 +830,12 @@ func (m *AppManager) ensureOCIArtifactContent(
 	if !ok {
 		return persistence.GoldenContentHandle{}, fmt.Errorf("OCI source %s is a non-image artifact but this Podman runtime has no artifact support", source.Reference)
 	}
-	if err := artifactRuntime.PullArtifact(ctx, runtime, source.Reference); err != nil {
+	if err := artifactRuntime.PullArtifactWithProgress(
+		ctx,
+		runtime,
+		source.Reference,
+		artifactTransferCallback(ctx),
+	); err != nil {
 		return persistence.GoldenContentHandle{}, fmt.Errorf("pull OCI artifact %s: %w", source.Reference, err)
 	}
 	info, err := artifactRuntime.InspectArtifact(ctx, runtime, source.Reference)
@@ -710,7 +907,17 @@ func (m *AppManager) ensureHuggingFaceContent(
 		Materialize: func(ctx context.Context, targetDir string) (persistence.GoldenMaterializationResult, error) {
 			projectionCtx, cancel := context.WithTimeout(ctx, huggingFaceMaxAttempt)
 			defer cancel()
-			if err := downloadHuggingFaceProjection(projectionCtx, client, defaultHuggingFaceEndpoint, source, resolved, targetDir); err != nil {
+			if err := downloadHuggingFaceProjection(
+				projectionCtx,
+				client,
+				defaultHuggingFaceEndpoint,
+				source,
+				resolved,
+				targetDir,
+				func(downloaded, total int64) {
+					reportArtifactTransferProgress(ctx, downloaded, total)
+				},
+			); err != nil {
 				return persistence.GoldenMaterializationResult{}, err
 			}
 			return persistence.GoldenMaterializationResult{}, nil
@@ -857,7 +1064,12 @@ func downloadHuggingFaceProjection(
 	source api.ArtifactSource,
 	resolved resolvedHuggingFaceSource,
 	targetDir string,
+	progress func(downloaded, total int64),
 ) error {
+	var completed int64
+	if progress != nil {
+		progress(0, resolved.Size)
+	}
 	for _, file := range resolved.Files {
 		relative := file.Path
 		if resolved.SelectedFile {
@@ -885,8 +1097,17 @@ func downloadHuggingFaceProjection(
 			target,
 			file.Size,
 			source.Digest,
+			func(downloaded int64) {
+				if progress != nil {
+					progress(completed+downloaded, resolved.Size)
+				}
+			},
 		); err != nil {
 			return err
+		}
+		completed += file.Size
+		if progress != nil {
+			progress(completed, resolved.Size)
 		}
 	}
 	return fsutil.ValidateArtifactTree(targetDir)
@@ -898,6 +1119,7 @@ func downloadHuggingFaceFile(
 	endpoint, repository, commit, repositoryPath, target string,
 	expectedSize int64,
 	expectedDigest string,
+	progress func(downloaded int64),
 ) error {
 	return downloadHuggingFaceFileWithStallTimeout(
 		ctx,
@@ -911,6 +1133,7 @@ func downloadHuggingFaceFile(
 		expectedDigest,
 		huggingFaceTransferStall,
 		huggingFaceDownloadAttemptTimeout(expectedSize),
+		progress,
 	)
 }
 
@@ -937,6 +1160,7 @@ func downloadHuggingFaceFileWithStallTimeout(
 	expectedDigest string,
 	stallTimeout time.Duration,
 	attemptTimeout time.Duration,
+	progress func(downloaded int64),
 ) error {
 	if expectedSize < 0 {
 		return fmt.Errorf("download Hugging Face file %s has invalid resolved size %d", repositoryPath, expectedSize)
@@ -989,10 +1213,15 @@ func downloadHuggingFaceFileWithStallTimeout(
 		cancel()
 		_ = resp.Body.Close()
 	})
+	var downloaded int64
 	progressBody := &progressResetReader{
 		reader: resp.Body,
-		progress: func() {
+		progress: func(read int) {
 			timer.Reset(stallTimeout)
+			downloaded += int64(read)
+			if progress != nil {
+				progress(downloaded)
+			}
 		},
 	}
 	limited := &io.LimitedReader{R: progressBody, N: expectedSize}
@@ -1047,13 +1276,13 @@ func downloadHuggingFaceFileWithStallTimeout(
 
 type progressResetReader struct {
 	reader   io.Reader
-	progress func()
+	progress func(read int)
 }
 
 func (r *progressResetReader) Read(buffer []byte) (int, error) {
 	read, err := r.reader.Read(buffer)
 	if read > 0 {
-		r.progress()
+		r.progress(read)
 	}
 	return read, err
 }

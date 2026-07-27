@@ -205,6 +205,10 @@ type mountEntry struct {
 	FSType string
 	// Source is the device path or other source token (mountinfo field 10).
 	Source string
+	// ReadOnly is derived from mountinfo's per-mount options. Golden content
+	// uses it to distinguish a legitimate consumer attachment from writable
+	// creation staging left behind by an older daemon.
+	ReadOnly bool
 }
 
 // kernelSnapshotReader returns a fresh snapshot. The expectedMappers argument
@@ -334,6 +338,7 @@ func readMountInfo(path string) (map[string]mountEntry, error) {
 		}
 		majMin := fields[2]
 		mp := decodeMountPoint(fields[4])
+		mountOptions := strings.Split(fields[5], ",")
 		fsType := fields[sep+1]
 		source := fields[sep+2]
 
@@ -346,7 +351,20 @@ func readMountInfo(path string) (map[string]mountEntry, error) {
 		if errMa != nil || errMi != nil {
 			continue
 		}
-		out[filepath.Clean(mp)] = mountEntry{Major: maj, Minor: min, FSType: fsType, Source: source}
+		readOnly := false
+		for _, option := range mountOptions {
+			if option == "ro" {
+				readOnly = true
+				break
+			}
+		}
+		out[filepath.Clean(mp)] = mountEntry{
+			Major:    maj,
+			Minor:    min,
+			FSType:   fsType,
+			Source:   source,
+			ReadOnly: readOnly,
+		}
 	}
 	return out, nil
 }

@@ -33,6 +33,7 @@ type MockContainerManager struct {
 	removeRunningError       bool
 	removedImages            []string
 	pulledImages             []string
+	progressPulledImages     []string
 	removeImageErr           error
 	reloadedContainers       []string
 	reloadErr                error
@@ -139,6 +140,7 @@ func (m *MockContainerManager) PullImage(ctx context.Context, runtime container.
 func (m *MockContainerManager) PullImageWithProgress(ctx context.Context, runtime container.PodmanRuntime, image string, callback container.ImagePullCallback) error {
 	_ = runtime
 	m.pulledImages = append(m.pulledImages, image)
+	m.progressPulledImages = append(m.progressPulledImages, image)
 	// Mock: if callback provided, emit a quick progress sequence
 	if callback != nil {
 		callback(container.ImagePullReport{

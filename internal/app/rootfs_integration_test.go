@@ -34,6 +34,57 @@ func TestReadImageConfigForGoldenRootfsFallsBackToLegacyRepoQualifiedGolden(t *t
 	}
 }
 
+func TestImagePullProgressDoesNotRegress(t *testing.T) {
+	reporter := &recordingArtifactProgressReporter{}
+	manager := &AppManager{}
+	manager.SetProgressReporter(reporter)
+	ctx := WithTaskID(context.Background(), "install-provider")
+	manager.emitProgress(
+		ctx,
+		taskTypeInstallApp,
+		"provider",
+		taskPhaseAllocatingPorts,
+		20,
+		"Allocated ports",
+		false,
+		nil,
+	)
+
+	callback := manager.makeImagePullProgressCallback(
+		ctx,
+		"provider",
+		"inference",
+		"registry.example/provider:latest",
+		transferProgressRange{Min: 15, Max: 55},
+	)
+	for _, report := range []container.ImagePullReport{
+		{OverallPercent: -1, Phase: "pulling"},
+		{OverallPercent: 60, Phase: "pulling", DownloadedBytes: 60, TotalBytes: 100},
+		{OverallPercent: 20, Phase: "pulling", DownloadedBytes: 20, TotalBytes: 100},
+		{OverallPercent: 100, Phase: "complete", DownloadedBytes: 100, TotalBytes: 100},
+	} {
+		callback(report)
+	}
+
+	var progress []int
+	var downloaded []int64
+	for _, event := range reporter.snapshot() {
+		if event.Phase == taskPhasePullingImage {
+			progress = append(progress, event.Progress)
+			if current, ok := event.Metadata["downloaded_bytes"].(int64); ok {
+				downloaded = append(downloaded, current)
+			}
+		}
+	}
+	want := []int{20, 41, 41, 55}
+	if !reflect.DeepEqual(progress, want) {
+		t.Fatalf("image lifecycle progress = %v, want monotonic %v", progress, want)
+	}
+	if wantBytes := []int64{0, 60, 60, 100}; !reflect.DeepEqual(downloaded, wantBytes) {
+		t.Fatalf("image byte detail = %v, want monotonic %v", downloaded, wantBytes)
+	}
+}
+
 func TestReadImageConfigForGoldenRootfsPrefersRecordedGoldenIdentity(t *testing.T) {
 	digest := "sha256:collision"
 	derivedGolden := "golden-" + persistence.ShortDigest(digest)

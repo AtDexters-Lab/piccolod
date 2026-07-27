@@ -2,6 +2,7 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -677,6 +678,62 @@ func TestLVManager_LVPath(t *testing.T) {
 	if got != want {
 		t.Errorf("LVPath: got %q, want %q", got, want)
 	}
+}
+
+func TestLVManager_LVExistsExact(t *testing.T) {
+	const exactKey = "lvs --noheadings -o lv_name " + DefaultVGName
+
+	t.Run("finds target without thin-pool filtering", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				exactKey: " thin-pool\n golden-model\n foreign-lv\n",
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		exists, err := manager.LVExistsExact(context.Background(), "golden-model")
+		if err != nil {
+			t.Fatalf("LVExistsExact: %v", err)
+		}
+		if !exists {
+			t.Fatal("LVExistsExact did not find exact LV")
+		}
+	})
+
+	t.Run("successful empty inventory proves absence", func(t *testing.T) {
+		run := &testutil.FakeRunner{}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		exists, err := manager.LVExistsExact(context.Background(), "golden-model")
+		if err != nil {
+			t.Fatalf("LVExistsExact: %v", err)
+		}
+		if exists {
+			t.Fatal("LVExistsExact reported absent LV present")
+		}
+	})
+
+	t.Run("malformed inventory is ambiguous", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				exactKey: "golden-model unexpected-column\n",
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.LVExistsExact(context.Background(), "golden-model"); err == nil {
+			t.Fatal("LVExistsExact accepted malformed inventory")
+		}
+	})
+
+	t.Run("command failure is ambiguous", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Errs: map[string]error{
+				exactKey: errors.New("lvs failed"),
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.LVExistsExact(context.Background(), "golden-model"); err == nil {
+			t.Fatal("LVExistsExact accepted failed inventory")
+		}
+	})
 }
 
 func TestLVManager_ListLVs(t *testing.T) {

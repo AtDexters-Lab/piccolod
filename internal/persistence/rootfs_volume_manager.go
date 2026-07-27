@@ -34,6 +34,9 @@ const (
 
 	btrfsRootfsMountOpts = "compress=zstd:1,discard=async,noatime"
 
+	goldenStagingTeardownAttempts = 5
+	goldenStagingTeardownDelay    = 250 * time.Millisecond
+
 	// defaultWorkspaceVirtualSize is the initial virtual size for workspace
 	// snapshot LVs. Thin-provisioned — only written blocks consume physical space.
 	defaultWorkspaceVirtualSize = 50 << 30 // 50 GiB
@@ -117,62 +120,11 @@ func (m *luksVolumeManager) checkThinPoolCapacity(ctx context.Context) error {
 	return nil
 }
 
-// resetGoldenStorageBeforePublication removes any stale physical LV and only
-// then clears its incomplete metadata. The caller must invoke this before
-// publishing the next incomplete marker: after that marker exists, failures
-// must leave it behind as durable retry evidence.
+// resetGoldenStorageBeforePublication settles and removes any stale golden
+// storage before publishing the next incomplete marker. It deliberately uses
+// the same content-agnostic destruction primitive as reconciliation and GC.
 func (m *luksVolumeManager) resetGoldenStorageBeforePublication(ctx context.Context, goldenID string) error {
-	m.mu.Lock()
-	delete(m.goldenLVs, goldenID)
-	m.mu.Unlock()
-
-	lvs, err := m.lvMgr.ListLVs(ctx)
-	if err != nil {
-		return fmt.Errorf("inspect stale golden LV %s: %w", goldenID, err)
-	}
-	exists := false
-	for _, lv := range lvs {
-		if lv.Name == goldenID {
-			exists = true
-			break
-		}
-	}
-	if exists {
-		mapper := volMapperName(goldenID)
-		_ = m.run.Run(ctx, "umount", paths.MountDir(goldenID))
-		_ = m.run.Run(ctx, "cryptsetup", "close", mapper)
-		_ = m.lvMgr.DeactivateLV(ctx, goldenID)
-		removeErr := m.lvMgr.RemoveThinLV(ctx, goldenID)
-
-		lvs, verifyErr := m.lvMgr.ListLVs(ctx)
-		if verifyErr != nil {
-			verifyErr = fmt.Errorf("verify stale golden LV %s removal: %w", goldenID, verifyErr)
-			if removeErr != nil {
-				return errors.Join(
-					fmt.Errorf("remove stale golden LV %s: %w", goldenID, removeErr),
-					verifyErr,
-				)
-			}
-			return verifyErr
-		}
-		for _, lv := range lvs {
-			if lv.Name != goldenID {
-				continue
-			}
-			if removeErr != nil {
-				return fmt.Errorf("remove stale golden LV %s: %w", goldenID, removeErr)
-			}
-			return fmt.Errorf("stale golden LV %s still exists after removal", goldenID)
-		}
-	}
-
-	if err := os.RemoveAll(paths.VolumeMetaDir(goldenID)); err != nil {
-		return fmt.Errorf("remove stale golden metadata %s: %w", goldenID, err)
-	}
-	if err := os.RemoveAll(paths.MountDir(goldenID)); err != nil {
-		return fmt.Errorf("remove stale golden mount directory %s: %w", goldenID, err)
-	}
-	return nil
+	return m.destroyGoldenLVLocked(ctx, goldenID)
 }
 
 // EnsureGoldenLV creates or reuses a verified golden LV. Existing image
@@ -222,6 +174,9 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	}
 	goldenID := selection.goldenID
 	if selection.ready {
+		if err := m.settleReadyGoldenLocked(ctx, goldenID); err != nil {
+			return "", fmt.Errorf("prove Ready golden LV %s reusable: %w", goldenID, err)
+		}
 		m.mu.Lock()
 		m.goldenLVs[goldenID] = selection.meta
 		m.mu.Unlock()
@@ -290,7 +245,7 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 
 	// Track which layers have been set up for deferred cleanup.
 	var (
-		lvCreated  bool
+		lvActive   bool
 		luksOpened bool
 		mounted    bool
 		success    bool
@@ -305,18 +260,24 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 
-		// Always tear down the transient mount stack — golden LV is only
-		// activated during flatten, then deactivated.
-		if mounted {
-			m.run.Run(cleanupCtx, "umount", mountDir)
+		teardownErr := m.teardownGoldenStaging(
+			cleanupCtx,
+			mountDir,
+			mapper,
+			lvName,
+			&mounted,
+			&luksOpened,
+			&lvActive,
+			goldenStagingTeardownDelay,
+		)
+		if teardownErr != nil {
+			log.Printf("WARN: clean golden LV %s staging stack: %v", goldenID, teardownErr)
 		}
-		if luksOpened {
-			m.run.Run(cleanupCtx, "cryptsetup", "close", mapper)
-		}
-		if lvCreated {
-			m.lvMgr.DeactivateLV(cleanupCtx, lvName)
-			if !success {
-				m.lvMgr.RemoveThinLV(cleanupCtx, lvName)
+		if !success {
+			if teardownErr != nil || mounted || luksOpened || lvActive {
+				log.Printf("WARN: retain incomplete golden LV %s until its staging stack can be settled", goldenID)
+			} else if err := m.destroyGoldenLVLocked(cleanupCtx, goldenID); err != nil {
+				log.Printf("WARN: retain incomplete golden LV %s after cleanup failure: %v", goldenID, err)
 			}
 		}
 	}()
@@ -324,7 +285,10 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	if err := m.lvMgr.CreateThinLV(ctx, lvName, sizeBytes); err != nil {
 		return "", fmt.Errorf("create golden LV: %w", err)
 	}
-	lvCreated = true
+	// ActivateLV performs lvchange before udevadm settle. Treat any activation
+	// attempt as possibly effective so a settle failure still deactivates the
+	// LV during cleanup.
+	lvActive = true
 	if err := m.lvMgr.ActivateLV(ctx, lvName); err != nil {
 		return "", fmt.Errorf("activate golden LV: %w", err)
 	}
@@ -368,6 +332,26 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 		return "", fmt.Errorf("syncfs golden: %w", err)
 	}
 
+	// Ready means the materialized bytes are durable and the transient
+	// creation stack is fully settled. Do this before the metadata commit so
+	// an EBUSY unmount (or a mapper/LV teardown failure) cannot be reported as
+	// successful materialization.
+	finalizeCtx, finalizeCancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	if err := m.teardownGoldenStaging(
+		finalizeCtx,
+		mountDir,
+		mapper,
+		lvName,
+		&mounted,
+		&luksOpened,
+		&lvActive,
+		goldenStagingTeardownDelay,
+	); err != nil {
+		finalizeCancel()
+		return "", fmt.Errorf("settle golden LV staging stack: %w", err)
+	}
+	finalizeCancel()
+
 	// OCI image projections retain their config for --rootfs consumers. Other
 	// artifacts have no image execution metadata.
 	if result.ImageConfig != nil {
@@ -406,6 +390,64 @@ func (m *luksVolumeManager) EnsureGoldenLV(ctx context.Context, req GoldenLVRequ
 	log.Printf("golden LV created: %s (source=%s identity=%s projection=%s size=%d)",
 		goldenID, sourceRef, identity.ResolvedIdentity, identity.Projection, sizeBytes)
 	return goldenID, nil
+}
+
+// teardownGoldenStaging settles the temporary stack used while populating a
+// golden LV. Each lower layer is released only after the layer above it has
+// been released, and transient busy errors receive a short bounded retry.
+func (m *luksVolumeManager) teardownGoldenStaging(
+	ctx context.Context,
+	mountDir, mapper, lvName string,
+	mounted, luksOpened, lvActive *bool,
+	retryDelay time.Duration,
+) error {
+	retry := func(operation string, run func() error) error {
+		var err error
+		for attempt := 1; attempt <= goldenStagingTeardownAttempts; attempt++ {
+			if err = run(); err == nil {
+				return nil
+			}
+			if attempt == goldenStagingTeardownAttempts {
+				break
+			}
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return fmt.Errorf("%s: %w", operation, errors.Join(err, ctx.Err()))
+			case <-timer.C:
+			}
+		}
+		return fmt.Errorf("%s after %d attempts: %w", operation, goldenStagingTeardownAttempts, err)
+	}
+
+	if *mounted {
+		if err := retry("unmount "+mountDir, func() error {
+			return m.run.Run(ctx, "umount", mountDir)
+		}); err != nil {
+			return err
+		}
+		*mounted = false
+	}
+	if *luksOpened {
+		if err := retry("close mapper "+mapper, func() error {
+			return m.run.Run(ctx, "cryptsetup", "close", mapper)
+		}); err != nil {
+			return err
+		}
+		*luksOpened = false
+	}
+	if *lvActive {
+		if err := retry("deactivate LV "+lvName, func() error {
+			return m.lvMgr.DeactivateLV(ctx, lvName)
+		}); err != nil {
+			return err
+		}
+		*lvActive = false
+	}
+	return nil
 }
 
 // CreateWorkspaceFromGolden creates a workspace rootfs from a golden LV snapshot.
@@ -788,6 +830,21 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 
 	switch state {
 	case AttachStateAttached:
+		if meta.Type == volumeTypeGolden {
+			stack, err := m.inspectGoldenLiveStack(volumeID)
+			if err != nil {
+				return RootfsHandle{}, err
+			}
+			if !stack.mounted || !stack.mountReadOnly || !stack.mapperOpen {
+				return RootfsHandle{}, fmt.Errorf(
+					"Ready golden LV %s is not attached read-only (mounted=%v read_only=%v mapper_open=%v)",
+					volumeID,
+					stack.mounted,
+					stack.mountReadOnly,
+					stack.mapperOpen,
+				)
+			}
+		}
 		// Fingerprint guard runs on every Attached return — see godoc.
 		if err := verifyIDMapFingerprint(volumeID, meta); err != nil {
 			return RootfsHandle{}, err
@@ -1227,7 +1284,9 @@ func (m *luksVolumeManager) detachRootfsLocked(ctx context.Context, volumeID str
 	return nil
 }
 
-// DestroyRootfs permanently removes a rootfs volume (workspace, service-rootfs, or golden).
+// DestroyRootfs permanently removes a workspace or service-rootfs volume.
+// Golden content is reference-owned and may only be removed by its
+// reference-aware garbage-collection path.
 // Acquires the per-volume lock; concurrent transitions on the same volumeID
 // serialize. Side-state cleanup (m.locks, schedules, cooldowns, unknown counter)
 // is owned by DestroyVolume — DestroyRootfs is one of its dispatch branches
@@ -1246,6 +1305,23 @@ func (m *luksVolumeManager) DestroyRootfs(ctx context.Context, volumeID string) 
 // recreated rootfs with the same volumeID doesn't inherit a sticky
 // AttachStateKernelStateCorrupted from the prior life.
 func (m *luksVolumeManager) destroyRootfsLocked(ctx context.Context, volumeID string) error {
+	if strings.HasPrefix(volumeID, goldenLVPrefix) {
+		return fmt.Errorf(
+			"refuse generic destruction of golden content %s; use reference-aware garbage collection",
+			volumeID,
+		)
+	}
+	metaDir := paths.VolumeMetaDir(volumeID)
+	metaPath := filepath.Join(metaDir, metadataV2File)
+	mountDir := paths.MountDir(volumeID)
+	meta, metaErr := readVolumeMetaV3(metaPath)
+	if metaErr == nil && meta.Type == volumeTypeGolden {
+		return fmt.Errorf(
+			"refuse generic destruction of golden content %s; use reference-aware garbage collection",
+			volumeID,
+		)
+	}
+
 	// Detach first (lock-already-held). detachRootfsLocked clears the
 	// resize cooldown.
 	_ = m.detachRootfsLocked(ctx, volumeID)
@@ -1254,16 +1330,11 @@ func (m *luksVolumeManager) destroyRootfsLocked(ctx context.Context, volumeID st
 	// DestroyRootfs callers — codex4-P2).
 	defer m.unknownCounter.Delete(volumeID)
 
-	metaDir := paths.VolumeMetaDir(volumeID)
-	metaPath := filepath.Join(metaDir, metadataV2File)
-	mountDir := paths.MountDir(volumeID)
-
-	meta, err := readVolumeMetaV3(metaPath)
-	if err != nil {
-		if os.IsNotExist(err) {
+	if metaErr != nil {
+		if os.IsNotExist(metaErr) {
 			return nil
 		}
-		return fmt.Errorf("read metadata: %w", err)
+		return fmt.Errorf("read metadata: %w", metaErr)
 	}
 
 	// Remove thin LV.
@@ -1281,24 +1352,188 @@ func (m *luksVolumeManager) destroyRootfsLocked(ctx context.Context, volumeID st
 	return nil
 }
 
-// destroyGoldenLVUnsafe destroys a golden LV without lock. Called under goldenMu.
-func (m *luksVolumeManager) destroyGoldenLVUnsafe(ctx context.Context, goldenID string) {
+type goldenLiveStack struct {
+	mounted       bool
+	mountReadOnly bool
+	mapperOpen    bool
+}
+
+func (m *luksVolumeManager) inspectGoldenLiveStack(goldenID string) (goldenLiveStack, error) {
+	mapper := volMapperName(goldenID)
+	reader := m.kernelSnapshotFn
+	if reader == nil {
+		reader = readLiveKernelSnapshot
+	}
+	snapshot, err := reader([]string{mapper})
+	if err != nil {
+		return goldenLiveStack{}, fmt.Errorf("inspect golden LV %s kernel stack: %w", goldenID, err)
+	}
+
+	mounted, mount := snapshot.lookupMount(paths.MountDir(goldenID))
+	if mounted && !mountSourceMatchesMapper(snapshot, mount, mapper) {
+		return goldenLiveStack{}, fmt.Errorf(
+			"refuse to clean golden LV %s: foreign mount at %s",
+			goldenID,
+			paths.MountDir(goldenID),
+		)
+	}
+	_, mapperOpen := snapshot.dmByName[mapper]
+	return goldenLiveStack{
+		mounted:       mounted,
+		mountReadOnly: mounted && mount.ReadOnly,
+		mapperOpen:    mapperOpen,
+	}, nil
+}
+
+func (m *luksVolumeManager) goldenLVExists(ctx context.Context, goldenID string) (bool, error) {
+	if m.lvMgr == nil {
+		return false, fmt.Errorf("golden LV manager is not configured")
+	}
+	exists, err := m.lvMgr.LVExistsExact(ctx, goldenID)
+	if err != nil {
+		return false, fmt.Errorf("inspect golden LV %s: %w", goldenID, err)
+	}
+	return exists, nil
+}
+
+// destroyGoldenLVLocked is the single persistence-layer destruction primitive
+// for golden content. OCI-image rootfs, OCI-artifact and Hugging Face content
+// all use this exact path: source/projection metadata never changes teardown
+// order or failure handling. The caller holds the golden identity/storage lock.
+func (m *luksVolumeManager) destroyGoldenLVLocked(ctx context.Context, goldenID string) error {
 	// Ready cache is derived from durable metadata and physical storage. Evict
-	// it before best-effort teardown so any cleanup failure leaves an unproven
+	// it before teardown so any cleanup failure leaves an unproven
 	// orphan, never cache-valid content.
 	m.mu.Lock()
 	delete(m.goldenLVs, goldenID)
 	m.mu.Unlock()
 
 	mapper := volMapperName(goldenID)
+	stack, err := m.inspectGoldenLiveStack(goldenID)
+	if err != nil {
+		return err
+	}
+	lvExists, err := m.goldenLVExists(ctx, goldenID)
+	if err != nil {
+		return err
+	}
 
-	// Best-effort teardown of any active state.
-	m.run.Run(ctx, "umount", paths.MountDir(goldenID))
-	m.run.Run(ctx, "cryptsetup", "close", mapper)
-	m.lvMgr.DeactivateLV(ctx, goldenID)
-	m.lvMgr.RemoveThinLV(ctx, goldenID)
-	_ = os.RemoveAll(paths.VolumeMetaDir(goldenID))
-	_ = os.RemoveAll(paths.MountDir(goldenID))
+	mounted := stack.mounted
+	mapperOpen := stack.mapperOpen
+	lvActive := lvExists
+	if err := m.teardownGoldenStaging(
+		ctx,
+		paths.MountDir(goldenID),
+		mapper,
+		goldenID,
+		&mounted,
+		&mapperOpen,
+		&lvActive,
+		goldenStagingTeardownDelay,
+	); err != nil {
+		return fmt.Errorf("settle golden LV %s before removal: %w", goldenID, err)
+	}
+
+	// Command success is not sufficient destruction authority. Re-probe the
+	// kernel stack before removing the LV beneath it.
+	stack, err = m.inspectGoldenLiveStack(goldenID)
+	if err != nil {
+		return err
+	}
+	if stack.mounted || stack.mapperOpen {
+		return fmt.Errorf(
+			"golden LV %s stack remains live after teardown (mounted=%v mapper_open=%v)",
+			goldenID,
+			stack.mounted,
+			stack.mapperOpen,
+		)
+	}
+
+	var removeErr error
+	if lvExists {
+		if err := m.lvMgr.RemoveThinLV(ctx, goldenID); err != nil {
+			removeErr = fmt.Errorf("remove golden LV %s: %w", goldenID, err)
+		}
+	}
+	stillExists, verifyErr := m.goldenLVExists(ctx, goldenID)
+	if verifyErr != nil {
+		if removeErr != nil {
+			return errors.Join(removeErr, fmt.Errorf("verify golden LV %s removal: %w", goldenID, verifyErr))
+		}
+		return fmt.Errorf("verify golden LV %s removal: %w", goldenID, verifyErr)
+	}
+	if stillExists {
+		if removeErr != nil {
+			return removeErr
+		}
+		return fmt.Errorf("golden LV %s still exists after removal", goldenID)
+	}
+
+	if err := os.Remove(paths.MountDir(goldenID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("remove golden mount directory %s: %w", goldenID, err)
+	}
+	if err := os.RemoveAll(paths.VolumeMetaDir(goldenID)); err != nil {
+		return fmt.Errorf("remove golden metadata %s: %w", goldenID, err)
+	}
+	return nil
+}
+
+// settleReadyGoldenLocked enforces the compatibility boundary for Ready
+// content created by older daemons. A read-only mounted golden is a legitimate
+// consumer attachment; every other live creation layer is settled without
+// deleting the verified content.
+func (m *luksVolumeManager) settleReadyGoldenLocked(ctx context.Context, goldenID string) error {
+	stack, err := m.inspectGoldenLiveStack(goldenID)
+	if err != nil {
+		return err
+	}
+	lvExists, err := m.goldenLVExists(ctx, goldenID)
+	if err != nil {
+		return err
+	}
+	if !lvExists {
+		return fmt.Errorf("Ready golden LV %s is missing", goldenID)
+	}
+
+	if stack.mounted && stack.mountReadOnly {
+		if !stack.mapperOpen {
+			return fmt.Errorf("Ready golden LV %s has a read-only mount without its mapper", goldenID)
+		}
+		return nil
+	}
+
+	mounted := stack.mounted
+	mapperOpen := stack.mapperOpen
+	// Exact existence does not expose activation state. Deactivation is
+	// idempotent, so run it for every detached/legacy-staging shape to prove
+	// the Ready LV is settled.
+	lvActive := true
+	if err := m.teardownGoldenStaging(
+		ctx,
+		paths.MountDir(goldenID),
+		volMapperName(goldenID),
+		goldenID,
+		&mounted,
+		&mapperOpen,
+		&lvActive,
+		goldenStagingTeardownDelay,
+	); err != nil {
+		return fmt.Errorf("settle Ready golden LV %s: %w", goldenID, err)
+	}
+
+	stack, err = m.inspectGoldenLiveStack(goldenID)
+	if err != nil {
+		return err
+	}
+	if stack.mounted || stack.mapperOpen {
+		return fmt.Errorf(
+			"Ready golden LV %s remains live after settlement (mounted=%v mapper_open=%v)",
+			goldenID,
+			stack.mounted,
+			stack.mapperOpen,
+		)
+	}
+	return nil
 }
 
 // GarbageCollectGoldenLVs removes golden LVs with no remaining references.
@@ -1341,6 +1576,7 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 	}
 
 	// Remove unreferenced golden LVs.
+	var gcErrs []error
 	for goldenID := range goldenIDs {
 		if referencedGoldens[goldenID] {
 			continue
@@ -1389,14 +1625,14 @@ func (m *luksVolumeManager) GarbageCollectGoldenLVs(ctx context.Context) error {
 			unlockIdentity()
 			continue
 		}
-		m.destroyGoldenLVUnsafe(ctx, goldenID)
-		m.mu.Lock()
-		delete(m.goldenLVs, goldenID)
-		m.mu.Unlock()
+		destroyErr := m.destroyGoldenLVLocked(ctx, goldenID)
 		unlockIdentity()
+		if destroyErr != nil {
+			gcErrs = append(gcErrs, fmt.Errorf("GC golden LV %s: %w", goldenID, destroyErr))
+		}
 	}
 
-	return nil
+	return errors.Join(gcErrs...)
 }
 
 // ReconcileRootfsStates validates rootfs volumes on startup.
@@ -1405,6 +1641,7 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	var reconcileErrs []error
 
 	for _, volID := range volIDs {
 		metaPath := filepath.Join(paths.VolumeMetaDir(volID), metadataV2File)
@@ -1423,19 +1660,47 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 
 		switch meta.Type {
 		case volumeTypeGolden:
-			storageKey := strings.TrimPrefix(volID, goldenLVPrefix)
 			if goldenReadyTimestamp(meta) != "" {
-				// Fast path: materialization complete, cache and skip.
-				m.mu.Lock()
-				m.goldenLVs[volID] = meta
-				m.mu.Unlock()
+				identity, identityErr := goldenIdentityFromMeta(meta)
+				if identityErr != nil {
+					reconcileErrs = append(
+						reconcileErrs,
+						fmt.Errorf("reconcile Ready golden LV %s identity: %w", volID, identityErr),
+					)
+					continue
+				}
+				unlockIdentity, lockErr := m.lockGoldenIdentity(identity)
+				if lockErr != nil {
+					reconcileErrs = append(
+						reconcileErrs,
+						fmt.Errorf("lock Ready golden LV %s: %w", volID, lockErr),
+					)
+					continue
+				}
+				settleErr := m.settleReadyGoldenLocked(ctx, volID)
+				if settleErr == nil {
+					m.mu.Lock()
+					m.goldenLVs[volID] = meta
+					m.mu.Unlock()
+				}
+				unlockIdentity()
+				if settleErr != nil {
+					reconcileErrs = append(reconcileErrs, settleErr)
+				}
 			} else {
 				// Incomplete golden LV: destroy.
 				log.Printf("reconcile: destroying incomplete golden LV %s", volID)
+				storageKey := strings.TrimPrefix(volID, goldenLVPrefix)
 				mu := m.goldenMutex(storageKey)
 				mu.Lock()
-				m.destroyGoldenLVUnsafe(ctx, volID)
+				destroyErr := m.destroyGoldenLVLocked(ctx, volID)
 				mu.Unlock()
+				if destroyErr != nil {
+					reconcileErrs = append(
+						reconcileErrs,
+						fmt.Errorf("reconcile incomplete golden LV %s: %w", volID, destroyErr),
+					)
+				}
 			}
 
 		case volumeTypeWorkspace, volumeTypeServiceRootfs:
@@ -1446,7 +1711,10 @@ func (m *luksVolumeManager) ReconcileRootfsStates(ctx context.Context) error {
 	}
 
 	// GC golden LVs.
-	return m.GarbageCollectGoldenLVs(ctx)
+	if err := m.GarbageCollectGoldenLVs(ctx); err != nil {
+		reconcileErrs = append(reconcileErrs, err)
+	}
+	return errors.Join(reconcileErrs...)
 }
 
 // ReadGoldenImageConfig returns the OCI image config for a golden LV.

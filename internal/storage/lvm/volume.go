@@ -169,6 +169,44 @@ func (m *LVManager) LVExists(ctx context.Context, name string) bool {
 	return err == nil
 }
 
+// LVExistsExact returns authoritative existence for one LV name. Unlike
+// ListLVs, this probe enumerates every LV in the VG and treats any unexpected
+// row shape as ambiguous instead of silently filtering it out. Destructive
+// callers use it to prove physical absence before deleting ownership metadata.
+func (m *LVManager) LVExistsExact(ctx context.Context, name string) (bool, error) {
+	out, err := m.run.RunWithOutput(
+		ctx,
+		"lvs",
+		"--noheadings",
+		"-o",
+		"lv_name",
+		m.vgName,
+	)
+	if err != nil {
+		return false, fmt.Errorf("lvs exact existence %s/%s: %w", m.vgName, name, err)
+	}
+	for lineNumber, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		if len(fields) != 1 {
+			return false, fmt.Errorf(
+				"lvs exact existence %s/%s: malformed row %d: %q",
+				m.vgName,
+				name,
+				lineNumber+1,
+				line,
+			)
+		}
+		if fields[0] == name {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // LVPath returns the device path for a thin LV.
 func (m *LVManager) LVPath(name string) string {
 	return fmt.Sprintf("/dev/%s/%s", m.vgName, name)

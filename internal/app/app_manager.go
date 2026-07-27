@@ -2350,7 +2350,17 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 		return nil, fmt.Errorf("failed to install %s: exhausted host-port retries", instanceID)
 	}
 	if attempt > 0 {
-		m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseAllocatingPorts, 10, fmt.Sprintf("Retrying installation (attempt %d)", attempt+1), false, nil)
+		taskType, progress := m.inheritedTaskProgress(ctx, taskTypeInstallApp, 10)
+		m.emitProgress(
+			ctx,
+			taskType,
+			instanceID,
+			taskPhaseAllocatingPorts,
+			progress,
+			fmt.Sprintf("Retrying installation (attempt %d)", attempt+1),
+			false,
+			nil,
+		)
 	}
 
 	layout, err := m.ensureAppVolumeLayout(ctx, instanceID)
@@ -2389,7 +2399,6 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 	// Unified install path: all apps (service and workspace) use container groups.
 	// Storage preparation (image pull vs workspace disk) is handled inside installContainerGroup.
-	m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhaseCreatingContainer, 60, "Creating containers", false, nil)
 	app, err := m.installContainerGroup(ctx, appDef, instanceID, layout, runtime, endpoints, nil, false, true)
 	if err != nil {
 		if uncommittedContainerGroupMaySurvive(err) {

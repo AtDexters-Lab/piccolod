@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"piccolod/internal/state/paths"
@@ -800,6 +801,62 @@ func TestReconcileOrphanLVs(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestReconcileOrphanGoldenUsesFailClosedCleanup(t *testing.T) {
+	t.Run("removes through golden cleanup primitive", func(t *testing.T) {
+		paths.SetRootsForTest(t)
+		goldenID := goldenLVPrefix + "orphan"
+		run := &goldenDestroyRunner{goldenID: goldenID, physical: true}
+		manager := &luksVolumeManager{
+			run:              run,
+			lvMgr:            lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+			goldenLVs:        make(map[string]*volumeMetaV3),
+			goldenMu:         make(map[string]*sync.Mutex),
+			kernelSnapshotFn: run.snapshot,
+		}
+
+		if err := manager.ReconcileOrphanLVs(context.Background()); err != nil {
+			t.Fatalf("ReconcileOrphanLVs: %v", err)
+		}
+		if run.physical {
+			t.Fatal("metadata-less golden LV survived successful reconciliation")
+		}
+	})
+
+	t.Run("foreign mount retains orphan", func(t *testing.T) {
+		paths.SetRootsForTest(t)
+		goldenID := goldenLVPrefix + "foreign"
+		run := &goldenDestroyRunner{goldenID: goldenID, physical: true}
+		manager := &luksVolumeManager{
+			run:       run,
+			lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+			goldenLVs: make(map[string]*volumeMetaV3),
+			goldenMu:  make(map[string]*sync.Mutex),
+			kernelSnapshotFn: func(_ []string) (kernelSnapshot, error) {
+				return kernelSnapshot{
+					mounts: map[string]mountEntry{
+						filepath.Clean(paths.MountDir(goldenID)): {
+							Major:  8,
+							Minor:  1,
+							FSType: "ext4",
+							Source: "/dev/foreign",
+						},
+					},
+					dmByName: make(map[string]string),
+					dmByDev:  make(map[string]string),
+				}, nil
+			},
+		}
+
+		err := manager.ReconcileOrphanLVs(context.Background())
+		if err == nil || !strings.Contains(err.Error(), "foreign mount") {
+			t.Fatalf("ReconcileOrphanLVs error = %v, want foreign-mount refusal", err)
+		}
+		if !run.physical {
+			t.Fatal("foreign mount allowed orphan golden LV removal")
+		}
+	})
 }
 
 func TestListAppDataRollbackArtifacts(t *testing.T) {

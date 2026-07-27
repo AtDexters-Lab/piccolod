@@ -205,7 +205,48 @@ var (
 
 var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
 
-const podmanWaitDelay = 5 * time.Second
+const (
+	podmanWaitDelay        = 5 * time.Second
+	pullReaderDrainTimeout = 2 * time.Second
+)
+
+func drainPullProgressReader(
+	reader io.Closer,
+	readDone <-chan struct{},
+	timeout time.Duration,
+) error {
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-readDone:
+		return nil
+	case <-timer.C:
+	}
+
+	closeErr := reader.Close()
+	timer.Reset(timeout)
+	select {
+	case <-readDone:
+		return nil
+	case <-timer.C:
+		return errors.Join(closeErr, fmt.Errorf("progress reader did not stop after PTY close"))
+	}
+}
+
+func stopAndJoinPullProgressWorker(done chan struct{}, stopped <-chan struct{}) {
+	close(done)
+	<-stopped
+}
+
+func publishImagePullProgress(
+	lock sync.Locker,
+	callback ImagePullCallback,
+	snapshot func() ImagePullReport,
+) {
+	lock.Lock()
+	defer lock.Unlock()
+	callback(snapshot())
+}
 
 func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) (*exec.Cmd, error) {
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkPodman); err != nil {
@@ -980,11 +1021,29 @@ type ArtifactInfo struct {
 // support is intentionally optional at the AppManager seam so older test
 // doubles and image-only runtimes remain unchanged.
 func (p *PodmanCLI) PullArtifact(ctx context.Context, runtime PodmanRuntime, reference string) error {
+	return p.PullArtifactWithProgress(ctx, runtime, reference, nil)
+}
+
+// PullArtifactWithProgress uses the same Podman blob-copy progress stream as
+// image pulls. OCI transport progress is content-generic; callers decide how
+// to map the report into their lifecycle range.
+func (p *PodmanCLI) PullArtifactWithProgress(
+	ctx context.Context,
+	runtime PodmanRuntime,
+	reference string,
+	callback ImagePullCallback,
+) error {
 	if err := ValidateImageReference(reference); err != nil {
 		return fmt.Errorf("invalid artifact reference: %w", err)
 	}
-	_, err := runPodman(ctx, runtime, []string{"artifact", "pull", reference})
-	return err
+	return p.pullWithProgress(
+		ctx,
+		runtime,
+		reference,
+		[]string{"artifact", "pull", reference},
+		callback,
+		false,
+	)
 }
 
 // InspectArtifact returns the resolved descriptor digest and aggregate size.
@@ -2115,8 +2174,25 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	if err := ValidateImageReference(image); err != nil {
 		return fmt.Errorf("invalid image name: %w", err)
 	}
+	return p.pullWithProgress(
+		ctx,
+		runtime,
+		image,
+		[]string{"pull", image},
+		callback,
+		true,
+	)
+}
 
-	args, err := BuildPodmanArgs(runtime, []string{"pull", image})
+func (p *PodmanCLI) pullWithProgress(
+	ctx context.Context,
+	runtime PodmanRuntime,
+	image string,
+	pullArgs []string,
+	callback ImagePullCallback,
+	classifyNonImage bool,
+) error {
+	args, err := BuildPodmanArgs(runtime, pullArgs)
 	if err != nil {
 		return err
 	}
@@ -2132,10 +2208,14 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		}
 		output, err := cmd.CombinedOutput()
 		if err != nil {
+			if classifyNonImage && podmanClassifiedNonImageArtifact(string(output)+" "+err.Error()) {
+				return &NotContainerImageError{Reference: image, Output: string(output), Err: err}
+			}
 			return fmt.Errorf("podman pull failed: %w, output: %s", err, string(output))
 		}
 		return nil
 	}
+	var progressPublishMu sync.Mutex
 
 	// Use PTY for progress output
 	log.Printf("INFO: PullImageWithProgress: starting podman pull %s (args=%v uid=%v)", image, args, runtime.Credential)
@@ -2183,7 +2263,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 	// Watchdog: log periodically + stall detection
 	watchdog := time.NewTicker(pullWatchdogInterval)
+	watchdogDone := make(chan struct{})
 	go func() {
+		defer close(watchdogDone)
 		defer watchdog.Stop()
 		var prevBytes int64
 		var stallCount int
@@ -2227,6 +2309,10 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 					log.Printf("INFO: PullImageWithProgress: still waiting for podman pull %s (pid=%d, %s/%s, %d%%)",
 						image, cmd.Process.Pid, formatBytesCompact(downloaded), formatBytesCompact(total), pct)
 				}
+				// The caller owns lifecycle mapping and visible copy. Re-emit
+				// the current transport snapshot so quiet or indeterminate
+				// pulls remain visibly alive without fabricating percentage.
+				publishImagePullProgress(&progressPublishMu, callback, parser.report)
 
 				if stallCount >= pullStallTicks {
 					stallDuration := time.Duration(stallCount) * pullWatchdogInterval
@@ -2243,10 +2329,12 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 	}()
 
 	// Emit initial progress
-	callback(ImagePullReport{
-		Image:          image,
-		OverallPercent: 0,
-		Phase:          "pulling",
+	publishImagePullProgress(&progressPublishMu, callback, func() ImagePullReport {
+		return ImagePullReport{
+			Image:          image,
+			OverallPercent: 0,
+			Phase:          "pulling",
+		}
 	})
 
 	// Capture recent PTY output lines for diagnostics on failure.
@@ -2276,8 +2364,12 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		return strings.Join(lines, "\n")
 	}
 
-	// Read PTY output and parse progress
+	// Read PTY output and parse progress. Wait for this reader after the
+	// process exits so final progress and error classification see the complete
+	// output tail.
+	readDone := make(chan struct{})
 	go func() {
+		defer close(readDone)
 		buf := make([]byte, 4096)
 		var lineBuf strings.Builder
 
@@ -2321,7 +2413,7 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 			// Throttled callback
 			if parser.shouldCallback() {
-				callback(parser.report())
+				publishImagePullProgress(&progressPublishMu, callback, parser.report)
 			}
 		}
 
@@ -2335,16 +2427,24 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 
 	// Wait for command to finish
 	cmdErr = cmd.Wait()
-	close(done)
+	// The watchdog also emits progress. Join it before draining the reader and
+	// before any terminal callback so no stale heartbeat can arrive after the
+	// operation has completed or returned an error.
+	stopAndJoinPullProgressWorker(done, watchdogDone)
+	if err := drainPullProgressReader(ptmx, readDone, pullReaderDrainTimeout); err != nil {
+		return errors.Join(cmdErr, fmt.Errorf("drain podman pull progress: %w", err))
+	}
 	log.Printf("INFO: PullImageWithProgress: podman pull %s finished (err=%v pid=%d)", image, cmdErr, cmd.Process.Pid)
 
 	// Always emit final completion
-	finalReport := parser.report()
-	if cmdErr == nil {
-		finalReport.Phase = "complete"
-		finalReport.OverallPercent = 100
-	}
-	callback(finalReport)
+	publishImagePullProgress(&progressPublishMu, callback, func() ImagePullReport {
+		finalReport := parser.report()
+		if cmdErr == nil {
+			finalReport.Phase = "complete"
+			finalReport.OverallPercent = 100
+		}
+		return finalReport
+	})
 
 	if cmdErr != nil {
 		// Always log the diagnostic tail on failure — context cancellation is
@@ -2353,6 +2453,9 @@ func (p *PodmanCLI) PullImageWithProgress(ctx context.Context, runtime PodmanRun
 		tail := getTail()
 		if tail != "" {
 			log.Printf("WARN: PullImageWithProgress: podman pull %s output tail:\n%s", image, tail)
+		}
+		if classifyNonImage && podmanClassifiedNonImageArtifact(tail+" "+cmdErr.Error()) {
+			return &NotContainerImageError{Reference: image, Output: tail, Err: cmdErr}
 		}
 		// Check stall detection first — it's more specific than a generic
 		// context timeout and provides structured diagnostic data.

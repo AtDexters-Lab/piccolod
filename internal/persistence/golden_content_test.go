@@ -12,7 +12,6 @@ import (
 
 	"piccolod/internal/state/paths"
 	"piccolod/internal/storage/lvm"
-	"piccolod/internal/testutil"
 )
 
 func TestOCIImageGoldenIdentityKeepsLegacyReuseKey(t *testing.T) {
@@ -74,17 +73,12 @@ func TestPreferredGoldenIDReplacesMetadataLessOrphan(t *testing.T) {
 		t.Fatalf("candidateGoldenIDs: %v", err)
 	}
 	preferred := candidates[0]
-	lvsKey := testutil.BuildKey("lvs", []string{"--noheadings", lvm.DefaultVGName + "/" + preferred})
-	run := &testutil.FakeRunner{
-		Errs: map[string]error{
-			"lvs":  errors.New("missing"),
-			lvsKey: nil,
-		},
-	}
+	run := &goldenDestroyRunner{goldenID: preferred, physical: true}
 	manager := &luksVolumeManager{
-		run:       run,
-		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
-		goldenLVs: map[string]*volumeMetaV3{},
+		run:              run,
+		lvMgr:            lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs:        map[string]*volumeMetaV3{},
+		kernelSnapshotFn: run.snapshot,
 	}
 
 	ordinary, err := manager.selectGoldenStorage(context.Background(), identity, "", "")
@@ -107,14 +101,14 @@ func TestPreferredGoldenIDReplacesMetadataLessOrphan(t *testing.T) {
 		t.Fatalf("preferred selection = %+v, want empty exact slot %s", exact, preferred)
 	}
 	foundRemoval := false
-	for _, call := range run.GetCalls() {
+	for _, call := range run.calls {
 		if strings.Contains(call, "lvremove -f "+lvm.DefaultVGName+"/"+preferred) {
 			foundRemoval = true
 			break
 		}
 	}
 	if !foundRemoval {
-		t.Fatalf("metadata-less preferred orphan was not removed: %v", run.GetCalls())
+		t.Fatalf("metadata-less preferred orphan was not removed: %v", run.calls)
 	}
 }
 
@@ -130,17 +124,16 @@ func TestFailedPreferredOrphanRemovalEvictsReadyCache(t *testing.T) {
 		t.Fatalf("candidateGoldenIDs: %v", err)
 	}
 	preferred := candidates[0]
-	lvsKey := testutil.BuildKey("lvs", []string{"--noheadings", lvm.DefaultVGName + "/" + preferred})
-	run := &testutil.FakeRunner{
-		Errs: map[string]error{
-			"lvs":      errors.New("missing"),
-			lvsKey:     nil,
-			"lvremove": errors.New("busy"),
-		},
+	removeErr := errors.New("busy")
+	run := &goldenDestroyRunner{
+		goldenID:  preferred,
+		physical:  true,
+		removeErr: removeErr,
 	}
 	manager := &luksVolumeManager{
-		run:   run,
-		lvMgr: lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		run:              run,
+		lvMgr:            lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		kernelSnapshotFn: run.snapshot,
 		goldenLVs: map[string]*volumeMetaV3{
 			preferred: {
 				GoldenIdentity:      &identity,
@@ -149,8 +142,8 @@ func TestFailedPreferredOrphanRemovalEvictsReadyCache(t *testing.T) {
 		},
 	}
 
-	if _, err := manager.selectGoldenStorage(context.Background(), identity, "", preferred); err != nil {
-		t.Fatalf("preferred selection: %v", err)
+	if _, err := manager.selectGoldenStorage(context.Background(), identity, "", preferred); !errors.Is(err, removeErr) {
+		t.Fatalf("preferred selection error = %v, want removal failure", err)
 	}
 	if _, cached := manager.goldenLVs[preferred]; cached {
 		t.Fatal("failed orphan removal retained Ready cache entry")

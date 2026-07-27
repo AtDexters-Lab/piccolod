@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 
@@ -129,6 +130,27 @@ func parseDevKey(devKey string) (int, int) {
 		}
 	}
 	return 0, 0
+}
+
+func TestReadMountInfoCapturesReadOnlyOption(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "mountinfo")
+	data := strings.Join([]string{
+		"36 25 253:10 / /mnt/ready ro,relatime - btrfs /dev/mapper/ready rw",
+		"37 25 253:11 / /mnt/staging rw,relatime - btrfs /dev/mapper/staging rw",
+	}, "\n")
+	if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	mounts, err := readMountInfo(path)
+	if err != nil {
+		t.Fatalf("readMountInfo: %v", err)
+	}
+	if !mounts["/mnt/ready"].ReadOnly {
+		t.Fatal("read-only mount option was not captured")
+	}
+	if mounts["/mnt/staging"].ReadOnly {
+		t.Fatal("read-write mount was classified read-only")
+	}
 }
 
 // staticSnapshot returns a reader that always yields the given snapshot.
@@ -955,4 +977,3 @@ func newTestManager() *luksVolumeManager {
 	mgr, _ := NewLUKSVolumeManager(LUKSVolumeManagerConfig{})
 	return mgr
 }
-

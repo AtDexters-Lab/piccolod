@@ -111,7 +111,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	for _, svcName := range startOrder {
 		addSubtask(svcName, svcName, "service")
 	}
-	emitCreateProgress(fmt.Sprintf("Creating containers (0/%d)", totalContainers))
 
 	// Defensive cleanup: prune labeled containers that belong to this instance but are not expected.
 	// This addresses partial installs (e.g., crash mid-way) where no app state exists yet to trigger reconcile.
@@ -132,13 +131,20 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 
 	// Prepare storage for each service (pull images or init workspace disks)
-	// Progress range 15-55% is divided equally among images
+	// Progress range 15-55% is divided equally among every content unit:
+	// declared artifacts first, then service images/rootfs preparation.
 	const pullProgressMin = 15
 	const pullProgressMax = 55
 	numServices := len(appDef.Services)
-	pullRangePerService := 0
-	if numServices > 0 {
-		pullRangePerService = (pullProgressMax - pullProgressMin) / numServices
+	numArtifacts := len(appDef.Artifacts)
+	numContentUnits := numArtifacts + numServices
+	anchorNeedsPreparation := true
+	if prebuiltRootfs != nil {
+		_, anchorPrebuilt := prebuiltRootfs[networkAnchorServiceName]
+		anchorNeedsPreparation = !anchorPrebuilt
+	}
+	if anchorNeedsPreparation {
+		numContentUnits++
 	}
 
 	// Block-native rootfs: prepare per-service rootfs from golden LV snapshots.
@@ -155,7 +161,32 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		return nil, err
 	}
 
-	artifacts, err := m.prepareArtifactAttachments(ctx, appDef, instanceID, idmap, reuseRecordedArtifacts)
+	artifactProgressRange := transferProgressRange{
+		Min: pullProgressMin,
+		Max: pullProgressMin,
+	}
+	if numArtifacts > 0 {
+		artifactProgressRange.Min = progressRangeForUnit(
+			pullProgressMin,
+			pullProgressMax,
+			0,
+			numContentUnits,
+		).Min
+		artifactProgressRange.Max = progressRangeForUnit(
+			pullProgressMin,
+			pullProgressMax,
+			numArtifacts-1,
+			numContentUnits,
+		).Max
+	}
+	artifacts, err := m.prepareArtifactAttachments(
+		ctx,
+		appDef,
+		instanceID,
+		idmap,
+		reuseRecordedArtifacts,
+		artifactProgressRange,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -190,13 +221,12 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		svc := appDef.Services[svcName]
 
 		// Calculate progress range for this service
-		progressRange := imagePullProgressRange{
-			Min: pullProgressMin + (serviceIdx * pullRangePerService),
-			Max: pullProgressMin + ((serviceIdx + 1) * pullRangePerService),
-		}
-		if serviceIdx == numServices-1 {
-			progressRange.Max = pullProgressMax
-		}
+		progressRange := progressRangeForUnit(
+			pullProgressMin,
+			pullProgressMax,
+			numArtifacts+serviceIdx,
+			numContentUnits,
+		)
 
 		if svc.Image != "" {
 			// Skip expensive image pull if a golden LV is already cached and fresh.
@@ -214,8 +244,21 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 				}
 				if useCache {
 					log.Printf("INFO: using cached golden LV for image %s (digest=%s) -- skipping pull", svc.Image, cachedDigest)
-					m.emitProgress(ctx, taskTypeInstallApp, instanceID, taskPhasePullingImage, progressRange.Max,
-						fmt.Sprintf("Using cached image %s", svc.Image), false, nil)
+					taskType, progress := m.inheritedTaskProgress(
+						ctx,
+						taskTypeInstallApp,
+						progressRange.Max,
+					)
+					m.emitProgress(
+						ctx,
+						taskType,
+						instanceID,
+						taskPhasePullingImage,
+						progress,
+						fmt.Sprintf("Using cached image %s", svc.Image),
+						false,
+						nil,
+					)
 					rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, cachedDigest, svc.Image, idmap, 0, "")
 					if err != nil {
 						return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
@@ -271,7 +314,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	// Prepare network anchor rootfs via golden LV pipeline.
 	// Anchor always uses ModeService regardless of app mode — it's a service container.
 	// Skip if the caller already provides an attached anchor rootfs (e.g., image update path).
-	if prebuiltRootfs != nil {
+	if !anchorNeedsPreparation {
 		if rInfo, ok := prebuiltRootfs[networkAnchorServiceName]; ok {
 			blockNativeRootfsMap[networkAnchorServiceName] = rInfo
 		}
@@ -281,7 +324,25 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 		if ephErr != nil {
 			return nil, fmt.Errorf("create ephemeral runtime for anchor: %w", ephErr)
 		}
-		if pullErr := m.containerManager.PullImage(ctx, ephRT, networkAnchorImage()); pullErr != nil {
+		anchorProgressRange := progressRangeForUnit(
+			pullProgressMin,
+			pullProgressMax,
+			numArtifacts+numServices,
+			numContentUnits,
+		)
+		anchorProgress := m.makeImagePullProgressCallback(
+			ctx,
+			instanceID,
+			networkAnchorServiceName,
+			networkAnchorImage(),
+			anchorProgressRange,
+		)
+		if pullErr := m.containerManager.PullImageWithProgress(
+			ctx,
+			ephRT,
+			networkAnchorImage(),
+			anchorProgress,
+		); pullErr != nil {
 			ephCleanup()
 			return nil, fmt.Errorf("pull anchor image: %w", pullErr)
 		}
