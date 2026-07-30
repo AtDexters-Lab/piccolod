@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -157,6 +158,171 @@ func TestFailedPreferredOrphanRemovalEvictsReadyCache(t *testing.T) {
 	}
 }
 
+func TestPreferredGoldenReconstructionRefusesForeignPoolLV(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: strings.Repeat("e", 40),
+		Projection:       GoldenProjectionHuggingFace + ":model.gguf",
+	}
+	candidates, err := candidateGoldenIDs(identity, "")
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	preferred := candidates[0]
+	run := &goldenDestroyRunner{
+		goldenID: preferred,
+		poolName: "foreign-pool",
+		physical: true,
+	}
+	manager := &luksVolumeManager{
+		run:              run,
+		lvMgr:            lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs:        make(map[string]*volumeMetaV3),
+		goldenMu:         make(map[string]*sync.Mutex),
+		kernelSnapshotFn: run.snapshot,
+	}
+
+	_, err = manager.selectGoldenStorage(context.Background(), identity, "", preferred)
+	if err == nil || !strings.Contains(err.Error(), `unexpected pool "foreign-pool"`) {
+		t.Fatalf("preferred selection error = %v, want foreign-pool refusal", err)
+	}
+	if !run.physical {
+		t.Fatal("preferred reconstruction removed a same-named foreign-pool LV")
+	}
+	for _, call := range run.calls {
+		if strings.HasPrefix(call, "lvchange ") || strings.HasPrefix(call, "lvremove ") {
+			t.Fatalf("preferred reconstruction mutated a foreign-pool LV: %v", run.calls)
+		}
+	}
+}
+
+func TestForegroundReadyCandidateRequiresStrictPhysicalProof(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	const (
+		digest   = "sha256:strict-proof"
+		imageRef = "registry.example.test/provider:latest"
+	)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	candidates, err := candidateGoldenIDs(identity, digest)
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	meta := &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		BaseImageRef:        imageRef,
+		BaseImageDigest:     digest,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), meta); err != nil {
+		t.Fatal(err)
+	}
+	run := &goldenDestroyRunner{goldenID: goldenID, physical: false}
+	materialized := false
+	manager := &luksVolumeManager{
+		run:              run,
+		lvMgr:            lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs:        map[string]*volumeMetaV3{goldenID: meta},
+		goldenMu:         make(map[string]*sync.Mutex),
+		kernelSnapshotFn: run.snapshot,
+		flattenFn: func(context.Context, string, string, string) (GoldenImageConfig, error) {
+			materialized = true
+			return GoldenImageConfig{}, nil
+		},
+	}
+	_, err = manager.EnsureGoldenLV(context.Background(), GoldenLVRequest{
+		ImageDigest: digest,
+		ImageRef:    imageRef,
+	})
+	var missing *GoldenContentMissingError
+	if !errors.As(err, &missing) {
+		t.Fatalf("EnsureGoldenLV error = %v, want GoldenContentMissingError", err)
+	}
+	if materialized {
+		t.Fatal("failed Ready-candidate proof rematerialized a mutable source")
+	}
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Fatalf("stale ready metadata survived proven physical absence: %v", statErr)
+	}
+	if _, cached := manager.goldenLVs[goldenID]; cached {
+		t.Fatal("stale ready cache survived proven physical absence")
+	}
+}
+
+func TestUnverifiedPreferredGoldenMissDoesNotPullMutableSource(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	const (
+		digest   = "sha256:cached-digest"
+		imageRef = "registry.example.test/provider:latest"
+	)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	candidates, err := candidateGoldenIDs(identity, digest)
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	run := &goldenDestroyRunner{goldenID: goldenID, physical: false}
+	materialized := false
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: make(map[string]*volumeMetaV3),
+		goldenMu:  make(map[string]*sync.Mutex),
+		flattenFn: func(context.Context, string, string, string) (GoldenImageConfig, error) {
+			materialized = true
+			return GoldenImageConfig{}, nil
+		},
+	}
+
+	_, err = manager.EnsureGoldenLV(context.Background(), GoldenLVRequest{
+		ImageDigest:       digest,
+		ImageRef:          imageRef,
+		PreferredGoldenID: goldenID,
+	})
+	var missing *GoldenContentMissingError
+	if !errors.As(err, &missing) || missing.GoldenID != goldenID {
+		t.Fatalf("EnsureGoldenLV error = %v, want exact GoldenContentMissingError for %s", err, goldenID)
+	}
+	if materialized {
+		t.Fatal("unverified cache miss pulled a mutable image reference")
+	}
+}
+
+func TestCreateRootfsReportsGoldenLossForBoundedReconstruction(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	manager := &luksVolumeManager{}
+
+	_, err := manager.createRootfsFromGolden(
+		context.Background(),
+		"golden-gc-winner",
+		"svc-rootfs-provider--main",
+		volumeTypeServiceRootfs,
+		true,
+		&IDMapConfig{},
+	)
+	var missing *GoldenContentMissingError
+	if !errors.As(err, &missing) || missing.GoldenID != "golden-gc-winner" {
+		t.Fatalf("createRootfsFromGolden error = %v, want retryable golden loss", err)
+	}
+}
+
 func TestArtifactReferenceIDRejectsFilesystemSyntax(t *testing.T) {
 	for _, referenceID := range []string{"", "../escape", "nested/reference", "bad\x00id"} {
 		if validateArtifactReferenceID(referenceID) == nil {
@@ -165,6 +331,81 @@ func TestArtifactReferenceIDRejectsFilesystemSyntax(t *testing.T) {
 	}
 	if err := validateArtifactReferenceID("provider--artifact--model--abcdef"); err != nil {
 		t.Fatalf("valid reference ID rejected: %v", err)
+	}
+}
+
+func TestArtifactReferencePublishesUnderGoldenIdentityLock(t *testing.T) {
+	paths.SetCoreRootForTest(t, t.TempDir())
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: strings.Repeat("d", 40),
+		Projection:       GoldenProjectionHuggingFace + ":model.gguf",
+	}
+	candidates, err := candidateGoldenIDs(identity, "")
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339Nano),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	manager := &luksVolumeManager{goldenMu: make(map[string]*sync.Mutex)}
+	unlockIdentity, err := manager.lockGoldenIdentity(identity)
+	if err != nil {
+		t.Fatalf("lock golden identity: %v", err)
+	}
+
+	const referenceID = "provider--artifact--model--locked"
+	result := make(chan error, 1)
+	go func() {
+		_, createErr := manager.CreateArtifactReference(context.Background(), ArtifactReferenceRequest{
+			ReferenceID: referenceID,
+			GoldenID:    goldenID,
+			Identity:    identity,
+		})
+		result <- createErr
+	}()
+
+	deadline := time.NewTimer(100 * time.Millisecond)
+	defer deadline.Stop()
+	select {
+	case err := <-result:
+		unlockIdentity()
+		t.Fatalf("CreateArtifactReference returned before held identity lock was released: %v", err)
+	case <-deadline.C:
+	}
+	if _, err := os.Stat(artifactReferencePath(referenceID)); !os.IsNotExist(err) {
+		unlockIdentity()
+		t.Fatalf("artifact reference became durable outside the golden identity lock: %v", err)
+	}
+
+	if err := os.RemoveAll(metaDir); err != nil {
+		unlockIdentity()
+		t.Fatal(err)
+	}
+	unlockIdentity()
+
+	select {
+	case err := <-result:
+		var missing *ArtifactContentMissingError
+		if !errors.As(err, &missing) ||
+			missing.GoldenID != goldenID ||
+			missing.Identity != identity {
+			t.Fatalf("CreateArtifactReference error = %v, want exact retryable artifact loss", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("CreateArtifactReference did not resume after identity lock release")
 	}
 }
 

@@ -269,6 +269,17 @@ type GinServer struct {
 	opCtx    context.Context
 	opCancel context.CancelFunc
 
+	// Reconstructible golden/rootfs maintenance has one post-Ready worker.
+	// Nudges coalesce; every pass is finite and retries from completion while
+	// the server remains unlocked.
+	rootfsMaintenanceMu             sync.Mutex
+	rootfsMaintenanceCancel         context.CancelFunc
+	rootfsMaintenanceDone           chan struct{}
+	rootfsMaintenanceNudge          chan struct{}
+	rootfsMaintenanceRetryInterval  time.Duration
+	rootfsMaintenanceAttemptTimeout time.Duration
+	rootfsMaintenancePass           func(context.Context) error
+
 	// Task-pressure recovery reconciliation is an optional mutating owner. Stop
 	// closes admission before DRAIN, cancels any in-flight pass through opCtx,
 	// and waits for it before app quiescence begins.
@@ -2215,6 +2226,14 @@ func (s *GinServer) onUnlockChainReady() {
 		s.healthTracker.Setf("persistence", health.LevelOK, "control store unlocked")
 		s.healthTracker.Setf("app-manager", health.LevelOK, "app manager ready")
 	}
+	s.nudgeRootfsMaintenance()
+	if s.persistence != nil {
+		if volumes := s.persistence.Volumes(); volumes != nil {
+			if monitor, ok := volumes.(persistence.WorkspaceResizeMonitor); ok {
+				monitor.StartWorkspaceResizeMonitor()
+			}
+		}
+	}
 	if s.decryptedOwnersStarted.Load() && s.decryptedEvents != nil {
 		s.decryptedEvents.Publish(events.Event{
 			Topic:   events.TopicLockStateChanged,
@@ -2224,6 +2243,138 @@ func (s *GinServer) onUnlockChainReady() {
 	if s.unlockReady != nil {
 		s.unlockReadyOnce.Do(func() { close(s.unlockReady) })
 	}
+}
+
+const (
+	defaultRootfsMaintenanceRetryInterval  = 30 * time.Second
+	defaultRootfsMaintenanceAttemptTimeout = 10 * time.Minute
+)
+
+func (s *GinServer) runRootfsMaintenancePass(ctx context.Context) error {
+	if s.rootfsMaintenancePass != nil {
+		return s.rootfsMaintenancePass(ctx)
+	}
+	if s.persistence == nil {
+		return nil
+	}
+	rootfs := s.persistence.Rootfs()
+	if rootfs == nil {
+		return nil
+	}
+	return rootfs.RunPhysicalMaintenance(ctx)
+}
+
+func (s *GinServer) nudgeRootfsMaintenance() {
+	if s == nil {
+		return
+	}
+
+	s.rootfsMaintenanceMu.Lock()
+	serverCtx := s.serverContext()
+	if serverCtx.Err() != nil || (s.lifecycle != nil && !s.lifecycle.IsReady()) {
+		s.rootfsMaintenanceMu.Unlock()
+		return
+	}
+	if s.rootfsMaintenanceDone == nil {
+		ctx, cancel := context.WithCancel(serverCtx)
+		done := make(chan struct{})
+		nudge := make(chan struct{}, 1)
+		retryInterval := s.rootfsMaintenanceRetryInterval
+		if retryInterval <= 0 {
+			retryInterval = defaultRootfsMaintenanceRetryInterval
+		}
+		attemptTimeout := s.rootfsMaintenanceAttemptTimeout
+		if attemptTimeout <= 0 {
+			attemptTimeout = defaultRootfsMaintenanceAttemptTimeout
+		}
+		s.rootfsMaintenanceCancel = cancel
+		s.rootfsMaintenanceDone = done
+		s.rootfsMaintenanceNudge = nudge
+		go s.runRootfsMaintenanceWorker(ctx, done, nudge, retryInterval, attemptTimeout)
+	}
+	nudge := s.rootfsMaintenanceNudge
+	s.rootfsMaintenanceMu.Unlock()
+
+	select {
+	case nudge <- struct{}{}:
+	default:
+	}
+}
+
+func (s *GinServer) runRootfsMaintenanceWorker(
+	ctx context.Context,
+	done chan struct{},
+	nudge <-chan struct{},
+	retryInterval, attemptTimeout time.Duration,
+) {
+	defer close(done)
+	select {
+	case <-ctx.Done():
+		return
+	case <-nudge:
+	}
+	for {
+		started := time.Now()
+		attemptCtx, cancel := context.WithTimeout(ctx, attemptTimeout)
+		err := s.runRootfsMaintenancePass(attemptCtx)
+		cancel()
+		duration := time.Since(started)
+		switch {
+		case errors.Is(err, context.Canceled) && ctx.Err() != nil:
+			return
+		case err != nil:
+			log.Printf("WARN: post-Ready rootfs maintenance failed after %s: %v", duration, err)
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("rootfs-maintenance", health.LevelWarn, "last pass failed after %s: %v", duration.Round(time.Millisecond), err)
+			}
+		default:
+			log.Printf("INFO: post-Ready rootfs maintenance completed in %s", duration)
+			if s.healthTracker != nil {
+				s.healthTracker.Setf("rootfs-maintenance", health.LevelOK, "last pass completed in %s", duration.Round(time.Millisecond))
+			}
+		}
+
+		timer := time.NewTimer(retryInterval)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
+			return
+		case <-nudge:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+		}
+	}
+}
+
+func (s *GinServer) cancelAndJoinRootfsMaintenance(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.rootfsMaintenanceMu.Lock()
+	cancel := s.rootfsMaintenanceCancel
+	done := s.rootfsMaintenanceDone
+	s.rootfsMaintenanceMu.Unlock()
+	if cancel == nil || done == nil {
+		return nil
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		return fmt.Errorf("join rootfs maintenance: %w", ctx.Err())
+	}
+	s.rootfsMaintenanceMu.Lock()
+	if s.rootfsMaintenanceDone == done {
+		s.rootfsMaintenanceCancel = nil
+		s.rootfsMaintenanceDone = nil
+		s.rootfsMaintenanceNudge = nil
+	}
+	s.rootfsMaintenanceMu.Unlock()
+	return nil
 }
 
 // TaskPressureSnapshot exposes the guard's bounded current state to the
@@ -2376,6 +2527,9 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// before DRAIN's StopAllApps needs it.
 	if s.opCancel != nil {
 		s.opCancel()
+	}
+	if err := s.cancelAndJoinRootfsMaintenance(ctx); err != nil {
+		return err
 	}
 	// An OnNormal callback may already own reconciliation. Its context is now
 	// canceled; wait for that owner to release before StopAllApps starts
@@ -2704,8 +2858,7 @@ func (s *GinServer) setupGinRoutes() {
 		admin := authed.Group("/")
 		admin.Use(s.requireAdmin())
 
-		// Crypto endpoints (session required for lock/recovery management)
-		admin.POST("/crypto/lock", s.handleCryptoLock)
+		// Crypto recovery endpoints (session required)
 		admin.POST("/crypto/recovery-key/generate", s.handleCryptoRecoveryGenerate)
 		admin.POST("/crypto/recovery-key/ack", s.handleCryptoRecoveryKeyAck)
 		admin.POST("/tunnels/certificates", s.requireUnlocked(), s.handleTunnelCertificateIssue)
@@ -3233,7 +3386,7 @@ func (s *GinServer) registerUnlockReloader(r unlockReloader) {
 	s.reloadersMu.Unlock()
 }
 
-func (s *GinServer) reloadComponentsAfterUnlock() {
+func (s *GinServer) reloadComponentsAfterUnlock(ctx context.Context) {
 	if s == nil {
 		return
 	}
@@ -3253,24 +3406,14 @@ func (s *GinServer) reloadComponentsAfterUnlock() {
 		s.refreshServerCertSANs()
 	}
 
-	// Post-unlock reconciliation: clean up orphan LVs and golden LV GC.
-	// Must run before unlock reloaders (which start the app manager) to prevent
-	// the app manager from racing with orphan cleanup.
+	// Before Ready, hydrate only the durable golden metadata/index needed by
+	// foreground exact reuse. Physical LVM discovery, settlement, scoped
+	// golden/rootfs GC, and the workspace resize monitor start from the
+	// post-Ready callback.
 	if s.persistence != nil {
-		rctx := context.Background()
 		if rootfs := s.persistence.Rootfs(); rootfs != nil {
-			if err := rootfs.ReconcileRootfsStates(rctx); err != nil {
-				log.Printf("WARN: post-unlock rootfs reconciliation: %v", err)
-			}
-		}
-		if volumes := s.persistence.Volumes(); volumes != nil {
-			if reconciler, ok := volumes.(persistence.OrphanReconciler); ok {
-				if err := reconciler.ReconcileOrphanLVs(rctx); err != nil {
-					log.Printf("WARN: post-unlock orphan LV cleanup: %v", err)
-				}
-			}
-			if wrm, ok := volumes.(persistence.WorkspaceResizeMonitor); ok {
-				wrm.StartWorkspaceResizeMonitor()
+			if err := rootfs.HydrateGoldenMetadata(ctx); err != nil {
+				log.Printf("WARN: post-unlock golden metadata hydration: %v", err)
 			}
 		}
 	}

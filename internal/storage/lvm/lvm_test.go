@@ -681,12 +681,12 @@ func TestLVManager_LVPath(t *testing.T) {
 }
 
 func TestLVManager_LVExistsExact(t *testing.T) {
-	const exactKey = "lvs --noheadings -o lv_name " + DefaultVGName
+	const exactKey = "lvs --noheadings --separator | --unquoted -o lv_name,lv_uuid,lv_attr,pool_lv --select lv_name=golden-model " + DefaultVGName
 
-	t.Run("finds target without thin-pool filtering", func(t *testing.T) {
+	t.Run("finds exact target", func(t *testing.T) {
 		run := &testutil.FakeRunner{
 			Outputs: map[string]string{
-				exactKey: " thin-pool\n golden-model\n foreign-lv\n",
+				exactKey: " golden-model | uuid-golden | Vwi-a-tz-- | thinpool\n",
 			},
 		}
 		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
@@ -714,7 +714,7 @@ func TestLVManager_LVExistsExact(t *testing.T) {
 	t.Run("malformed inventory is ambiguous", func(t *testing.T) {
 		run := &testutil.FakeRunner{
 			Outputs: map[string]string{
-				exactKey: "golden-model unexpected-column\n",
+				exactKey: "golden-model|uuid-golden|Vwi-a-tz--\n",
 			},
 		}
 		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
@@ -732,6 +732,86 @@ func TestLVManager_LVExistsExact(t *testing.T) {
 		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
 		if _, err := manager.LVExistsExact(context.Background(), "golden-model"); err == nil {
 			t.Fatal("LVExistsExact accepted failed inventory")
+		}
+	})
+}
+
+func TestLVManager_StrictLVInventory(t *testing.T) {
+	const inventoryKey = "lvs --noheadings --separator | --unquoted -o lv_name,lv_uuid,lv_attr,pool_lv " + DefaultVGName
+
+	t.Run("captures exact identities and activity", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				inventoryKey: strings.Join([]string{
+					"golden-model|uuid-golden|Vwi-a-tz--|thinpool",
+					"vol-app|uuid-app|Vwi---tz--|thinpool",
+				}, "\n"),
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		inventory, err := manager.StrictLVInventory(context.Background())
+		if err != nil {
+			t.Fatalf("StrictLVInventory: %v", err)
+		}
+		if got := inventory["golden-model"]; got.UUID != "uuid-golden" || !got.Active {
+			t.Fatalf("golden identity = %+v", got)
+		}
+		if got := inventory["vol-app"]; got.UUID != "uuid-app" || got.Active {
+			t.Fatalf("app identity = %+v", got)
+		}
+	})
+
+	t.Run("duplicate name fails closed", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				inventoryKey: strings.Join([]string{
+					"golden-model|uuid-one|Vwi-a-tz--|thinpool",
+					"golden-model|uuid-two|Vwi---tz--|thinpool",
+				}, "\n"),
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.StrictLVInventory(context.Background()); err == nil {
+			t.Fatal("StrictLVInventory accepted duplicate LV name")
+		}
+	})
+
+	t.Run("duplicate uuid fails closed", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				inventoryKey: strings.Join([]string{
+					"golden-one|uuid-shared|Vwi-a-tz--|thinpool",
+					"golden-two|uuid-shared|Vwi---tz--|thinpool",
+				}, "\n"),
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.StrictLVInventory(context.Background()); err == nil {
+			t.Fatal("StrictLVInventory accepted duplicate LV UUID")
+		}
+	})
+
+	t.Run("truncated lv_attr fails closed", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				inventoryKey: "golden-model|uuid-golden|Vwi-a|thinpool",
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.StrictLVInventory(context.Background()); err == nil {
+			t.Fatal("StrictLVInventory accepted truncated lv_attr")
+		}
+	})
+
+	t.Run("ambiguous activation state fails closed", func(t *testing.T) {
+		run := &testutil.FakeRunner{
+			Outputs: map[string]string{
+				inventoryKey: "golden-model|uuid-golden|Vwi-s-tz--|thinpool",
+			},
+		}
+		manager := NewLVManager(run, DefaultVGName, DefaultThinPoolName)
+		if _, err := manager.StrictLVInventory(context.Background()); err == nil {
+			t.Fatal("StrictLVInventory accepted suspended lv_attr")
 		}
 	})
 }

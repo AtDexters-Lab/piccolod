@@ -184,7 +184,7 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 		log.Printf("WARN: setup-complete check failed, assuming complete: %v", err)
 		// Fail closed for genuine transient errors: assume provisioned,
 		// route to login. The user can retry if needed.
-		s.reloadComponentsAfterUnlock()
+		s.reloadComponentsAfterUnlock(ctx)
 		return unlockChainResult{setupComplete: true, luksErr: luksErr}, nil
 	}
 	// Reconcile the durable provisioning marker from the authoritative
@@ -197,7 +197,7 @@ func (s *GinServer) runUnlockChain(ctx context.Context) (unlockChainResult, erro
 	// post-success callback. Keeping them inside this body means the
 	// coordinator's independent liveness timer also covers a blocked reloader
 	// and lifecycle Ready cannot be published prematurely.
-	s.reloadComponentsAfterUnlock()
+	s.reloadComponentsAfterUnlock(ctx)
 	return unlockChainResult{setupComplete: setupComplete, luksErr: luksErr}, nil
 }
 
@@ -470,7 +470,7 @@ func (s *GinServer) handleCryptoSetup(c *gin.Context) {
 			// Fresh setup does not run through the joinable unlock execution
 			// owner. Complete the same post-decrypt reload work before publishing
 			// lifecycle Ready so decrypted observers cannot run ahead of it.
-			s.reloadComponentsAfterUnlock()
+			s.reloadComponentsAfterUnlock(setupCtx)
 			if err := s.lifecycle.MarkReady(); err != nil {
 				log.Printf("WARN: lifecycle: setup Ready commit failed: %v", err)
 				return
@@ -925,51 +925,6 @@ func (s *GinServer) handleCryptoResetPassword(c *gin.Context) {
 
 	s.publishAuditEvent(c, "auth.reset_with_recovery", map[string]any{"was_locked": wasLocked})
 
-	c.JSON(http.StatusOK, gin.H{"message": "ok"})
-}
-
-// handleCryptoLock: POST /api/v1/crypto/lock
-func (s *GinServer) handleCryptoLock(c *gin.Context) {
-	if !s.cryptoManager.IsInitialized() {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "not initialized"})
-		return
-	}
-	// Reject lock-during-unlock to prevent the in-flight chain's later
-	// MarkReady from leaving lifecycle == Ready while crypto is locked.
-	// Coordinator.Lock() rejects the Unlocking → Locked transition by
-	// design (the chain must reach a terminal state first); we surface
-	// that as a retriable 409 rather than mutate crypto and leak an
-	// inconsistent state.
-	if s.lifecycle != nil && s.lifecycle.State() == lifecycle.StateUnlocking {
-		c.JSON(http.StatusConflict, gin.H{"error": "unlock chain in flight; retry after it completes"})
-		return
-	}
-	ctx, cancel := s.opContext(c, 2*time.Minute)
-	defer cancel()
-	// Lock LUKS data volume before crypto lock (best-effort).
-	if s.storageMgr != nil {
-		if err := s.storageMgr.LockDataVolume(ctx); err != nil {
-			log.Printf("WARN: lock data volume: %v", err)
-		}
-	}
-	// Lifecycle ordering convention: when moving AWAY from Ready, the
-	// lifecycle transition fires BEFORE the underlying-layer mutation,
-	// not after. Briefly claiming "not ready" while the SDEK is still
-	// loaded is safe (more conservative than reality); claiming "ready"
-	// while the SDEK is gone is not. This also closes the
-	// notifyPersistence-fails window: even if the persistence notify
-	// hangs or errors, composite consumers already see Locked.
-	if s.lifecycle != nil {
-		if err := s.lifecycle.Lock(); err != nil {
-			log.Printf("WARN: lifecycle: Lock from %s rejected: %v", s.lifecycle.State(), err)
-		}
-	}
-	s.cryptoManager.Lock()
-	if err := s.notifyPersistenceLockState(ctx, true); err != nil {
-		log.Printf("WARN: failed to propagate lock state: %v", err)
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to update persistence state"})
-		return
-	}
 	c.JSON(http.StatusOK, gin.H{"message": "ok"})
 }
 

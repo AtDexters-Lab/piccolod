@@ -457,8 +457,29 @@ func (m *AppManager) prepareArtifactAttachments(
 			handle, err := manager.CreateArtifactReference(progressCtx, persistence.ArtifactReferenceRequest{
 				ReferenceID: referenceID,
 				GoldenID:    content.GoldenID,
+				Identity:    content.Identity,
 				IDMap:       idmap,
 			})
+			var missing *persistence.ArtifactContentMissingError
+			if errors.As(err, &missing) {
+				if rebuildErr := m.reconstructRecordedArtifactContent(
+					progressCtx,
+					source,
+					missing,
+				); rebuildErr != nil {
+					return fmt.Errorf(
+						"reconstruct artifact %q before reference publication: %w",
+						name,
+						rebuildErr,
+					)
+				}
+				handle, err = manager.CreateArtifactReference(progressCtx, persistence.ArtifactReferenceRequest{
+					ReferenceID: referenceID,
+					GoldenID:    content.GoldenID,
+					Identity:    content.Identity,
+					IDMap:       idmap,
+				})
+			}
 			if err != nil {
 				return fmt.Errorf("create artifact reference %q: %w", name, err)
 			}

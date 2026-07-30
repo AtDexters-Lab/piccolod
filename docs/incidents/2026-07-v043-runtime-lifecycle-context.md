@@ -144,6 +144,13 @@ suggestions.
     repair.
 23. The post-update recovery RFC and its fallback UI are a separate
     implementation stream.
+24. Active Stage, app-detail, and capability screens revalidate their
+    authoritative backend projection every 30 seconds in addition to SSE,
+    reconnect, activation, and trailing-edge refetches.
+25. Every external runtime command executed while a lifecycle owner holds the
+    global gate has a Piccolod-enforced finite deadline. The 45-second
+    runtime-control bound also covers ordinary reconciliation, not only
+    uninstall.
 
 ## Load-bearing obligations
 
@@ -290,6 +297,39 @@ are adversarial scenarios to evaluate, not mechanisms that must be ported.
 - removal or extension of the 30-second unlock watchdog;
 - generic artifact supervisors and permanent storage-diagnostics APIs.
 - durable outbox/event delivery or a broad OIDC desired-state controller.
+
+## 2026-07-30 review checkpoint
+
+Fresh holistic review found that the reduced RFC and dirty Slice 1
+implementation had moved and hardened the existing destructive generic
+orphan-LV cleanup after `Ready`. That conflicts with this ledger's explicit
+deferral of destructive orphan-LV cleanup and the read-only 350-LV audit
+boundary.
+
+The required root cut is subtractive: remove automatic generic orphan deletion
+and its allocation-versus-deletion protocol from this remediation. Post-Ready
+maintenance may retain one strict inventory for scoped golden/rootfs
+settlement and GC; unknown LV ownership remains read-only evidence for the
+later audit.
+
+The same review found two plan clarifications that preserve already-locked
+behavior without new authority:
+
+- containment uses a child context derived from, and capped by, the remaining
+  two-minute uninstall attempt rather than a new independent owner;
+- one automatic lifecycle-gate admission dispatches at most one uninstall
+  phase attempt before releasing.
+
+The user selected a simple 30-second authoritative revalidation while Stage,
+app-detail, or capability screens remain active. This bounds a dropped SSE
+wake without adding durable event delivery or a removal-specific client state
+machine.
+
+At the final Plan Review iteration, the user also confirmed that ordinary
+reconciliation cannot retain the global lifecycle gate through an unbounded
+external runtime command. Runtime observation/control commands use the same
+local hard-bound policy as uninstall teardown; longer transfer/materialization
+work remains subordinate to its explicit finite operation budget.
 
 ## Remaining evidence gates
 

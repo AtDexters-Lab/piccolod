@@ -1,6 +1,12 @@
 package server
 
-import "testing"
+import (
+	"net/http"
+	"net/http/httptest"
+	"testing"
+
+	"piccolod/internal/auth"
+)
 
 func TestIsEmergencyAllowed(t *testing.T) {
 	tests := []struct {
@@ -57,9 +63,6 @@ func TestIsEmergencySoftAllowed(t *testing.T) {
 		// Allowed: setup is idempotent and needed for partial-setup recovery
 		{"/api/v1/crypto/setup", true},
 
-		// Blocked in soft emergency
-		{"/api/v1/crypto/lock", false},
-
 		// Unrelated paths
 		{"/api/v1/apps", false},
 		{"/api/v1/users", false},
@@ -70,5 +73,23 @@ func TestIsEmergencySoftAllowed(t *testing.T) {
 				t.Errorf("isEmergencySoftAllowed(%q) = %v, want %v", tt.path, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestPublicManualLockRouteRemoved(t *testing.T) {
+	sessions := auth.NewSessionStore()
+	session := sessions.CreatePortalSession("user-1", "admin", "admin", "http://example.com", 60)
+	srv := &GinServer{sessions: sessions}
+	srv.setupGinRoutes()
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/crypto/lock", nil)
+	req.Host = "example.com"
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: session.ID})
+	req.Header.Set("X-CSRF-Token", session.CSRF)
+
+	srv.router.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("POST /api/v1/crypto/lock status = %d, want 404; body=%s", w.Code, w.Body.String())
 	}
 }

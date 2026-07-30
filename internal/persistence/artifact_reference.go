@@ -139,27 +139,40 @@ func (m *luksVolumeManager) CreateArtifactReference(ctx context.Context, req Art
 	if !strings.HasPrefix(req.GoldenID, goldenLVPrefix) {
 		return ArtifactHandle{}, fmt.Errorf("artifact reference requires a golden LV")
 	}
-	meta, err := readVolumeMetaV3(filepath.Join(paths.VolumeMetaDir(req.GoldenID), metadataV2File))
-	if err != nil {
-		return ArtifactHandle{}, fmt.Errorf("read referenced golden metadata: %w", err)
-	}
-	if meta.Type != volumeTypeGolden || goldenReadyTimestamp(meta) == "" {
-		return ArtifactHandle{}, fmt.Errorf("artifact reference requires verified Ready golden content")
-	}
-	identity, err := goldenIdentityFromMeta(meta)
-	if err != nil {
-		return ArtifactHandle{}, fmt.Errorf("read referenced golden identity: %w", err)
+	if err := validateGoldenIdentity(req.Identity); err != nil {
+		return ArtifactHandle{}, fmt.Errorf("artifact reference identity: %w", err)
 	}
 
 	lock := m.lockFor("artifact-reference-" + req.ReferenceID)
 	lock.Lock()
 	defer lock.Unlock()
 
+	unlockIdentity, err := m.lockGoldenIdentity(req.Identity)
+	if err != nil {
+		return ArtifactHandle{}, err
+	}
+	defer unlockIdentity()
+
+	meta, lockedIdentity, err := readReadyGoldenMeta(req.GoldenID)
+	if errors.Is(err, os.ErrNotExist) {
+		return ArtifactHandle{}, &ArtifactContentMissingError{
+			ReferenceID: req.ReferenceID,
+			GoldenID:    req.GoldenID,
+			Identity:    req.Identity,
+		}
+	}
+	if err != nil {
+		return ArtifactHandle{}, fmt.Errorf("read referenced golden metadata: %w", err)
+	}
+	if lockedIdentity != req.Identity || !goldenMetaMatchesIdentity(meta, req.Identity) {
+		return ArtifactHandle{}, fmt.Errorf("artifact reference requires matching verified Ready golden content")
+	}
+
 	record := artifactReferenceRecord{
 		Version:     artifactReferenceVersion,
 		ReferenceID: req.ReferenceID,
 		GoldenID:    req.GoldenID,
-		Identity:    identity,
+		Identity:    req.Identity,
 		IDMap:       idMapMeta(req.IDMap),
 	}
 	created := false
@@ -186,7 +199,7 @@ func (m *luksVolumeManager) CreateArtifactReference(ctx context.Context, req Art
 		created = true
 	}
 
-	handle, err := m.attachArtifactReferenceLocked(ctx, &record)
+	handle, err := m.attachArtifactReferenceWithIdentityLocked(ctx, &record)
 	if err != nil && created {
 		_ = os.Remove(artifactReferencePath(req.ReferenceID))
 	}
@@ -213,6 +226,13 @@ func (m *luksVolumeManager) attachArtifactReferenceLocked(ctx context.Context, r
 	}
 	defer unlockIdentity()
 
+	return m.attachArtifactReferenceWithIdentityLocked(ctx, record)
+}
+
+func (m *luksVolumeManager) attachArtifactReferenceWithIdentityLocked(
+	ctx context.Context,
+	record *artifactReferenceRecord,
+) (ArtifactHandle, error) {
 	meta, err := readVolumeMetaV3(filepath.Join(paths.VolumeMetaDir(record.GoldenID), metadataV2File))
 	if os.IsNotExist(err) ||
 		(err == nil && m.lvMgr != nil && !m.lvMgr.LVExists(ctx, record.GoldenID)) {

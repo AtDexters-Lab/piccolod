@@ -18,6 +18,9 @@ func TestOpenAPISpec_Validates(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to load OpenAPI spec: %v", err)
 	}
+	if path := doc.Paths.Find("/crypto/lock"); path != nil {
+		t.Fatal("removed public manual-lock operation remains in OpenAPI")
+	}
 
 	if err := doc.Validate(context.Background()); err != nil {
 		t.Fatalf("OpenAPI validation failed: %v", err)

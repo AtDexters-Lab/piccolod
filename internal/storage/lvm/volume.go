@@ -17,6 +17,15 @@ type LVManager struct {
 	pool   string
 }
 
+// LVInventoryEntry is the exact physical identity captured for one LV.
+// UUID distinguishes an LV that was removed and recreated under the same
+// name after a broad inventory was collected.
+type LVInventoryEntry struct {
+	UUID     string
+	PoolName string
+	Active   bool
+}
+
 // NewLVManager creates an LV manager for the given VG and thin pool.
 func NewLVManager(run runner.CommandRunner, vgName, poolName string) *LVManager {
 	if vgName == "" {
@@ -174,37 +183,124 @@ func (m *LVManager) LVExists(ctx context.Context, name string) bool {
 // row shape as ambiguous instead of silently filtering it out. Destructive
 // callers use it to prove physical absence before deleting ownership metadata.
 func (m *LVManager) LVExistsExact(ctx context.Context, name string) (bool, error) {
-	out, err := m.run.RunWithOutput(
-		ctx,
-		"lvs",
+	_, exists, err := m.InspectLVExact(ctx, name)
+	return exists, err
+}
+
+const strictLVSeparator = "|"
+
+func (m *LVManager) strictInventory(
+	ctx context.Context,
+	selectName string,
+) (map[string]LVInventoryEntry, error) {
+	args := []string{
 		"--noheadings",
-		"-o",
-		"lv_name",
-		m.vgName,
-	)
-	if err != nil {
-		return false, fmt.Errorf("lvs exact existence %s/%s: %w", m.vgName, name, err)
+		"--separator", strictLVSeparator,
+		"--unquoted",
+		"-o", "lv_name,lv_uuid,lv_attr,pool_lv",
 	}
+	if selectName != "" {
+		args = append(args, "--select", "lv_name="+selectName)
+	}
+	args = append(args, m.vgName)
+	out, err := m.run.RunWithOutput(ctx, "lvs", args...)
+	if err != nil {
+		if selectName != "" {
+			return nil, fmt.Errorf("lvs exact identity %s/%s: %w", m.vgName, selectName, err)
+		}
+		return nil, fmt.Errorf("lvs strict inventory %s: %w", m.vgName, err)
+	}
+
+	inventory := make(map[string]LVInventoryEntry)
+	uuids := make(map[string]string)
 	for lineNumber, line := range strings.Split(string(out), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
-		fields := strings.Fields(line)
-		if len(fields) != 1 {
-			return false, fmt.Errorf(
-				"lvs exact existence %s/%s: malformed row %d: %q",
+		fields := strings.Split(line, strictLVSeparator)
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("lvs strict inventory %s: malformed row %d: %q", m.vgName, lineNumber+1, line)
+		}
+		for index := range fields {
+			fields[index] = strings.TrimSpace(fields[index])
+		}
+		name, uuid, attr, poolName := fields[0], fields[1], fields[2], fields[3]
+		if name == "" || uuid == "" || attr == "" {
+			return nil, fmt.Errorf("lvs strict inventory %s: incomplete row %d: %q", m.vgName, lineNumber+1, line)
+		}
+		if len(attr) != 10 {
+			return nil, fmt.Errorf(
+				"lvs strict inventory %s: malformed lv_attr %q for %q",
 				m.vgName,
+				attr,
 				name,
-				lineNumber+1,
-				line,
 			)
 		}
-		if fields[0] == name {
-			return true, nil
+		if selectName != "" && name != selectName {
+			return nil, fmt.Errorf(
+				"lvs exact identity %s/%s: unexpected identity %q",
+				m.vgName,
+				selectName,
+				name,
+			)
 		}
+		if _, duplicate := inventory[name]; duplicate {
+			return nil, fmt.Errorf("lvs strict inventory %s: duplicate LV name %q", m.vgName, name)
+		}
+		if priorName, duplicate := uuids[uuid]; duplicate {
+			return nil, fmt.Errorf(
+				"lvs strict inventory %s: duplicate LV UUID %q for %q and %q",
+				m.vgName,
+				uuid,
+				priorName,
+				name,
+			)
+		}
+		var active bool
+		switch attr[4] {
+		case 'a':
+			active = true
+		case '-':
+			active = false
+		default:
+			return nil, fmt.Errorf(
+				"lvs strict inventory %s: ambiguous activation state %q in lv_attr %q for %q",
+				m.vgName,
+				attr[4],
+				attr,
+				name,
+			)
+		}
+		inventory[name] = LVInventoryEntry{
+			UUID:     uuid,
+			PoolName: poolName,
+			Active:   active,
+		}
+		uuids[uuid] = name
 	}
-	return false, nil
+	return inventory, nil
+}
+
+// StrictLVInventory returns one fail-closed broad inventory for a maintenance
+// pass. Callers must treat it as discovery only and refresh exact ownership
+// before destructive work.
+func (m *LVManager) StrictLVInventory(ctx context.Context) (map[string]LVInventoryEntry, error) {
+	return m.strictInventory(ctx, "")
+}
+
+// InspectLVExact performs a strict targeted identity proof for one LV name.
+// An empty successful result proves absence; malformed, duplicate, or
+// unexpected rows fail closed.
+func (m *LVManager) InspectLVExact(ctx context.Context, name string) (LVInventoryEntry, bool, error) {
+	inventory, err := m.strictInventory(ctx, name)
+	if err != nil {
+		return LVInventoryEntry{}, false, err
+	}
+	if len(inventory) == 0 {
+		return LVInventoryEntry{}, false, nil
+	}
+	return inventory[name], true, nil
 }
 
 // LVPath returns the device path for a thin LV.

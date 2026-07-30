@@ -529,11 +529,6 @@ paths:
         '200': { description: OK }
         '401': { description: Unauthorized }
         '429': { description: Too Many Requests, headers: { Retry-After: { schema: { type: integer } } } }
-  /crypto/lock:
-    post:
-      summary: Lock crypto (forget SDEK)
-      responses:
-        '200': { description: OK }
   /crypto/recovery-key:
     get:
       summary: Recovery key status

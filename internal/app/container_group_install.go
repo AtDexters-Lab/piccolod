@@ -230,7 +230,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 
 		if svc.Image != "" {
 			// Skip expensive image pull if a golden LV is already cached and fresh.
-			if cachedDigest, _, ok := rootfsMgr.FindGoldenByImageRef(svc.Image); ok {
+			if cachedDigest, cachedGoldenID, ok := rootfsMgr.FindGoldenByImageRef(svc.Image); ok {
 				useCache := true
 				// Freshness check: verify the tag still resolves to the same digest.
 				// If the registry is unreachable, fall back to the cached golden LV.
@@ -259,13 +259,21 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 						false,
 						nil,
 					)
-					rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, cachedDigest, svc.Image, idmap, 0, "")
-					if err != nil {
+					rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, cachedDigest, svc.Image, idmap, 0, "", cachedGoldenID)
+					var missing *persistence.GoldenContentMissingError
+					if err != nil && !errors.As(err, &missing) {
 						return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
 					}
-					blockNativeRootfsMap[svcName] = rInfo
-					serviceIdx++
-					continue
+					if err == nil {
+						blockNativeRootfsMap[svcName] = rInfo
+						serviceIdx++
+						continue
+					}
+					log.Printf(
+						"INFO: cached golden LV %s for image %s is absent -- pulling verified image",
+						missing.GoldenID,
+						svc.Image,
+					)
 				}
 			}
 
@@ -301,7 +309,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			// Pass the pre-pulled runtime's root dir so flattenFn skips pulling again.
 			// ephRT.Root is "<base>/root" — pass the parent (base) dir.
 			prePulledDir := filepath.Dir(ephRT.Root)
-			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, rootfsImageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir)
+			rInfo, err := m.prepareRootfsStorage(ctx, mode, instanceID, svcName, rootfsImageDigest, svc.Image, idmap, imgConfig.Size, prePulledDir, "")
 			ephCleanup()
 			if err != nil {
 				return nil, fmt.Errorf("prepare rootfs for service '%s': %w", svcName, err)
@@ -363,7 +371,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 			return nil, fmt.Errorf("inspect anchor image: canonical digest unavailable")
 		}
 		anchorPrePulledDir := filepath.Dir(ephRT.Root)
-		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorRootfsDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir)
+		rInfo, err := m.prepareRootfsStorage(ctx, ModeService, instanceID, networkAnchorServiceName, anchorRootfsDigest, networkAnchorImage(), idmap, imgConfig.Size, anchorPrePulledDir, "")
 		ephCleanup()
 		if err != nil {
 			return nil, fmt.Errorf("prepare rootfs for network anchor: %w", err)

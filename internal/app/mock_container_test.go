@@ -382,9 +382,14 @@ type stubRootfsManager struct {
 	resizedWorkspace   []string
 	resizedApplication []string
 	createServiceErr   error
+	createServiceErrs  []error
+	createServiceReqs  []persistence.ServiceRootfsRequest
 	detachErr          error
 	destroyErr         error
 	attachHook         func()
+	findGoldenDigest   string
+	findGoldenID       string
+	findGoldenOK       bool
 }
 
 func newStubRootfsManager(baseDir string) *stubRootfsManager {
@@ -404,6 +409,7 @@ func (s *stubRootfsManager) CreateWorkspaceFromGolden(_ context.Context, req per
 }
 
 func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persistence.ServiceRootfsRequest) (persistence.RootfsHandle, error) {
+	s.createServiceReqs = append(s.createServiceReqs, req)
 	volID := req.VolumeID
 	if volID == "" {
 		volID = fmt.Sprintf("svc-rootfs-%s--%s", req.InstanceID, req.ServiceName)
@@ -422,6 +428,13 @@ func (s *stubRootfsManager) CreateServiceRootfs(_ context.Context, req persisten
 	}
 	if s.createServiceErr != nil {
 		return persistence.RootfsHandle{}, s.createServiceErr
+	}
+	if len(s.createServiceErrs) > 0 {
+		err := s.createServiceErrs[0]
+		s.createServiceErrs = s.createServiceErrs[1:]
+		if err != nil {
+			return persistence.RootfsHandle{}, err
+		}
 	}
 	return persistence.RootfsHandle{VolumeID: volID, MountPath: mp, ReadOnly: true}, nil
 }
@@ -462,7 +475,8 @@ func (s *stubRootfsManager) DestroyRootfs(_ context.Context, volumeID string) er
 }
 
 func (s *stubRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
-func (s *stubRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
+func (s *stubRootfsManager) HydrateGoldenMetadata(_ context.Context) error   { return nil }
+func (s *stubRootfsManager) RunPhysicalMaintenance(_ context.Context) error  { return nil }
 
 func (s *stubRootfsManager) ReadGoldenImageConfig(_ context.Context, goldenID string) (persistence.GoldenImageConfig, error) {
 	s.goldenReads = append(s.goldenReads, goldenID)
@@ -506,7 +520,7 @@ func (s *stubRootfsManager) ReadRootfsImageIdentity(volumeID string) (persistenc
 	}, nil
 }
 func (s *stubRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
-	return "", "", false
+	return s.findGoldenDigest, s.findGoldenID, s.findGoldenOK
 }
 func (s *stubRootfsManager) ResizeWorkspace(_ context.Context, volumeID string, _ int64) error {
 	s.resizedWorkspace = append(s.resizedWorkspace, volumeID)

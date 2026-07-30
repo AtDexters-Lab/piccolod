@@ -961,7 +961,8 @@ func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string)
 func (s *stubTestRootfsManager) DetachRootfs(_ context.Context, _ string) error  { return nil }
 func (s *stubTestRootfsManager) DestroyRootfs(_ context.Context, _ string) error { return nil }
 func (s *stubTestRootfsManager) GarbageCollectGoldenLVs(_ context.Context) error { return nil }
-func (s *stubTestRootfsManager) ReconcileRootfsStates(_ context.Context) error   { return nil }
+func (s *stubTestRootfsManager) HydrateGoldenMetadata(_ context.Context) error   { return nil }
+func (s *stubTestRootfsManager) RunPhysicalMaintenance(_ context.Context) error  { return nil }
 func (s *stubTestRootfsManager) ReadGoldenImageConfig(_ context.Context, _ string) (persistence.GoldenImageConfig, error) {
 	return persistence.GoldenImageConfig{Entrypoint: []string{"/bin/sh"}}, nil
 }

@@ -365,3 +365,210 @@ func TestRawPersistenceUnlockDoesNotReachDecryptedOwners(t *testing.T) {
 		t.Fatal("lifecycle Ready did not reach decrypted owners")
 	}
 }
+
+func readyLifecycle(t *testing.T) *lifecycle.Coordinator {
+	t.Helper()
+	lc := lifecycle.New(lifecycle.StateLocked)
+	if err := lc.BeginUnlock(); err != nil {
+		t.Fatal(err)
+	}
+	if err := lc.MarkReady(); err != nil {
+		t.Fatal(err)
+	}
+	return lc
+}
+
+func TestRootfsMaintenanceStartsAfterReadyAndCoalescesNudges(t *testing.T) {
+	lc := readyLifecycle(t)
+	opCtx, opCancel := context.WithCancel(context.Background())
+	defer opCancel()
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var calls atomic.Int32
+	var concurrent atomic.Int32
+	var maxConcurrent atomic.Int32
+	srv := &GinServer{
+		lifecycle:                       lc,
+		opCtx:                           opCtx,
+		healthTracker:                   health.NewTracker(),
+		rootfsMaintenanceRetryInterval:  time.Hour,
+		rootfsMaintenanceAttemptTimeout: time.Second,
+		rootfsMaintenancePass: func(ctx context.Context) error {
+			if !lc.IsReady() {
+				t.Error("physical maintenance started before lifecycle Ready")
+			}
+			call := calls.Add(1)
+			current := concurrent.Add(1)
+			defer concurrent.Add(-1)
+			for {
+				maximum := maxConcurrent.Load()
+				if current <= maximum || maxConcurrent.CompareAndSwap(maximum, current) {
+					break
+				}
+			}
+			if call == 1 {
+				close(started)
+				select {
+				case <-release:
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			}
+			return nil
+		},
+	}
+
+	srv.onUnlockChainReady()
+	<-started
+	for range 8 {
+		srv.onUnlockChainReady()
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("concurrent maintenance calls = %d, want 1", got)
+	}
+	close(release)
+	deadline := time.Now().Add(time.Second)
+	for calls.Load() < 2 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("coalesced maintenance calls = %d, want 2", got)
+	}
+	if got := maxConcurrent.Load(); got != 1 {
+		t.Fatalf("max concurrent maintenance passes = %d, want 1", got)
+	}
+	if err := srv.cancelAndJoinRootfsMaintenance(context.Background()); err != nil {
+		t.Fatalf("cancelAndJoinRootfsMaintenance: %v", err)
+	}
+}
+
+func TestRootfsMaintenanceRetryIntervalStartsAfterPassCompletion(t *testing.T) {
+	lc := readyLifecycle(t)
+	opCtx, opCancel := context.WithCancel(context.Background())
+	defer opCancel()
+	const retryInterval = 40 * time.Millisecond
+	completed := make(chan time.Time, 1)
+	retried := make(chan time.Time, 1)
+	var calls atomic.Int32
+	srv := &GinServer{
+		lifecycle:                       lc,
+		opCtx:                           opCtx,
+		rootfsMaintenanceRetryInterval:  retryInterval,
+		rootfsMaintenanceAttemptTimeout: time.Second,
+		rootfsMaintenancePass: func(context.Context) error {
+			if calls.Add(1) == 1 {
+				time.Sleep(20 * time.Millisecond)
+				completed <- time.Now()
+			} else {
+				retried <- time.Now()
+			}
+			return nil
+		},
+	}
+
+	srv.onUnlockChainReady()
+	firstCompleted := <-completed
+	secondStarted := <-retried
+	if elapsed := secondStarted.Sub(firstCompleted); elapsed < retryInterval-5*time.Millisecond {
+		t.Fatalf("retry began %s after completion, want at least %s", elapsed, retryInterval)
+	}
+	if err := srv.cancelAndJoinRootfsMaintenance(context.Background()); err != nil {
+		t.Fatalf("cancelAndJoinRootfsMaintenance: %v", err)
+	}
+}
+
+func TestRootfsMaintenanceFailureWarnsWithoutReversingReady(t *testing.T) {
+	lc := readyLifecycle(t)
+	opCtx, opCancel := context.WithCancel(context.Background())
+	defer opCancel()
+	attempted := make(chan struct{})
+	srv := &GinServer{
+		lifecycle:                       lc,
+		opCtx:                           opCtx,
+		healthTracker:                   health.NewTracker(),
+		rootfsMaintenanceRetryInterval:  time.Hour,
+		rootfsMaintenanceAttemptTimeout: time.Second,
+		rootfsMaintenancePass: func(context.Context) error {
+			close(attempted)
+			return errors.New("injected maintenance failure")
+		},
+	}
+
+	srv.onUnlockChainReady()
+	<-attempted
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if status, ok := srv.healthTracker.Status("rootfs-maintenance"); ok {
+			if status.Level != health.LevelWarn {
+				t.Fatalf("maintenance health = %s, want warn", status.Level)
+			}
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if got := lc.State(); got != lifecycle.StateReady {
+		t.Fatalf("lifecycle after maintenance failure = %s, want ready", got)
+	}
+	if err := srv.cancelAndJoinRootfsMaintenance(context.Background()); err != nil {
+		t.Fatalf("cancelAndJoinRootfsMaintenance: %v", err)
+	}
+}
+
+func TestRootfsMaintenanceCancellationJoinsBusyPass(t *testing.T) {
+	lc := readyLifecycle(t)
+	opCtx, opCancel := context.WithCancel(context.Background())
+	defer opCancel()
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	srv := &GinServer{
+		lifecycle:                       lc,
+		opCtx:                           opCtx,
+		rootfsMaintenanceRetryInterval:  time.Hour,
+		rootfsMaintenanceAttemptTimeout: time.Minute,
+		rootfsMaintenancePass: func(ctx context.Context) error {
+			close(started)
+			<-ctx.Done()
+			close(returned)
+			return ctx.Err()
+		},
+	}
+
+	srv.onUnlockChainReady()
+	<-started
+	joinCtx, cancelJoin := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoin()
+	if err := srv.cancelAndJoinRootfsMaintenance(joinCtx); err != nil {
+		t.Fatalf("cancelAndJoinRootfsMaintenance: %v", err)
+	}
+	select {
+	case <-returned:
+	default:
+		t.Fatal("maintenance join returned before the active pass exited")
+	}
+}
+
+func TestRootfsMaintenanceDoesNotStartAfterOperationContextCancellation(t *testing.T) {
+	opCtx, opCancel := context.WithCancel(context.Background())
+	opCancel()
+	var calls atomic.Int32
+	srv := &GinServer{
+		lifecycle: readyLifecycle(t),
+		opCtx:     opCtx,
+		rootfsMaintenancePass: func(context.Context) error {
+			calls.Add(1)
+			return nil
+		},
+	}
+
+	srv.nudgeRootfsMaintenance()
+
+	srv.rootfsMaintenanceMu.Lock()
+	done := srv.rootfsMaintenanceDone
+	srv.rootfsMaintenanceMu.Unlock()
+	if done != nil {
+		t.Fatal("maintenance worker was admitted after operation context cancellation")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("maintenance calls = %d, want 0", got)
+	}
+}

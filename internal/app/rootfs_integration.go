@@ -242,6 +242,7 @@ func (m *AppManager) prepareRootfsStorage(
 	idmapConfig persistence.IDMapConfig,
 	imageSizeHint int64,
 	prePulledDir string,
+	preferredGoldenID string,
 ) (*rootfsMountInfo, error) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
@@ -254,22 +255,24 @@ func (m *AppManager) prepareRootfsStorage(
 	switch mode {
 	case ModeService:
 		handle, err = rootfs.CreateServiceRootfs(ctx, persistence.ServiceRootfsRequest{
-			InstanceID:    instanceID,
-			ServiceName:   serviceName,
-			ImageDigest:   imageDigest,
-			ImageRef:      imageRef,
-			IDMap:         idmapConfig,
-			ImageSizeHint: imageSizeHint,
-			PrePulledDir:  prePulledDir,
+			InstanceID:        instanceID,
+			ServiceName:       serviceName,
+			ImageDigest:       imageDigest,
+			ImageRef:          imageRef,
+			PreferredGoldenID: preferredGoldenID,
+			IDMap:             idmapConfig,
+			ImageSizeHint:     imageSizeHint,
+			PrePulledDir:      prePulledDir,
 		})
 	case ModeWorkspace:
 		handle, err = rootfs.CreateWorkspaceFromGolden(ctx, persistence.WorkspaceRootfsRequest{
-			InstanceID:    instanceID,
-			ImageDigest:   imageDigest,
-			ImageRef:      imageRef,
-			IDMap:         idmapConfig,
-			ImageSizeHint: imageSizeHint,
-			PrePulledDir:  prePulledDir,
+			InstanceID:        instanceID,
+			ImageDigest:       imageDigest,
+			ImageRef:          imageRef,
+			PreferredGoldenID: preferredGoldenID,
+			IDMap:             idmapConfig,
+			ImageSizeHint:     imageSizeHint,
+			PrePulledDir:      prePulledDir,
 		})
 	default:
 		return nil, fmt.Errorf("unknown mode %q for rootfs", mode)

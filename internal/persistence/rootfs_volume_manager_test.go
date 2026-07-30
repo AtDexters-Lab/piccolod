@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"piccolod/internal/crypt"
 	"piccolod/internal/state/paths"
@@ -44,6 +46,7 @@ type goldenEnsureRunner struct {
 type goldenDestroyRunner struct {
 	calls         []string
 	goldenID      string
+	poolName      string
 	physical      bool
 	mounted       bool
 	mountReadOnly bool
@@ -87,11 +90,24 @@ func (r *goldenGCContinueRunner) RunWithOutput(
 	var names []string
 	for goldenID, exists := range r.physical {
 		if exists {
+			selected := ""
+			for _, arg := range args {
+				if strings.HasPrefix(arg, "lv_name=") {
+					selected = strings.TrimPrefix(arg, "lv_name=")
+				}
+			}
+			if selected != "" && selected != goldenID {
+				continue
+			}
 			names = append(names, goldenID)
 		}
 	}
 	sort.Strings(names)
-	return []byte(strings.Join(names, "\n") + "\n"), nil
+	rows := make([]string, 0, len(names))
+	for _, goldenID := range names {
+		rows = append(rows, goldenID+"|uuid-"+goldenID+"|Vwi-a-tz--|"+lvm.DefaultThinPoolName)
+	}
+	return []byte(strings.Join(rows, "\n") + "\n"), nil
 }
 
 func (r *goldenGCContinueRunner) RunWithStdin(
@@ -136,14 +152,23 @@ func (r *goldenDestroyRunner) RunWithOutput(
 	args ...string,
 ) ([]byte, error) {
 	if name == "lvs" && r.physical {
-		if strings.Join(args, " ") == "--noheadings -o lv_name "+lvm.DefaultVGName {
-			return []byte(r.goldenID + "\n"), nil
+		poolName := r.poolName
+		if poolName == "" {
+			poolName = lvm.DefaultThinPoolName
 		}
-		return []byte(fmt.Sprintf(
-			"%s 1073741824 Vwi-a-tz-- %s\n",
-			r.goldenID,
-			lvm.DefaultThinPoolName,
-		)), nil
+		if strings.Contains(strings.Join(args, " "), "lv_name,lv_size,lv_attr,pool_lv") {
+			return []byte(fmt.Sprintf(
+				"%s 1073741824 Vwi-a-tz-- %s\n",
+				r.goldenID,
+				poolName,
+			)), nil
+		}
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "lv_name=") && strings.TrimPrefix(arg, "lv_name=") != r.goldenID {
+				return nil, nil
+			}
+		}
+		return []byte(r.goldenID + "|uuid-" + r.goldenID + "|Vwi-a-tz--|" + poolName + "\n"), nil
 	}
 	return nil, nil
 }
@@ -211,10 +236,12 @@ func (r *goldenEnsureRunner) RunWithOutput(
 	args ...string,
 ) ([]byte, error) {
 	if name == "lvs" && r.physical {
-		if strings.Join(args, " ") == "--noheadings -o lv_name "+lvm.DefaultVGName {
-			return []byte(r.goldenID + "\n"), nil
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "lv_name=") && strings.TrimPrefix(arg, "lv_name=") != r.goldenID {
+				return nil, nil
+			}
 		}
-		return []byte(r.goldenID + " 1073741824 Vwi-a-tz-- " + lvm.DefaultThinPoolName + "\n"), nil
+		return []byte(r.goldenID + "|uuid-" + r.goldenID + "|Vwi-a-tz--|" + lvm.DefaultThinPoolName + "\n"), nil
 	}
 	return nil, nil
 }
@@ -226,6 +253,14 @@ func (r *goldenEnsureRunner) RunWithStdin(
 	args ...string,
 ) error {
 	return r.Run(ctx, name, args...)
+}
+
+func (r *goldenEnsureRunner) snapshot(_ []string) (kernelSnapshot, error) {
+	return kernelSnapshot{
+		mounts:   make(map[string]mountEntry),
+		dmByName: make(map[string]string),
+		dmByDev:  make(map[string]string),
+	}, nil
 }
 
 func (r *goldenTeardownRunner) Run(_ context.Context, name string, args ...string) error {
@@ -303,14 +338,12 @@ func (r *goldenRecreateOrderRunner) RunWithOutput(
 	args ...string,
 ) ([]byte, error) {
 	if name == "lvs" && r.physicalExists {
-		if strings.Join(args, " ") == "--noheadings -o lv_name "+lvm.DefaultVGName {
-			return []byte(r.goldenID + "\n"), nil
+		for _, arg := range args {
+			if strings.HasPrefix(arg, "lv_name=") && strings.TrimPrefix(arg, "lv_name=") != r.goldenID {
+				return nil, nil
+			}
 		}
-		return []byte(fmt.Sprintf(
-			"%s 1073741824 Vwi-a-tz-- %s\n",
-			r.goldenID,
-			lvm.DefaultThinPoolName,
-		)), nil
+		return []byte(r.goldenID + "|uuid-" + r.goldenID + "|Vwi-a-tz--|" + lvm.DefaultThinPoolName + "\n"), nil
 	}
 	return nil, nil
 }
@@ -595,6 +628,73 @@ func TestTeardownGoldenStagingRetriesInOrder(t *testing.T) {
 	for index := range want {
 		if run.calls[index] != want[index] {
 			t.Fatalf("teardown calls = %v, want %v", run.calls, want)
+		}
+	}
+}
+
+func TestEnsureGoldenLVDoesNotResetForeignPoolCandidate(t *testing.T) {
+	root := t.TempDir()
+	paths.SetCoreRootForTest(t, root)
+	digest := "sha256:" + strings.Repeat("f", 64)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	candidates, err := candidateGoldenIDs(identity, digest)
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:         metadataV3Version,
+		Type:            volumeTypeGolden,
+		LVName:          goldenID,
+		VGName:          lvm.DefaultVGName,
+		FSType:          "btrfs",
+		BaseImageRef:    "registry.example/provider:latest",
+		BaseImageDigest: digest,
+		GoldenIdentity:  &identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	run := &goldenDestroyRunner{
+		goldenID: goldenID,
+		poolName: "foreign-pool",
+		physical: true,
+	}
+	manager, err := NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+		Run:   run,
+		LVMgr: lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		FlattenFn: func(context.Context, string, string, string) (GoldenImageConfig, error) {
+			return GoldenImageConfig{}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("NewLUKSVolumeManager: %v", err)
+	}
+	manager.kernelSnapshotFn = run.snapshot
+
+	_, err = manager.EnsureGoldenLV(context.Background(), GoldenLVRequest{
+		ImageDigest: digest,
+		ImageRef:    "registry.example/provider:latest",
+	})
+	if err == nil || !strings.Contains(err.Error(), `unexpected pool "foreign-pool"`) {
+		t.Fatalf("EnsureGoldenLV error = %v, want foreign-pool refusal", err)
+	}
+	if !run.physical {
+		t.Fatal("incomplete reset removed a same-named foreign-pool LV")
+	}
+	if _, statErr := os.Stat(filepath.Join(metaDir, metadataV2File)); statErr != nil {
+		t.Fatalf("incomplete reset removed metadata despite foreign-pool collision: %v", statErr)
+	}
+	for _, call := range run.calls {
+		if strings.HasPrefix(call, "lvchange ") || strings.HasPrefix(call, "lvremove ") {
+			t.Fatalf("incomplete reset mutated a foreign-pool LV: %v", run.calls)
 		}
 	}
 }
@@ -1017,6 +1117,457 @@ func TestReconcilePreservesReadOnlyReadyGoldenAttachment(t *testing.T) {
 			strings.HasPrefix(call, "lvchange ") ||
 			strings.HasPrefix(call, "lvremove ") {
 			t.Fatalf("legitimate read-only consumer attachment was disturbed: %v", run.calls)
+		}
+	}
+}
+
+func TestHydrateGoldenMetadataPerformsNoPhysicalDiscovery(t *testing.T) {
+	paths.SetRootsForTest(t)
+	const (
+		goldenID = goldenLVPrefix + "hydrate"
+		imageRef = "registry.example.test/provider:latest"
+		digest   = "sha256:hydrate"
+	)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		BaseImageRef:        imageRef,
+		BaseImageDigest:     digest,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, imageConfigFile), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	run := &fakeRunner{}
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: make(map[string]*volumeMetaV3),
+	}
+
+	if err := manager.HydrateGoldenMetadata(context.Background()); err != nil {
+		t.Fatalf("HydrateGoldenMetadata: %v", err)
+	}
+	if calls := run.GetCalls(); len(calls) != 0 {
+		t.Fatalf("metadata hydration performed physical commands: %v", calls)
+	}
+	gotDigest, gotID, found := manager.FindGoldenByImageRef(imageRef)
+	if !found || gotDigest != digest || gotID != goldenID {
+		t.Fatalf("hydrated lookup = (%q, %q, %v)", gotDigest, gotID, found)
+	}
+}
+
+func TestHydrateGoldenMetadataHonorsCanceledUnlockContext(t *testing.T) {
+	paths.SetRootsForTest(t)
+	metaDir := paths.VolumeMetaDir(goldenLVPrefix + "canceled-hydration")
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	manager := &luksVolumeManager{goldenLVs: make(map[string]*volumeMetaV3)}
+
+	if err := manager.HydrateGoldenMetadata(ctx); !errors.Is(err, context.Canceled) {
+		t.Fatalf("HydrateGoldenMetadata error = %v, want context canceled", err)
+	}
+	if len(manager.goldenLVs) != 0 {
+		t.Fatalf("canceled hydration published cache entries: %+v", manager.goldenLVs)
+	}
+}
+
+func TestHydratedMissingGoldenRebuildsFromVerifiedGenericMaterializer(t *testing.T) {
+	root := t.TempDir()
+	paths.SetCoreRootForTest(t, root)
+	const imageRef = "registry.example.test/provider:latest"
+	digest := "sha256:" + strings.Repeat("d", 64)
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceOCI,
+		ResolvedIdentity: digest,
+		Projection:       GoldenProjectionOCIImageRootfs,
+	}
+	candidates, err := candidateGoldenIDs(identity, digest)
+	if err != nil {
+		t.Fatalf("candidateGoldenIDs: %v", err)
+	}
+	goldenID := candidates[0]
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		FSType:              "btrfs",
+		ReadOnly:            true,
+		BaseImageRef:        imageRef,
+		BaseImageDigest:     digest,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(metaDir, imageConfigFile), []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	run := &goldenEnsureRunner{}
+	verifiedPullDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(verifiedPullDir, "verified"), []byte("ok"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	materializeCalls := 0
+	manager, err := NewLUKSVolumeManager(LUKSVolumeManagerConfig{
+		Run:    run,
+		Crypto: newResizeTestCryptManager(t, root),
+		LVMgr:  lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+	})
+	if err != nil {
+		t.Fatalf("NewLUKSVolumeManager: %v", err)
+	}
+	manager.tmpfsDir = t.TempDir()
+	manager.kernelSnapshotFn = run.snapshot
+
+	if err := manager.HydrateGoldenMetadata(context.Background()); err != nil {
+		t.Fatalf("HydrateGoldenMetadata: %v", err)
+	}
+	if gotDigest, gotID, found := manager.FindGoldenByImageRef(imageRef); !found ||
+		gotDigest != digest ||
+		gotID != goldenID {
+		t.Fatalf(
+			"hydrated lookup = (%q, %q, %v), want (%q, %q, true)",
+			gotDigest,
+			gotID,
+			found,
+			digest,
+			goldenID,
+		)
+	}
+
+	rebuilt, err := manager.EnsureGoldenContent(context.Background(), GoldenContentRequest{
+		Identity:  identity,
+		SourceRef: imageRef,
+		Materialize: func(_ context.Context, targetDir string) (GoldenMaterializationResult, error) {
+			materializeCalls++
+			if _, err := os.Stat(filepath.Join(verifiedPullDir, "verified")); err != nil {
+				return GoldenMaterializationResult{}, fmt.Errorf("verified pull evidence: %w", err)
+			}
+			if err := os.WriteFile(
+				filepath.Join(targetDir, "provider"),
+				[]byte("verified pull"),
+				0o600,
+			); err != nil {
+				return GoldenMaterializationResult{}, err
+			}
+			return GoldenMaterializationResult{ImageConfig: &GoldenImageConfig{}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("EnsureGoldenContent verified rebuild: %v", err)
+	}
+	if rebuilt.GoldenID != goldenID || rebuilt.Identity != identity {
+		t.Fatalf("rebuilt golden = %+v, want ID %q identity %+v", rebuilt, goldenID, identity)
+	}
+	if materializeCalls != 1 {
+		t.Fatalf("verified rebuild materialize calls = %d, want 1", materializeCalls)
+	}
+	if gotDigest, gotID, found := manager.FindGoldenByImageRef(imageRef); !found ||
+		gotDigest != digest ||
+		gotID != goldenID {
+		t.Fatalf(
+			"rebuilt lookup = (%q, %q, %v), want (%q, %q, true)",
+			gotDigest,
+			gotID,
+			found,
+			digest,
+			goldenID,
+		)
+	}
+}
+
+func TestRunPhysicalMaintenanceSharesOneBroadInventory(t *testing.T) {
+	paths.SetRootsForTest(t)
+	const goldenID = goldenLVPrefix + "shared-pass"
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: "org/model@revision",
+		Projection:       GoldenProjectionHuggingFace + ":models",
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	referenceID := "svc-rootfs-shared-pass"
+	if err := os.MkdirAll(paths.VolumeMetaDir(referenceID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(
+		filepath.Join(paths.VolumeMetaDir(referenceID), metadataV2File),
+		&volumeMetaV3{
+			Version:  metadataV3Version,
+			Type:     volumeTypeServiceRootfs,
+			LVName:   referenceID,
+			GoldenLV: goldenID,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	run := &testutil.FakeRunner{
+		Outputs: map[string]string{
+			testutil.BuildKey("lvs", []string{
+				"--noheadings",
+				"--separator", "|",
+				"--unquoted",
+				"-o", "lv_name,lv_uuid,lv_attr,pool_lv",
+				lvm.DefaultVGName,
+			}): goldenID + "|uuid-shared-pass|Vwi-a-tz--|" + lvm.DefaultThinPoolName,
+			testutil.BuildKey("lvs", []string{
+				"--noheadings",
+				"--separator", "|",
+				"--unquoted",
+				"-o", "lv_name,lv_uuid,lv_attr,pool_lv",
+				"--select", "lv_name=" + goldenID,
+				lvm.DefaultVGName,
+			}): goldenID + "|uuid-shared-pass|Vwi-a-tz--|" + lvm.DefaultThinPoolName,
+		},
+	}
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: make(map[string]*volumeMetaV3),
+		goldenMu:  make(map[string]*sync.Mutex),
+		kernelSnapshotFn: func(_ []string) (kernelSnapshot, error) {
+			return kernelSnapshot{
+				mounts:   make(map[string]mountEntry),
+				dmByName: make(map[string]string),
+				dmByDev:  make(map[string]string),
+			}, nil
+		},
+	}
+
+	if err := manager.RunPhysicalMaintenance(context.Background()); err != nil {
+		t.Fatalf("RunPhysicalMaintenance: %v", err)
+	}
+	broadCommands := 0
+	for _, call := range run.GetCalls() {
+		if strings.HasPrefix(call, "lvs ") && !strings.Contains(call, "--select") {
+			broadCommands++
+		}
+	}
+	if broadCommands != 1 {
+		t.Fatalf("broad LV inventory commands = %d, want 1; calls=%v", broadCommands, run.GetCalls())
+	}
+}
+
+func TestRunPhysicalMaintenanceRetiresAbsentUnreferencedReadyGoldenMetadata(t *testing.T) {
+	paths.SetRootsForTest(t)
+	const goldenID = goldenLVPrefix + "absent-ready"
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: "org/model@absent-ready",
+		Projection:       GoldenProjectionHuggingFace + ":models",
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	run := &testutil.FakeRunner{}
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: map[string]*volumeMetaV3{goldenID: {GoldenIdentity: &identity}},
+		goldenMu:  make(map[string]*sync.Mutex),
+		kernelSnapshotFn: func(_ []string) (kernelSnapshot, error) {
+			return kernelSnapshot{
+				mounts:   make(map[string]mountEntry),
+				dmByName: make(map[string]string),
+				dmByDev:  make(map[string]string),
+			}, nil
+		},
+	}
+
+	err := manager.RunPhysicalMaintenance(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "missing from strict inventory") {
+		t.Fatalf("RunPhysicalMaintenance error = %v, want initial missing-LV report", err)
+	}
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Fatalf("absent Ready golden metadata survived maintenance: %v", statErr)
+	}
+	if _, cached := manager.goldenLVs[goldenID]; cached {
+		t.Fatal("absent Ready golden remained cache-visible after retirement")
+	}
+	for _, call := range run.GetCalls() {
+		if strings.HasPrefix(call, "lvremove ") {
+			t.Fatalf("metadata-only retirement attempted LV removal: %v", run.GetCalls())
+		}
+	}
+}
+
+func TestRunPhysicalMaintenanceRetiresMetadataOnlyIncompleteGolden(t *testing.T) {
+	paths.SetRootsForTest(t)
+	const goldenID = goldenLVPrefix + "metadata-only-incomplete"
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: "org/model@metadata-only-incomplete",
+		Projection:       GoldenProjectionHuggingFace + ":models",
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:        metadataV3Version,
+		Type:           volumeTypeGolden,
+		LVName:         goldenID,
+		VGName:         lvm.DefaultVGName,
+		GoldenIdentity: &identity,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	run := &testutil.FakeRunner{}
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: make(map[string]*volumeMetaV3),
+		goldenMu:  make(map[string]*sync.Mutex),
+		kernelSnapshotFn: func(_ []string) (kernelSnapshot, error) {
+			return kernelSnapshot{
+				mounts:   make(map[string]mountEntry),
+				dmByName: make(map[string]string),
+				dmByDev:  make(map[string]string),
+			}, nil
+		},
+	}
+
+	if err := manager.RunPhysicalMaintenance(context.Background()); err != nil {
+		t.Fatalf("RunPhysicalMaintenance: %v", err)
+	}
+	if _, statErr := os.Stat(metaDir); !os.IsNotExist(statErr) {
+		t.Fatalf("metadata-only incomplete golden survived maintenance: %v", statErr)
+	}
+	for _, call := range run.GetCalls() {
+		if strings.HasPrefix(call, "lvremove ") {
+			t.Fatalf("metadata-only retirement attempted LV removal: %v", run.GetCalls())
+		}
+	}
+}
+
+func TestRunPhysicalMaintenanceRefusesReplacedReadyGoldenLV(t *testing.T) {
+	paths.SetRootsForTest(t)
+	const goldenID = goldenLVPrefix + "replaced-after-inventory"
+	identity := GoldenContentIdentity{
+		SourceKind:       GoldenSourceHuggingFace,
+		ResolvedIdentity: "org/model@revision",
+		Projection:       GoldenProjectionHuggingFace + ":models",
+	}
+	metaDir := paths.VolumeMetaDir(goldenID)
+	if err := os.MkdirAll(metaDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(filepath.Join(metaDir, metadataV2File), &volumeMetaV3{
+		Version:             metadataV3Version,
+		Type:                volumeTypeGolden,
+		LVName:              goldenID,
+		VGName:              lvm.DefaultVGName,
+		GoldenIdentity:      &identity,
+		MaterializeComplete: time.Now().UTC().Format(time.RFC3339),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	referenceID := "svc-rootfs-replaced-after-inventory"
+	if err := os.MkdirAll(paths.VolumeMetaDir(referenceID), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeVolumeMetaV3(
+		filepath.Join(paths.VolumeMetaDir(referenceID), metadataV2File),
+		&volumeMetaV3{
+			Version:  metadataV3Version,
+			Type:     volumeTypeServiceRootfs,
+			LVName:   referenceID,
+			GoldenLV: goldenID,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	broadKey := testutil.BuildKey("lvs", []string{
+		"--noheadings",
+		"--separator", "|",
+		"--unquoted",
+		"-o", "lv_name,lv_uuid,lv_attr,pool_lv",
+		lvm.DefaultVGName,
+	})
+	exactKey := testutil.BuildKey("lvs", []string{
+		"--noheadings",
+		"--separator", "|",
+		"--unquoted",
+		"-o", "lv_name,lv_uuid,lv_attr,pool_lv",
+		"--select", "lv_name=" + goldenID,
+		lvm.DefaultVGName,
+	})
+	run := &testutil.FakeRunner{
+		Outputs: map[string]string{
+			broadKey: goldenID + "|uuid-before|Vwi-a-tz--|" + lvm.DefaultThinPoolName,
+			exactKey: goldenID + "|uuid-replacement|Vwi-a-tz--|" + lvm.DefaultThinPoolName,
+		},
+	}
+	manager := &luksVolumeManager{
+		run:       run,
+		lvMgr:     lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName),
+		goldenLVs: make(map[string]*volumeMetaV3),
+		goldenMu:  make(map[string]*sync.Mutex),
+		kernelSnapshotFn: func(_ []string) (kernelSnapshot, error) {
+			return kernelSnapshot{
+				mounts:   make(map[string]mountEntry),
+				dmByName: make(map[string]string),
+				dmByDev:  make(map[string]string),
+			}, nil
+		},
+	}
+
+	err := manager.RunPhysicalMaintenance(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "changed identity after strict inventory") {
+		t.Fatalf("RunPhysicalMaintenance error = %v, want changed-identity refusal", err)
+	}
+	for _, call := range run.GetCalls() {
+		if strings.HasPrefix(call, "lvchange ") {
+			t.Fatalf("maintenance mutated replacement LV: %v", run.GetCalls())
 		}
 	}
 }

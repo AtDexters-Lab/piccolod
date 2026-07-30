@@ -1,7 +1,7 @@
 # v0.2.43 runtime-lifecycle remediation plan
 
-**Status:** Accepted on 2026-07-29 for slice-by-slice implementation; no
-runtime implementation has started.
+**Status:** Accepted on 2026-07-29 for slice-by-slice implementation; Slice 1
+implementation and review are complete, with alpha/device validation pending.
 
 This plan is governed by
 `docs/incidents/2026-07-v043-runtime-lifecycle-context.md`. If this plan and
@@ -93,8 +93,10 @@ Split current rootfs reconciliation into two contracts:
   mount, snapshot, LV settlement, GC, or broad physical discovery and remains
   in the bounded unlock chain.
 - **Physical maintenance:** after lifecycle `Ready`, collect one strict LV
-  inventory for the pass, settle ready golden records under the existing
-  identity-local lock, and run GC.
+  inventory for the pass, supply that snapshot to all golden records, settle
+  ready golden records under the existing identity-local lock, and run scoped
+  golden/rootfs GC. Generic orphan-LV deletion does not run automatically;
+  unknown LVs remain read-only audit evidence.
 
 `onUnlockChainReady` nudges one GinServer-owned maintenance worker. The worker
 uses a finite context per attempt, records a Warn health detail on failure,
@@ -113,8 +115,9 @@ identity lock: it skips that identity and retries it in a later pass.
 The LVM inventory parser fails closed on malformed rows and duplicate exact
 identities. A pass supplies its single snapshot to all golden records rather
 than calling `LVExistsExact` per record. That snapshot is physical discovery,
-not deletion authority: GC re-reads current rootfs/artifact references under
-the exact identity lock immediately before destruction.
+never deletion authority: scoped golden GC re-reads current rootfs/artifact
+references under the exact golden identity lock immediately before
+destruction. A busy identity is retained for a later pass.
 
 ### 2. Global lifecycle admission and shutdown
 
@@ -136,7 +139,10 @@ pass, not a catch-up ticker. A failed transition attempt releases the gate and
 waits at least the existing 30-second interval before automatic retry. This
 gives queued foreground and shutdown work a real admission window without a
 scheduler, waiter registry, or durable retry counter. `Retry now` may bypass
-that wait only through an explicit user request.
+that wait only through an explicit user request. One automatic gate admission
+dispatches at most one uninstall phase attempt and returns before another
+transition or ordinary reconciliation. Ordinary reconciliation uses a
+separate admission and yields when foreground or shutdown work owns the gate.
 
 On shutdown, GinServer first fences new HTTP work and cancels normal operation
 and background roots. `StopAllApps` then acquires the same gate using the
@@ -150,6 +156,13 @@ no-detach result applies after successful gate acquisition if `StopAllApps`
 returns any error, an app lacks a complete quiescence proof, or the drain
 deadline expires.
 
+Shutdown is also removal-phase-aware. An app in `uninstall_pending` or
+`uninstall_containing` receives containment-only handling. An app in
+`uninstall_finalizing` or `uninstall_identity_retiring` must never pass through
+ordinary ensure, attach, restore, or publication paths that can recreate an
+already-removed resource; shutdown only proves containment and detaches
+resources that are still observed present.
+
 ### 3. Bounded runtime teardown
 
 Keep the existing container grace request of 30 seconds, but give the Podman
@@ -157,6 +170,15 @@ command a fixed Piccolod hard deadline of 45 seconds. Run it in its own process
 group. When that deadline expires, terminate the command process group, reap
 it, and return a typed timeout; the timeout must not target Piccolod's process
 group.
+
+The same command-ownership rule applies to every admitted lifecycle owner, not
+only uninstall. Runtime observation/control commands such as inspect, start,
+stop, remove, and storage reset use a Piccolod-enforced hard deadline no longer
+than 45 seconds or the caller's remaining finite budget, whichever is sooner.
+Long-running transfer or materialization commands keep their existing
+operation-specific finite budget. No external runtime command may replace its
+owner with a background or otherwise unbounded context while the global gate
+is held.
 
 Every uninstall entry path—initial HTTP work, startup recovery, automatic
 reconcile, and `Retry now`—runs one phase-dispatch attempt with a two-minute
@@ -168,9 +190,19 @@ longer than the remaining attempt budget. Deadline or cancellation records the
 latest error when persistence remains available, releases the global gate,
 and leaves the durable phase for a later attempt.
 
-The caller then uses a fresh finite context to enter the existing per-app
-user/session containment path. Destructive volume, rootfs, artifact, or
-identity cleanup proceeds only after both of these are proven:
+The existing service-publication owner exposes a strict context-aware
+app-removal operation for uninstall. Firewall, proxy, publication-withdrawal,
+and endpoint cleanup use the attempt context or a shorter child deadline and
+return failure to the transition; they must not replace it with a background
+context. Existing best-effort callers may retain their current wrapper, but
+uninstall cannot advance while publication absence remains unproven.
+
+After a Podman subcommand returns or times out, the caller enters the existing
+per-app user/session containment path using a new child context derived from
+the admitted attempt context. Its deadline is no later than the attempt's
+remaining two-minute deadline; “new” does not create an independent execution
+owner. Destructive volume, rootfs, artifact, or identity cleanup proceeds only
+after both of these are proven:
 
 - the app's delegated cgroup contains no processes; and
 - no process runs under the app's recorded numeric UID.
@@ -217,6 +249,15 @@ before lifecycle `Ready`, app restoration, background reconciliation, or
 app-scoped terminal/OIDC/capability admission. An active uninstall transition
 is sufficient to make the app disabled/ineligible even if a crash occurred
 before `Enabled=false` was persisted. Physical recovery remains post-Ready.
+
+The transition filename itself is a conservative app-local fence before its
+contents are parsed. If a present record cannot be read or validated, the app
+directory and ID remain reserved, all runtime/ingress/terminal/OIDC/capability
+authority stays denied, and no destructive cleanup runs. The device may still
+reach `Ready`; list/get derive a disabled transition-recovery error from the
+app directory rather than inventing another durable record. Reconciliation
+retries the authoritative record indefinitely and resumes normal phase
+dispatch only after it becomes valid.
 
 After intent commits:
 
@@ -300,14 +341,20 @@ as normally stopped. The Stage tile remains selectable into read-only removal
 details, while Open, Start, Stop, Update, Rollback, Terminal, and Uninstall are
 suppressed. An active attempt shows `Removing...` or `Retrying...` and no retry
 action. An idle failed attempt shows the latest error and one `Retry now`;
-pressing it immediately disables the action until the authoritative refetch.
+the same state says, “Removal will retry automatically. Retry now starts
+another attempt immediately.” Pressing it immediately disables the action
+until the authoritative refetch.
 Only final publication retirement removes the tile/detail.
 
 The Stage app list, detail view, and capability view refetch their
 authoritative endpoints after coalesced app/capability SSE wakes, on stream
 connect/reconnect, and when the screen becomes active. This closes missed-wake
-gaps without a removal poller, client epoch, durable event, or client-side
-transition state machine.
+gaps without a removal-specific poller, client epoch, durable event, or
+client-side transition state machine. Coalescing has a trailing-edge guarantee:
+a wake received while a refetch is in flight schedules exactly one additional
+authoritative refetch after that request settles. While one of those screens
+remains active, one lightweight 30-second timer revalidates its authoritative
+projection so a dropped wake cannot leave it indefinitely stale.
 
 Confirmed uninstall returns `202 Accepted` once durable intent commits. The
 request may drive one finite attempt, but HTTP lifetime is not the operation
@@ -378,6 +425,10 @@ resource observation decide correctness.
   does not invoke Podman stop again.
 - Crash after uninstall intent but before `Enabled=false`: the pre-Ready fence
   scan excludes the app from restoration and all app-scoped admission.
+- A present uninstall transition is unreadable: its directory/ID remains
+  reserved and app authority stays fenced, while unrelated apps and device
+  `Ready` continue; later reconciliation retries the read without destructive
+  inference.
 - Crash immediately before or after the purge fence: the stored phase is the
   sole source of the UI data promise; work before finalizing cannot purge data.
 - Crash after account deletion: `uninstall_identity_retiring` verifies the
@@ -387,6 +438,11 @@ resource observation decide correctness.
 - OIDC create races uninstall: same-app OIDC serialization plus a final
   transition eligibility check makes ensure-absent win before uninstall can
   advance.
+- Service-publication withdrawal stalls: the same finite uninstall attempt
+  expires, records the error without advancing phase, and releases the global
+  lifecycle owner.
+- Shutdown overlaps a finalizing uninstall: containment is proven without
+  ensuring, attaching, restoring, or republishing already-removed resources.
 - Foreground golden reuse races maintenance: both serialize on exact golden
   identity; GC refreshes references under that lock and cache/inventory
   snapshots alone never authorize deletion.
@@ -395,7 +451,10 @@ resource observation decide correctness.
 - Maintenance fails or is canceled: lifecycle remains `Ready`; Warn persists
   and the next finite attempt retries.
 - UI misses an SSE wake: connect/reconnect or screen activation refetches the
-  authoritative removal and capability projection.
+  authoritative removal and capability projection. A wake during an in-flight
+  fetch causes one trailing refetch, so coalescing cannot indefinitely preserve
+  the earlier response; the 30-second active-screen revalidation repairs a wake
+  dropped before it reaches the client.
 
 ## Implementation slices and affected sites
 
@@ -404,7 +463,7 @@ required runtime site outside it is a stop condition requiring plan update
 before editing. Adjacent tests may be added beside an accepted production
 site.
 
-### Slice 1: bounded unlock and physical maintenance
+### Slice 1: bounded unlock, physical maintenance, and manual-lock removal
 
 - `internal/persistence/interfaces.go`
 - `internal/persistence/rootfs_volume_manager.go`
@@ -418,6 +477,10 @@ site.
 - `internal/server/gin_server.go`
 - `internal/server/recovery_execution_test.go`
 - `internal/server/gin_crypto_handlers.go`
+- `internal/server/gin_emergency_handlers_test.go`
+- `docs/api/openapi.yaml`
+- `docs/api/openapi_validation_test.go`
+- `docs/api/manual-lock-removal.md`
 
 ### Slice 2: lifecycle gate, bounded runtime, and shutdown join
 
@@ -460,6 +523,8 @@ site.
 - `internal/app/podman_runtime.go`
 - `internal/persistence/luks_volume_manager.go`
 - `internal/persistence/luks_volume_manager_test.go`
+- `internal/services/manager.go`
+- `internal/services/manager_publication_test.go`
 
 ### Slice 4: narrow resource-owner integration
 
@@ -479,21 +544,15 @@ site.
 - `internal/server/catalog_sync_host.go`
 - `internal/server/gin_server.go`
 
-### Slice 5: API, UI, manual-lock removal, and audit
+### Slice 5: uninstall API, UI, and audit
 
 - `internal/app/types.go`
 - `internal/app/app_manager.go`
 - `internal/server/gin_app_handlers.go`
 - `internal/server/gin_app_handlers_test.go`
 - `internal/server/gin_server.go`
-- `internal/server/gin_crypto_handlers.go`
-- `internal/server/gin_emergency_handlers_test.go`
-- `internal/server/gin_boot_handler.go`
-- `internal/server/gin_boot_handler_test.go`
-- `internal/server/staleness_helpers.go`
 - `docs/api/openapi.yaml`
 - `docs/api/openapi_validation_test.go`
-- `docs/api/manual-lock-removal.md`
 - `ui/lib/core/models/app_models.dart`
 - `ui/lib/core/models/app_status_event.dart`
 - `ui/lib/core/services/app_service.dart`
@@ -519,31 +578,42 @@ the accepted contracts above.
    the relevant UI suite.
 3. **Unlock regression:** representative large golden metadata and LV
    inventory reaches `Ready` comfortably inside 30 seconds; physical
-   maintenance is observed only after Ready; command count proves one broad
-   inventory per pass. A stale inventory cannot delete a newly referenced
-   golden, and cancellation while an identity is busy joins promptly.
+   golden/rootfs maintenance is observed only after Ready; command count proves
+   one broad inventory per pass shared by all golden consumers. A stale
+   inventory cannot delete a newly referenced golden, and unknown/generic
+   orphan LVs are never deleted by the pass. Cancellation while an identity is
+   busy joins promptly. The public manual-lock route, handler, and OpenAPI
+   operation are absent, the authenticated route returns 404, and the migration
+   note directs intentional offline operation to power-off or reboot.
 4. **Runtime failure injection:** a Podman/runc stop that never returns reaches
    the local deadline, releases the global gate, creates no repeated stop
    processes on replay, and never restarts Piccolod or the host. The same test
    applies to every external teardown command and proves the complete
-   two-minute attempt bound.
+   two-minute attempt bound. A stuck inspect/start/stop command during ordinary
+   reconciliation also reaches its local deadline and releases the gate.
 5. **Crash matrix:** restart immediately before and after every uninstall phase
    write and destructive effect; the app remains visible until completion,
    data claims stay truthful, and app ID/UID ownership cannot be reused
    unsafely. A crash between intent and `Enabled=false` cannot restore runtime,
-   terminal, OIDC, or capability authority.
+   terminal, OIDC, or capability authority. A present but unreadable transition
+   record keeps that app locally fenced and visible as recovery-blocked without
+   preventing lifecycle `Ready` or authorizing destructive inference.
 6. **Authority races:** terminal create versus uninstall, OIDC create versus
    ensure-absent, capability replacement failure, client disconnect while
    queued, shutdown while admitted, slice-policy reconcile versus removal, and
    golden reuse versus maintenance. A non-releasing admitted owner must prevent
    `StopAllApps` and persistence shutdown rather than permitting unsafe detach;
    after successful gate acquisition, one app's failed quiescence proof must
-   likewise prevent persistence shutdown.
+   likewise prevent persistence shutdown. Publication teardown must obey the
+   finite attempt context, and shutdown overlapping finalizing removal must not
+   recreate, attach, restore, or republish an already-removed resource.
 7. **Alpha VM/device:** install two unrelated apps, inject a stuck teardown in
    one, confirm the other is usable after the finite attempt releases, reboot
    mid-removal, observe convergence, and repeat unlock with representative
    storage population. A retry attempt longer than 30 seconds must still yield
-   a full interval and admit unrelated foreground work before retry.
+   a full interval and admit unrelated foreground work before retry. With
+   multiple pending transitions, one automatic admission performs at most one
+   attempt and releases before another transition or ordinary reconciliation.
 8. **LV gate:** review the read-only ownership classification before proposing
    any retention or deletion change.
 9. **Review closure:** independent code-quality review against this RFC and the
@@ -553,9 +623,14 @@ the accepted contracts above.
    the user.
 10. **Removal UX:** widget tests cover permanent-delete and selected-provider
     disclosures, normal-action suppression, active versus failed retry states,
+    automatic-retry disclosure beside the latest error and `Retry now`,
     missed-wake reconnect refetch on Stage/detail/capability views, Stage
     disappearance after authoritative list refetch, and disappearance only
-    after authoritative publication retirement.
+    after authoritative publication retirement. They also prove one trailing
+    refetch after a wake arrives during an in-flight fetch and convergence
+    within one 30-second active-screen revalidation after a wake is dropped.
+    OpenAPI validation covers the `202` response, acknowledgement input,
+    removal fields, retry availability, and phase-derived retention contract.
 
 ## Implementation Notes & Status
 
@@ -563,4 +638,20 @@ the accepted contracts above.
 - 2026-07-29: User accepted the plan, including the proposed 45-second Podman
   hard deadline, two-minute uninstall-attempt budget, and completion-relative
   30-second automatic retry interval.
-- No runtime implementation has started on the reduced branch.
+- 2026-07-30: During Slice 1 code review, the manual-lock handler was found to
+  race concurrent unlock while joining post-Ready maintenance. The user
+  approved moving the already-accepted complete public manual-lock removal
+  from Slice 5 into Slice 1 instead of adding temporary lock/unlock
+  serialization for an endpoint being removed.
+- 2026-07-30: Holistic re-review found that moving destructive generic
+  orphan-LV cleanup post-Ready contradicted the governing read-only LV-audit
+  boundary. It was removed from the plan together with its deletion-race
+  protocol. The user selected a 30-second active-screen authoritative refetch
+  to repair dropped SSE wakes without durable event delivery.
+- 2026-07-30: The user confirmed that Piccolod command deadlines cover every
+  external runtime command executed while a lifecycle owner holds the global
+  gate, including ordinary reconciliation; the 45-second runtime-control cap
+  is not limited to uninstall.
+- 2026-07-30: Slice 1 passed focused normal/race validation, affected-package
+  suites, targeted security review, a clean final Codex gate, and RFC
+  implementation closure. Alpha/device validation remains pending.

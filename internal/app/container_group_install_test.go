@@ -8,8 +8,97 @@ import (
 
 	"piccolod/internal/api"
 	"piccolod/internal/container"
+	"piccolod/internal/persistence"
 	"piccolod/internal/services"
 )
+
+func TestInstallContainerGroupRepullsWhenHydratedGoldenIsPhysicallyMissing(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+	rootfs := newStubRootfsManager(t.TempDir())
+	rootfs.findGoldenDigest = "sha256:cached"
+	rootfs.findGoldenID = "golden-cached"
+	rootfs.findGoldenOK = true
+	rootfs.createServiceErrs = []error{
+		&persistence.GoldenContentMissingError{
+			GoldenID: "golden-cached",
+		},
+	}
+	mgr.SetRootfsManager(rootfs)
+	t.Setenv("PATH", t.TempDir())
+
+	def := &api.AppDefinition{
+		Listeners: []api.AppListener{{
+			Name: "demo", GuestPort: 8080, Flow: api.FlowTCP,
+			Protocol: api.ListenerProtocolHTTP, Primary: true,
+		}},
+		PrimaryService: "main",
+		Services: map[string]api.AppService{
+			"main": {Image: "example.test/demo:latest", BindPorts: []int{8080}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	}
+	SetDefaults(def)
+
+	ctx := context.Background()
+	layout, err := mgr.ensureAppVolumeLayout(ctx, "demo")
+	if err != nil {
+		t.Fatalf("ensureAppVolumeLayout: %v", err)
+	}
+	runtime, err := mgr.podmanRuntimeForApp(ctx, "demo", layout, ModeService, appRuntimeEnsureReady)
+	if err != nil {
+		t.Fatalf("podmanRuntimeForApp: %v", err)
+	}
+	endpoints, err := mgr.serviceManager.AllocateForApp("demo", def.Listeners)
+	if err != nil {
+		t.Fatalf("allocate publication: %v", err)
+	}
+
+	if _, err := mgr.installContainerGroup(
+		ctx,
+		def,
+		"demo",
+		layout,
+		runtime,
+		endpoints,
+		nil,
+		false,
+		true,
+	); err != nil {
+		t.Fatalf("installContainerGroup: %v", err)
+	}
+
+	if len(rootfs.createServiceReqs) < 2 {
+		t.Fatalf("service rootfs requests = %d, want cache attempt plus verified rebuild", len(rootfs.createServiceReqs))
+	}
+	first, second := rootfs.createServiceReqs[0], rootfs.createServiceReqs[1]
+	if first.ServiceName != "main" ||
+		first.PrePulledDir != "" ||
+		first.PreferredGoldenID != "golden-cached" {
+		t.Fatalf("cached rootfs request = %+v, want exact cached golden without pre-pulled content", first)
+	}
+	if second.ServiceName != "main" ||
+		second.PrePulledDir == "" ||
+		second.PreferredGoldenID != "" {
+		t.Fatalf("verified rebuild request = %+v, want main with pre-pulled content", second)
+	}
+	pulledService := false
+	for _, image := range mock.pulledImages {
+		if image == "example.test/demo:latest" {
+			pulledService = true
+			break
+		}
+	}
+	if !pulledService {
+		t.Fatalf("missing cached golden did not trigger verified pull: %v", mock.pulledImages)
+	}
+}
 
 func TestInstallMultiContainer_UnprovenCleanupRetainsOwnershipUntilRetry(t *testing.T) {
 	tempDir := t.TempDir()

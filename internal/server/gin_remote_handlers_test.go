@@ -426,7 +426,7 @@ func TestRemote_ReloadsConfigAfterUnlockEvent(t *testing.T) {
 	if err := server.lifecycle.BeginUnlock(); err != nil {
 		t.Fatalf("BeginUnlock: %v", err)
 	}
-	server.reloadComponentsAfterUnlock()
+	server.reloadComponentsAfterUnlock(context.Background())
 	if err := server.lifecycle.MarkReady(); err != nil {
 		t.Fatalf("MarkReady: %v", err)
 	}

@@ -122,8 +122,12 @@ type RootfsVolumeManager interface {
 	DestroyRootfs(ctx context.Context, volumeID string) error
 	// GarbageCollectGoldenLVs removes golden LVs with no remaining references.
 	GarbageCollectGoldenLVs(ctx context.Context) error
-	// ReconcileRootfsStates validates rootfs volumes on startup.
-	ReconcileRootfsStates(ctx context.Context) error
+	// HydrateGoldenMetadata loads only durable metadata and image config. It
+	// must not inspect or mutate LVM, mounts, mappers, or snapshots.
+	HydrateGoldenMetadata(ctx context.Context) error
+	// RunPhysicalMaintenance performs one finite post-Ready pass using one
+	// shared strict LV inventory. Generic orphan cleanup is not part of it.
+	RunPhysicalMaintenance(ctx context.Context) error
 	// ReadGoldenImageConfig returns the OCI image config stored alongside a golden LV.
 	// The goldenID is the golden LV name (e.g., "golden-abc123").
 	ReadGoldenImageConfig(ctx context.Context, goldenID string) (GoldenImageConfig, error)
@@ -212,6 +216,7 @@ type GoldenContentHandle struct {
 type ArtifactReferenceRequest struct {
 	ReferenceID string
 	GoldenID    string
+	Identity    GoldenContentIdentity
 	IDMap       IDMapConfig
 }
 
@@ -234,6 +239,17 @@ func (e *ArtifactContentMissingError) Error() string {
 	return "artifact reference " + e.ReferenceID + " is missing local golden content " + e.GoldenID
 }
 
+// GoldenContentMissingError tells an OCI image caller that metadata identified
+// an exact cached digest but the local golden LV was proven absent. The caller
+// must run its verified pull path before asking persistence to reconstruct it.
+type GoldenContentMissingError struct {
+	GoldenID string
+}
+
+func (e *GoldenContentMissingError) Error() string {
+	return "cached golden content " + e.GoldenID + " is physically absent"
+}
+
 // GoldenLVRequest describes the image for a golden LV.
 type GoldenLVRequest struct {
 	ImageDigest   string
@@ -252,24 +268,26 @@ type GoldenLVRequest struct {
 
 // WorkspaceRootfsRequest describes a workspace rootfs creation request.
 type WorkspaceRootfsRequest struct {
-	InstanceID    string
-	ImageDigest   string
-	ImageRef      string
-	IDMap         IDMapConfig
-	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
-	PrePulledDir  string // podman root dir with image already pulled
+	InstanceID        string
+	ImageDigest       string
+	ImageRef          string
+	PreferredGoldenID string
+	IDMap             IDMapConfig
+	ImageSizeHint     int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir      string // podman root dir with image already pulled
 }
 
 // ServiceRootfsRequest describes a service rootfs creation request.
 type ServiceRootfsRequest struct {
-	InstanceID    string
-	ServiceName   string // per-service rootfs; empty = legacy single-rootfs
-	ImageDigest   string
-	ImageRef      string
-	IDMap         IDMapConfig
-	VolumeID      string // optional: override derived volume ID (for versioned updates, RFC 20260302)
-	ImageSizeHint int64  // uncompressed image size; when > 0, skips imageSizeFn pull
-	PrePulledDir  string // podman root dir with image already pulled
+	InstanceID        string
+	ServiceName       string // per-service rootfs; empty = legacy single-rootfs
+	ImageDigest       string
+	ImageRef          string
+	PreferredGoldenID string
+	IDMap             IDMapConfig
+	VolumeID          string // optional: override derived volume ID (for versioned updates, RFC 20260302)
+	ImageSizeHint     int64  // uncompressed image size; when > 0, skips imageSizeFn pull
+	PrePulledDir      string // podman root dir with image already pulled
 }
 
 // RootfsHandle is a reference to a mounted rootfs volume.

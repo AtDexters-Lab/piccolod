@@ -13,6 +13,7 @@ import (
 	"sync"
 
 	"piccolod/internal/state/paths"
+	"piccolod/internal/storage/lvm"
 )
 
 func validateGoldenIdentity(identity GoldenContentIdentity) error {
@@ -135,10 +136,57 @@ func (m *luksVolumeManager) lockGoldenIdentity(identity GoldenContentIdentity) (
 	}, nil
 }
 
+// tryLockGoldenIdentity is the non-blocking maintenance counterpart to
+// lockGoldenIdentity. If any candidate key is busy, it releases keys already
+// acquired and leaves the foreground identity owner undisturbed.
+func (m *luksVolumeManager) tryLockGoldenIdentity(identity GoldenContentIdentity) (func(), bool, error) {
+	keys, err := goldenIdentityLockKeys(identity)
+	if err != nil {
+		return nil, false, err
+	}
+	mutexes := make([]*sync.Mutex, 0, len(keys))
+	for _, key := range keys {
+		mutex := m.goldenMutex(key)
+		if !mutex.TryLock() {
+			for index := len(mutexes) - 1; index >= 0; index-- {
+				mutexes[index].Unlock()
+			}
+			return nil, false, nil
+		}
+		mutexes = append(mutexes, mutex)
+	}
+	return func() {
+		for index := len(mutexes) - 1; index >= 0; index-- {
+			mutexes[index].Unlock()
+		}
+	}, true, nil
+}
+
 type goldenStorageSelection struct {
 	goldenID string
 	meta     *volumeMetaV3
 	ready    bool
+}
+
+func (m *luksVolumeManager) readyGoldenPhysicallyPresent(
+	ctx context.Context,
+	goldenID string,
+) (bool, error) {
+	if m.lvMgr == nil {
+		return false, fmt.Errorf("golden LV manager is not configured")
+	}
+	entry, exists, err := m.lvMgr.InspectLVExact(ctx, goldenID)
+	if err != nil {
+		return false, fmt.Errorf("inspect golden storage candidate %s: %w", goldenID, err)
+	}
+	if exists && entry.PoolName != lvm.DefaultThinPoolName {
+		return false, fmt.Errorf(
+			"golden storage candidate %s belongs to unexpected pool %q",
+			goldenID,
+			entry.PoolName,
+		)
+	}
+	return exists, nil
 }
 
 // selectGoldenStorage compares the complete durable identity before reuse.
@@ -175,9 +223,12 @@ func (m *luksVolumeManager) selectGoldenStorage(
 		m.mu.Unlock()
 		if preferredGoldenID == "" &&
 			goldenMetaMatchesIdentity(cached, identity) &&
-			goldenReadyTimestamp(cached) != "" &&
-			(m.lvMgr == nil || m.lvMgr.LVExists(ctx, goldenID)) {
-			return goldenStorageSelection{goldenID: goldenID, meta: cached, ready: true}, nil
+			goldenReadyTimestamp(cached) != "" {
+			ready, inspectErr := m.readyGoldenPhysicallyPresent(ctx, goldenID)
+			if inspectErr != nil {
+				return goldenStorageSelection{}, inspectErr
+			}
+			return goldenStorageSelection{goldenID: goldenID, meta: cached, ready: ready}, nil
 		}
 
 		metaPath := filepath.Join(paths.VolumeMetaDir(goldenID), metadataV2File)
@@ -192,11 +243,17 @@ func (m *luksVolumeManager) selectGoldenStorage(
 				}
 				continue
 			}
-			lvExists := m.lvMgr == nil || m.lvMgr.LVExists(ctx, goldenID)
+			ready := false
+			if goldenReadyTimestamp(meta) != "" {
+				ready, readErr = m.readyGoldenPhysicallyPresent(ctx, goldenID)
+				if readErr != nil {
+					return goldenStorageSelection{}, readErr
+				}
+			}
 			return goldenStorageSelection{
 				goldenID: goldenID,
 				meta:     meta,
-				ready:    goldenReadyTimestamp(meta) != "" && lvExists,
+				ready:    ready,
 			}, nil
 		}
 		if !os.IsNotExist(readErr) {
@@ -211,7 +268,30 @@ func (m *luksVolumeManager) selectGoldenStorage(
 			}
 			continue
 		}
-		if m.lvMgr != nil && m.lvMgr.LVExists(ctx, goldenID) {
+		var lv lvm.LVInventoryEntry
+		lvExists := false
+		if m.lvMgr != nil {
+			var inspectErr error
+			lv, lvExists, inspectErr = m.lvMgr.InspectLVExact(ctx, goldenID)
+			if inspectErr != nil {
+				return goldenStorageSelection{}, fmt.Errorf(
+					"inspect golden storage candidate %s: %w",
+					goldenID,
+					inspectErr,
+				)
+			}
+		}
+		if lvExists {
+			if lv.PoolName != lvm.DefaultThinPoolName {
+				if preferredGoldenID == goldenID {
+					return goldenStorageSelection{}, fmt.Errorf(
+						"preferred golden LV %s belongs to unexpected pool %q",
+						goldenID,
+						lv.PoolName,
+					)
+				}
+				continue
+			}
 			// An LV without matching durable metadata is likewise not reusable.
 			if preferredGoldenID == goldenID {
 				// Exact reconstruction has a surviving reference containing
