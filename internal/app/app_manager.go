@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -42,9 +43,11 @@ type AppManager struct {
 	eventsMu              sync.Mutex
 	eventCancel           context.CancelFunc
 	eventSubCancels       []func()
+	eventsStopped         bool
 	eventsWG              sync.WaitGroup
-	reconcileMu           sync.Mutex
+	lifecycleGate         lifecycleAdmissionGate
 	reconcileCancel       context.CancelFunc
+	backgroundStopFenced  bool
 	reconcileWG           sync.WaitGroup
 	stateMu               sync.RWMutex
 	leadershipMu          sync.RWMutex
@@ -132,7 +135,187 @@ type AppManager struct {
 	acceleratorPermission func(context.Context, uint32, []string, bool) error
 }
 
+// lifecycleAdmissionGate keeps the existing capacity-one global lifecycle
+// boundary while allowing queued work to stop waiting when its admission
+// context is canceled. Its zero value is ready for use.
+type lifecycleAdmissionGate struct {
+	once   sync.Once
+	token  chan struct{}
+	mu     sync.Mutex
+	fenced bool
+}
+
+func (g *lifecycleAdmissionGate) initialize() {
+	g.once.Do(func() {
+		g.token = make(chan struct{}, 1)
+		g.token <- struct{}{}
+	})
+}
+
+func (g *lifecycleAdmissionGate) acquire(ctx context.Context) (func(), error) {
+	return g.acquireWithAdmission(ctx, ctx)
+}
+
+func (g *lifecycleAdmissionGate) acquireWithAdmission(executionCtx, admissionCtx context.Context) (func(), error) {
+	g.initialize()
+	if executionCtx == nil {
+		executionCtx = context.Background()
+	}
+	if admissionCtx == nil {
+		admissionCtx = executionCtx
+	}
+	if err := executionCtx.Err(); err != nil {
+		return nil, err
+	}
+	if err := admissionCtx.Err(); err != nil {
+		return nil, err
+	}
+	if g.isFenced() {
+		return nil, errLifecycleAdmissionFenced
+	}
+	select {
+	case <-g.token:
+		if g.isFenced() {
+			g.token <- struct{}{}
+			return nil, errLifecycleAdmissionFenced
+		}
+		if err := executionCtx.Err(); err != nil {
+			g.token <- struct{}{}
+			return nil, err
+		}
+		if err := admissionCtx.Err(); err != nil {
+			g.token <- struct{}{}
+			return nil, err
+		}
+		return g.releaseFunc(), nil
+	case <-executionCtx.Done():
+		return nil, executionCtx.Err()
+	case <-admissionCtx.Done():
+		return nil, admissionCtx.Err()
+	}
+}
+
+func (g *lifecycleAdmissionGate) fenceAndAcquire(ctx context.Context) (func(), error) {
+	g.initialize()
+	g.mu.Lock()
+	g.fenced = true
+	g.mu.Unlock()
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	select {
+	case <-g.token:
+		return g.releaseFunc(), nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func (g *lifecycleAdmissionGate) tryAcquire() (func(), bool) {
+	g.initialize()
+	if g.isFenced() {
+		return nil, false
+	}
+	select {
+	case <-g.token:
+		if g.isFenced() {
+			g.token <- struct{}{}
+			return nil, false
+		}
+		return g.releaseFunc(), true
+	default:
+		return nil, false
+	}
+}
+
+func (g *lifecycleAdmissionGate) releaseFunc() func() {
+	var once sync.Once
+	return func() {
+		once.Do(func() { g.token <- struct{}{} })
+	}
+}
+
+func (g *lifecycleAdmissionGate) isFenced() bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.fenced
+}
+
+type lifecycleAdmissionContextKey struct{}
+
+type lifecycleAdmissionMarker struct {
+	ctx      context.Context
+	consumed atomic.Bool
+}
+
+// WithLifecycleAdmissionContext makes admission request-cancellable without
+// changing the execution context used after the gate is acquired.
+func WithLifecycleAdmissionContext(executionCtx, admissionCtx context.Context) context.Context {
+	if executionCtx == nil {
+		executionCtx = context.Background()
+	}
+	if admissionCtx == nil {
+		return executionCtx
+	}
+	return context.WithValue(executionCtx, lifecycleAdmissionContextKey{}, &lifecycleAdmissionMarker{ctx: admissionCtx})
+}
+
+func lifecycleAdmissionContext(ctx context.Context) context.Context {
+	if ctx != nil {
+		if marker, ok := ctx.Value(lifecycleAdmissionContextKey{}).(*lifecycleAdmissionMarker); ok &&
+			marker != nil && marker.ctx != nil && !marker.consumed.Load() {
+			return marker.ctx
+		}
+	}
+	return ctx
+}
+
+func consumeLifecycleAdmissionContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	if marker, ok := ctx.Value(lifecycleAdmissionContextKey{}).(*lifecycleAdmissionMarker); ok && marker != nil {
+		marker.consumed.Store(true)
+	}
+	return ctx
+}
+
+func (m *AppManager) acquireLifecycle(ctx context.Context) (context.Context, func(), error) {
+	admissionCtx := lifecycleAdmissionContext(ctx)
+	release, err := m.lifecycleGate.acquireWithAdmission(ctx, admissionCtx)
+	if err != nil {
+		return ctx, nil, err
+	}
+	ctx = consumeLifecycleAdmissionContext(ctx)
+	return container.WithLifecycleRuntimeControl(ctx), release, nil
+}
+
+func (m *AppManager) tryAcquireLifecycle(ctx context.Context) (context.Context, func(), bool) {
+	if ctx != nil && ctx.Err() != nil {
+		return ctx, nil, false
+	}
+	release, ok := m.lifecycleGate.tryAcquire()
+	if !ok {
+		return ctx, nil, false
+	}
+	if ctx != nil && ctx.Err() != nil {
+		release()
+		return ctx, nil, false
+	}
+	ctx = consumeLifecycleAdmissionContext(ctx)
+	return container.WithLifecycleRuntimeControl(ctx), release, true
+}
+
+func (m *AppManager) acquireLifecycleForShutdown(ctx context.Context) (context.Context, func(), error) {
+	release, err := m.lifecycleGate.fenceAndAcquire(ctx)
+	if err != nil {
+		return ctx, nil, err
+	}
+	return container.WithLifecycleRuntimeControl(ctx), release, nil
+}
+
 var (
+	errLifecycleAdmissionFenced      = errors.New("app manager: lifecycle admission fenced for shutdown")
 	ErrLocked                        = errors.New("app manager: persistence locked")
 	ErrNotLeader                     = errors.New("app manager: not leader")
 	ErrVolumeUnavailable             = errors.New("app manager: persistence volume not mounted")
@@ -379,22 +562,23 @@ func (m *AppManager) ensureScratchVolume(ctx context.Context) (string, error) {
 	return handle.MountDir, nil
 }
 
-// releaseScratchVolume detaches the shared scratch volume. Best-effort —
-// logs warnings but never fails shutdown. Does not destroy the LV — cleanup
-// and recreation happen lazily on next ensureScratchVolume call.
-func (m *AppManager) releaseScratchVolume(ctx context.Context) {
+// releaseScratchVolume detaches the shared scratch volume after all app
+// containment has succeeded. It does not destroy the LV — cleanup and
+// recreation happen lazily on next ensureScratchVolume call.
+func (m *AppManager) releaseScratchVolume(ctx context.Context) error {
 	m.scratchMu.Lock()
 	defer m.scratchMu.Unlock()
 
 	if !m.scratchAttached {
-		return
+		return nil
 	}
 
 	if err := m.volumeManager.Detach(ctx, m.scratchHandle); err != nil {
-		log.Printf("WARN: detach scratch volume: %v", err)
+		return fmt.Errorf("detach scratch volume: %w", err)
 	}
 	m.scratchAttached = false
 	log.Printf("INFO: scratch flatten volume detached")
+	return nil
 }
 
 // newFlattenRuntime creates an ephemeral podman runtime backed by the shared
@@ -512,7 +696,7 @@ func (m *AppManager) getObservedStatusAndMessage(instanceID string) (status, mes
 
 // updateStatusWithEvent updates the in-memory observed status and publishes an event if the status changed.
 // Clears any transient status message. This should be called within the appropriate lock context
-// (reconcileMu for reconciler paths, request-scoped for lifecycle operations).
+// (the lifecycle gate for reconciler paths, request-scoped for lifecycle operations).
 func (m *AppManager) updateStatusWithEvent(instanceID, newStatus string) {
 	m.updateStatusAndMessageWithEvent(instanceID, newStatus, "")
 }
@@ -625,21 +809,25 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 		return
 	}
 	m.eventsMu.Lock()
+	if m.eventsStopped {
+		m.eventsMu.Unlock()
+		return
+	}
 	if m.eventCancel != nil {
 		m.eventCancel()
 	}
+	for _, cancel := range m.eventSubCancels {
+		cancel()
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.eventCancel = cancel
-	m.eventsMu.Unlock()
-
 	leaders, cancelLeaders := bus.SubscribeWithCancel(events.TopicLeadershipRoleChanged, 16)
 	locks, cancelLocks := bus.SubscribeWithCancel(events.TopicLockStateChanged, 8)
-	m.eventsMu.Lock()
 	m.eventSubCancels = []func(){cancelLeaders, cancelLocks}
-	m.eventsMu.Unlock()
 	loopCtx := ctx
 
 	m.eventsWG.Add(1)
+	m.eventsMu.Unlock()
 	go func() {
 		defer m.eventsWG.Done()
 		for {
@@ -692,7 +880,15 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 					// non-deterministic. Sequencing avoids the redundant
 					// volume-attach work the loser would have done, and lets
 					// reconcile see the restored proxy state as input.
+					m.eventsMu.Lock()
+					if m.eventsStopped {
+						m.eventsMu.Unlock()
+						continue
+					}
+					m.eventsWG.Add(1)
+					m.eventsMu.Unlock()
 					go func() {
+						defer m.eventsWG.Done()
 						m.RestoreServices(loopCtx)
 						m.ReconcileOnce(loopCtx)
 					}()
@@ -710,7 +906,21 @@ func (m *AppManager) ObserveRuntimeEvents(bus *events.Bus) {
 // StopRuntimeEvents stops event observers and waits for goroutines to exit.
 // Uses a 10-second timeout to prevent indefinite blocking during shutdown.
 func (m *AppManager) StopRuntimeEvents() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := m.StopRuntimeEventsContext(ctx); err != nil {
+		log.Printf("WARN: %v", err)
+	}
+}
+
+// StopRuntimeEventsContext permanently fences new event work, cancels current
+// observers, and joins every event-spawned lifecycle owner.
+func (m *AppManager) StopRuntimeEventsContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	m.eventsMu.Lock()
+	m.eventsStopped = true
 	if m.eventCancel != nil {
 		m.eventCancel()
 		m.eventCancel = nil
@@ -721,7 +931,6 @@ func (m *AppManager) StopRuntimeEvents() {
 	m.eventSubCancels = nil
 	m.eventsMu.Unlock()
 
-	// Wait with timeout to prevent indefinite blocking
 	done := make(chan struct{})
 	go func() {
 		m.eventsWG.Wait()
@@ -729,9 +938,9 @@ func (m *AppManager) StopRuntimeEvents() {
 	}()
 	select {
 	case <-done:
-		// Goroutines exited cleanly
-	case <-time.After(10 * time.Second):
-		log.Printf("WARN: StopRuntimeEvents timed out waiting for event goroutines")
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("stop app runtime event work: %w", ctx.Err())
 	}
 }
 
@@ -748,32 +957,24 @@ func (m *AppManager) StartBackgroundAfterInitial() {
 
 func (m *AppManager) startBackground(runInitial bool) {
 	m.stateMu.Lock()
-	if m.reconcileCancel != nil {
+	if m.backgroundStopFenced || m.reconcileCancel != nil {
 		m.stateMu.Unlock()
 		return
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.reconcileCancel = cancel
+	// Register every background owner before publishing the running state by
+	// releasing stateMu. Shutdown takes the same lock before waiting, so Add
+	// can never race with Wait.
+	m.reconcileWG.Add(3)
 	m.stateMu.Unlock()
 
-	const interval = 30 * time.Second
-	m.reconcileWG.Add(1)
 	go func() {
 		defer m.reconcileWG.Done()
-		ticker := time.NewTicker(interval)
-		defer ticker.Stop()
-
 		if runInitial {
 			m.ReconcileOnce(ctx)
 		}
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				m.ReconcileOnce(ctx)
-			}
-		}
+		runCompletionRelativeReconcileLoop(ctx, 30*time.Second, m.ReconcileOnce)
 	}()
 
 	// Resource stewardship: one-shot startup reconcile of slice policies
@@ -781,7 +982,6 @@ func (m *AppManager) startBackground(runInitial bool) {
 	// startup pass fixes drift accumulated while piccolod was down (reboot,
 	// crash); the periodic pass retries transient failures (systemctl
 	// hiccups, /etc/systemd ephemerally unwritable). See plan P1.7.
-	m.reconcileWG.Add(1)
 	go func() {
 		defer m.reconcileWG.Done()
 		const slicePolicyInterval = 5 * time.Minute
@@ -803,14 +1003,43 @@ func (m *AppManager) startBackground(runInitial bool) {
 	m.startCatalogSyncLoop(ctx, runInitial)
 }
 
+func runCompletionRelativeReconcileLoop(ctx context.Context, interval time.Duration, pass func(context.Context)) {
+	timer := time.NewTimer(interval)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+			pass(ctx)
+			timer.Reset(interval)
+		}
+	}
+}
+
 func (m *AppManager) StopBackground() {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := m.stopBackground(ctx); err != nil {
+		log.Printf("WARN: %v", err)
+	}
+}
+
+// FenceAndCancelBackground prevents late restarts and cancels the shared root
+// of app reconciliation, slice-policy reconciliation, and catalog sync.
+func (m *AppManager) FenceAndCancelBackground() {
 	m.stateMu.Lock()
+	m.backgroundStopFenced = true
 	cancel := m.reconcileCancel
 	m.reconcileCancel = nil
 	m.stateMu.Unlock()
 	if cancel != nil {
 		cancel()
 	}
+}
+
+func (m *AppManager) stopBackground(ctx context.Context) error {
+	m.FenceAndCancelBackground()
 	done := make(chan struct{})
 	go func() {
 		m.reconcileWG.Wait()
@@ -819,10 +1048,11 @@ func (m *AppManager) StopBackground() {
 	select {
 	case <-done:
 		log.Printf("INFO: Background reconciliation stopped cleanly")
-	case <-time.After(15 * time.Second):
-		log.Printf("WARN: StopBackground timed out after 15s waiting for reconcile goroutine")
+	case <-ctx.Done():
+		return fmt.Errorf("stop background reconciliation: %w", ctx.Err())
 	}
 	m.closeCapabilityIngresses()
+	return nil
 }
 
 // StopAllApps proves every app cgroup quiescent before detaching its volume.
@@ -832,16 +1062,17 @@ func (m *AppManager) StopBackground() {
 func (m *AppManager) StopAllApps(ctx context.Context) error {
 	log.Printf("INFO: Quiescing all apps for graceful shutdown...")
 
-	// Release the shared scratch volume on all exit paths (best-effort).
-	// Uses a fresh context so the unmount runs even if the shutdown ctx expired.
-	defer func() {
-		releaseCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		m.releaseScratchVolume(releaseCtx)
-	}()
-
-	// First, stop the background reconciliation loop
-	m.StopBackground()
+	// Cancel background contenders before permanently fencing new admission.
+	// Acquiring the fenced gate joins any already-admitted lifecycle owner.
+	m.FenceAndCancelBackground()
+	ctx, releaseLifecycle, err := m.acquireLifecycleForShutdown(ctx)
+	if err != nil {
+		return fmt.Errorf("join app lifecycle owner: %w", err)
+	}
+	defer releaseLifecycle()
+	if err := m.stopBackground(ctx); err != nil {
+		return err
+	}
 
 	// Get the state manager - if unavailable (locked/unmounted), skip app stopping
 	// since containers won't be able to access their volumes anyway
@@ -851,13 +1082,13 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 
 	if stateMgr == nil {
 		log.Printf("INFO: State manager not initialized, skipping app shutdown")
-		return nil
+		return m.releaseScratchVolume(ctx)
 	}
 
 	apps := stateMgr.ListApps()
 	if len(apps) == 0 {
 		log.Printf("INFO: No apps to stop")
-		return nil
+		return m.releaseScratchVolume(ctx)
 	}
 
 	var errs []error
@@ -910,7 +1141,7 @@ func (m *AppManager) StopAllApps(ctx context.Context) error {
 	if len(errs) > 0 {
 		return errors.Join(errs...)
 	}
-	return nil
+	return m.releaseScratchVolume(ctx)
 }
 
 // stopAppForShutdown stops an app's containers without updating state or
@@ -1342,6 +1573,15 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 
 // RestoreServices rebuilds service proxies for running apps based on current container port bindings.
 func (m *AppManager) RestoreServices(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	m.markPendingRestore()
+	ctx, releaseLifecycle, admitted := m.tryAcquireLifecycle(ctx)
+	if !admitted {
+		return
+	}
+	defer releaseLifecycle()
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return
 	}
@@ -1639,8 +1879,11 @@ func (m *AppManager) recoverTransitionWithLegacyJournal(ctx context.Context, sta
 
 func (m *AppManager) RetryTransitionFollowUp(ctx context.Context, instanceID string, action TransitionActionKind) (err error) {
 	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}
@@ -1885,8 +2128,11 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, admitted := m.tryAcquireLifecycle(ctx)
+	if !admitted {
+		return
+	}
+	defer releaseLifecycle()
 
 	if err := m.ensureUnlocked(); err != nil {
 		return
@@ -2095,7 +2341,11 @@ func (m *AppManager) reconcileApp(ctx context.Context, state *FilesystemStateMan
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil
 	}
-	projectStarting := previousStatus != StatusRunning
+	// A complete non-running observation supersedes a last-known Running
+	// projection. Preserve Running only while runtime readiness itself remains
+	// unknown; once absence/stoppage is proven, recovery (or exhausted recovery)
+	// must be visible to callers.
+	projectStarting := runtimeObserveErr == nil || previousStatus != StatusRunning
 	if !m.beginAutomaticStartupAttemptWithProjection(state, appInst, projectStarting) {
 		return nil
 	}
@@ -2234,14 +2484,17 @@ func (m *AppManager) Install(ctx context.Context, appDef *api.AppDefinition) (*A
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
-	m.reconcileMu.Lock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return nil, err
+	}
 	inst, err := m.installLocked(ctx, appDef)
-	m.reconcileMu.Unlock()
+	releaseLifecycle()
 	// Resource stewardship: derive + apply slice policies for all installed apps.
-	// Runs *outside* reconcileMu so the systemctl daemon-reload/set-property
+	// Runs *outside* the lifecycle gate so the systemctl daemon-reload/set-property
 	// calls don't block app lifecycle work. The catalog-sync apply path
 	// (catalog_sync_apply.go) calls ReconcileAllSlicePolicies *inside*
-	// reconcileMu — that asymmetry is intentional: sync-apply needs the
+	// lifecycle gate — that asymmetry is intentional: sync-apply needs the
 	// D-9 ordering invariant (slice update strictly before container recreate),
 	// while the Install path here has already completed the recreate so
 	// ordering is moot. Both are serialized at the sliceReconcileMu layer
@@ -2475,7 +2728,7 @@ func (m *AppManager) installWithRetries(ctx context.Context, state *FilesystemSt
 
 	// The first installed provider becomes the automatic default only after its
 	// ordinary install has committed. Converge that default and its runtime
-	// effects before returning while this lifecycle still owns reconcileMu.
+	// effects before returning while this lifecycle still owns the lifecycle gate.
 	// Other provider installs do not steal or re-finalize an existing default.
 	providedCapabilities := make([]string, 0, len(registeredCapabilities()))
 	for _, capability := range registeredCapabilities() {
@@ -2524,6 +2777,7 @@ func (m *AppManager) cleanupInstallResources(instanceID string, runtime containe
 
 	ctx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
 	defer cancel()
+	ctx = container.WithLifecycleRuntimeControl(ctx)
 
 	// Destroy block-native rootfs if it was partially created.
 	// Best-effort: detach + destroy + GC before cleaning up the data volume.
@@ -2600,8 +2854,11 @@ func (m *AppManager) CloneWorkspace(ctx context.Context, originID, cloneID strin
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 	return m.cloneWorkspaceLocked(ctx, originID, cloneID)
 }
 
@@ -3014,8 +3271,11 @@ func (m *AppManager) Start(ctx context.Context, instanceID string) error {
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -3164,8 +3424,11 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 // Stop stops an application instance by instanceID.
 func (m *AppManager) Stop(ctx context.Context, instanceID string) error {
 	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 
 	if err := m.ensureUnlocked(); err != nil {
 		return err
@@ -3188,6 +3451,11 @@ func (m *AppManager) stopForFollowerTransition(ctx context.Context, instanceID s
 	// be able to stop the local app through Warning, while Critical continues
 	// to take precedence through the admission gate's hard fence.
 	ctx = pressure.WithTransitionContinuation(ctx)
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 
 	state, err := m.ensureStateManager()
 	if err != nil {
@@ -3342,23 +3610,26 @@ func (m *AppManager) uninstall(ctx context.Context, instanceID string, acknowled
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
 	}
-	m.reconcileMu.Lock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
 	state, stateErr := m.ensureStateManager()
 	if stateErr != nil {
-		m.reconcileMu.Unlock()
+		releaseLifecycle()
 		return stateErr
 	}
 	if err := m.rejectIfTransitionInProgress(state, instanceID, TransitionFenceUninstall); err != nil {
-		m.reconcileMu.Unlock()
+		releaseLifecycle()
 		return err
 	}
 	capability, selected, err := capabilitySelectedByProvider(state, instanceID)
 	if err != nil {
-		m.reconcileMu.Unlock()
+		releaseLifecycle()
 		return err
 	}
 	if selected && !acknowledged {
-		m.reconcileMu.Unlock()
+		releaseLifecycle()
 		return &CapabilityProviderChangeConfirmationRequiredError{
 			Capability: capability,
 			Current:    instanceID,
@@ -3376,10 +3647,10 @@ func (m *AppManager) uninstall(ctx context.Context, instanceID string, acknowled
 			err = &CapabilitySelectionReconcilePendingError{Cause: reconcileErr}
 		}
 	}
-	m.reconcileMu.Unlock()
+	releaseLifecycle()
 
 	// Recompute slice policies for remaining apps: num_active_elastic may
-	// have changed. Runs outside reconcileMu (systemctl calls).
+	// have changed. Runs outside the lifecycle gate (systemctl calls).
 	if uninstalled {
 		m.ReconcileAllSlicePolicies()
 	}
@@ -3571,8 +3842,11 @@ func (m *AppManager) UpdateImage(ctx context.Context, instanceID string) error {
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -4675,14 +4949,17 @@ func mapsEqual(a, b map[string]string) bool {
 }
 
 // RollbackToSnapshot rolls back an app to its latest snapshot generation (RFC 20260302 Phase 3).
-// This is the exported entry point — acquires reconcileMu.
+// This is the exported entry point — acquires the lifecycle gate.
 func (m *AppManager) RollbackToSnapshot(ctx context.Context, instanceID string) error {
 	defer pressure.BeginLifecycleOwner("app:" + instanceID)()
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return err
@@ -4734,7 +5011,7 @@ func (m *AppManager) HasSnapshotAvailable(ctx context.Context, instanceID string
 	return ts.LatestSnapshot() != nil
 }
 
-// rollbackToSnapshotLocked performs the rollback. Caller holds reconcileMu.
+// rollbackToSnapshotLocked performs the rollback. Caller holds the lifecycle gate.
 func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *FilesystemStateManager, appInst *AppInstance) (err error) {
 	instanceID := appInst.InstanceID
 	m.emitProgress(ctx, taskTypeRollbackApp, instanceID, taskPhaseStopping, 0, "Stopping containers", false, nil)
@@ -4978,8 +5255,11 @@ func (m *AppManager) UpdateListeners(ctx context.Context, instanceID string, lis
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
@@ -5251,8 +5531,6 @@ func listenerCapabilityProvidersEqual(oldListeners, newListeners []api.AppListen
 // Revert is a no-op stub. Legacy revert is superseded by tuple-based rollback
 // (RollbackToSnapshot). Returns an error unconditionally.
 func (m *AppManager) Revert(ctx context.Context, instanceID string) error {
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
 	return m.revertLocked(ctx, instanceID)
 }
 

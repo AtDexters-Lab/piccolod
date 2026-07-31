@@ -40,8 +40,11 @@ func TestDesiredRecoveryAppOwnersUsesDurableEnabledOrderWithoutMutation(t *testi
 
 func TestDesiredRecoveryAppOwnersLockAcquisitionHonorsDeadline(t *testing.T) {
 	mgr, _, _ := newRecoveryOwnerTestManager(t)
-	mgr.reconcileMu.Lock()
-	defer mgr.reconcileMu.Unlock()
+	release, err := mgr.lifecycleGate.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
@@ -52,6 +55,148 @@ func TestDesiredRecoveryAppOwnersLockAcquisitionHonorsDeadline(t *testing.T) {
 	}
 	if elapsed := time.Since(started); elapsed > 250*time.Millisecond {
 		t.Fatalf("deadline-aware lock returned after %s", elapsed)
+	}
+}
+
+func TestLifecycleAdmissionCancelsQueuedRequestButNotAdmittedExecution(t *testing.T) {
+	mgr, _, _ := newRecoveryOwnerTestManager(t)
+	held, err := mgr.lifecycleGate.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	executionCtx, cancelExecution := context.WithTimeout(context.Background(), time.Second)
+	defer cancelExecution()
+	ctx := WithLifecycleAdmissionContext(executionCtx, requestCtx)
+	queued := make(chan error, 1)
+	go func() {
+		_, err := mgr.DesiredRecoveryAppOwners(ctx)
+		queued <- err
+	}()
+	cancelRequest()
+	select {
+	case err := <-queued:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("queued admission error = %v, want context canceled", err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("queued lifecycle admission ignored request cancellation")
+	}
+	held()
+
+	requestCtx, cancelRequest = context.WithCancel(context.Background())
+	ctx = WithLifecycleAdmissionContext(executionCtx, requestCtx)
+	admittedCtx, release, err := mgr.acquireLifecycle(ctx)
+	if err != nil {
+		t.Fatalf("initial admission: %v", err)
+	}
+	cancelRequest()
+	release()
+
+	// Consumption is shared with the original operation context, so both the
+	// admitted child and a compensating operation that reuses the parent's
+	// context no longer follow request cancellation.
+	_, release, err = mgr.acquireLifecycle(admittedCtx)
+	if err != nil {
+		t.Fatalf("post-admission execution inherited request cancellation: %v", err)
+	}
+	release()
+	_, release, err = mgr.acquireLifecycle(ctx)
+	if err != nil {
+		t.Fatalf("compensating acquisition on original operation context inherited request cancellation: %v", err)
+	}
+	release()
+}
+
+func TestLifecycleShutdownFenceJoinsOwnerAndRejectsQueuedAndLateWork(t *testing.T) {
+	mgr, _, _ := newRecoveryOwnerTestManager(t)
+	held, err := mgr.lifecycleGate.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	type result struct {
+		release func()
+		err     error
+	}
+	shutdown := make(chan result, 1)
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		release, err := mgr.lifecycleGate.fenceAndAcquire(ctx)
+		shutdown <- result{release: release, err: err}
+	}()
+
+	deadline := time.Now().Add(time.Second)
+	for !mgr.lifecycleGate.isFenced() {
+		if time.Now().After(deadline) {
+			t.Fatal("shutdown did not fence lifecycle admission")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	held()
+	got := <-shutdown
+	if got.err != nil {
+		t.Fatalf("shutdown join: %v", got.err)
+	}
+	got.release()
+
+	if release, err := mgr.lifecycleGate.acquire(context.Background()); release != nil || !errors.Is(err, errLifecycleAdmissionFenced) {
+		t.Fatalf("late admission = (%v, %v), want fenced", release != nil, err)
+	}
+}
+
+func TestAutomaticReconcileYieldsWhenLifecycleGateBusy(t *testing.T) {
+	mgr, _, _ := newRecoveryOwnerTestManager(t)
+	held, err := mgr.lifecycleGate.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held()
+
+	started := time.Now()
+	mgr.ReconcileOnce(context.Background())
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("automatic reconcile waited %s for busy lifecycle gate", elapsed)
+	}
+}
+
+func TestAutomaticReconcileIntervalStartsAfterPassCompletes(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	firstStarted := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	secondStarted := make(chan time.Time, 1)
+	passCount := 0
+	go runCompletionRelativeReconcileLoop(ctx, 40*time.Millisecond, func(context.Context) {
+		passCount++
+		switch passCount {
+		case 1:
+			close(firstStarted)
+			<-releaseFirst
+		case 2:
+			secondStarted <- time.Now()
+		}
+	})
+
+	select {
+	case <-firstStarted:
+	case <-time.After(time.Second):
+		t.Fatal("first automatic reconcile pass did not start")
+	}
+	time.Sleep(60 * time.Millisecond)
+	firstCompleted := time.Now()
+	close(releaseFirst)
+
+	select {
+	case started := <-secondStarted:
+		if gap := started.Sub(firstCompleted); gap < 25*time.Millisecond {
+			t.Fatalf("next pass started %s after prior completion; interval was measured while pass ran", gap)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("second automatic reconcile pass did not start")
 	}
 }
 
@@ -252,9 +397,12 @@ func TestObserveDesiredAppRecoveryActiveFailsClosedOnLostRuntimeProof(t *testing
 
 	t.Run("busy lifecycle is unknown", func(t *testing.T) {
 		mgr, _ := newActiveOwner(t)
-		mgr.reconcileMu.Lock()
+		release, err := mgr.lifecycleGate.acquire(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
 		active, err := mgr.ObserveDesiredAppRecoveryActive(context.Background(), "alpha")
-		mgr.reconcileMu.Unlock()
+		release()
 		if active || !errors.Is(err, ErrRecoveryObservationUnknown) {
 			t.Fatalf("active=%v err=%v, want false/%v", active, err, ErrRecoveryObservationUnknown)
 		}
@@ -285,7 +433,10 @@ func TestRecoverDesiredAppRechecksCancellationAfterSerializationWait(t *testing.
 	appInst := createRecoveryOwnerRuntime(t, mgr, mock, state, "alpha", false)
 	before := mock.containers[appInst.NetworkAnchorID].Status
 
-	mgr.reconcileMu.Lock()
+	release, err := mgr.lifecycleGate.acquire(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	type outcome struct {
@@ -301,10 +452,10 @@ func TestRecoverDesiredAppRechecksCancellationAfterSerializationWait(t *testing.
 	select {
 	case got = <-done:
 	case <-time.After(250 * time.Millisecond):
-		mgr.reconcileMu.Unlock()
+		release()
 		t.Fatal("deadline-bound recovery did not return while lifecycle lock remained held")
 	}
-	mgr.reconcileMu.Unlock()
+	release()
 	if !errors.Is(got.err, context.DeadlineExceeded) || got.result.Recovered || got.result.ActivePublication {
 		t.Fatalf("serialized cancellation = %+v, err=%v", got.result, got.err)
 	}

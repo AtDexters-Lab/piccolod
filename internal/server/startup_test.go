@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os/user"
 	"testing"
 	"time"
@@ -60,7 +62,9 @@ func TestTaskPressureResumeStopsBeforeAppDrain(t *testing.T) {
 	// then waits for the already-owned reconcile before app DRAIN.
 	srv.stopTaskPressureResumeAdmission()
 	opCancel()
-	srv.waitTaskPressureResume()
+	if err := srv.waitTaskPressureResume(context.Background()); err != nil {
+		t.Fatalf("wait task-pressure resume: %v", err)
+	}
 	select {
 	case <-finished:
 	default:
@@ -73,6 +77,88 @@ func TestTaskPressureResumeStopsBeforeAppDrain(t *testing.T) {
 	case <-late:
 		t.Fatal("task-pressure resume started after shutdown admission closed")
 	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+func TestShutdownOwnerJoinsRunConcurrentlyAndHonorSharedDeadline(t *testing.T) {
+	started := make(chan struct{}, 2)
+	release := make(chan struct{})
+	join := func(context.Context) error {
+		started <- struct{}{}
+		<-release
+		return nil
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- joinShutdownOwners(context.Background(), join, join)
+	}()
+	for range 2 {
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("shutdown owners were joined serially")
+		}
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("join shutdown owners: %v", err)
+	}
+
+	deadlineCtx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	err := joinShutdownOwners(
+		deadlineCtx,
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+		func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("bounded shutdown joins error = %v, want deadline exceeded", err)
+	}
+}
+
+func TestShutdownHTTPServersCanJoinHandlersAfterFenceTimeout(t *testing.T) {
+	handlerStarted := make(chan struct{})
+	releaseHandler := make(chan struct{})
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		close(handlerStarted)
+		<-releaseHandler
+	}))
+	server.Start()
+	t.Cleanup(server.Close)
+
+	requestDone := make(chan error, 1)
+	go func() {
+		_, err := server.Client().Get(server.URL)
+		requestDone <- err
+	}()
+	<-handlerStarted
+
+	fenceCtx, cancelFence := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	err := shutdownHTTPServers(fenceCtx, server.Config)
+	cancelFence()
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("fence shutdown error = %v, want deadline exceeded", err)
+	}
+
+	close(releaseHandler)
+	joinCtx, cancelJoin := context.WithTimeout(context.Background(), time.Second)
+	defer cancelJoin()
+	if err := shutdownHTTPServers(joinCtx, server.Config); err != nil {
+		t.Fatalf("join shutdown handlers: %v", err)
+	}
+	select {
+	case err := <-requestDone:
+		if err != nil {
+			t.Fatalf("request after handler release: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("request did not finish after handler release")
 	}
 }
 

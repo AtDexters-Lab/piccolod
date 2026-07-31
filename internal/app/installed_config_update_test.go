@@ -378,15 +378,18 @@ func TestRefreshInstallSystemContextSerializesLegacyInstallStateWrite(t *testing
 
 	lockAcquired := make(chan struct{})
 	go func() {
-		mgr.reconcileMu.Lock()
-		defer mgr.reconcileMu.Unlock()
+		release, err := mgr.lifecycleGate.acquire(context.Background())
+		if err != nil {
+			return
+		}
+		defer release()
 		close(lockAcquired)
 	}()
 
 	select {
 	case <-lockAcquired:
 		close(releaseWrite)
-		t.Fatalf("legacy install_state write ran outside reconcileMu")
+		t.Fatalf("legacy install_state write ran outside lifecycle gate")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -397,7 +400,7 @@ func TestRefreshInstallSystemContextSerializesLegacyInstallStateWrite(t *testing
 	select {
 	case <-lockAcquired:
 	case <-time.After(time.Second):
-		t.Fatalf("reconcileMu remained locked after refresh-context returned")
+		t.Fatalf("lifecycle gate remained locked after refresh-context returned")
 	}
 }
 

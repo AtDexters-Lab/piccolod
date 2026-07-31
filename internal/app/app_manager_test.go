@@ -43,7 +43,8 @@ func (s *stubLockReader) set(locked bool) {
 }
 
 type stubVolumeManager struct {
-	root string
+	root      string
+	detachErr error
 }
 
 func (s *stubVolumeManager) EnsureVolume(ctx context.Context, req persistence.VolumeRequest) (persistence.VolumeHandle, error) {
@@ -68,7 +69,7 @@ func (s *stubVolumeManager) Attach(ctx context.Context, handle persistence.Volum
 func (s *stubVolumeManager) Detach(ctx context.Context, handle persistence.VolumeHandle) error {
 	_ = ctx
 	_ = handle
-	return nil
+	return s.detachErr
 }
 
 func (s *stubVolumeManager) DestroyVolume(ctx context.Context, id string) error {
@@ -1755,6 +1756,64 @@ func TestAppManager_ReconcileOnceResolvesStaleContainerID(t *testing.T) {
 	}
 	if updated.PrimaryContainerID() != original {
 		t.Fatalf("expected container id to be resolved back to %s, got %s", original, updated.PrimaryContainerID())
+	}
+}
+
+func TestAppManagerStopAllAppsPropagatesScratchDetachFailure(t *testing.T) {
+	detachErr := errors.New("scratch detach unavailable")
+	mgr := &AppManager{
+		volumeManager:   &stubVolumeManager{detachErr: detachErr},
+		scratchHandle:   persistence.VolumeHandle{ID: scratchFlattenVolumeID, MountDir: t.TempDir()},
+		scratchAttached: true,
+	}
+
+	err := mgr.StopAllApps(context.Background())
+	if !errors.Is(err, detachErr) {
+		t.Fatalf("StopAllApps error = %v, want scratch detach failure", err)
+	}
+	if !mgr.scratchAttached {
+		t.Fatal("scratch attachment was cleared after failed detach")
+	}
+}
+
+func TestAppManagerStopAllAppsKeepsScratchAttachedWithoutContainmentProof(t *testing.T) {
+	tempDir := t.TempDir()
+	mock := NewMockContainerManager()
+	mgr, err := NewAppManagerForTest(mock, tempDir)
+	if err != nil {
+		t.Fatalf("NewAppManager: %v", err)
+	}
+	allowHostStorage(t, mgr)
+	mgr.ForceLockState(false)
+
+	def := &api.AppDefinition{
+		WorkspaceName: "demo",
+		Type:          "user",
+		Services: map[string]api.AppService{
+			"main": {Image: "nginx:alpine", BindPorts: []int{}},
+		},
+		Extensions: map[string]interface{}{"mode": "workspace"},
+	}
+	if _, err := mgr.Install(context.Background(), def); err != nil {
+		t.Fatalf("install: %v", err)
+	}
+
+	stopErr := errors.New("podman stop unavailable")
+	proofErr := errors.New("PID 1 proof unavailable")
+	mock.stopError = stopErr
+	mgr.userSessionQuiescer = func(context.Context, string) error { return proofErr }
+	mgr.scratchAttached = true
+	mgr.scratchHandle = persistence.VolumeHandle{
+		ID:       scratchFlattenVolumeID,
+		MountDir: t.TempDir(),
+	}
+
+	err = mgr.StopAllApps(context.Background())
+	if !errors.Is(err, stopErr) || !errors.Is(err, proofErr) {
+		t.Fatalf("StopAllApps error = %v, want stop and containment-proof failures", err)
+	}
+	if !mgr.scratchAttached {
+		t.Fatal("scratch volume detached without app containment proof")
 	}
 }
 

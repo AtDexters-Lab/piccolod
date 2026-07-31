@@ -29,7 +29,9 @@ func (s *GinServer) handleGinAppSyncStatus(c *gin.Context) {
 // POST /api/v1/apps/:name/sync/disable
 func (s *GinServer) handleGinAppSyncDisable(c *gin.Context) {
 	appName := c.Param("name")
-	if err := s.appManager.SetSyncDisabled(c.Request.Context(), appName, true); err != nil {
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	if err := s.appManager.SetSyncDisabled(ctx, appName, true); err != nil {
 		if handleAppManagerError(c, err, "disable sync") {
 			return
 		}
@@ -44,7 +46,9 @@ func (s *GinServer) handleGinAppSyncDisable(c *gin.Context) {
 // POST /api/v1/apps/:name/sync/enable
 func (s *GinServer) handleGinAppSyncEnable(c *gin.Context) {
 	appName := c.Param("name")
-	if err := s.appManager.SetSyncDisabled(c.Request.Context(), appName, false); err != nil {
+	ctx, cancel := s.opContext(c, 30*time.Second)
+	defer cancel()
+	if err := s.appManager.SetSyncDisabled(ctx, appName, false); err != nil {
 		if handleAppManagerError(c, err, "enable sync") {
 			return
 		}

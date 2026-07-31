@@ -925,7 +925,8 @@ func (s *stubTestVolumeManager) IsAttachedAdvisory(ctx context.Context, id strin
 
 // stubTestRootfsManager provides a minimal RootfsVolumeManager for server tests.
 type stubTestRootfsManager struct {
-	root string
+	root   string
+	resize func(context.Context) error
 }
 
 func (s *stubTestRootfsManager) EnsureGoldenLV(_ context.Context, _ persistence.GoldenLVRequest) (string, error) {
@@ -979,11 +980,114 @@ func (s *stubTestRootfsManager) ReadRootfsImageIdentity(volumeID string) (persis
 func (s *stubTestRootfsManager) FindGoldenByImageRef(_ string) (string, string, bool) {
 	return "", "", false
 }
-func (s *stubTestRootfsManager) ResizeWorkspace(_ context.Context, _ string, _ int64) error {
+func (s *stubTestRootfsManager) ResizeWorkspace(ctx context.Context, _ string, _ int64) error {
+	if s.resize != nil {
+		return s.resize(ctx)
+	}
 	return nil
 }
-func (s *stubTestRootfsManager) ResizeApplication(_ context.Context, _ string, _ int64) error {
+func (s *stubTestRootfsManager) ResizeApplication(ctx context.Context, _ string, _ int64) error {
+	if s.resize != nil {
+		return s.resize(ctx)
+	}
 	return nil
+}
+
+func TestResizeStorageHandlerCancelsOnlyBeforeLifecycleAdmission(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	tempDir := t.TempDir()
+	server := createGinTestServer(t, tempDir)
+
+	_, err := server.appManager.Install(context.Background(), &api.AppDefinition{
+		Type: "user",
+		Listeners: []api.AppListener{{
+			Name:      "resizecontext",
+			GuestPort: 80,
+			Flow:      api.FlowTCP,
+			Protocol:  api.ListenerProtocolHTTP,
+			Primary:   true,
+		}},
+		Services: map[string]api.AppService{
+			"main": {Image: "alpine", BindPorts: []int{80}},
+		},
+		Extensions: map[string]interface{}{"mode": "service"},
+	})
+	if err != nil {
+		t.Fatalf("install app: %v", err)
+	}
+
+	resizeStarted := make(chan context.Context, 2)
+	releaseResize := make(chan struct{})
+	server.appManager.SetRootfsManager(&stubTestRootfsManager{
+		root: tempDir,
+		resize: func(ctx context.Context) error {
+			resizeStarted <- ctx
+			select {
+			case <-releaseResize:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+
+	invoke := func(requestCtx context.Context) (*httptest.ResponseRecorder, <-chan struct{}) {
+		recorder := httptest.NewRecorder()
+		ginCtx, _ := gin.CreateTestContext(recorder)
+		ginCtx.Params = gin.Params{{Key: "name", Value: "resizecontext"}}
+		req := httptest.NewRequest(
+			http.MethodPost,
+			"/api/v1/apps/resizecontext/resize-storage",
+			strings.NewReader(`{"size_bytes":4096}`),
+		).WithContext(requestCtx)
+		req.Header.Set("Content-Type", "application/json")
+		ginCtx.Request = req
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			server.handleAppResizeStorage(ginCtx)
+		}()
+		return recorder, done
+	}
+
+	firstRequestCtx, cancelFirstRequest := context.WithCancel(context.Background())
+	firstRecorder, firstDone := invoke(firstRequestCtx)
+	admittedCtx := <-resizeStarted
+
+	secondRequestCtx, cancelSecondRequest := context.WithCancel(context.Background())
+	_, secondDone := invoke(secondRequestCtx)
+	select {
+	case <-secondDone:
+		t.Fatal("second resize completed while lifecycle admission was occupied")
+	case <-time.After(20 * time.Millisecond):
+	}
+	cancelSecondRequest()
+	select {
+	case <-secondDone:
+	case <-time.After(time.Second):
+		t.Fatal("queued resize ignored request cancellation")
+	}
+	select {
+	case <-resizeStarted:
+		t.Fatal("canceled queued resize reached the storage mutation")
+	default:
+	}
+
+	cancelFirstRequest()
+	select {
+	case <-admittedCtx.Done():
+		t.Fatalf("admitted resize inherited request cancellation: %v", admittedCtx.Err())
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(releaseResize)
+	select {
+	case <-firstDone:
+	case <-time.After(time.Second):
+		t.Fatal("admitted resize did not finish after storage release")
+	}
+	if firstRecorder.Code != http.StatusOK {
+		t.Fatalf("admitted resize status = %d, want %d; body=%s", firstRecorder.Code, http.StatusOK, firstRecorder.Body.String())
+	}
 }
 
 func TestInstallInstanceIDForDefinition(t *testing.T) {
@@ -1152,15 +1256,54 @@ func TestEnsureProxyOIDCClientBeforeInstall_RequiresOIDCManager(t *testing.T) {
 	}
 }
 
+func TestOIDCConvergenceContextOutlivesExpiredOperationAndRemainsBounded(t *testing.T) {
+	srv := &GinServer{}
+	operationCtx, cancelOperation := context.WithCancel(
+		app.WithTaskID(context.Background(), "oidc-tail"),
+	)
+	cancelOperation()
+
+	ctx, cancel := srv.oidcConvergenceContext(operationCtx)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("fresh convergence context inherited operation cancellation: %v", err)
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		t.Fatal("convergence context has no deadline")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > oidcConvergenceTimeout {
+		t.Fatalf("convergence deadline remaining = %s, want within (0, %s]", remaining, oidcConvergenceTimeout)
+	}
+	if got := app.TaskIDFromContext(ctx); got != "oidc-tail" {
+		t.Fatalf("task ID = %q, want oidc-tail", got)
+	}
+}
+
+func TestDeleteProxyOIDCClientReportsLookupFailure(t *testing.T) {
+	repo := newMemoryOIDCClientRepo()
+	repo.getErr = context.DeadlineExceeded
+	srv := &GinServer{
+		persistence: &testOIDCPersistence{
+			control: &testOIDCControl{oidcClients: repo},
+		},
+	}
+
+	err := srv.deleteProxyOIDCClient(context.Background(), "piclu")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("deleteProxyOIDCClient error = %v, want deadline exceeded", err)
+	}
+}
+
 func TestGinAppInstall_CleansPrecreatedProxyOIDCClientWhenAppOIDCPersistFails(t *testing.T) {
 	srv := createGinTestServer(t, t.TempDir())
-	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
-
 	repo := newMemoryOIDCClientRepo()
 	repo.failAppClientCreate = true
 	srv.persistence = &testOIDCPersistence{
 		control: &testOIDCControl{oidcClients: repo},
 	}
+	sessionCookie, csrfToken := setupTestAdminSession(t, srv)
 
 	payload := `{
 		"app_definition": "type: user\nlisteners:\n  - name: __primary\n    guest_port: 80\n    flow: tcp\n    protocol: http\n    auth:\n      rules:\n        - path: \"/\"\n          type: prefix\n          strategy: protected\nservices:\n  main:\n    image: docker.io/library/nginx:alpine\n    bind_ports: [80]\n    oidc_client:\n      redirect_uri_paths:\n        - /callback\n      ca_mount_path: /etc/ssl/certs/piccolo-internal-ca.crt\n      env:\n        ISSUER_URL: \"{{ .System.Auth.Issuer }}\"\n        CLIENT_ID: \"{{ .System.Auth.ClientID }}\"\n        CLIENT_SECRET: \"{{ .System.Auth.ClientSecret }}\"\nx-piccolo:\n  mode: service\n",
@@ -1181,6 +1324,12 @@ func TestGinAppInstall_CleansPrecreatedProxyOIDCClientWhenAppOIDCPersistFails(t 
 	if _, err := repo.Get(context.Background(), "piccolo-rollbackoidc-proxy"); !errors.Is(err, persistence.ErrNotFound) {
 		t.Fatalf("proxy OIDC client after rollback err=%v, want ErrNotFound", err)
 	}
+	if repo.deleteContext == nil {
+		t.Fatal("proxy OIDC cleanup did not reach the repository")
+	}
+	if _, ok := repo.deleteContext.Deadline(); !ok {
+		t.Fatal("proxy OIDC cleanup did not retain the install operation deadline")
+	}
 	if _, err := srv.appManager.Get(context.Background(), "rollbackoidc"); err == nil {
 		t.Fatalf("expected app rollback to uninstall rollbackoidc")
 	}
@@ -1189,6 +1338,8 @@ func TestGinAppInstall_CleansPrecreatedProxyOIDCClientWhenAppOIDCPersistFails(t 
 type memoryOIDCClientRepo struct {
 	clients             map[string]persistence.OIDCClient
 	failAppClientCreate bool
+	getErr              error
+	deleteContext       context.Context
 }
 
 func newMemoryOIDCClientRepo() *memoryOIDCClientRepo {
@@ -1210,6 +1361,9 @@ func (r *memoryOIDCClientRepo) Create(_ context.Context, client persistence.OIDC
 }
 
 func (r *memoryOIDCClientRepo) Get(_ context.Context, clientID string) (persistence.OIDCClient, error) {
+	if r.getErr != nil {
+		return persistence.OIDCClient{}, r.getErr
+	}
 	client, ok := r.clients[clientID]
 	if !ok {
 		return persistence.OIDCClient{}, persistence.ErrNotFound
@@ -1226,7 +1380,8 @@ func (r *memoryOIDCClientRepo) GetByAppID(_ context.Context, appID string) (pers
 	return persistence.OIDCClient{}, persistence.ErrNotFound
 }
 
-func (r *memoryOIDCClientRepo) Delete(_ context.Context, clientID string) error {
+func (r *memoryOIDCClientRepo) Delete(ctx context.Context, clientID string) error {
+	r.deleteContext = ctx
 	if _, ok := r.clients[clientID]; !ok {
 		return persistence.ErrNotFound
 	}

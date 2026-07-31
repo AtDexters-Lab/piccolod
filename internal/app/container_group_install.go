@@ -385,6 +385,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	cleanup := func() (bool, error) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), cleanupBudget)
 		defer cancel()
+		cleanupCtx = container.WithLifecycleRuntimeControl(cleanupCtx)
 
 		candidate := &AppInstance{
 			InstanceID:      instanceID,

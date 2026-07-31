@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,142 @@ func TestPodmanCmdRejectsBeforeConstructionWhenTaskFenced(t *testing.T) {
 	cmd, err := podmanCmd(context.Background(), PodmanRuntime{}, "ps")
 	if cmd != nil || !pressure.IsAdmissionError(err) {
 		t.Fatalf("podmanCmd = (%v, %v), want nil typed admission error", cmd, err)
+	}
+}
+
+func TestLifecycleRuntimeControlTimeoutKillsProcessGroupAndReaps(t *testing.T) {
+	binDir := t.TempDir()
+	pidFile := filepath.Join(t.TempDir(), "child.pid")
+	script := "#!/bin/sh\n" +
+		"sleep 30 &\n" +
+		"child=$!\n" +
+		"echo \"$child\" > \"" + pidFile + "\"\n" +
+		"wait \"$child\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "podman"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+
+	ctx := withLifecycleRuntimeControlLimit(context.Background(), 75*time.Millisecond)
+	started := time.Now()
+	err := (&PodmanCLI{}).StopContainer(ctx, PodmanRuntime{}, strings.Repeat("a", 64))
+	var timeoutErr *runtimeCommandTimeoutError
+	if !errors.As(err, &timeoutErr) {
+		t.Fatalf("StopContainer error = %v, want runtimeCommandTimeoutError", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("bounded runtime control returned after %s", elapsed)
+	}
+
+	raw, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read child pid: %v", err)
+	}
+	childPID, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil {
+		t.Fatalf("parse child pid: %v", err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for {
+		signalErr := syscall.Kill(childPID, 0)
+		if errors.Is(signalErr, syscall.ESRCH) || processIsZombieForTest(childPID) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("runtime-control descendant %d survived process-group timeout: %v", childPID, signalErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func processIsZombieForTest(pid int) bool {
+	raw, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return false
+	}
+	fields := strings.Fields(string(raw))
+	return len(fields) >= 3 && fields[2] == "Z"
+}
+
+func TestLifecycleRuntimeControlPreCanceledContextNeverStartsCommand(t *testing.T) {
+	binDir := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "started")
+	script := "#!/bin/sh\n" +
+		"touch \"" + marker + "\"\n"
+	if err := os.WriteFile(filepath.Join(binDir, "podman"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	ctx := withLifecycleRuntimeControlLimit(canceled, time.Second)
+	err := (&PodmanCLI{}).StopContainer(ctx, PodmanRuntime{}, strings.Repeat("c", 64))
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("StopContainer error = %v, want context canceled", err)
+	}
+	if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("pre-canceled runtime command started; marker stat error = %v", statErr)
+	}
+}
+
+func TestLifecycleRuntimeControlUsesCallerDeadlineAndDoesNotShortenPull(t *testing.T) {
+	binDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(binDir, "podman"), []byte("#!/bin/sh\nsleep 30\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+
+	parent, cancel := context.WithTimeout(context.Background(), 40*time.Millisecond)
+	ctx := withLifecycleRuntimeControlLimit(parent, time.Second)
+	err := (&PodmanCLI{}).StopContainer(ctx, PodmanRuntime{}, strings.Repeat("b", 64))
+	cancel()
+	var timeoutErr *runtimeCommandTimeoutError
+	if !errors.As(err, &timeoutErr) || timeoutErr.Limit >= time.Second {
+		t.Fatalf("StopContainer error = %v, limit=%v; want caller-bounded timeout", err, timeoutErr)
+	}
+
+	if err := os.WriteFile(filepath.Join(binDir, "podman"), []byte("#!/bin/sh\nsleep 0.08\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	transferCtx, cancelTransfer := context.WithTimeout(context.Background(), time.Second)
+	defer cancelTransfer()
+	transferCtx = withLifecycleRuntimeControlLimit(transferCtx, 20*time.Millisecond)
+	if err := (&PodmanCLI{}).PullImage(transferCtx, PodmanRuntime{}, "example.test/image:latest"); err != nil {
+		t.Fatalf("PullImage inherited runtime-control cap: %v", err)
+	}
+}
+
+func TestLifecycleRuntimeControlIntegrityFailuresStayFailClosed(t *testing.T) {
+	binDir := t.TempDir()
+	script := "#!/bin/sh\n" +
+		"case \" $* \" in\n" +
+		"  *\" stop \"*) echo 'no such container' >&2 ;;\n" +
+		"  *) echo 'ignorable reset-looking failure' >&2 ;;\n" +
+		"esac\n" +
+		"sleep 30\n"
+	if err := os.WriteFile(filepath.Join(binDir, "podman"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", binDir+":"+os.Getenv("PATH"))
+	t.Setenv("PICCOLO_ALLOW_UNMOUNTED_TESTS", "1")
+
+	stopCtx := withLifecycleRuntimeControlLimit(context.Background(), 50*time.Millisecond)
+	stopErr := (&PodmanCLI{}).StopContainer(stopCtx, PodmanRuntime{}, strings.Repeat("d", 64))
+	var timeoutErr *runtimeCommandTimeoutError
+	var notFoundErr *ContainerNotFoundError
+	if !errors.As(stopErr, &timeoutErr) || errors.As(stopErr, &notFoundErr) {
+		t.Fatalf("StopContainer error = %v, want timeout and not benign not-found", stopErr)
+	}
+
+	resetCtx := withLifecycleRuntimeControlLimit(context.Background(), 50*time.Millisecond)
+	resetErr := (&PodmanCLI{}).ResetStorage(resetCtx, PodmanRuntime{})
+	timeoutErr = nil
+	if !errors.As(resetErr, &timeoutErr) {
+		t.Fatalf("ResetStorage error = %v, want non-ignorable timeout", resetErr)
 	}
 }
 

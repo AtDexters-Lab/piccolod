@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"log"
 
 	"piccolod/internal/api"
 	"piccolod/internal/app"
@@ -97,5 +98,7 @@ func (h catalogSyncHost) DeleteProxyOIDCClient(ctx context.Context, instanceID s
 	if h.server == nil {
 		return
 	}
-	h.server.deleteProxyOIDCClient(ctx, instanceID)
+	if err := h.server.deleteProxyOIDCClient(ctx, instanceID); err != nil {
+		log.Printf("WARN: delete proxy OIDC client for %s after catalog sync: %v", instanceID, err)
+	}
 }

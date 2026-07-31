@@ -1214,6 +1214,7 @@ func (m *AppManager) compensateUncommittedContainerGroup(
 		cleanupBudget,
 	)
 	defer cancel()
+	cleanupCtx = container.WithLifecycleRuntimeControl(cleanupCtx)
 
 	// Mount ownership cannot be withdrawn until every candidate process is
 	// authoritatively absent. Accelerator permission belongs to the selected app

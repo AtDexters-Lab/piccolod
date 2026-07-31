@@ -86,7 +86,7 @@ service: ## Build and install/update piccolod systemd service
 	@echo "==> Generating systemd service file (PORT=$(RUN_PORT))..."
 	@echo '[Unit]' > piccolod.service
 	@echo 'Description=Piccolo Daemon' >> piccolod.service
-	@echo 'After=network.target' >> piccolod.service
+	@echo 'After=network.target local-fs.target blk-availability.service' >> piccolod.service
 	@echo 'StartLimitIntervalSec=900' >> piccolod.service
 	@echo 'StartLimitBurst=3' >> piccolod.service
 	@echo 'OnFailure=piccolod-start-limit-recovery.service' >> piccolod.service
@@ -104,7 +104,7 @@ service: ## Build and install/update piccolod systemd service
 	@echo 'RestartSec=5' >> piccolod.service
 	@echo 'TasksMax=15%' >> piccolod.service
 	@echo 'WatchdogSec=60s' >> piccolod.service
-	@echo 'TimeoutStopSec=120' >> piccolod.service
+	@echo 'TimeoutStopSec=210' >> piccolod.service
 	@echo 'KillMode=mixed' >> piccolod.service
 	@echo 'OOMScoreAdjust=-500' >> piccolod.service
 	@echo '' >> piccolod.service

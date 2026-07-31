@@ -7,12 +7,9 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	"piccolod/internal/resources/pressure"
 )
-
-const recoveryReconcileLockRetryInterval = 10 * time.Millisecond
 
 var (
 	// ErrRecoveryDeadlineRequired prevents an automatic recovery owner from
@@ -77,10 +74,11 @@ func (m *AppManager) ObserveDesiredAppRecoveryActive(ctx context.Context, instan
 	if instanceID == "" {
 		return false, fmt.Errorf("%w: empty instance id", ErrRecoveryAppNotDesired)
 	}
-	if !m.reconcileMu.TryLock() {
+	ctx, releaseLifecycle, admitted := m.tryAcquireLifecycle(ctx)
+	if !admitted {
 		return false, fmt.Errorf("%w: app lifecycle is busy", ErrRecoveryObservationUnknown)
 	}
-	defer m.reconcileMu.Unlock()
+	defer releaseLifecycle()
 
 	if err := m.ensureUnlocked(); err != nil {
 		return false, err
@@ -124,10 +122,11 @@ func (m *AppManager) DesiredRecoveryAppOwners(ctx context.Context) ([]DesiredApp
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := m.lockRecoveryReconcile(ctx); err != nil {
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
 		return nil, err
 	}
-	defer m.reconcileMu.Unlock()
+	defer releaseLifecycle()
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -159,26 +158,6 @@ func (m *AppManager) DesiredRecoveryAppOwners(ctx context.Context) ([]DesiredApp
 	return owners, nil
 }
 
-// lockRecoveryReconcile lets bounded recovery discovery abandon lifecycle
-// serialization when its caller deadline expires. Ordinary lifecycle methods
-// retain their existing blocking lock semantics.
-func (m *AppManager) lockRecoveryReconcile(ctx context.Context) error {
-	for {
-		if m.reconcileMu.TryLock() {
-			return nil
-		}
-		timer := time.NewTimer(recoveryReconcileLockRetryInterval)
-		select {
-		case <-ctx.Done():
-			if !timer.Stop() {
-				<-timer.C
-			}
-			return ctx.Err()
-		case <-timer.C:
-		}
-	}
-}
-
 // RecoverDesiredApp performs exactly one app owner's startup recovery under
 // the existing lifecycle serialization and admission policy. It does not scan
 // or reconcile any other app. The caller supplies a fresh finite context for
@@ -200,10 +179,11 @@ func (m *AppManager) RecoverDesiredApp(ctx context.Context, instanceID string) (
 
 	releaseOwner := pressure.BeginLifecycleOwner("app:" + result.InstanceID)
 	defer releaseOwner()
-	if err := m.lockRecoveryReconcile(ctx); err != nil {
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
 		return result, err
 	}
-	defer m.reconcileMu.Unlock()
+	defer releaseLifecycle()
 	if err := ctx.Err(); err != nil {
 		return result, err
 	}

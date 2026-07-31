@@ -73,8 +73,10 @@ import (
 )
 
 const (
-	acmeHTTPFallbackPort  = services.ACMEHTTPFallbackPort
-	maxStaticAssetPathLen = 4 * 1024 // guard against path-based DoS
+	acmeHTTPFallbackPort    = services.ACMEHTTPFallbackPort
+	maxStaticAssetPathLen   = 4 * 1024 // guard against path-based DoS
+	shutdownPreDrainTimeout = 60 * time.Second
+	shutdownAppDrainTimeout = 60 * time.Second
 )
 
 var errInvalidStaticPath = errors.New("invalid static asset path")
@@ -359,14 +361,71 @@ func (s *GinServer) stopTaskPressureResumeAdmission() {
 	s.taskResumeMu.Unlock()
 }
 
-func (s *GinServer) waitTaskPressureResume() {
-	s.taskResumeWG.Wait()
+func (s *GinServer) waitTaskPressureResume(ctx context.Context) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	done := make(chan struct{})
+	go func() {
+		s.taskResumeWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("join task-pressure reconciliation: %w", ctx.Err())
+	}
+}
+
+func joinShutdownOwners(ctx context.Context, joins ...func(context.Context) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	results := make(chan error, len(joins))
+	for _, join := range joins {
+		join := join
+		go func() {
+			results <- join(ctx)
+		}()
+	}
+
+	var errs []error
+	for range joins {
+		select {
+		case err := <-results:
+			if err != nil {
+				errs = append(errs, err)
+			}
+		case <-ctx.Done():
+			return errors.Join(append(errs, ctx.Err())...)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func shutdownHTTPServers(ctx context.Context, servers ...*http.Server) error {
+	joins := make([]func(context.Context) error, 0, len(servers))
+	for _, server := range servers {
+		if server == nil {
+			continue
+		}
+		server := server
+		joins = append(joins, func(ctx context.Context) error {
+			if err := server.Shutdown(ctx); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				return err
+			}
+			return nil
+		})
+	}
+	return joinShutdownOwners(ctx, joins...)
 }
 
 // opContext returns a context for state-mutating operations that survives HTTP
 // disconnections but respects server shutdown. Callers must defer the cancel func.
 func (s *GinServer) opContext(c *gin.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithTimeout(s.serverContext(), timeout)
+	ctx = app.WithLifecycleAdmissionContext(ctx, c.Request.Context())
 	if taskID := c.GetHeader("X-Piccolo-Task-ID"); taskID != "" {
 		ctx = app.WithTaskID(ctx, taskID)
 	}
@@ -2506,15 +2565,16 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// ── Phase 1: FENCE (5s) ─────────────────────────────────────────────
 	// Close all listeners to stop accepting new connections and drain in-flight requests.
 	log.Printf("INFO: Phase 1/3: FENCE — closing listeners")
+	httpServers := []*http.Server{s.httpSrv, s.secureSrv, s.internalSrv}
 	fenceCtx, fenceCancel := context.WithTimeout(ctx, 5*time.Second)
 	defer fenceCancel()
-	if s.httpSrv != nil {
-		if err := s.httpSrv.Shutdown(fenceCtx); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Printf("WARN: HTTP server shutdown: %v", err)
-		}
+	if err := shutdownHTTPServers(fenceCtx, httpServers...); err != nil {
+		log.Printf("WARN: HTTP server fence drain: %v", err)
 	}
-	s.stopSecureLoopback(fenceCtx)
-	s.stopInternalHTTPSListener(fenceCtx)
+	s.secureSrv = nil
+	s.secureListener = nil
+	s.securePort.Store(0)
+	s.internalSrv = nil
 	if s.certRefreshUnsub != nil {
 		s.certRefreshUnsub()
 		s.certRefreshUnsub = nil
@@ -2523,18 +2583,30 @@ func (s *GinServer) Stop(ctx context.Context) error {
 
 	// Cancel in-flight mutating handlers (using opContext). Placed after FENCE
 	// so handlers get the 5s drain window to complete naturally. Any handler
-	// still holding reconcileMu is force-canceled here, releasing the lock
-	// before DRAIN's StopAllApps needs it.
+	// still owning lifecycle work is force-canceled here so DRAIN can join it.
 	if s.opCancel != nil {
 		s.opCancel()
 	}
-	if err := s.cancelAndJoinRootfsMaintenance(ctx); err != nil {
-		return err
+	if s.appManager != nil {
+		s.appManager.FenceAndCancelBackground()
 	}
-	// An OnNormal callback may already own reconciliation. Its context is now
-	// canceled; wait for that owner to release before StopAllApps starts
-	// stopping containers and detaching their volumes.
-	s.waitTaskPressureResume()
+
+	// Rootfs maintenance and task-pressure resume are independent owners.
+	// Cancel and join both under one pre-drain budget instead of spending the
+	// same shutdown allowance serially.
+	preDrainCtx, preDrainCancel := context.WithTimeout(ctx, shutdownPreDrainTimeout)
+	preDrainErr := joinShutdownOwners(
+		preDrainCtx,
+		func(ctx context.Context) error {
+			return shutdownHTTPServers(ctx, httpServers...)
+		},
+		s.cancelAndJoinRootfsMaintenance,
+		s.waitTaskPressureResume,
+	)
+	preDrainCancel()
+	if preDrainErr != nil {
+		return fmt.Errorf("join pre-drain background owners: %w", preDrainErr)
+	}
 
 	// Stop the keyslot reconciler with a bounded budget. Per RFC D7 the
 	// kill+add pair runs under context.WithoutCancel so an in-flight
@@ -2550,13 +2622,18 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	// ── Phase 2: DRAIN (60s) ────────────────────────────────────────────
 	// Stop app event observers, reconciliation, containers, and detach app volumes.
 	log.Printf("INFO: Phase 2/3: DRAIN — stopping apps and background work")
-	drainCtx, drainCancel := context.WithTimeout(ctx, 60*time.Second)
+	drainCtx, drainCancel := context.WithTimeout(ctx, shutdownAppDrainTimeout)
 	defer drainCancel()
 	if s.appManager != nil {
-		s.appManager.StopRuntimeEvents()
-		if err := s.appManager.StopAllApps(drainCtx); err != nil {
-			log.Printf("WARN: Failed to stop all apps cleanly: %v", err)
+		if err := s.appManager.StopRuntimeEventsContext(drainCtx); err != nil {
+			return fmt.Errorf("drain app runtime event work: %w", err)
 		}
+		if err := s.appManager.StopAllApps(drainCtx); err != nil {
+			return fmt.Errorf("drain apps before persistence shutdown: %w", err)
+		}
+	}
+	if err := drainCtx.Err(); err != nil {
+		return fmt.Errorf("app drain deadline: %w", err)
 	}
 	s.oidcProviderMu.Lock()
 	if s.oidcProvider != nil {
@@ -2573,7 +2650,7 @@ func (s *GinServer) Stop(ctx context.Context) error {
 	}
 	if s.persistence != nil {
 		if err := s.persistence.Shutdown(ctx); err != nil {
-			log.Printf("WARN: Failed to shutdown persistence cleanly: %v", err)
+			return fmt.Errorf("shutdown persistence: %w", err)
 		}
 	}
 	// Close TPM device (identity service does NOT own TPM lifecycle)
@@ -4303,22 +4380,38 @@ func (s *GinServer) requiresProxyOIDCClient(appDef *api.AppDefinition) bool {
 // obtained (e.g. control store still locked during boot).
 var errOIDCManagerUnavailable = errors.New("OIDC client manager unavailable")
 
+const oidcConvergenceTimeout = 10 * time.Second
+
+// oidcConvergenceContext gives post-mutation OIDC work a fresh finite budget
+// after the main app operation has committed. It remains server-owned so
+// shutdown can cancel it, and it preserves task correlation when present.
+func (s *GinServer) oidcConvergenceContext(operationCtx context.Context) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(s.serverContext(), oidcConvergenceTimeout)
+	if taskID := app.TaskIDFromContext(operationCtx); taskID != "" {
+		ctx = app.WithTaskID(ctx, taskID)
+	}
+	return ctx, cancel
+}
+
 // deleteProxyOIDCClient removes the proxy OIDC client for an app if one exists.
 // Used when listener auth rules change such that a proxy client is no longer needed.
-func (s *GinServer) deleteProxyOIDCClient(ctx context.Context, appName string) {
+func (s *GinServer) deleteProxyOIDCClient(ctx context.Context, appName string) error {
 	clientMgr := s.getOIDCClientManager()
 	if clientMgr == nil {
-		return
+		return errOIDCManagerUnavailable
 	}
 	client, err := clientMgr.GetProxyClientByAppName(ctx, appName)
 	if err != nil {
-		return // no proxy client exists — nothing to clean up
+		if errors.Is(err, persistence.ErrNotFound) {
+			return nil
+		}
+		return fmt.Errorf("look up proxy client for %s: %w", appName, err)
 	}
 	if err := clientMgr.DeleteClient(ctx, client.ID); err != nil {
-		log.Printf("WARN: failed to delete stale proxy OIDC client for %s: %v", appName, err)
-	} else {
-		log.Printf("INFO: deleted proxy OIDC client for app %s (auth no longer required)", appName)
+		return fmt.Errorf("delete proxy client for %s: %w", appName, err)
 	}
+	log.Printf("INFO: deleted proxy OIDC client for app %s (auth no longer required)", appName)
+	return nil
 }
 
 // registerProxyOIDCClient registers a proxy OIDC client for an app per RFC 20260122 §5.3.

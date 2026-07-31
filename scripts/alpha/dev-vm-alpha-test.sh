@@ -1921,6 +1921,10 @@ print(json.dumps({
     "systemctl show piccolod.service -p RestartUSec" "RestartUSec=5s"
   check_ssh "21.3d" "Piccolod preserves graceful helper dependencies before final cgroup cleanup" \
     "systemctl show piccolod.service -p KillMode" "KillMode=mixed"
+  check_ssh_ok "21.3d1" "Piccolod shutdown precedes local-filesystem and block-storage teardown" \
+    "after=\$(systemctl show piccolod.service -p After --value); printf '%s\n' \"\$after\" | grep -Eq '(^| )local-fs\\.target( |$)' && printf '%s\n' \"\$after\" | grep -Eq '(^| )blk-availability\\.service( |$)'"
+  check_ssh_ok "21.3d2" "Effective Piccolod shutdown allowance is 210 seconds" \
+    "systemctl show piccolod.service -p TimeoutStopUSec --value | grep -Eq '^(3min 30s|210s|210000000us)$'"
   check_ssh "21.3e" "Piccolod repeated-start window is bounded" \
     "systemctl cat piccolod.service --no-pager" "StartLimitIntervalSec=900"
   check_ssh_ok "21.3e1" "Effective Piccolod repeated-start window is fifteen minutes" \

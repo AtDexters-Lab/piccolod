@@ -125,14 +125,16 @@ Replace direct use of `sync.Mutex` with a capacity-one gate exposing
 context-aware acquire, non-blocking try-acquire, and release. Every current
 `reconcileMu` owner migrates to that gate; global serialization is unchanged.
 
-An HTTP mutation supplies a cancellable request context for gate admission.
-After admission, each operation keeps its existing execution-context contract;
-this plan does not change the post-admission cancellation semantics of
-non-uninstall mutations.
+An HTTP mutation supplies its request context only for gate admission. A
+disconnect cancels the mutation while it is queued. Once admitted, the gate
+consumes that request-cancellation marker and the operation, including bounded
+compensation and tail work, continues under finite server-owned contexts.
+Operation deadlines and server shutdown still cancel that work. This contract
+applies uniformly to uninstall and non-uninstall mutations.
 
-For uninstall, once durable intent is stored, request cancellation can stop
-the current finite attempt but cannot cancel the operation. The existing
-transition reconciler retries it later.
+For uninstall, once durable intent is stored, an operation deadline or server
+shutdown can stop the current finite attempt but cannot cancel the durable
+operation. The existing transition reconciler retries it later.
 
 Automatic reconciliation uses a timer measured from completion of the prior
 pass, not a catch-up ticker. A failed transition attempt releases the gate and

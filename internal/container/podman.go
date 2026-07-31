@@ -23,6 +23,7 @@ import (
 	"github.com/acarl005/stripansi"
 	"github.com/creack/pty"
 	distref "github.com/distribution/reference"
+	"golang.org/x/sys/unix"
 
 	"piccolod/internal/resources/pressure"
 )
@@ -38,6 +39,28 @@ type ContainerNotFoundError struct {
 type InvalidOutputError struct {
 	Operation string
 }
+
+type runtimeCommandTimeoutError struct {
+	Operation string
+	Limit     time.Duration
+}
+
+func (e *runtimeCommandTimeoutError) Error() string {
+	return fmt.Sprintf("podman %s timed out after %s", e.Operation, e.Limit)
+}
+
+func (e *runtimeCommandTimeoutError) Unwrap() error { return context.DeadlineExceeded }
+func (e *runtimeCommandTimeoutError) Timeout() bool { return true }
+
+type runtimeCommandContainmentError struct {
+	SignalErr error
+}
+
+func (e *runtimeCommandContainmentError) Error() string {
+	return fmt.Sprintf("runtime command containment failed: signal process group: %v", e.SignalErr)
+}
+
+func (e *runtimeCommandContainmentError) Unwrap() error { return e.SignalErr }
 
 func (e *InvalidOutputError) Error() string {
 	return fmt.Sprintf("podman %s returned invalid output", e.Operation)
@@ -208,7 +231,32 @@ var portInUseRe = regexp.MustCompile(`:(\d+): bind: address already in use`)
 const (
 	podmanWaitDelay        = 5 * time.Second
 	pullReaderDrainTimeout = 2 * time.Second
+	runtimeControlMax      = 45 * time.Second
 )
+
+type lifecycleRuntimeControlKey struct{}
+
+// WithLifecycleRuntimeControl marks contexts that execute while Piccolod owns
+// the global app-lifecycle gate. Observation/control commands receive a local
+// hard bound; transfer and materialization commands keep their own budgets.
+func WithLifecycleRuntimeControl(ctx context.Context) context.Context {
+	return withLifecycleRuntimeControlLimit(ctx, runtimeControlMax)
+}
+
+func withLifecycleRuntimeControlLimit(ctx context.Context, limit time.Duration) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, lifecycleRuntimeControlKey{}, limit)
+}
+
+func lifecycleRuntimeControlLimit(ctx context.Context) (time.Duration, bool) {
+	if ctx == nil {
+		return 0, false
+	}
+	limit, ok := ctx.Value(lifecycleRuntimeControlKey{}).(time.Duration)
+	return limit, ok && limit > 0
+}
 
 func drainPullProgressReader(
 	reader io.Closer,
@@ -267,6 +315,133 @@ func podmanCmd(ctx context.Context, rt PodmanRuntime, args ...string) (*exec.Cmd
 	return cmd, nil
 }
 
+const pidfdSignalProcessGroupFlag = 1 << 2
+
+var pidfdSendSignal = unix.PidfdSendSignal
+
+func signalCommandProcessGroup(process *os.Process) error {
+	if process == nil {
+		return os.ErrProcessDone
+	}
+	var signalErr error
+	err := process.WithHandle(func(handle uintptr) {
+		signalErr = pidfdSendSignal(int(handle), unix.SIGKILL, nil, pidfdSignalProcessGroupFlag)
+	})
+	if err != nil {
+		return err
+	}
+	if errors.Is(signalErr, unix.ESRCH) {
+		return os.ErrProcessDone
+	}
+	return signalErr
+}
+
+func isPodmanCommandIntegrityFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+	var timeoutErr *runtimeCommandTimeoutError
+	var containmentErr *runtimeCommandContainmentError
+	if errors.As(err, &timeoutErr) ||
+		errors.As(err, &containmentErr) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var exitErr *exec.ExitError
+	return !errors.As(err, &exitErr)
+}
+
+func runPodmanControl(ctx context.Context, rt PodmanRuntime, subcmdArgs []string) ([]byte, error) {
+	return runPodmanControlOutput(ctx, rt, subcmdArgs, false)
+}
+
+func runPodmanControlOutput(ctx context.Context, rt PodmanRuntime, subcmdArgs []string, combined bool) ([]byte, error) {
+	if len(subcmdArgs) == 0 {
+		return nil, errors.New("runPodmanControl: no subcommand provided")
+	}
+	limit, bounded := lifecycleRuntimeControlLimit(ctx)
+	args, err := BuildPodmanArgs(rt, subcmdArgs)
+	if err != nil {
+		return nil, err
+	}
+	operation := subcmdArgs[0]
+	if len(subcmdArgs) >= 2 && !strings.HasPrefix(subcmdArgs[1], "-") {
+		operation += " " + subcmdArgs[1]
+	}
+	runCtx := ctx
+	cancel := func() {}
+	if bounded {
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining := time.Until(deadline)
+			if remaining < limit {
+				limit = remaining
+			}
+		}
+		if limit <= 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			return nil, context.DeadlineExceeded
+		}
+		runCtx, cancel = context.WithTimeout(ctx, limit)
+	}
+	defer cancel()
+	if err := runCtx.Err(); err != nil {
+		return nil, err
+	}
+	cmd, err := podmanCmd(runCtx, rt, args...)
+	if err != nil {
+		return nil, err
+	}
+
+	var cancelMu sync.Mutex
+	var groupSignalErr error
+	if bounded {
+		if cmd.SysProcAttr == nil {
+			cmd.SysProcAttr = &syscall.SysProcAttr{}
+		}
+		cmd.SysProcAttr.Setpgid = true
+		cmd.Cancel = func() error {
+			err := signalCommandProcessGroup(cmd.Process)
+			cancelMu.Lock()
+			groupSignalErr = err
+			cancelMu.Unlock()
+			return err
+		}
+	}
+
+	var output []byte
+	if combined {
+		output, err = cmd.CombinedOutput()
+	} else {
+		output, err = cmd.Output()
+		if err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				output = append(output, exitErr.Stderr...)
+			}
+		}
+	}
+
+	cancelMu.Lock()
+	signalErr := groupSignalErr
+	cancelMu.Unlock()
+	if bounded && runCtx.Err() != nil {
+		if signalErr != nil && !errors.Is(signalErr, os.ErrProcessDone) {
+			err = errors.Join(err, &runtimeCommandContainmentError{SignalErr: signalErr})
+		} else if errors.Is(runCtx.Err(), context.DeadlineExceeded) {
+			err = errors.Join(err, &runtimeCommandTimeoutError{Operation: operation, Limit: limit})
+		} else {
+			err = errors.Join(err, runCtx.Err())
+		}
+	}
+	if err != nil {
+		return output, fmt.Errorf("podman %s failed: %w, output: %s", operation, err, strings.TrimSpace(string(output)))
+	}
+	return output, nil
+}
+
 // runPodman builds args, runs a podman subcommand, and returns combined output.
 // Encapsulates the buildPodmanArgs + podmanCmd + CombinedOutput pattern used by
 // most methods. subcmdArgs must be non-empty; the first one or two non-flag
@@ -298,6 +473,9 @@ func runPodman(ctx context.Context, rt PodmanRuntime, subcmdArgs []string) ([]by
 // Returns a typed ContainerNotFoundError if detected, otherwise wraps with the
 // given prefix.
 func checkContainerNotFound(output string, containerRef, errPrefix string, err error) error {
+	if isPodmanCommandIntegrityFailure(err) {
+		return fmt.Errorf("%s: %w, output: %s", errPrefix, err, output)
+	}
 	lower := strings.ToLower(output)
 	if strings.Contains(lower, "no such container") || strings.Contains(lower, "no container with") {
 		return &ContainerNotFoundError{Ref: containerRef}
@@ -392,6 +570,9 @@ func ApplyRuntimeCredential(cmd *exec.Cmd, rt PodmanRuntime, extraEnv ...string)
 // negatives fail closed: an ambiguous exit is an operational error, not
 // fabricated absence.
 func podmanExitOneMeansAbsent(rt PodmanRuntime, output []byte, err error) bool {
+	if isPodmanCommandIntegrityFailure(err) {
+		return false
+	}
 	code, ok := exitCode(err)
 	if !ok || code != 1 {
 		return false
@@ -866,20 +1047,14 @@ func (e *NameInUseError) Error() string {
 func (p *PodmanCLI) CreateContainer(ctx context.Context, runtime PodmanRuntime, spec ContainerCreateSpec) (string, error) {
 	// All inputs must be validated before calling this method
 
-	// Execute command using exec.CommandContext (no shell interpretation)
 	createArgs := buildCreateArgs(spec)
-	args, err := BuildPodmanArgs(runtime, createArgs)
-	if err != nil {
-		return "", err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return "", err
-	}
-	output, err := cmd.CombinedOutput()
+	output, err := runPodmanControl(ctx, runtime, createArgs)
 
 	if err != nil {
 		outStr := string(output)
+		if isPodmanCommandIntegrityFailure(err) {
+			return "", fmt.Errorf("podman create failed: %w, output: %s", err, outStr)
+		}
 		if strings.Contains(outStr, "address already in use") {
 			port := 0
 			if match := portInUseRe.FindStringSubmatch(outStr); len(match) == 2 {
@@ -918,8 +1093,11 @@ func (p *PodmanCLI) StartContainer(ctx context.Context, runtime PodmanRuntime, c
 	if !isValidContainerID(containerID) {
 		return fmt.Errorf("invalid container ID format: %s", containerID)
 	}
-	_, err := runPodman(ctx, runtime, []string{"start", containerID})
-	return err
+	output, err := runPodmanControl(ctx, runtime, []string{"start", containerID})
+	if err != nil {
+		return fmt.Errorf("podman start failed: %w, output: %s", err, string(output))
+	}
+	return nil
 }
 
 // StopContainer stops a container by validated ID.
@@ -928,15 +1106,7 @@ func (p *PodmanCLI) StopContainer(ctx context.Context, runtime PodmanRuntime, co
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := BuildPodmanArgs(runtime, []string{"stop", "--time", "30", containerID})
-	if err != nil {
-		return err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return err
-	}
-	output, err := cmd.CombinedOutput()
+	output, err := runPodmanControl(ctx, runtime, []string{"stop", "--time", "30", containerID})
 	if err != nil {
 		return checkContainerNotFound(string(output), containerID, "podman stop failed", err)
 	}
@@ -949,15 +1119,7 @@ func (p *PodmanCLI) RemoveContainer(ctx context.Context, runtime PodmanRuntime, 
 	if !isValidContainerID(containerID) {
 		return &ContainerNotFoundError{Ref: containerID}
 	}
-	args, err := BuildPodmanArgs(runtime, []string{"rm", containerID})
-	if err != nil {
-		return err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return err
-	}
-	output, err := cmd.CombinedOutput()
+	output, err := runPodmanControl(ctx, runtime, []string{"rm", containerID})
 	if err != nil {
 		return checkContainerNotFound(string(output), containerID, "podman rm failed", err)
 	}
@@ -970,15 +1132,7 @@ func (p *PodmanCLI) ImageExists(ctx context.Context, runtime PodmanRuntime, imag
 		return false, fmt.Errorf("invalid image name: %w", err)
 	}
 
-	args, err := BuildPodmanArgs(runtime, []string{"image", "exists", imageName})
-	if err != nil {
-		return false, err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return false, err
-	}
-	output, err := cmd.CombinedOutput()
+	output, err := runPodmanControl(ctx, runtime, []string{"image", "exists", imageName})
 	if err == nil {
 		return true, nil
 	}
@@ -994,8 +1148,11 @@ func (p *PodmanCLI) RemoveImage(ctx context.Context, runtime PodmanRuntime, imag
 	if err := ValidateImageReference(imageName); err != nil {
 		return fmt.Errorf("invalid image name: %w", err)
 	}
-	_, err := runPodman(ctx, runtime, []string{"rmi", imageName})
-	return err
+	output, err := runPodmanControl(ctx, runtime, []string{"rmi", imageName})
+	if err != nil {
+		return fmt.Errorf("podman rmi failed: %w, output: %s", err, string(output))
+	}
+	return nil
 }
 
 // PullImage pulls an image by name
@@ -1051,7 +1208,7 @@ func (p *PodmanCLI) InspectArtifact(ctx context.Context, runtime PodmanRuntime, 
 	if err := ValidateImageReference(reference); err != nil {
 		return nil, fmt.Errorf("invalid artifact reference: %w", err)
 	}
-	output, err := runPodman(ctx, runtime, []string{"artifact", "inspect", reference})
+	output, err := runPodmanControl(ctx, runtime, []string{"artifact", "inspect", reference})
 	if err != nil {
 		return nil, err
 	}
@@ -1091,7 +1248,7 @@ func (p *PodmanCLI) Logs(ctx context.Context, runtime PodmanRuntime, containerID
 	if lines <= 0 {
 		lines = 200
 	}
-	output, err := runPodman(ctx, runtime, []string{"logs", "--tail", fmt.Sprintf("%d", lines), containerID})
+	output, err := runPodmanControlOutput(ctx, runtime, []string{"logs", "--tail", fmt.Sprintf("%d", lines), containerID}, true)
 	if err != nil {
 		return nil, err
 	}
@@ -1196,15 +1353,7 @@ func (p *PodmanCLI) LogsStream(ctx context.Context, runtime PodmanRuntime, conta
 }
 
 func (p *PodmanCLI) containerExists(ctx context.Context, runtime PodmanRuntime, containerRef string) (bool, error) {
-	args, err := BuildPodmanArgs(runtime, []string{"container", "exists", containerRef})
-	if err != nil {
-		return false, err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return false, err
-	}
-	out, err := cmd.CombinedOutput()
+	out, err := runPodmanControl(ctx, runtime, []string{"container", "exists", containerRef})
 	if err == nil {
 		return true, nil
 	}
@@ -1227,15 +1376,7 @@ func (p *PodmanCLI) ResolveContainerIDByName(ctx context.Context, runtime Podman
 		return "", ErrContainerNotFound(name)
 	}
 
-	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.Id}}", name})
-	if err != nil {
-		return "", err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return "", err
-	}
-	out, err := cmd.Output()
+	out, err := runPodmanControl(ctx, runtime, []string{"inspect", "--format", "{{.Id}}", name})
 	if err != nil {
 		return "", podmanInspectError("id", err)
 	}
@@ -1258,7 +1399,7 @@ func (p *PodmanCLI) ListContainersByLabel(ctx context.Context, runtime PodmanRun
 	}
 
 	filter := fmt.Sprintf("label=%s=%s", labelKey, labelValue)
-	out, err := runPodman(ctx, runtime, []string{
+	out, err := runPodmanControl(ctx, runtime, []string{
 		"ps", "-a",
 		"--filter", filter,
 		"--format", "{{.ID}}\t{{.Names}}",
@@ -1314,15 +1455,7 @@ func (p *PodmanCLI) InspectContainerState(ctx context.Context, runtime PodmanRun
 	}
 
 	// Get both running state and PID to detect stale state after reboot
-	args, err := BuildPodmanArgs(runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
-	if err != nil {
-		return ContainerState{}, err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return ContainerState{}, err
-	}
-	out, err := cmd.Output()
+	out, err := runPodmanControl(ctx, runtime, []string{"inspect", "--format", "{{.State.Running}}|{{.State.Pid}}", containerID})
 	if err != nil {
 		return ContainerState{}, podmanInspectError("running", err)
 	}
@@ -1385,15 +1518,7 @@ func (p *PodmanCLI) InspectPublishedPorts(ctx context.Context, runtime PodmanRun
 	if containerID == "" {
 		return nil, fmt.Errorf("container ID required")
 	}
-	args, err := BuildPodmanArgs(runtime, []string{"port", containerID})
-	if err != nil {
-		return nil, err
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return nil, err
-	}
-	output, err := cmd.Output()
+	output, err := runPodmanControl(ctx, runtime, []string{"port", containerID})
 	if err != nil {
 		return nil, fmt.Errorf("podman port failed: %w", err)
 	}
@@ -1467,8 +1592,11 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 		}
 	}
 
-	output, err := runPodman(ctx, runtime, []string{"network", "reload", containerNameOrID})
+	output, err := runPodmanControl(ctx, runtime, []string{"network", "reload", containerNameOrID})
 	if err != nil {
+		if isPodmanCommandIntegrityFailure(err) {
+			return err
+		}
 		outStr := strings.ToLower(string(output))
 		// Treat "not running" as non-fatal — container may have been stopped between check and reload
 		if strings.Contains(outStr, "not running") || strings.Contains(outStr, "is not running") {
@@ -1483,15 +1611,13 @@ func (p *PodmanCLI) NetworkReload(ctx context.Context, runtime PodmanRuntime, co
 // ResetStorage cleans up container references for this runtime's storage.
 func (p *PodmanCLI) ResetStorage(ctx context.Context, runtime PodmanRuntime) error {
 	// Remove all containers for this runtime (should already be done, but be thorough)
-	args, err := BuildPodmanArgs(runtime, []string{"rm", "--all", "--force"})
-	if err != nil {
+	output, err := runPodmanControl(ctx, runtime, []string{"rm", "--all", "--force"})
+	if isPodmanCommandIntegrityFailure(err) {
 		return err
 	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
 	if err != nil {
-		return err
+		log.Printf("DEBUG: podman storage reset returned an ignorable error: %v, output: %s", err, strings.TrimSpace(string(output)))
 	}
-	_ = cmd.Run() // Ignore errors - containers may already be gone
 	return nil
 }
 
@@ -1528,17 +1654,12 @@ var storagePathKeywords = []string{
 // are returned as errors. Returns true if repair was performed.
 func (p *PodmanCLI) ValidateAndRepairStorage(ctx context.Context, runtime PodmanRuntime) (bool, error) {
 	// Quick health check: try listing images
-	args, err := BuildPodmanArgs(runtime, []string{"images", "--quiet", "--noheading"})
-	if err != nil {
-		return false, fmt.Errorf("build podman args: %w", err)
-	}
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return false, err
-	}
-	output, runErr := cmd.CombinedOutput()
+	output, runErr := runPodmanControl(ctx, runtime, []string{"images", "--quiet", "--noheading"})
 	if runErr == nil {
 		return false, nil // Storage is healthy
+	}
+	if isPodmanCommandIntegrityFailure(runErr) {
+		return false, fmt.Errorf("podman images check did not complete safely: %w, output: %s", runErr, string(output))
 	}
 
 	// Check if the failure indicates storage corruption vs. a transient/unrelated error.
@@ -1728,20 +1849,11 @@ func (p *PodmanCLI) InspectImage(ctx context.Context, runtime PodmanRuntime, ima
 	}
 
 	// Use podman image inspect to get the full image configuration including digest
-	args, err := BuildPodmanArgs(runtime, []string{
+	output, err := runPodmanControl(ctx, runtime, []string{
 		"image", "inspect",
 		"--format", `{"entrypoint":{{json .Config.Entrypoint}},"cmd":{{json .Config.Cmd}},"env":{{json .Config.Env}},"workingDir":{{json .Config.WorkingDir}},"user":{{json .Config.User}},"digest":{{json .Digest}},"repoDigests":{{json .RepoDigests}},"size":{{json .Size}}}`,
 		imageName,
 	})
-	if err != nil {
-		return nil, err
-	}
-
-	cmd, err := podmanCmd(ctx, runtime, args...)
-	if err != nil {
-		return nil, err
-	}
-	output, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("podman image inspect failed: %w, output: %s", err, string(output))
 	}

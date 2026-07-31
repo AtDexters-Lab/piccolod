@@ -103,8 +103,11 @@ func (m *AppManager) ResizeStorage(ctx context.Context, instanceID string, sizeB
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return StorageResizeResult{}, err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return StorageResizeResult{}, err
+	}
+	defer releaseLifecycle()
 
 	state, err := m.ensureStateManager()
 	if err != nil {

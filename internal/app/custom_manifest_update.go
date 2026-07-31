@@ -573,8 +573,11 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 
 	taskType := taskTypeUpdateServiceApp
 	accessRepairPending := false

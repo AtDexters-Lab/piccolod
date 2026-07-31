@@ -793,6 +793,7 @@ func (m *AppManager) MakeFlattenFn() func(ctx context.Context, imageRef, targetD
 		defer func() {
 			rmCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
+			rmCtx = container.WithLifecycleRuntimeControl(rmCtx)
 			_ = m.containerManager.RemoveContainer(rmCtx, rt, cid)
 		}()
 

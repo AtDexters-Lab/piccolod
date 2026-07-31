@@ -263,8 +263,11 @@ func (m *AppManager) syncManifestIfDrifted(ctx context.Context, instanceID strin
 	}
 	defer finishSync()
 
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 
 	return m.syncManifestIfDriftedLocked(ctx, host, instanceID, manual, stagedSystemCtx)
 }
@@ -285,7 +288,7 @@ func (m *AppManager) beginSyncAttempt(instanceID string) (func(), error) {
 	}, nil
 }
 
-// syncManifestIfDriftedLocked performs sync while the caller owns reconcileMu
+// syncManifestIfDriftedLocked performs sync while the caller owns the lifecycle gate
 // and has registered the per-app sync attempt with beginSyncAttempt.
 func (m *AppManager) syncManifestIfDriftedLocked(ctx context.Context, host SyncHost, instanceID string, manual bool, stagedSystemCtx *InstallSystemContext) error {
 	if err := m.ensureUnlocked(); err != nil {
@@ -319,7 +322,7 @@ func (m *AppManager) syncManifestIfDriftedLocked(ctx context.Context, host SyncH
 	}
 	// Grace period: skip apps whose install completed less than installGracePeriod
 	// ago. The install handler writes install_state.json AFTER releasing
-	// reconcileMu, so a sync tick firing in that window would observe the
+	// lifecycle gate, so a sync tick firing in that window would observe the
 	// app without install_state.json and misclassify it as a legacy backfill.
 	// The handler's RecordInstallState always finishes within milliseconds in
 	// the normal case; the grace period is generous to cover any transient
@@ -338,7 +341,7 @@ func (m *AppManager) syncManifestIfDriftedLocked(ctx context.Context, host SyncH
 		return nil
 	}
 
-	// Manual triggers clear throttle state under reconcileMu so a concurrent
+	// Manual triggers clear throttle state under the lifecycle gate so a concurrent
 	// auto-sync pass can't race on the cached AppInstance pointer's
 	// LastSyncAttemptHash / LastSyncError fields. The clear is the only
 	// way /sync/trigger can bypass a sticky failed-hash gate.

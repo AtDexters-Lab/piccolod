@@ -402,8 +402,11 @@ func (m *AppManager) selectCapabilityProvider(
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 	if err := m.ensureUnlocked(); err != nil {
 		return err
 	}

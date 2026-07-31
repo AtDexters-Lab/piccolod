@@ -786,10 +786,13 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 		writeGinError(c, http.StatusInternalServerError, "Failed to register proxy OIDC client: "+err.Error())
 		return
 	}
-	cleanupProxyOIDC := func() {
-		if proxyOIDCCreated && proxyOIDCAppID != "" {
-			s.deleteProxyOIDCClient(context.Background(), proxyOIDCAppID)
+	cleanupProxyOIDC := func() error {
+		if !proxyOIDCCreated || proxyOIDCAppID == "" {
+			return nil
 		}
+		cleanupCtx, cancelCleanup := s.oidcConvergenceContext(installCtx)
+		defer cancelCleanup()
+		return s.deleteProxyOIDCClient(cleanupCtx, proxyOIDCAppID)
 	}
 
 	// Note: OIDC clients are registered AFTER Install (below). Init scripts
@@ -805,7 +808,12 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 			capabilityReconcilePending = true
 			log.Printf("WARN: app %s installed with capability reconciliation pending: %v", appInstance.InstanceID, err)
 		} else {
-			cleanupProxyOIDC()
+			if cleanupErr := cleanupProxyOIDC(); cleanupErr != nil {
+				log.Printf("ERROR: install failed and proxy OIDC cleanup also failed for %s: %v", proxyOIDCAppID, cleanupErr)
+				writeGinError(c, http.StatusInternalServerError,
+					fmt.Sprintf("Failed to install app: %v; proxy OIDC cleanup also failed: %v", err, cleanupErr))
+				return
+			}
 			if handleAppManagerError(c, err, "install app") {
 				return
 			}
@@ -818,12 +826,19 @@ func (s *GinServer) handleGinAppInstall(c *gin.Context) {
 	if oidcClientID != "" {
 		if err := clientMgr.CreateClient(installCtx, oidcClientID, oidcClientSecret, appInstance.InstanceID); err != nil {
 			log.Printf("ERROR: failed to persist OIDC client for %s: %v. Rolling back install.", appInstance.InstanceID, err)
-			cleanupProxyOIDC()
+			cleanupErr := cleanupProxyOIDC()
+			if cleanupErr != nil {
+				log.Printf("ERROR: proxy OIDC cleanup also failed for %s: %v", proxyOIDCAppID, cleanupErr)
+			}
 			// Rollback: uninstall the app
 			if rbErr := s.appManager.Uninstall(installCtx, appInstance.InstanceID); rbErr != nil {
 				log.Printf("CRITICAL: failed to rollback uninstall for %s: %v", appInstance.InstanceID, rbErr)
 			}
-			writeGinError(c, http.StatusInternalServerError, "Failed to register OIDC client: "+err.Error())
+			message := "Failed to register OIDC client: " + err.Error()
+			if cleanupErr != nil {
+				message += "; proxy OIDC cleanup also failed: " + cleanupErr.Error()
+			}
+			writeGinError(c, http.StatusInternalServerError, message)
 			return
 		}
 	}
@@ -1122,13 +1137,21 @@ func (s *GinServer) handleGinAppUpdateListeners(c *gin.Context) {
 	// RFC 20260122 §5.3: Register/cleanup proxy OIDC client based on updated listener auth.
 	// No post-persist event exists for listener updates, so this is done explicitly here.
 	// Install and restore paths are handled by observeProxyOIDCClients.
-	// Use context.Background() so OIDC registration outlives the HTTP request.
+	// Use a fresh finite server-owned budget because UpdateListeners may consume
+	// its entire operation deadline immediately after committing the new state.
+	oidcCtx, cancelOIDC := s.oidcConvergenceContext(ctx)
+	defer cancelOIDC()
+	var oidcErr error
 	if s.requiresProxyOIDCClient(newApp.Definition) {
-		if err := s.registerProxyOIDCClient(context.Background(), appName); err != nil {
-			log.Printf("WARN: failed to register proxy OIDC client for %s: %v", appName, err)
-		}
+		oidcErr = s.registerProxyOIDCClient(oidcCtx, appName)
 	} else {
-		s.deleteProxyOIDCClient(context.Background(), appName)
+		oidcErr = s.deleteProxyOIDCClient(oidcCtx, appName)
+	}
+	if oidcErr != nil {
+		log.Printf("ERROR: listeners updated but proxy OIDC reconciliation failed for %s: %v", appName, oidcErr)
+		writeGinError(c, http.StatusInternalServerError,
+			"Listeners updated, but failed to reconcile proxy OIDC client: "+oidcErr.Error())
+		return
 	}
 
 	recreated := oldApp.PrimaryContainerID() != newApp.PrimaryContainerID()
@@ -1789,7 +1812,6 @@ func (s *GinServer) deriveAppHealth(inst *app.AppInstance) *services.ListenerHea
 // body are unchanged from before the resource-stewardship change.
 func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
 	appName := c.Param("name")
-	ctx := c.Request.Context()
 
 	var req struct {
 		SizeBytes int64 `json:"size_bytes" binding:"required,gt=0"`
@@ -1798,6 +1820,8 @@ func (s *GinServer) handleAppResizeStorage(c *gin.Context) {
 		writeGinError(c, http.StatusBadRequest, "Invalid request: "+err.Error())
 		return
 	}
+	ctx, cancel := s.opContext(c, 2*time.Minute)
+	defer cancel()
 	res, err := s.appManager.ResizeStorage(ctx, appName, req.SizeBytes)
 	if err != nil {
 		if handleAppManagerError(c, err, "resize storage") {

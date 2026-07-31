@@ -69,9 +69,9 @@ func ResolveRuntimeCredential(username string) (*RuntimeUser, error) {
 // ownership changes.
 //
 // Concurrency safety: this fast-path is safe because lifecycle operations
-// (install, start, stop, uninstall, reconcile) are serialized per-app via
-// reconcileMu in app_manager.go. No concurrent caller can change ownership
-// between the root stat and the decision to skip the walk.
+// (install, start, stop, uninstall, reconcile) are serialized by AppManager's
+// global lifecycle gate. No concurrent caller can change ownership between the
+// root stat and the decision to skip the walk.
 func ChownIfNeeded(root string, uid, gid int) error {
 	info, err := os.Stat(root)
 	if err != nil {

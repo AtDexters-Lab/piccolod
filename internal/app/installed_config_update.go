@@ -1216,8 +1216,11 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	if err := pressure.DefaultAdmission.Check(ctx, pressure.WorkLifecycle); err != nil {
 		return nil, err
 	}
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer releaseLifecycle()
 
 	accessRepairPending := false
 	m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseValidating, 0, "Validating config update", false, nil)

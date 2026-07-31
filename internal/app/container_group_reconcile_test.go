@@ -1497,6 +1497,38 @@ func TestAutomaticStartupRecoveryAllowsFifthAttemptThenGuardsSixth(t *testing.T)
 	}
 }
 
+func TestReconcileKnownMissingWorkloadProjectsErrorAfterRecoveryExhausted(t *testing.T) {
+	mgr, mock, state, def, _, runtime := newReconcileTestEnv(t)
+	appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+	mgr.setObservedStatus(appInst.InstanceID, StatusRunning)
+
+	firstFailure := time.Now().Add(-time.Minute)
+	appInst.StartupAttempts = startupEscalateAfterAttempts
+	appInst.FirstStartupFailureAt = &firstFailure
+	if err := state.StoreAppMetadata(appInst); err != nil {
+		t.Fatalf("store exhausted startup history: %v", err)
+	}
+
+	// Model the alpha failure: the API still projects Running after the service
+	// process/container has authoritatively disappeared and automatic recovery
+	// has no remaining attempt.
+	delete(mock.containers, appInst.Containers["main"])
+	beforeNextID := mock.nextID
+
+	if err := mgr.reconcileApp(context.Background(), state, appInst); err != nil {
+		t.Fatalf("reconcile known missing workload: %v", err)
+	}
+	if status, message := mgr.getObservedStatusAndMessage(appInst.InstanceID); status != StatusError || message != msgStartupFailed {
+		t.Fatalf("observed projection = (%q, %q), want (%q, %q)", status, message, StatusError, msgStartupFailed)
+	}
+	if appInst.StartupAttempts != startupEscalateAfterAttempts {
+		t.Fatalf("startup attempts = %d, want exhausted %d", appInst.StartupAttempts, startupEscalateAfterAttempts)
+	}
+	if mock.nextID != beforeNextID {
+		t.Fatalf("exhausted recovery created another container: next ID = %d, want %d", mock.nextID, beforeNextID)
+	}
+}
+
 func TestExhaustedAutomaticGuardBreaksOldProbationBeforeManualSuccess(t *testing.T) {
 	mgr, _, state, def, _, _ := newReconcileTestEnv(t)
 	now := time.Now()

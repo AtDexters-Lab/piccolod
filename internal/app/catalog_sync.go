@@ -109,7 +109,6 @@ func (m *AppManager) currentSyncHost() SyncHost {
 // other eager owners. Task recovery supplies runInitial=false after joining a
 // serialized initial pass, so the loop waits for its first steady-state tick.
 func (m *AppManager) startCatalogSyncLoop(ctx context.Context, runInitial bool) {
-	m.reconcileWG.Add(1)
 	go func() {
 		defer m.reconcileWG.Done()
 
@@ -138,7 +137,7 @@ func (m *AppManager) startCatalogSyncLoop(ctx context.Context, runInitial bool) 
 
 // runCatalogSyncPass enumerates installed apps and applies catalog manifest
 // drift to each one in series. Pass-by-pass serialization (rather than
-// fan-out) avoids head-of-line blocking on reconcileMu and gives concurrent
+// fan-out) avoids head-of-line blocking on the lifecycle gate and gives concurrent
 // operations (UpdateImage, UpdateListeners, reconcile) a chance to interleave
 // between apps.
 func (m *AppManager) runCatalogSyncPass(ctx context.Context) {
@@ -190,7 +189,7 @@ type RecordInstallStateInput struct {
 // and install state for an installed app instance. Called by the install
 // handler after Install + OIDC client registration succeed.
 //
-// Does NOT acquire reconcileMu — that would block the install HTTP handler
+// Does NOT acquire the lifecycle gate — that would block the install HTTP handler
 // behind any in-flight sync ticker pass (observed: 3-minute install hang
 // when the first sync tick was processing a stale legacy app for 1m21s).
 // The race window where sync could observe the just-installed app without
@@ -237,7 +236,7 @@ const installGracePeriod = 5 * time.Minute
 // SyncManifest is the public entrypoint for /sync/trigger. Returns an error
 // if no sync host is wired or this node is not the cluster leader (writes
 // must always go through the leader). The throttle clear happens inside
-// syncManifestIfDrifted under reconcileMu so it cannot race with a
+// syncManifestIfDrifted under the lifecycle gate so it cannot race with a
 // concurrent auto-sync pass writing the same fields on the cached
 // AppInstance pointer.
 func (m *AppManager) SyncManifest(ctx context.Context, instanceID string) error {
@@ -262,8 +261,11 @@ func (m *AppManager) SyncManifest(ctx context.Context, instanceID string) error 
 // re-evaluates the catalog hash. Must run on the cluster leader so the
 // metadata write is the canonical truth across the cluster.
 func (m *AppManager) SetSyncDisabled(ctx context.Context, instanceID string, disabled bool) error {
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 
 	if err := m.ensureKernelLeader(); err != nil {
 		return err
@@ -343,8 +345,11 @@ func (m *AppManager) RefreshInstallSystemContext(ctx context.Context, instanceID
 	}
 	defer finishSync()
 
-	m.reconcileMu.Lock()
-	defer m.reconcileMu.Unlock()
+	ctx, releaseLifecycle, err := m.acquireLifecycle(ctx)
+	if err != nil {
+		return err
+	}
+	defer releaseLifecycle()
 
 	state, err := m.ensureStateManager()
 	if err != nil {

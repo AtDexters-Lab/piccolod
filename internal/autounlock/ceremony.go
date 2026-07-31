@@ -10,7 +10,7 @@ import (
 )
 
 // ceremonyTimeoutBudget bounds the total wall-clock time the ceremony can
-// consume during shutdown. Well within systemd TimeoutStopSec=120s, leaving
+// consume during shutdown. Well within systemd TimeoutStopSec=210s, leaving
 // headroom for the rest of the Stop() phases.
 const ceremonyTimeoutBudget = 25 * time.Second
 
