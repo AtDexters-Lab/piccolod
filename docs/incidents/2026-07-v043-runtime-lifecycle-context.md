@@ -1,7 +1,10 @@
 # v0.2.43 runtime-lifecycle remediation context
 
-Status: authoritative accepted decision ledger for the reduced remediation
-plan.
+Status: historical accepted-decision ledger. Released Slices 1 and 2 remain
+authoritative, but the unshipped Slice 3 implementation was abandoned as a
+release candidate on 2026-08-13. Do not use this file alone as authorization to
+resume that implementation. See
+`docs/incidents/2026-08-v043-slice3-remediation-retrospective.md`.
 
 This file preserves the incident evidence, user-approved product decisions,
 review lessons, and scope guardrails that must survive context compaction and

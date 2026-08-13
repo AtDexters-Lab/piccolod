@@ -1,7 +1,11 @@
 # v0.2.43 runtime-lifecycle remediation plan
 
-**Status:** Accepted on 2026-07-29 for slice-by-slice implementation; Slice 1
-implementation and review are complete, with alpha/device validation pending.
+**Status:** Historical plan. Slices 1 and 2 shipped in `v0.2.44`; the unshipped
+Slice 3 implementation was abandoned as a release candidate on 2026-08-13
+after repeated review convergence failures. Do not resume the complete Slice 3
+diff from this RFC. See
+`docs/incidents/2026-08-v043-slice3-remediation-retrospective.md` for the
+attempt history, retained decisions, failures, and fresh-start charter.
 
 This plan is governed by
 `docs/incidents/2026-07-v043-runtime-lifecycle-context.md`. If this plan and
