@@ -131,6 +131,17 @@ func (m *AppManager) ReconcileAllSlicePolicies() {
 			// App provisioning hasn't completed — user doesn't exist yet.
 			continue
 		}
+		// Bounded apps can receive pressure-driven soft-limit relief. Reuse
+		// only an exact generated policy for this declaration; drift or a
+		// changed declaration cannot silently import an unrelated budget.
+		if app.Definition != nil && app.Definition.Resources != nil && app.Definition.Resources.Memory != nil &&
+			app.Definition.Resources.Memory.Profile != api.ProfileElastic {
+			policy, err = policy.RestoreAdaptiveMemoryHigh()
+			if err != nil {
+				log.Printf("WARN: slice policy restore %s: %v", app.InstanceID, err)
+				continue
+			}
+		}
 		if err := policy.Apply(); err != nil {
 			m.reportSlicePolicyFailure(app, err)
 		}
@@ -258,6 +269,9 @@ func (m *AppManager) ListAppUIDs() []uint32 {
 // Called from the uninstall path before user deletion. Does not live-reset
 // the slice — the slice itself is about to be torn down.
 func (m *AppManager) RemoveSlicePolicyForApp(instanceID string) {
+	sliceReconcileMu.Lock()
+	defer sliceReconcileMu.Unlock()
+	delete(m.memoryRelief, instanceID)
 	user, err := container.ResolveRuntimeCredential(container.AppUsername(instanceID))
 	if err != nil {
 		// User may already be gone; nothing to do.

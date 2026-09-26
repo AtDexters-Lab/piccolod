@@ -74,6 +74,46 @@ servers):
 - `MemoryHigh = min(min_required × 1.25, slice_ceiling_cap × 0.9)`
 - `MemoryMax  = min(min_required × 2, slice_ceiling_cap)`
 
+These are the initial limits, not a claim that the functional minimum predicts
+the app's complete operating footprint. Piccolod may raise a running bounded
+app's `MemoryHigh` in response to sustained limit-induced pressure, up to its
+unchanged `MemoryMax`. The author declaration is not rewritten.
+
+### Pressure-driven relief for bounded apps
+
+The existing 30-second pressure monitor also samples each app user's entire
+slice: usage, finite live limits, local `high` events, and PSI `some`/`full`
+`avg10`. Relief requires two successive pressure observations (`some avg10`
+at least 10%), increasing local throttling counters, and usage near the soft
+limit. The first sample establishes a counter baseline. Missing, stale, or
+malformed telemetry and cgroup replacement cannot supply adjustment evidence.
+Existing pressure notifications retain their `avg60` behavior.
+
+Available host memory must exceed `max(20% total RAM, 256 MiB)`. One poll may
+grant at most half the surplus across all affected apps. This is a capacity
+check at the time of the grant; a soft limit does not reserve physical RAM.
+Global PSI is not a veto: tasks stalled by a local slice limit also contribute
+to host PSI, so it does not independently prove host memory exhaustion.
+
+Each increase is 25% of the effective soft limit, with a 16 MiB minimum step,
+clamped to the unchanged hard limit. There is a 60-second cooldown and at most
+two successful increases per continuous pressure episode. Piccolod evaluates
+pressure after each increase; the second probe may proceed even when the first
+did not help. Two successive healthy samples reset the episode. It does not
+automatically lower limits, grow hard ceilings, restart apps, or stop siblings.
+If relief cannot proceed, the existing pressure notifications continue and
+the hold reason is logged once until it changes.
+
+The effective limit is saved in the existing generated systemd slice drop-in,
+with its original derived baseline recorded in a comment. Periodic and startup
+reconciliation restore it only when the complete generated file still matches
+the current baseline, hard ceiling, and CPU policy. Declaration changes,
+profile changes, and policy removal invalidate the saved adjustment. Evidence
+and cooldown state remain process-local and are reacquired after restart.
+
+See [`20260926-pressure-driven-memory-relief.md`](../rfc/20260926-pressure-driven-memory-relief.md)
+for the ownership, validation, and rollback boundaries.
+
 ### `elastic` profile
 
 Grows to fill available memory when the box has headroom. For apps that
