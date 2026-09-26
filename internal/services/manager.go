@@ -2236,6 +2236,28 @@ func (m *ServiceManager) DeactivateApp(appName string) {
 	m.removeAppEndpoints(appName, false)
 }
 
+// DeactivateAppUnlessSuspended withdraws a stopped app, but preserves endpoint
+// allocations owned by a transaction that already suspended publication. The
+// transaction needs those bindings to recreate containers and resume access.
+func (m *ServiceManager) DeactivateAppUnlessSuspended(appName string) {
+	m.publicationLifecycleMu.Lock()
+	defer m.publicationLifecycleMu.Unlock()
+
+	m.mu.Lock()
+	if inactive := m.deactivated[appName]; inactive != nil && inactive.kind == publicationInactiveSuspended {
+		// Listener allocations outlive the stopped runtime; its container
+		// identity and transient health state do not.
+		delete(m.containerIDs, appName)
+		m.mu.Unlock()
+		m.appTransientMu.Lock()
+		delete(m.appTransient, appName)
+		m.appTransientMu.Unlock()
+		return
+	}
+	m.mu.Unlock()
+	m.removeAppEndpointsLocked(appName, false)
+}
+
 func (m *ServiceManager) authorizePublicationActivationLocked(appName string, token PublicationResumeToken) error {
 	inactive := m.deactivated[appName]
 	if inactive == nil || inactive.kind == publicationInactiveStopped {
