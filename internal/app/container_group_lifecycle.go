@@ -222,7 +222,7 @@ func (m *AppManager) finalizeQuiescedContainerGroup(ctx context.Context, appInst
 	}
 	m.updateStatusWithEvent(appInst.InstanceID, StatusStopped)
 	if m.serviceManager != nil {
-		m.serviceManager.DeactivateApp(appInst.InstanceID)
+		m.serviceManager.DeactivateAppUnlessSuspended(appInst.InstanceID)
 	}
 	m.interruptStartupProbation(appInst.InstanceID)
 }
