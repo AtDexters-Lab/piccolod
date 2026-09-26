@@ -261,27 +261,67 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
             backgroundColor: PiccoloTheme.mist,
           ),
           const SizedBox(height: Spacing.md),
-          ExpansionTile(
-            tilePadding: EdgeInsets.zero,
-            childrenPadding: EdgeInsets.zero,
-            title: Text(
-              'Details',
-              style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
-                fontWeight: FontWeight.w600,
+          Material(
+            type: MaterialType.transparency,
+            child: ExpansionTile(
+              tilePadding: EdgeInsets.zero,
+              childrenPadding: EdgeInsets.zero,
+              title: Text(
+                'Details',
+                style: PiccoloTheme.textTheme.bodyMedium?.copyWith(
+                  fontWeight: FontWeight.w600,
+                ),
               ),
-            ),
-            children: [
-              if (subtasks.isNotEmpty) ...[
-                Padding(
-                  padding: const EdgeInsets.only(bottom: Spacing.sm),
-                  child: Text(
-                    'Containers',
-                    style: PiccoloTheme.textTheme.labelMedium?.copyWith(
-                      color: PiccoloTheme.inkMuted,
+              children: [
+                if (subtasks.isNotEmpty) ...[
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: Spacing.sm),
+                    child: Text(
+                      'Containers',
+                      style: PiccoloTheme.textTheme.labelMedium?.copyWith(
+                        color: PiccoloTheme.inkMuted,
+                      ),
                     ),
                   ),
-                ),
-                for (final st in subtasks)
+                  for (final st in subtasks)
+                    Padding(
+                      padding: const EdgeInsets.only(bottom: Spacing.sm),
+                      child: Row(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          SizedBox(
+                            width: 120,
+                            child: Text(
+                              st.name,
+                              style: PiccoloTheme.textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: PiccoloTheme.inkMuted,
+                                  ),
+                            ),
+                          ),
+                          const SizedBox(width: Spacing.sm),
+                          Expanded(
+                            child: Text(
+                              st.message,
+                              style: PiccoloTheme.textTheme.bodyMedium,
+                            ),
+                          ),
+                          if (st.progress >= 0) ...[
+                            const SizedBox(width: Spacing.sm),
+                            Text(
+                              '${st.progress}%',
+                              style: PiccoloTheme.textTheme.labelSmall
+                                  ?.copyWith(
+                                    color: PiccoloTheme.inkMuted,
+                                  ),
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  const Divider(height: Spacing.lg),
+                ],
+                for (final evt in _history)
                   Padding(
                     padding: const EdgeInsets.only(bottom: Spacing.sm),
                     child: Row(
@@ -290,7 +330,7 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                         SizedBox(
                           width: 120,
                           child: Text(
-                            st.name,
+                            evt.phase,
                             style: PiccoloTheme.textTheme.labelSmall?.copyWith(
                               color: PiccoloTheme.inkMuted,
                             ),
@@ -299,50 +339,15 @@ class _TaskProgressPanelState extends State<TaskProgressPanel> {
                         const SizedBox(width: Spacing.sm),
                         Expanded(
                           child: Text(
-                            st.message,
+                            evt.message,
                             style: PiccoloTheme.textTheme.bodyMedium,
                           ),
                         ),
-                        if (st.progress >= 0) ...[
-                          const SizedBox(width: Spacing.sm),
-                          Text(
-                            '${st.progress}%',
-                            style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-                              color: PiccoloTheme.inkMuted,
-                            ),
-                          ),
-                        ],
                       ],
                     ),
                   ),
-                const Divider(height: Spacing.lg),
               ],
-              for (final evt in _history)
-                Padding(
-                  padding: const EdgeInsets.only(bottom: Spacing.sm),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      SizedBox(
-                        width: 120,
-                        child: Text(
-                          evt.phase,
-                          style: PiccoloTheme.textTheme.labelSmall?.copyWith(
-                            color: PiccoloTheme.inkMuted,
-                          ),
-                        ),
-                      ),
-                      const SizedBox(width: Spacing.sm),
-                      Expanded(
-                        child: Text(
-                          evt.message,
-                          style: PiccoloTheme.textTheme.bodyMedium,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
+            ),
           ),
         ],
       ),

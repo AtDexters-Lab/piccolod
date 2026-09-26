@@ -77,6 +77,9 @@ type AppManager struct {
 	automaticSuppressionMu sync.RWMutex
 	automaticSuppression   map[string]string
 	quiesceFinalizeMu      sync.Mutex
+	// Pressure-response evidence is process-local; the effective soft limit
+	// lives in the existing slice drop-in. Guarded by sliceReconcileMu.
+	memoryRelief map[string]*memoryReliefState
 
 	// Internal CA path for OIDC trust
 	internalCAPath string

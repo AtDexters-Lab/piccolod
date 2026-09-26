@@ -581,12 +581,16 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 
 	taskType := taskTypeUpdateServiceApp
 	accessRepairPending := false
+	accessRepairMessage := ""
 	m.emitProgress(ctx, taskType, req.InstanceID, taskPhaseValidating, 0, "Validating app update", false, nil)
 	defer func() {
 		if err != nil {
 			m.emitProgress(ctx, taskType, req.InstanceID, taskPhaseComplete, 100, "App update failed", true, err)
 		} else if accessRepairPending {
-			m.emitProgress(ctx, taskType, req.InstanceID, taskPhaseComplete, 100, "App update applied; access repair pending", true, nil)
+			m.emitProgressWithMetadata(ctx, taskType, req.InstanceID, taskPhaseComplete, 100, "App update applied; access repair pending", true, map[string]any{
+				"access_repair_pending": true,
+				"access_repair_message": accessRepairMessage,
+			}, nil)
 		} else {
 			m.emitProgress(ctx, taskType, req.InstanceID, taskPhaseComplete, 100, "App update complete", true, nil)
 		}
@@ -752,7 +756,6 @@ func (m *AppManager) ApplyCustomManifestUpdate(ctx context.Context, req Manifest
 			log.Printf("WARN: manifest update %s: committed catalog metadata pending retry: %v", req.InstanceID, err)
 		}
 	}
-	accessRepairMessage := ""
 	accessRepairErr := applyTxn.publishAccess()
 	if accessRepairErr == nil &&
 		slices.Contains(cand.Classification.OperationRiskFlags, "capability_provider_authority_changed") {

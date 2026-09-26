@@ -63,7 +63,8 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
   String? _accessRepairMessage;
   bool _applied = false;
   bool _applyResponsePending = false;
-  bool _applyTaskSucceeded = false;
+  TaskProgressEvent? _applyTerminalEvent;
+  bool _applyOutcomeUnknown = false;
 
   @override
   void initState() {
@@ -339,6 +340,7 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
   }
 
   Future<void> _apply() async {
+    if (_busy || _applied || _taskId != null) return;
     final dryRun = _dryRun;
     if (dryRun == null || !dryRun.applicable || dryRun.dryRunToken.isEmpty) {
       return;
@@ -351,7 +353,8 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
       _accessRepairMessage = null;
       _taskId = taskId;
       _applyResponsePending = true;
-      _applyTaskSucceeded = false;
+      _applyTerminalEvent = null;
+      _applyOutcomeUnknown = false;
     });
     widget.onTaskStarted?.call(
       taskId,
@@ -367,32 +370,25 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         confirmations: _confirmedReviewItems.toList(),
         catalogPending: widget.catalogPending,
       );
-      if (!mounted || _applied) return;
+      if (!mounted || _applied || _taskId != taskId) return;
       _applyResponsePending = false;
       if (result.accessRepairPending) {
-        _applied = true;
-        await widget.onApplied();
-        if (!mounted) return;
-        setState(() {
-          _busy = false;
-          _taskId = null;
-          _dryRun = result;
-          _accessRepairMessage = result.accessRepairMessage.isEmpty
-              ? 'Update committed, but access publication needs repair.'
-              : result.accessRepairMessage;
-        });
-        _revealDryRunSummary();
+        _dryRun = result;
+        await _showAccessRepair(result.accessRepairMessage);
         return;
       }
       await _finishApply();
     } on Object catch (e) {
-      if (!mounted) return;
+      if (!mounted || _applied || _taskId != taskId) return;
       _applyResponsePending = false;
-      if (shouldFinishApplyFromTaskSuccess(
-        taskSucceeded: _applyTaskSucceeded,
-        alreadyApplied: _applied,
-      )) {
-        await _finishApply();
+      if (isAmbiguousApplyResponseError(e)) {
+        final terminal = _applyTerminalEvent;
+        if (terminal != null) {
+          await _completeApply(terminal);
+        } else {
+          setState(() => _applyOutcomeUnknown = true);
+          _revealTaskProgress();
+        }
         return;
       }
       if (isStaleUpdatePreviewError(e)) {
@@ -417,27 +413,51 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
   }
 
   Future<void> _completeApply(TaskProgressEvent event) async {
-    if (_applied) return;
-    if (_applyResponsePending) {
-      _applyTaskSucceeded = event.error == null || event.error!.isEmpty;
+    if (!mounted || _applied || event.taskId != _taskId || !event.isComplete) {
       return;
     }
+    _applyTerminalEvent = event;
+    // A received HTTP response carries the authoritative repair outcome.
+    if (_applyResponsePending) return;
     if (event.error != null && event.error!.isNotEmpty) {
-      if (!mounted) return;
       setState(() {
         _busy = false;
         _taskId = null;
-        _applyResponsePending = false;
+        _applyOutcomeUnknown = false;
         _error = event.error;
       });
       _revealError();
       return;
     }
+    final repairMessage = applyAccessRepairMessage(
+      event,
+      'Update committed, but access publication needs repair.',
+    );
+    if (repairMessage != null) {
+      await _showAccessRepair(repairMessage);
+      return;
+    }
     await _finishApply();
   }
 
+  Future<void> _showAccessRepair(String message) async {
+    if (!mounted || _applied) return;
+    _applied = true;
+    await widget.onApplied();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _taskId = null;
+      _applyOutcomeUnknown = false;
+      _accessRepairMessage = message.isEmpty
+          ? 'Update committed, but access publication needs repair.'
+          : message;
+    });
+    _revealDryRunSummary();
+  }
+
   Future<void> _finishApply() async {
-    if (_applied) return;
+    if (!mounted || _applied) return;
     _applied = true;
     await widget.onApplied();
     if (mounted) Navigator.of(context).pop();
@@ -525,6 +545,10 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
                     key: _dryRunSummaryKey,
                     child: _buildDryRunSummary(_dryRun!),
                   ),
+                ],
+                if (_applyOutcomeUnknown) ...[
+                  const SizedBox(height: Spacing.base),
+                  const Text(pendingApplyOutcomeMessage),
                 ],
                 if (_taskId != null) ...[
                   const SizedBox(height: Spacing.lg),
@@ -697,15 +721,13 @@ class _ManifestUpdateWizardState extends State<ManifestUpdateWizard> {
         value: _inputControllers[field.name]?.text == 'true',
         onChanged: field.locked || _busy
             ? null
-            : (value) => setState(
-                () {
-                  _dryRun = null;
-                  _touchedInputs.add(field.name);
-                  _inputControllers[field.name]?.text = (value ?? false)
-                      ? 'true'
-                      : 'false';
-                },
-              ),
+            : (value) => setState(() {
+                _dryRun = null;
+                _touchedInputs.add(field.name);
+                _inputControllers[field.name]?.text = (value ?? false)
+                    ? 'true'
+                    : 'false';
+              }),
         title: Text(field.name),
         subtitle: Text(_manifestFieldHelp(field)),
         controlAffinity: ListTileControlAffinity.leading,
@@ -1532,19 +1554,22 @@ class _TechnicalDetailsSection extends StatelessWidget {
           borderRadius: BorderRadius.circular(Radii.sm),
           color: PiccoloTheme.porcelain,
         ),
-        child: ExpansionTile(
-          tilePadding: const EdgeInsets.symmetric(horizontal: Spacing.base),
-          childrenPadding: const EdgeInsets.fromLTRB(
-            Spacing.base,
-            0,
-            Spacing.base,
-            Spacing.base,
+        child: Material(
+          type: MaterialType.transparency,
+          child: ExpansionTile(
+            tilePadding: const EdgeInsets.symmetric(horizontal: Spacing.base),
+            childrenPadding: const EdgeInsets.fromLTRB(
+              Spacing.base,
+              0,
+              Spacing.base,
+              Spacing.base,
+            ),
+            title: const Text(
+              'Technical details',
+              style: TextStyle(fontWeight: FontWeight.w700),
+            ),
+            children: children,
           ),
-          title: const Text(
-            'Technical details',
-            style: TextStyle(fontWeight: FontWeight.w700),
-          ),
-          children: children,
         ),
       ),
     );

@@ -53,6 +53,12 @@ type AppLister interface {
 	ListAppUIDs() []uint32
 }
 
+// MemoryPressureResponder optionally reacts to a complete polling round. The
+// monitor supplies observations; the responder owns policy and actuation.
+type MemoryPressureResponder interface {
+	RespondToMemoryPressure(context.Context, []MemorySample, HostMemorySample)
+}
+
 // Monitor is the per-app-slice pressure-attribution component.
 type Monitor struct {
 	bus    *events.Bus
@@ -156,7 +162,19 @@ func (m *Monitor) loop(ctx context.Context) {
 }
 
 func (m *Monitor) poll(ctx context.Context) {
+	m.pollWithMemoryReaders(ctx, ReadMemorySample, ReadHostMemorySample)
+}
+
+func (m *Monitor) pollWithMemoryReaders(ctx context.Context, readSample func(uint32) MemorySample, readHost func() HostMemorySample) {
+	if ctx.Err() != nil {
+		return
+	}
 	uids := m.lister.ListAppUIDs()
+	responder, responds := m.lister.(MemoryPressureResponder)
+	var samples []MemorySample
+	if responds {
+		samples = make([]MemorySample, 0, len(uids))
+	}
 
 	// Release-and-reacquire style: brief lock for state access, release
 	// before I/O so a slow cgroup read doesn't block other operations.
@@ -181,7 +199,19 @@ func (m *Monitor) poll(ctx context.Context) {
 	m.mu.Unlock()
 
 	for _, uid := range uids {
+		if ctx.Err() != nil {
+			return
+		}
 		m.sampleSlice(uid)
+		if responds {
+			samples = append(samples, readSample(uid))
+		}
+	}
+	if responds && ctx.Err() == nil {
+		host := readHost()
+		if ctx.Err() == nil {
+			responder.RespondToMemoryPressure(ctx, samples, host)
+		}
 	}
 }
 
@@ -375,7 +405,7 @@ func severityRank(s string) int {
 }
 
 // readPSI parses a cgroup v2 pressure file and returns the "some" or "full"
-// avg10 percentage. Returns -1 on error (file missing, unparseable).
+// avg60 percentage. Returns -1 on error (file missing, unparseable).
 func readPSI(path, kind string) float64 {
 	f, err := os.Open(path)
 	if err != nil {

@@ -120,7 +120,8 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   bool _dryRunning = false;
   bool _applied = false;
   bool _applyResponsePending = false;
-  bool _applyTaskSucceeded = false;
+  TaskProgressEvent? _applyTerminalEvent;
+  bool _applyOutcomeUnknown = false;
 
   @override
   void initState() {
@@ -317,6 +318,7 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   }
 
   Future<void> _apply() async {
+    if (_busy || _applied || _taskId != null) return;
     final dryRun = _dryRun;
     if (dryRun == null || !dryRun.applicable || dryRun.dryRunToken.isEmpty) {
       return;
@@ -328,7 +330,8 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       _taskId = taskId;
       _accessRepairMessage = null;
       _applyResponsePending = true;
-      _applyTaskSucceeded = false;
+      _applyTerminalEvent = null;
+      _applyOutcomeUnknown = false;
     });
     widget.onTaskStarted?.call(
       taskId,
@@ -342,32 +345,25 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
         dryRun,
         taskId: taskId,
       );
-      if (!mounted || _applied) return;
+      if (!mounted || _applied || _taskId != taskId) return;
       _applyResponsePending = false;
       if (result.accessRepairPending) {
-        _applied = true;
-        await widget.onApplied();
-        if (!mounted) return;
-        setState(() {
-          _busy = false;
-          _taskId = null;
-          _dryRun = result;
-          _accessRepairMessage = result.accessRepairMessage.isEmpty
-              ? 'Config committed, but access publication needs repair.'
-              : result.accessRepairMessage;
-        });
-        _revealDryRunSummary();
+        _dryRun = result;
+        await _showAccessRepair(result.accessRepairMessage);
         return;
       }
       await _finishApply();
     } on Object catch (e) {
-      if (!mounted) return;
+      if (!mounted || _applied || _taskId != taskId) return;
       _applyResponsePending = false;
-      if (shouldFinishApplyFromTaskSuccess(
-        taskSucceeded: _applyTaskSucceeded,
-        alreadyApplied: _applied,
-      )) {
-        await _finishApply();
+      if (isAmbiguousApplyResponseError(e)) {
+        final terminal = _applyTerminalEvent;
+        if (terminal != null) {
+          await _completeApply(terminal);
+        } else {
+          setState(() => _applyOutcomeUnknown = true);
+          _revealTaskProgress();
+        }
         return;
       }
       if (isStaleUpdatePreviewError(e)) {
@@ -391,27 +387,51 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
   }
 
   Future<void> _completeApply(TaskProgressEvent event) async {
-    if (_applied) return;
-    if (_applyResponsePending) {
-      _applyTaskSucceeded = event.error == null || event.error!.isEmpty;
+    if (!mounted || _applied || event.taskId != _taskId || !event.isComplete) {
       return;
     }
+    _applyTerminalEvent = event;
+    // A received HTTP response carries the authoritative repair outcome.
+    if (_applyResponsePending) return;
     if (event.error != null && event.error!.isNotEmpty) {
-      if (!mounted) return;
       setState(() {
         _busy = false;
         _taskId = null;
-        _applyResponsePending = false;
+        _applyOutcomeUnknown = false;
         _error = event.error;
       });
       _revealError();
       return;
     }
+    final repairMessage = applyAccessRepairMessage(
+      event,
+      'Config committed, but access publication needs repair.',
+    );
+    if (repairMessage != null) {
+      await _showAccessRepair(repairMessage);
+      return;
+    }
     await _finishApply();
   }
 
+  Future<void> _showAccessRepair(String message) async {
+    if (!mounted || _applied) return;
+    _applied = true;
+    await widget.onApplied();
+    if (!mounted) return;
+    setState(() {
+      _busy = false;
+      _taskId = null;
+      _applyOutcomeUnknown = false;
+      _accessRepairMessage = message.isEmpty
+          ? 'Config committed, but access publication needs repair.'
+          : message;
+    });
+    _revealDryRunSummary();
+  }
+
   Future<void> _finishApply() async {
-    if (_applied) return;
+    if (!mounted || _applied) return;
     _applied = true;
     await widget.onApplied();
     if (mounted) Navigator.of(context).pop();
@@ -435,7 +455,9 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
       ),
       actions: [
         TextButton(
-          onPressed: _busy ? null : () => Navigator.of(context).pop(),
+          onPressed: _busy && !_applyOutcomeUnknown
+              ? null
+              : () => Navigator.of(context).pop(),
           child: Text(_taskId != null || _applied ? 'Close' : 'Cancel'),
         ),
         FilledButton.icon(
@@ -547,6 +569,10 @@ class _InstalledConfigWizardState extends State<InstalledConfigWizard> {
             key: _dryRunSummaryKey,
             child: _buildDryRunSummary(_dryRun!),
           ),
+        ],
+        if (_applyOutcomeUnknown) ...[
+          const SizedBox(height: Spacing.base),
+          const Text(pendingApplyOutcomeMessage),
         ],
         if (_taskId != null) ...[
           const SizedBox(height: Spacing.lg),
