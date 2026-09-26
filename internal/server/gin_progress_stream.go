@@ -53,6 +53,10 @@ func (s *GinServer) handleGinTaskProgressStream(c *gin.Context) {
 		return conn.WriteMessage(websocket.PingMessage, nil)
 	}
 
+	// Subscribe before the snapshot so completion during replay is either
+	// present in Last or queued for this connection, never lost in between.
+	evtCh, unsubscribe := s.events.SubscribeWithCancel(events.TopicTaskProgress, 256)
+	defer unsubscribe()
 	if s.progress != nil {
 		if evt, ok := s.progress.Last(taskID); ok {
 			_ = sendJSON(progressMessage{Type: "task_progress", Payload: evt})
@@ -61,9 +65,6 @@ func (s *GinServer) handleGinTaskProgressStream(c *gin.Context) {
 			}
 		}
 	}
-
-	evtCh, unsubscribe := s.events.SubscribeWithCancel(events.TopicTaskProgress, 256)
-	defer unsubscribe()
 
 	readDone := make(chan struct{})
 	go func() {

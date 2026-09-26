@@ -42,6 +42,13 @@ func TestApplyCustomManifestUpdatePreservesUnchangedListeners(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			advertisements := 0
+			mgr.serviceManager.SetRuntimePublicationCallbacks(nil, func() {
+				advertisements++
+				if _, ok := mgr.serviceManager.ResolveByHostLabelAnyPort(before[0].DerivedHostLabel); !ok {
+					t.Error("runtime advertised before publication became active")
+				}
+			})
 			mock.containers["main-old"] = &mockContainer{
 				ID: "main-old", Status: "running",
 				Spec: container.ContainerCreateSpec{Name: "piclu", Labels: map[string]string{"io.piccolo.instance": "piclu"}},
@@ -112,6 +119,9 @@ func TestApplyCustomManifestUpdatePreservesUnchangedListeners(t *testing.T) {
 			after, err := mgr.serviceManager.GetByApp("piclu")
 			if err != nil || !reflect.DeepEqual(after, before) || !mgr.serviceManager.AppPublicationActive("piclu") {
 				t.Fatalf("final publication = %+v, err=%v, want active original bindings %+v", after, err, before)
+			}
+			if advertisements != 1 {
+				t.Fatalf("runtime advertisements = %d, want one restored publication", advertisements)
 			}
 			if _, err := state.LoadManifestUpdateTransaction("piclu"); !os.IsNotExist(err) {
 				t.Fatalf("completed update retained transaction: %v", err)

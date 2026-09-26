@@ -1223,12 +1223,16 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 	defer releaseLifecycle()
 
 	accessRepairPending := false
+	accessRepairMessage := ""
 	m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseValidating, 0, "Validating config update", false, nil)
 	defer func() {
 		if err != nil {
 			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update failed", true, err)
 		} else if accessRepairPending {
-			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update applied; access repair pending", true, nil)
+			m.emitProgressWithMetadata(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update applied; access repair pending", true, map[string]any{
+				"access_repair_pending": true,
+				"access_repair_message": accessRepairMessage,
+			}, nil)
 		} else {
 			m.emitProgress(ctx, taskTypeUpdateConfig, instanceID, taskPhaseComplete, 100, "Config update complete", true, nil)
 		}
@@ -1367,7 +1371,6 @@ func (m *AppManager) ApplyInstalledConfigUpdate(ctx context.Context, instanceID 
 			log.Printf("WARN: config update %s: committed catalog metadata pending retry: %v", instanceID, err)
 		}
 	}
-	accessRepairMessage := ""
 	if err := applyTxn.publishAccess(); err != nil {
 		accessRepairPending = true
 		if catalogMetadataErr != nil {

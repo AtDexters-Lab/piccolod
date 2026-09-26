@@ -2759,7 +2759,9 @@ func TestApplyCustomManifestUpdate_PostCommitAccessFailureReturnsRepairPending(t
 		registerErr:     errors.New("proxy registry unavailable"),
 	})
 
-	applied, err := mgr.ApplyCustomManifestUpdate(context.Background(), ManifestUpdateRequest{
+	reporter := &recordingArtifactProgressReporter{}
+	mgr.SetProgressReporter(reporter)
+	applied, err := mgr.ApplyCustomManifestUpdate(WithTaskID(context.Background(), "manifest-repair-result"), ManifestUpdateRequest{
 		InstanceID:         "oidcapp",
 		BaseManifestHash:   cand.BaseManifestHash,
 		RuntimeFingerprint: cand.RuntimeFingerprint,
@@ -2771,6 +2773,10 @@ func TestApplyCustomManifestUpdate_PostCommitAccessFailureReturnsRepairPending(t
 	}
 	if !applied.AccessRepairPending || !strings.Contains(applied.AccessRepairMessage, "proxy registry unavailable") {
 		t.Fatalf("access repair result = pending:%v message:%q", applied.AccessRepairPending, applied.AccessRepairMessage)
+	}
+	terminal, ok := reporter.Last("manifest-repair-result")
+	if !ok || !terminal.IsComplete || terminal.Error != "" || terminal.Metadata["access_repair_pending"] != true || terminal.Metadata["access_repair_message"] != applied.AccessRepairMessage {
+		t.Fatalf("terminal progress lost repair outcome: %+v", terminal)
 	}
 	if len(registered) != 1 || registered[0] != "oidcapp" {
 		t.Fatalf("proxy registration calls = %v, want failed publish attempt", registered)

@@ -1744,8 +1744,16 @@ func (p *PreparedReconcile) publishContext(ctx context.Context, token Publicatio
 	}
 	p.manager.publicationLifecycleMu.Lock()
 	defer p.manager.publicationLifecycleMu.Unlock()
+	readvertise := false
 	p.manager.mu.Lock()
-	defer p.manager.mu.Unlock()
+	defer func() {
+		p.manager.mu.Unlock()
+		// Projection callbacks resolve the committed registry under mu.
+		// Retain lifecycle ownership until the restored routes are advertised.
+		if readvertise {
+			p.manager.advertiseRuntimePublication()
+		}
+	}()
 	if err := p.manager.authorizePublicationActivationLocked(p.appName, token); err != nil {
 		return ReconcileResult{}, false, err
 	}
@@ -1755,10 +1763,12 @@ func (p *PreparedReconcile) publishContext(ctx context.Context, token Publicatio
 	if p.published {
 		return p.result, p.containerChange, nil
 	}
+	_, wasDeactivated := p.manager.deactivated[p.appName]
 	if err := p.manager.publishPreparedReconcileLocked(ctx, p); err != nil {
 		return ReconcileResult{}, false, err
 	}
 	p.published = true
+	readvertise = wasDeactivated
 	return p.result, p.containerChange, nil
 }
 
@@ -2098,13 +2108,20 @@ func (m *ServiceManager) publishPreparedReconcileLocked(ctx context.Context, pre
 	delete(m.deactivated, prepared.appName)
 	m.rebuildPortClaimCache()
 
-	// Publish endpoint changes (non-blocking). Listener config changes are
-	// permanent — removed endpoints will not come back.
-	if len(prepared.result.Added) > 0 || len(prepared.result.Updated) > 0 || len(prepared.result.Removed) > 0 {
+	added := prepared.result.Added
+	updated := prepared.result.Updated
+	if wasDeactivated {
+		// Suspension withdrew discovery for the complete route set. Restore
+		// retained listeners too, even when configuration has no changes.
+		// Added already includes updated endpoints; do not duplicate labels.
+		added = prepared.result.Endpoints
+		updated = nil
+	}
+	if len(added) > 0 || len(updated) > 0 || len(prepared.result.Removed) > 0 {
 		m.publishEndpointsEvent(events.ServiceEndpointsChanged{
 			App:     prepared.appName,
-			Added:   endpointInfoSlice(prepared.result.Added),
-			Updated: endpointInfoSlice(prepared.result.Updated),
+			Added:   endpointInfoSlice(added),
+			Updated: endpointInfoSlice(updated),
 			Removed: endpointInfoSlice(prepared.result.Removed),
 		})
 	}
