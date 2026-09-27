@@ -19,6 +19,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> image-update-rollback # stage 20: image refresh rollback artifact lifecycle
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> modify-app-image-update # stage 23: Modify App image switch, shared mounts, alias & rollback
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> reboot           # stage 9: reboot & unlock cycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> storage-post     # stage 10: post-reboot storage
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> stewardship      # stage 11: resource stewardship (slice drop-ins, podman args)
@@ -68,7 +69,7 @@ LOG_DIR="$ALPHA_STATE_DIR/logs"
 SSH_OPTS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
 
 # SSH into the VM.
-vssh() { ssh "${SSH_OPTS[@]}" "root@$IP" "$@"; }
+vssh() { ssh "${SSH_OPTS[@]}" -p "${PICCOLO_TEST_SSH_PORT:-22}" "root@${PICCOLO_TEST_SSH_HOST:-$IP}" "$@"; }
 
 # HTTP helpers (same as production test script). GETs are safe to retry across
 # transient dev-VM NIC resets; mutation helpers remain single-attempt.
@@ -1026,7 +1027,18 @@ stage20_list_test_rollback_lvs() {
   local app_name="$1"
   local pattern
   pattern=$(stage20_rollback_lv_pattern "$app_name")
-  vssh "lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+\$//' | grep -E '$pattern' || true" 2>/dev/null
+  vssh "bash -s -- '$pattern'" 2>/dev/null <<'SH'
+pattern=$1
+# An unavailable inventory must never look like a successful empty result.
+inventory=$(lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null) || exit $?
+names=$(printf '%s\n' "$inventory" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || exit $?
+if owned=$(printf '%s\n' "$names" | grep -E "$pattern"); then
+  printf '%s\n' "$owned"
+else
+  status=$?
+  [[ "$status" -eq 1 ]] || exit "$status"
+fi
+SH
 }
 
 stage20_cleanup_test_rollback_lvs_if_absent() {
@@ -1034,7 +1046,28 @@ stage20_cleanup_test_rollback_lvs_if_absent() {
   local pattern
   pattern=$(stage20_rollback_lv_pattern "$app_name")
   stage20_wait_app_absent "$app_name" || return 1
-  vssh "for lv in \$(lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null | sed -E 's/^[[:space:]]+//; s/[[:space:]]+\$//' | grep -E '$pattern' || true); do lvremove -y piccolo-data-vg/\$lv >/dev/null 2>&1 || exit 1; done" >/dev/null 2>&1
+  vssh "bash -s -- '$pattern'" >/dev/null 2>&1 <<'SH'
+pattern=$1
+inventory=$(lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null) || exit $?
+names=$(printf '%s\n' "$inventory" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || exit $?
+if owned=$(printf '%s\n' "$names" | grep -E "$pattern"); then
+  while IFS= read -r lv; do
+    lvremove -y "piccolo-data-vg/$lv" >/dev/null 2>&1 || exit $?
+  done <<< "$owned"
+else
+  status=$?
+  [[ "$status" -eq 1 ]] || exit "$status"
+fi
+# Verify removal against a fresh, successfully-read inventory.
+inventory=$(lvs --noheadings -o lv_name piccolo-data-vg 2>/dev/null) || exit $?
+names=$(printf '%s\n' "$inventory" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//') || exit $?
+if printf '%s\n' "$names" | grep -Eq "$pattern"; then
+  exit 1
+else
+  status=$?
+  [[ "$status" -eq 1 ]] || exit "$status"
+fi
+SH
 }
 
 stage_image_update_rollback() {
@@ -1244,6 +1277,289 @@ except: print('')" 2>/dev/null)
     ((FAIL_COUNT++)) || true
     vssh "lvremove -y piccolo-data-vg/$STALE_SNAPSHOT >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
   fi
+}
+
+# ─────────────────────────────────────────────────────────
+# Stage 23: Modify App Image Update Attachment Boundary
+# ─────────────────────────────────────────────────────────
+# This focused stage never manages VM lifecycle. Its run-scoped app, loopback
+# registry, and registries.conf drop-in are removed even after a baseline failure.
+stage_modify_app_image_update() {
+  echo -e "\n${CYAN}═══ Stage 23: Modify App Image Update Attachment Boundary ═══${NC}"
+  local result_file
+  result_file=$(mktemp "$ALPHA_STATE_DIR/modify-counts-XXXXXX")
+  (
+    local original_pass="$PASS_COUNT" original_fail="$FAIL_COUNT" original_skip="$SKIP_COUNT"
+    local run_id app_name local_dir remote_dir registry_conf created=0 remote_created=0 registry_launch_attempted=0
+    run_id="$(date +%s)-$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+    # App address names are limited to 16 characters. Keep the longer run ID
+    # for evidence paths, while retaining 48 bits of collision resistance here.
+    app_name="mi$(python3 -c 'import secrets; print(secrets.token_hex(6))')"
+    local_dir=$(mktemp -d "$ALPHA_STATE_DIR/modify-fixture-XXXXXX")
+    remote_dir="/tmp/piccolo-modify-image-$run_id"
+    registry_conf="/etc/containers/registries.conf.d/99-piccolo-modify-$run_id.conf"
+    local fixture_dir="$SCRIPT_DIR/fixtures/modify-app-image"
+    local evidence_dir="$LOG_DIR/modify-app-image-$run_id"
+    mkdir -p "$evidence_dir"
+    _modify_cleanup() {
+      local code="404"
+      if [[ "$created" == "1" ]]; then
+        code=$(delete_app_if_present "$app_name")
+        if [[ "$code" == "200" || "$code" == "404" ]] && stage20_wait_app_absent "$app_name"; then
+          check "23.cleanup" "Run-owned app absent after cleanup" "yes" "yes"
+          # Manifest rollback retains test-owned data snapshots/failure LVs;
+          # remove only this invocation's artifacts, and only after app absence.
+          local remaining_lvs
+          if stage20_cleanup_test_rollback_lvs_if_absent "$app_name"; then
+            if remaining_lvs=$(stage20_list_test_rollback_lvs "$app_name") && [[ -z "$remaining_lvs" ]]; then
+              check "23.cleanup.rollback" "Run-owned rollback LVs absent after cleanup" "yes" "yes"
+            else
+              check "23.cleanup.rollback" "Run-owned rollback LVs absent after cleanup" "unproven: $remaining_lvs" "yes"
+            fi
+          else
+            check "23.cleanup.rollback" "Run-owned rollback LVs absent after cleanup" "cleanup failed" "yes"
+          fi
+        else
+          check "23.cleanup" "Run-owned app absent after cleanup" "HTTP $code; absence unproven" "yes"
+        fi
+      fi
+      if [[ "$remote_created" == "1" ]]; then
+        local stop_command="true"
+        [[ "$registry_launch_attempted" == "0" ]] || stop_command="python3 '$remote_dir/fixture.py' stop '$remote_dir/registry'"
+        # Preserve the run directory (including pid/log evidence) if owned
+        # process termination cannot be proven. Cleanup failures fail the gate.
+        if vssh "$stop_command && rm -f '$registry_conf' && rm -rf '$remote_dir' && test ! -e '$registry_conf' && test ! -e '$remote_dir'" > "$evidence_dir/registry-cleanup.txt" 2>&1; then
+          check "23.cleanup.registry" "Owned registry absent; temporary config and files removed" "yes" "yes"
+        else
+          check "23.cleanup.registry" "Owned registry absent; temporary config and files removed" "unproven; inspect $evidence_dir/registry-cleanup.txt and $remote_dir" "yes"
+        fi
+      fi
+      rm -rf "$local_dir"
+      printf '%s %s %s\n' "$((PASS_COUNT-original_pass))" "$((FAIL_COUNT-original_fail))" "$((SKIP_COUNT-original_skip))" > "$result_file"
+    }
+    trap _modify_cleanup EXIT
+    _modify_abort() {
+      echo -e "  ${RED}FAIL${NC} [23.fixture] $1"
+      ((FAIL_COUNT++)) || true
+      dump_logs "stage23-$run_id"
+      exit 1
+    }
+    ensure_session || _modify_abort "Could not establish test session"
+    command -v go >/dev/null && command -v python3 >/dev/null || _modify_abort "Host needs Go and Python 3"
+    local arch
+    arch=$(vssh "uname -m") || _modify_abort "Root SSH unavailable"
+    case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; *) _modify_abort "Unsupported guest architecture: $arch" ;; esac
+    vssh "command -v python3 >/dev/null && command -v curl >/dev/null && command -v skopeo >/dev/null && test -d /etc/containers/registries.conf.d" || _modify_abort "Guest needs Python 3, curl, skopeo and Podman registry drop-in directory"
+    CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "$local_dir/fixture" "$fixture_dir/main.go" || _modify_abort "Static fixture build failed"
+    python3 "$fixture_dir/fixture.py" build "$local_dir/registry" --binary "$local_dir/fixture" --arch "$arch" || _modify_abort "OCI fixture generation failed"
+    cp "$fixture_dir/fixture.py" "$local_dir/fixture.py"
+    vssh "mkdir -m 0700 '$remote_dir'" || _modify_abort "Run directory creation failed"
+    remote_created=1
+    tar -C "$local_dir" -cf - registry fixture.py | vssh "tar -C '$remote_dir' -xf -" || _modify_abort "Fixture transfer failed"
+    registry_launch_attempted=1
+    vssh "nohup python3 '$remote_dir/fixture.py' serve '$remote_dir/registry' > '$remote_dir/registry.log' 2>&1 < /dev/null &" || _modify_abort "Local registry launch failed"
+    local registry_port=""
+    for _ in $(seq 1 20); do
+      registry_port=$(vssh "cat '$remote_dir/registry/port' 2>/dev/null" || true)
+      [[ "$registry_port" =~ ^[1-9][0-9]*$ ]] && break
+      sleep 1
+    done
+    [[ "$registry_port" =~ ^[1-9][0-9]*$ ]] || _modify_abort "Local registry did not start"
+    vssh "printf '[[registry]]\nlocation = \"127.0.0.1:$registry_port\"\ninsecure = true\n' > '$registry_conf'; curl -sf 'http://127.0.0.1:$registry_port/v2/' >/dev/null" || _modify_abort "Registry configuration failed"
+    local image_base="127.0.0.1:$registry_port/fixture" digest1 digest2 digest_fail
+    digest1=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["v1"])' "$local_dir/registry/refs.json")
+    digest2=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["v2"])' "$local_dir/registry/refs.json")
+    digest_fail=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fail"])' "$local_dir/registry/refs.json")
+    cp "$local_dir/registry/refs.json" "$evidence_dir/fixture-digests.json"
+    echo -e "  ${CYAN}INFO${NC} Run-owned app: $app_name; immutable fixture digests: $evidence_dir/fixture-digests.json"
+    _modify_manifest() {
+      python3 - "$fixture_dir/app.yaml" "$1" "$image_base@$digest1" <<'PY'
+import sys
+print(open(sys.argv[1]).read().replace('__MAIN_IMAGE__',sys.argv[2]).replace('__SIDE_IMAGE__',sys.argv[3]),end='')
+PY
+    }
+    _modify_post() {
+      local path="$1" payload_file="$2" response_file="$3" token
+      token=$(csrf) || return 1
+      curl -s -o "$response_file" -w '%{http_code}' --connect-timeout 10 --max-time 300 \
+        -b "$COOKIE_JAR" -c "$COOKIE_JAR" -X POST -H 'Content-Type: application/json' \
+        -H "X-CSRF-Token: $token" -d @"$payload_file" "http://$IP$path" 2>/dev/null
+    }
+    _modify_payload() {
+      local image="$1" output="$2"
+      _modify_manifest "$image" > "$local_dir/candidate.yaml"
+      python3 - "$local_dir/candidate.yaml" "$output" "$app_name" <<'PY'
+import json,sys
+with open(sys.argv[2], 'w') as out:
+    json.dump({'app_definition':open(sys.argv[1]).read(), 'inputs':{'__app_address__':sys.argv[3]}}, out)
+PY
+    }
+    _modify_snapshot() {
+      local label="$1" state
+      state=$(vssh "python3 '$remote_dir/fixture.py' inspect '$app_name'" 2>"$evidence_dir/$label-mount-error.txt") || return 1
+      printf '%s\n' "$state" > "$evidence_dir/$label-state.json"
+    }
+    _modify_wait_running() {
+      local status=""
+      for _ in $(seq 1 90); do
+        status=$(api "/api/v1/apps/$app_name" | python3 -c 'import json,sys; print(json.load(sys.stdin)["data"]["app"]["status"])' 2>/dev/null || true)
+        [[ "$status" == "running" ]] && return 0
+        sleep 1
+      done
+      return 1
+    }
+    _modify_listener_snapshot() {
+      local label="$1"
+      api "/api/v1/apps/$app_name" > "$local_dir/listener-api.json" || return 1
+      python3 - "$local_dir/listener-api.json" "$evidence_dir/$label-listener.json" "$app_name" <<'PY'
+import json,sys
+listeners=json.load(open(sys.argv[1]))['data']['listeners']
+matches=[ep for ep in listeners if ep.get('name')==sys.argv[3]]
+assert len(matches)==1, 'exact primary listener name unavailable'
+ep=matches[0]
+assert ep.get('app')==sys.argv[3] and ep.get('primary') is True, 'primary listener identity changed'
+assert ep.get('derived_host_label')==sys.argv[3], 'primary domain label changed'
+assert ep.get('guest_port')==8080, 'primary guest port changed'
+assert isinstance(ep.get('host_port'),int) and ep['host_port']>0, 'primary HostBind unavailable'
+assert isinstance(ep.get('public_port'),int) and ep['public_port']>0, 'primary PublicPort unavailable'
+state={key:ep[key] for key in ('app','name','primary','derived_host_label','guest_port','host_port','public_port')}
+json.dump(state,open(sys.argv[2],'w'),sort_keys=True)
+print(ep['public_port'])
+PY
+    }
+    _modify_check_listener_preserved() {
+      local label="$1"
+      _modify_listener_snapshot "$label" >/dev/null || _modify_abort "Exact primary listener identity unavailable after $label"
+      if python3 - "$evidence_dir/before-listener.json" "$evidence_dir/$label-listener.json" <<'PY'
+import json,sys
+before,after=[json.load(open(path)) for path in sys.argv[1:]]
+if before!=after:
+    print('Original endpoint: '+json.dumps(before,sort_keys=True))
+    print('Current endpoint:  '+json.dumps(after,sort_keys=True))
+    sys.exit(1)
+PY
+      then
+        check "23.$label.endpoint" "Primary identity, HostBind and PublicPort preserved" "same" "same"
+      else
+        check "23.$label.endpoint" "Primary identity, HostBind and PublicPort preserved" "changed; endpoint evidence saved" "same"
+      fi
+    }
+    _modify_prepare() {
+      local image="$1" label="$2" code
+      _modify_payload "$image" "$local_dir/request.json"
+      code=$(_modify_post "/api/v1/apps/$app_name/manifest/configure" "$local_dir/request.json" "$evidence_dir/$label-configure.json")
+      check "23.$label.configure" "Modify App configure succeeds" "$code" "200"
+      [[ "$code" == "200" ]] || return 1
+      code=$(_modify_post "/api/v1/apps/$app_name/manifest/dry-run" "$local_dir/request.json" "$evidence_dir/$label-dry-run.json")
+      check "23.$label.dry-run" "Modify App dry run succeeds" "$code" "200"
+      [[ "$code" == "200" ]] || return 1
+      python3 - "$local_dir/request.json" "$evidence_dir/$label-dry-run.json" "$local_dir/apply.json" <<'PY'
+import json,sys
+request=json.load(open(sys.argv[1])); result=json.load(open(sys.argv[2]))['data']
+assert result['applicable'], result.get('blocking_reason')
+assert result.get('dry_run_token'), 'missing dry-run token'
+for key in ('base_manifest_hash','runtime_fingerprint','transition_plan_hash','dry_run_token'):
+    if key in result: request[key]=result[key]
+request['confirmations']=result.get('required_confirmations',[])
+json.dump(request,open(sys.argv[3],'w'))
+PY
+    }
+    local code public_port marker sentinel="sentinel-$run_id"
+    _modify_payload "$image_base@$digest1" "$local_dir/request.json"
+    # The unique name belongs to this invocation; clean up a partially-installed
+    # app even if the create request times out before its response reaches us.
+    created=1
+    code=$(_modify_post /api/v1/apps "$local_dir/request.json" "$evidence_dir/install.json")
+    check "23.1" "Two-service fixture installed" "$code" "201"
+    [[ "$code" == "201" ]] || _modify_abort "Fixture installation failed"
+    _modify_wait_running || _modify_abort "Fixture did not reach running"
+    public_port=$(_modify_listener_snapshot before) || _modify_abort "Exact initial primary listener unavailable"
+    [[ "$public_port" =~ ^[1-9][0-9]*$ ]] || _modify_abort "Fixture listener port unavailable"
+    _modify_http() { vssh "curl -sf --connect-timeout 5 --max-time 10 'http://127.0.0.1:$public_port$1'"; }
+    marker=$(_modify_http / || true)
+    check "23.2" "Installed HTTP workload serves v1" "$marker" "v1"
+    [[ "$marker" == "v1" ]] || _modify_abort "Initial HTTP marker incorrect"
+    vssh "curl -sf --max-time 10 -X POST --data '$sentinel' 'http://127.0.0.1:$public_port/sentinel'" >/dev/null || _modify_abort "Persistent sentinel write failed"
+    _modify_snapshot before || _modify_abort "Initial live rootfs mounts not proven"
+    _modify_prepare "$image_base@$digest2" switch || _modify_abort "Image-switch planning failed"
+    code=$(_modify_post "/api/v1/apps/$app_name/manifest/update" "$local_dir/apply.json" "$evidence_dir/switch-apply.json")
+    check "23.3" "Modify App image switch succeeds" "$code" "200"
+    if [[ "$code" != "200" ]]; then
+      # Baseline v0.2.46 fails here; retain the real response/mount evidence and
+      # fail normally. There is no expected-failure switch that masks this gate.
+      _modify_snapshot failed-switch || true
+      _modify_abort "Modify App image switch failed; baseline evidence saved in $evidence_dir"
+    fi
+    _modify_wait_running || _modify_abort "Updated app did not reach running"
+    _modify_check_listener_preserved switched
+    _modify_snapshot switched || _modify_abort "Shared rootfs mounts lost after image switch"
+    python3 - "$evidence_dir/before-state.json" "$evidence_dir/switched-state.json" "$digest2" "$image_base@$digest2" <<'PY'
+import json,sys
+before,after=[json.load(open(p)) for p in sys.argv[1:3]]
+assert after['main']['digest']==sys.argv[3], 'main selected wrong image digest'
+assert after['main']['image_ref']==sys.argv[4], 'main did not commit selected image ref'
+assert after['main']['volume']!=before['main']['volume'], 'main rootfs did not switch'
+for key in ('side','__netns__'):
+    assert after[key]['volume']==before[key]['volume'], key+' shared rootfs identity changed'
+    assert after[key]['live_mounts'], key+' lost live mounts'
+PY
+    [[ "$?" == "0" ]] || _modify_abort "Image selection/shared attachment mismatch"
+    check "23.4" "Main digest changed; unchanged service and anchor retain live mounts" "yes" "yes"
+    check "23.5" "Updated HTTP workload serves v2" "$(_modify_http / || true)" "v2"
+    check "23.6" "Persistent sentinel survives image switch" "$(_modify_http /sentinel || true)" "$sentinel"
+    _modify_prepare "$image_base:v2-alias" alias || _modify_abort "Same-digest alias planning failed"
+    code=$(_modify_post "/api/v1/apps/$app_name/manifest/update" "$local_dir/apply.json" "$evidence_dir/alias-apply.json")
+    check "23.7" "Same-digest reference alias applies" "$code" "200"
+    [[ "$code" == "200" ]] || _modify_abort "Same-digest alias apply failed"
+    _modify_check_listener_preserved alias
+    _modify_snapshot alias || _modify_abort "Alias update lost live mounts"
+    python3 - "$evidence_dir/switched-state.json" "$evidence_dir/alias-state.json" "$image_base:v2-alias" <<'PY'
+import json,sys
+before,after=[json.load(open(p)) for p in sys.argv[1:3]]
+assert {k:v['volume'] for k,v in before.items()}=={k:v['volume'] for k,v in after.items()}, 'alias changed rootfs identities'
+assert after['main']['image_ref']==sys.argv[3], 'alias image ref was not committed'
+PY
+    [[ "$?" == "0" ]] || _modify_abort "Same-digest alias recreated rootfs"
+    check "23.8" "Alias preserves HTTP marker and data" "$(_modify_http / || true)|$(_modify_http /sentinel || true)" "v2|$sentinel"
+    _modify_prepare "$image_base@$digest_fail" rollback || _modify_abort "Failure-case planning failed"
+    code=$(_modify_post "/api/v1/apps/$app_name/manifest/update" "$local_dir/apply.json" "$evidence_dir/rollback-apply.json")
+    check "23.9" "Candidate /proc mount fault fails during apply before PID 1" "$code" "500"
+    if [[ "$code" != "500" ]]; then
+      if [[ "$code" == "200" ]]; then
+        _modify_snapshot unexpected-candidate || true
+        vssh "python3 '$remote_dir/fixture.py' diagnostics '$app_name'" > "$evidence_dir/unexpected-candidate-execution.json" 2> "$evidence_dir/unexpected-candidate-execution-error.txt" || true
+      fi
+      _modify_abort "Induced precommit failure did not occur"
+    fi
+    # An arbitrary server error does not establish the injected startup fault.
+    if ! python3 "$fixture_dir/fixture.py" failure-cause "$evidence_dir/rollback-apply.json"; then
+      vssh "journalctl -u piccolod --no-pager -n 500 | grep -F '$app_name'" > "$evidence_dir/rollback-entrypoint-journal.txt" 2>/dev/null || true
+      python3 "$fixture_dir/fixture.py" failure-cause "$evidence_dir/rollback-entrypoint-journal.txt" || _modify_abort "Apply 500 was not proven to be the injected /proc mount failure"
+    fi
+    check "23.9.cause" "Apply failure identifies the injected /proc mount ENOTDIR" "yes" "yes"
+    _modify_wait_running || _modify_abort "Rollback did not restore running app"
+    # Preserve the original probe port. Endpoint drift is a regression, never
+    # repaired in the test by selecting a newly-assigned listener or port.
+    _modify_check_listener_preserved restored
+    _modify_snapshot restored || _modify_abort "Rollback did not restore all live rootfs mounts"
+    python3 - "$evidence_dir/alias-state.json" "$evidence_dir/restored-state.json" <<'PY'
+import json,sys
+before,after=[json.load(open(p)) for p in sys.argv[1:]]
+assert {k:(v['volume'],v['digest'],v['image_ref']) for k,v in before.items()}=={k:(v['volume'],v['digest'],v['image_ref']) for k,v in after.items()}, 'rollback changed committed rootfs/digests/image refs'
+PY
+    [[ "$?" == "0" ]] || _modify_abort "Rollback restored wrong image/rootfs state"
+    check "23.10" "Failed candidate restores old image and shared live mounts" "yes" "yes"
+    check "23.11" "Rollback restores committed v2 HTTP marker" "$(_modify_http / || true)" "v2"
+    check "23.12" "Rollback preserves persistent sentinel" "$(_modify_http /sentinel || true)" "$sentinel"
+    check_ssh_ok "23.13" "Manifest transaction cleared after rollback" "python3 '$remote_dir/fixture.py' transaction-cleared '$app_name'"
+    echo -e "  ${CYAN}INFO${NC} Modify App regression evidence: $evidence_dir"
+  ) || true
+  local stage_pass stage_fail stage_skip
+  read -r stage_pass stage_fail stage_skip < "$result_file"
+  PASS_COUNT=$((PASS_COUNT+stage_pass))
+  FAIL_COUNT=$((FAIL_COUNT+stage_fail))
+  SKIP_COUNT=$((SKIP_COUNT+stage_skip))
+  rm -f "$result_file"
 }
 
 # ─────────────────────────────────────────────────────────
@@ -3946,6 +4262,7 @@ case "$STAGE" in
   workspace-app)     stage_workspace_app ;;
   app-resize)        stage_app_resize ;;
   image-update-rollback) stage_image_update_rollback ;;
+  modify-app-image-update) stage_modify_app_image_update ;;
   reboot)            stage_reboot ;;
   storage-post)      stage_storage_post ;;
   stewardship)       stage_stewardship ;;
@@ -3988,9 +4305,14 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider workspace-app app-resize image-update-rollback reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider workspace-app app-resize image-update-rollback modify-app-image-update reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac
 
 summary
+# This regression is suitable for baseline/fixed gates: report a failed check
+# through the process status as well as the harness summary.
+if [[ "$STAGE" == "modify-app-image-update" ]]; then
+  [[ "$FAIL_COUNT" -eq 0 ]]
+fi

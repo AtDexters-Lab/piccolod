@@ -1,0 +1,31 @@
+listeners:
+  - name: __primary
+    guest_port: 8080
+    flow: tcp
+    protocol: http
+    auth:
+      rules:
+        - path: /
+          type: prefix
+          strategy: public
+services:
+  main:
+    image: __MAIN_IMAGE__
+    bind_ports: [8080]
+    storage:
+      persistent:
+        data:
+          container: /data
+          size_limit: 128MB
+  side:
+    image: __SIDE_IMAGE__
+    bind_ports: [8081]
+    environment:
+      FIXTURE_PORT: "8081"
+resources:
+  priority: normal
+  memory:
+    min_required: 64MB
+    profile: bounded
+x-piccolo:
+  mode: service
