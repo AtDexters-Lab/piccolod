@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -22,7 +23,9 @@ import (
 // installContainerGroup installs an app as a container group (network anchor + service containers).
 // All containers use --rootfs from golden LV snapshots (block-native architecture).
 // For workspace mode, workspace disks are prepared via golden LVs.
-// When prebuiltRootfs is non-nil, services with entries skip image pull + rootfs creation (used by clone).
+// Prebuilt rootfs entries select caller-owned volumes, not live attachment leases.
+// Reacquire their mount handles before preparation; quiescence may have detached them.
+// Services with entries skip image pull + rootfs creation (also used by clone).
 // runInitScripts is true only for the first ordinary install. Every recreation
 // reuses the already-initialized persistent state and must not repeat init side effects.
 func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppDefinition, instanceID string, layout appVolumeLayout, runtime container.PodmanRuntime, endpoints []services.ServiceEndpoint, prebuiltRootfs map[string]*rootfsMountInfo, reuseRecordedArtifacts, runInitScripts bool) (*AppInstance, error) {
@@ -36,6 +39,10 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	mode := piccoloModeFromExtensions(appDef.Extensions)
 	primary := primaryServiceFor(appDef, nil)
 	startOrder, err := serviceStartOrder(appDef.Services)
+	if err != nil {
+		return nil, err
+	}
+	prebuiltRootfs, err = m.attachPrebuiltRootfs(ctx, appDef, prebuiltRootfs)
 	if err != nil {
 		return nil, err
 	}
@@ -651,6 +658,52 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 	artifactCandidateAccepted = true
 	return result, nil
+}
+
+// attachPrebuiltRootfs resolves the caller's exact volume selections against
+// current storage state. A mount path saved during staging can become stale
+// when the previous runtime is quiesced. Copies keep refreshed handles local;
+// callers retain volume ownership and their existing rollback/cleanup rules.
+func (m *AppManager) attachPrebuiltRootfs(ctx context.Context, appDef *api.AppDefinition, selected map[string]*rootfsMountInfo) (map[string]*rootfsMountInfo, error) {
+	if len(selected) == 0 {
+		return selected, nil
+	}
+	names := make([]string, 0, len(selected))
+	for name := range selected {
+		if _, consumed := appDef.Services[name]; name != networkAnchorServiceName && !consumed {
+			continue
+		}
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	// Validate the complete consumed selection before attaching any volume.
+	for _, name := range names {
+		info := selected[name]
+		if info == nil || strings.TrimSpace(info.handle.VolumeID) == "" {
+			return nil, fmt.Errorf("attach prebuilt rootfs for %s: volume identity required", name)
+		}
+	}
+	if len(names) == 0 {
+		return nil, nil
+	}
+	rootfs := m.currentRootfsManager()
+	if rootfs == nil {
+		return nil, fmt.Errorf("attach prebuilt rootfs: rootfs volume manager not configured")
+	}
+	attached := make(map[string]*rootfsMountInfo, len(names))
+	for _, name := range names {
+		info := selected[name]
+		volumeID := info.handle.VolumeID
+		handle, err := rootfs.AttachRootfs(ctx, volumeID)
+		if err != nil {
+			return nil, fmt.Errorf("attach prebuilt rootfs for %s (%s): %w", name, volumeID, err)
+		}
+		if handle.VolumeID != volumeID || strings.TrimSpace(handle.MountPath) == "" {
+			return nil, fmt.Errorf("attach prebuilt rootfs for %s (%s): invalid attached handle", name, volumeID)
+		}
+		attached[name] = &rootfsMountInfo{handle: handle, imgConfig: info.imgConfig}
+	}
+	return attached, nil
 }
 
 // resolveRemoteDigest queries the registry for the current digest of an image

@@ -1110,7 +1110,8 @@ func (m *AppManager) removeUncommittedContainerGroup(
 		return fmt.Errorf("candidate container group is required for removal")
 	}
 	if m.serviceManager != nil {
-		m.serviceManager.DeactivateApp(candidate.InstanceID)
+		// A suspended transaction owns the bindings needed by rollback.
+		m.serviceManager.DeactivateAppUnlessSuspended(candidate.InstanceID)
 		m.serviceManager.SetAppContainerID(candidate.InstanceID, "")
 	}
 	m.removeCapabilityIngresses(candidate.InstanceID)
