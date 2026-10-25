@@ -16,6 +16,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> ai-provider      # stage 22: released AI provider + private capability binding
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-idmap-drift # stage 24: rootfs ID map follows a re-created app user
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> restart-in-place # stage 25: graceful restart keeps the container group
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
@@ -4362,6 +4363,115 @@ print(json.dumps({
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 25: A graceful restart restarts the container group in place
+#
+# The shutdown drain stops each app and detaches its rootfs volumes but keeps
+# its containers. Baseline binaries started the existing network anchor before
+# re-attaching its rootfs, so the start failed with `exec: "/pause": stat
+# /pause` and every restart recreated the whole group; they fail 25.5 and 25.6.
+# ─────────────────────────────────────────────────────────
+stage_restart_in_place() {
+  echo -e "\n${CYAN}═══ Stage 25: Graceful restart keeps the container group ═══${NC}"
+  ensure_session
+
+  local APP_NAME="restartkeep"
+  local app_user="pa-$APP_NAME"
+
+  _rip_status() {
+    api "/api/v1/apps/$APP_NAME" 2>/dev/null | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except Exception: print('')" 2>/dev/null
+  }
+  # Running containers of the group as the app user's Podman lists them, on
+  # one line so check compares the whole group rather than any one line.
+  _rip_running() {
+    local uid
+    uid=$(vssh "id -u $app_user 2>/dev/null || true" | tail -1 | tr -d '[:space:]')
+    [[ "$uid" =~ ^[1-9][0-9]*$ ]] || return 0
+    { vssh "cd /tmp && /usr/sbin/runuser --user $app_user -- /usr/bin/env XDG_RUNTIME_DIR=/run/user/$uid \
+      /usr/bin/podman --root /run/piccolo/podman/apps/$APP_NAME --runroot /run/piccolo/podman/app-$APP_NAME --storage-driver overlay \
+      ps --filter status=running --format '{{.ID}} {{.Names}}'" 2>/dev/null || true; } | sort | tr '\n' ' '
+  }
+  # Waits for the anchor and the workspace container to run.
+  _rip_wait_group() {
+    local running=""
+    for _ in $(seq 1 90); do
+      running=$(_rip_running)
+      [[ "$(wc -w <<<"$running")" -eq 4 && "$(_rip_status)" == "running" ]] && return 0
+      sleep 2
+    done
+    return 1
+  }
+
+  local template_yaml
+  template_yaml=$(api "/api/v1/catalog/code-server/template")
+  if [[ -z "$template_yaml" ]]; then
+    skip "25.x" "Graceful restart in place" "catalog template not available"
+    return
+  fi
+  delete_app_if_present "$APP_NAME" >/dev/null || true
+  local payload token install_http
+  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': os.environ['NAME'], 'password': 'E2eTest-2026!'},
+    'catalog_source': 'code-server'
+}))")
+  token=$(csrf)
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 600 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  check "25.1" "Workspace app installed" "$install_http" "201"
+  if [[ "$install_http" != "201" ]] || ! _rip_wait_group; then
+    check "25.2" "Workspace app and its anchor run" "$(_rip_status) $(_rip_running)" "running"
+    dump_logs "stage25-install"
+    delete_app_if_present "$APP_NAME" >/dev/null || true
+    return
+  fi
+  local before since
+  before=$(_rip_running)
+  check "25.2" "Workspace app and its anchor run" "$before" "${APP_NAME}__netns__"
+
+  # Stop, check, then start, rather than restart: the start path is exercised
+  # only if the drain really stopped the group and detached the anchor rootfs.
+  since=$(vssh "date +%s" | tail -1 | tr -d '[:space:]')
+  vssh "systemctl stop piccolod" >/dev/null 2>&1 || true
+  local anchor_mount
+  anchor_mount=$(vssh "findmnt -n -o TARGET /piccolo-core/mounts/svc-rootfs-$APP_NAME--__netns__-idmap || true" 2>/dev/null)
+  check "25.3" "Drain stops the group and detaches the anchor rootfs" \
+    "running: [$(_rip_running)] anchor rootfs: [$anchor_mount]" "running: [] anchor rootfs: []"
+  # reset-failed keeps repeated runs clear of the unit's start limit.
+  vssh "systemctl reset-failed piccolod; systemctl start piccolod" >/dev/null 2>&1 || true
+  for _ in $(seq 1 30); do
+    vssh "systemctl is-active piccolod" 2>/dev/null | grep -q '^active$' && break
+    sleep 2
+  done
+  # The restart invalidates the session.
+  ensure_session
+  _rip_wait_group || true
+  check "25.4" "Workspace app runs after piccolod starts again" "$(_rip_status)" "running"
+  check "25.5" "The same anchor and workspace containers run" "$(_rip_running)" "$before"
+  # The failure line names the app. Podman's error output ends in a newline,
+  # so its "recreating container group" suffix is a separate journal entry.
+  local start_failure
+  start_failure=$(vssh "journalctl -u piccolod --no-pager --since @$since | grep 'app $APP_NAME: anchor start failed'" 2>/dev/null || true)
+  if [[ -z "$start_failure" ]]; then
+    echo -e "  ${GREEN}PASS${NC} [25.6] No anchor start failure after the restart"
+    ((PASS_COUNT++)) || true
+  else
+    echo -e "  ${RED}FAIL${NC} [25.6] Anchor start failed after the restart:"
+    echo "$start_failure" | cut -c1-240 | sed 's/^/       /'
+    ((FAIL_COUNT++)) || true
+  fi
+
+  delete_app_if_present "$APP_NAME" >/dev/null || true
+  check_http "25.7" "Restart fixture uninstalled" "GET" "/api/v1/apps/$APP_NAME" "404"
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 if [[ -L "$ALPHA_STATE_DIR" ]] || { [[ -e "$ALPHA_STATE_DIR" ]] && [[ ! -d "$ALPHA_STATE_DIR" ]]; }; then
@@ -4398,6 +4508,7 @@ case "$STAGE" in
   service-app)       stage_service_app ;;
   ai-provider)       stage_ai_provider ;;
   rootfs-idmap-drift) stage_rootfs_idmap_drift ;;
+  restart-in-place)  stage_restart_in_place ;;
   workspace-app)     stage_workspace_app ;;
   app-resize)        stage_app_resize ;;
   image-update-rollback) stage_image_update_rollback ;;
@@ -4444,7 +4555,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider rootfs-idmap-drift workspace-app app-resize image-update-rollback modify-app-image-update reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider rootfs-idmap-drift restart-in-place workspace-app app-resize image-update-rollback modify-app-image-update reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac
@@ -4452,6 +4563,6 @@ esac
 summary
 # This regression is suitable for baseline/fixed gates: report a failed check
 # through the process status as well as the harness summary.
-if [[ "$STAGE" == "modify-app-image-update" || "$STAGE" == "rootfs-idmap-drift" ]]; then
+if [[ "$STAGE" == "modify-app-image-update" || "$STAGE" == "rootfs-idmap-drift" || "$STAGE" == "restart-in-place" ]]; then
   [[ "$FAIL_COUNT" -eq 0 ]]
 fi
