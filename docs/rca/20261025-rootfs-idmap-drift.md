@@ -41,16 +41,45 @@ later given to another app's user, the stale bind presents this app's files
 as that app's. Artifact references kept the same pinned copy and failed with
 "already names different durable content" after an ID change.
 
-What deleted the account is not established; the journal only reaches back
-to 19 October. The leading candidate is startup orphan cleanup: before
-`91aaab2` (v0.2.41, 25 July) its known-app set came only from
-`state.ListApps()`, and the node ran v0.2.28 or earlier on 12 June. An
-OS-level restore of `/etc/passwd` is the alternative. The snapper snapshots
-can date the change:
+### Why the user was deleted
 
-```bash
-for s in $(ls /.snapshots | sort -n); do f=/.snapshots/$s/snapshot/etc/passwd; [ -f "$f" ] || continue; d=$(sed -n 's/.*<date>\(.\{10\}\).*/\1/p' /.snapshots/$s/info.xml); u=$(awk -F: '$1=="pa-piccolospace"{print $3}' "$f"); echo "$s $d ${u:-none}"; done | awk '$3!=p{print; p=$3}'
-```
+piccolospace's stored definition stopped parsing after an upgrade, and the
+startup orphan cleanup of that era read "missing from the app list" as
+"orphaned".
+
+| When (IST) | What happened |
+|---|---|
+| 28 Mar 15:36–15:38 | piccolospace installed: data volume, workspace and anchor rootfs, app record (`created_at`). |
+| 31 Mar 22:02 | `nginx` listener added on guest port 80; the service kept `bind_ports: []` (`app.prev.yaml` has no listeners). |
+| ~19 Apr | Last working pull; `pa-piccolospace` still 474/472. |
+| 1 Jun 18:43 | `4711e91` ("feat: add TLS mux tunnel mTLS auth") adds a parser rule: every listener's `guest_port` must be declared in exactly one service's `bind_ports`. Released in v0.2.24. |
+| 2 Jun 00:11 | The node installs v0.2.24. On its next start, piccolod cannot parse piccolospace's `app.yaml`. `loadCache` prints a warning and leaves the app out of `ListApps()`. The first reconcile's orphan cleanup, whose known set was only `ListApps()`, kills `pa-piccolospace`'s processes and runs `userdel --remove`. The volumes survive; the app is down and absent from the app list. |
+| 3–12 Jun | v0.2.25, v0.2.27 and v0.2.28 keep rejecting the definition. |
+| 12 Jun 16:46:47 | `app.yaml_back` saved by hand. |
+| 12 Jun 16:47:51 | `app.yaml` edited: `bind_ports: []` → `bind_ports: [80]`. |
+| 12 Jun 16:48:34 | piccolod provisions a new `pa-piccolospace` as 468/468 with the same subordinate range; its home folder and linger file are born together. Both rootfs volumes still record 474/472, so the workspace comes back with unwritable root-owned files. |
+
+Evidence, all read on the node on 25 October:
+
+- zypper history gives the install times;
+- `stat` birth times of `/home/pa-*`, the linger files, the app records and
+  the volumes;
+- the app folder holds `app.yaml_back` and `app.prev.yaml`;
+- `transactional-update.log` records no rollbacks, and `pa-git` (19 May)
+  kept its account, which rules out an `/etc` restore.
+
+Parsing `app.yaml_back` with each release the node ran: v0.2.12–v0.2.23
+accept it, while v0.2.24, v0.2.25, v0.2.27 and v0.2.28 fail with
+`listener 'nginx' guest_port 80 must be declared in exactly one service
+bind_ports`. The repaired `app.yaml` parses on all of them.
+
+The exact minute of the deletion is unrecorded: the journal starts in
+October and the oldest snapshot is from 29 June. It was the first unlocked
+start of v0.2.24, on or after 2 June.
+
+Since `91aaab2` (v0.2.41) orphan cleanup also counts app directories, and
+since this fix it also counts surviving volumes, so the same parse failure
+would no longer delete the user.
 
 ## Repair
 
@@ -128,7 +157,14 @@ start while `kvm_amd` holds AMD-V (`VERR_SVM_IN_USE`).
 
 - Fix, tests and alpha stage: PR AtDexters-Lab/piccolod#47
   (`fix/rootfs-idmap-follows-app-user`).
-- Open: date the account deletion with the snapshot command above.
+- Deletion dated and explained: the first v0.2.24 start after 2 June 00:11
+  (see "Why the user was deleted").
+- Accepted limitation, no follow-up planned: `loadCache` still skips an app
+  whose stored definition no longer parses, with only a printed warning. The
+  `bind_ports` rule cannot recur, because installs and updates have enforced
+  it since v0.2.24 and every stored definition on the node loads today. The
+  user and volumes now survive any such skip. A future validation rule that
+  is stricter than stored definitions should ship with a migration for them.
 - Follow-up: uninstall and install cleanup destroyed the network anchor
   rootfs only when the definition had `Services`. The gate was latent: the
   parser has required `services` since January 2026, before anchors had their
@@ -137,4 +173,6 @@ start while `kvm_amd` holds AMD-V (`VERR_SVM_IN_USE`).
   `svc-rootfs-<id>--__netns__` and its versioned variants regardless
   (PR AtDexters-Lab/piccolod#48). To spot a leaked anchor on a node, list
   anchor volumes with no app record:
-  `comm -23 <(ls /piccolo-core/volumes | sed -n 's/^svc-rootfs-\(.*\)--__netns__.*/\1/p' | sort -u) <(ls /piccolo-core/apps | sort)`.
+  `comm -23 <(ls /piccolo-core/volumes | sed -n 's/^svc-rootfs-\(.*\)--__netns__.*/\1/p' | sort -u) <(ls /piccolo-core/mounts/control-plane/apps | sort)`.
+  App records live in the control volume, so the second listing reads
+  `/piccolo-core/mounts/control-plane/apps`.
