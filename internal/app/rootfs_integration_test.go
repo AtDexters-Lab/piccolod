@@ -3,13 +3,16 @@ package app
 import (
 	"bytes"
 	"context"
+	"os"
 	"reflect"
 	"slices"
 	"syscall"
 	"testing"
 
+	"piccolod/internal/api"
 	"piccolod/internal/container"
 	"piccolod/internal/persistence"
+	"piccolod/internal/state/paths"
 )
 
 func TestReadImageConfigForGoldenRootfsFallsBackToLegacyRepoQualifiedGolden(t *testing.T) {
@@ -140,5 +143,56 @@ func TestNewRootfsExportCommandAppliesRootlessWrapperAndPreservesPipe(t *testing
 	}
 	if cmd.SysProcAttr == nil || cmd.SysProcAttr.Credential != rt.Credential {
 		t.Fatal("rootfs export command did not receive the runtime credential")
+	}
+}
+
+func TestDestroyAllServiceRootfsDestroysAnchorWithoutServices(t *testing.T) {
+	const instanceID = "anchorleak"
+	anchor := persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+	versionedAnchor := persistence.VersionedServiceRootfsVolumeID(instanceID, networkAnchorServiceName, "0123456789ab")
+	service := persistence.ServiceRootfsVolumeID(instanceID, "main")
+	versionedService := persistence.VersionedServiceRootfsVolumeID(instanceID, "main", "0123456789ab")
+	otherAnchor := persistence.ServiceRootfsVolumeID("otherapp", networkAnchorServiceName)
+
+	tests := []struct {
+		name   string
+		mode   PiccoloMode
+		appDef *api.AppDefinition
+		want   []string
+	}{
+		{name: "definition without services", mode: ModeService, appDef: &api.AppDefinition{}, want: []string{anchor, versionedAnchor}},
+		// cleanupInstallResources' workspace pass has no definition.
+		{name: "nil definition", mode: ModeWorkspace, want: []string{anchor, versionedAnchor}},
+		{
+			name:   "definition with services",
+			mode:   ModeService,
+			appDef: &api.AppDefinition{Services: map[string]api.AppService{"main": {Image: "example/app:1"}}},
+			want:   []string{anchor, versionedAnchor, service, versionedService},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			core := t.TempDir()
+			paths.SetCoreRootForTest(t, core)
+			for _, volumeID := range []string{anchor, versionedAnchor, service, versionedService, otherAnchor} {
+				if err := os.MkdirAll(paths.VolumeMetaDir(volumeID), 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			rootfs := newStubRootfsManager(core)
+			mgr := &AppManager{}
+			mgr.SetRootfsManager(rootfs)
+
+			mgr.destroyAllServiceRootfs(context.Background(), instanceID, tc.mode, tc.appDef)
+
+			for _, volumeID := range tc.want {
+				if !slices.Contains(rootfs.destroyed, volumeID) {
+					t.Errorf("destroyed rootfs = %v, want %s", rootfs.destroyed, volumeID)
+				}
+			}
+			if slices.Contains(rootfs.destroyed, otherAnchor) {
+				t.Errorf("destroyed rootfs = %v, includes another app's %s", rootfs.destroyed, otherAnchor)
+			}
+		})
 	}
 }
