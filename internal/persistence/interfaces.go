@@ -117,7 +117,8 @@ type RootfsVolumeManager interface {
 	// AttachRootfs activates and mounts an existing rootfs volume. idmap is
 	// the owning app user's live ID map, nil only for volumes without one
 	// (golden content). The volume's recorded map follows it; a bind still
-	// mounted with an older map fails with ErrIDMapStaleMount.
+	// mounted with an older map fails with ErrIDMapStaleMount. The handle's
+	// AlreadyAttached reports layers the call found live and kept.
 	AttachRootfs(ctx context.Context, volumeID string, idmap *IDMapConfig) (RootfsHandle, error)
 	// DetachRootfs unmounts and deactivates a rootfs volume.
 	DetachRootfs(ctx context.Context, volumeID string) error
@@ -302,6 +303,11 @@ type RootfsHandle struct {
 	MountPath string
 	ReadOnly  bool
 	GoldenLV  string // golden LV this rootfs was snapshotted from (populated during attach)
+	// AlreadyAttached reports that the attach returning this handle found
+	// the volume attached, fully or in part, and kept those layers. They
+	// predate the call and may back running containers, so a caller undoing
+	// its own attaches must leave the volume attached.
+	AlreadyAttached bool
 }
 
 // IDMapConfig re-exports the fsutil IDMapConfig for use by callers.

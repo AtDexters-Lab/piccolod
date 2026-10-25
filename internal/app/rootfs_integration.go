@@ -509,11 +509,19 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 
 	// Service mode: per-service rootfs + network anchor rootfs.
 	result := make(map[string]*rootfsMountInfo, len(appDef.Services)+1)
+	// Undo only this call's own attaches: a volume it found attached may back
+	// running containers.
+	undoAttach := func(handle persistence.RootfsHandle) {
+		if handle.AlreadyAttached {
+			return
+		}
+		if detachErr := rootfs.DetachRootfs(ctx, handle.VolumeID); detachErr != nil {
+			log.Printf("WARN: rollback detach rootfs %s: %v", handle.VolumeID, detachErr)
+		}
+	}
 	rollbackAttached := func() {
 		for _, info := range result {
-			if detachErr := rootfs.DetachRootfs(ctx, info.handle.VolumeID); detachErr != nil {
-				log.Printf("WARN: rollback detach rootfs %s: %v", info.handle.VolumeID, detachErr)
-			}
+			undoAttach(info.handle)
 		}
 	}
 
@@ -565,8 +573,8 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 			cfg, cfgErr := rootfs.ReadGoldenImageConfig(ctx, handle.GoldenLV)
 			if cfgErr != nil {
 				rollbackAttached()
-				// Also detach the just-attached volume.
-				_ = rootfs.DetachRootfs(ctx, volumeID)
+				// Also undo this volume's attach.
+				undoAttach(handle)
 				return nil, fmt.Errorf("read image config for service %q: %w", svcName, cfgErr)
 			}
 			imgCfg = cfg

@@ -855,11 +855,14 @@ func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID strin
 //
 // Reconciliation shape: probes AttachStateOf under lock first.
 //   - Attached → return the metadata-derived RootfsHandle (no cache lookup
-//     required; rootfs handle is fully derivable from metadata).
+//     required; its identity is fully derivable from metadata).
 //   - ForeignMountAtPath / KernelStateCorrupted / Unknown → fail loud.
 //   - StaleMountRecord → lazy umount, then full attach.
 //   - Detached / PartialMapperOnly → run attachRootfsFromMeta, which is
 //     naturally idempotent.
+//
+// Attached and PartialMapperOnly keep layers that predate the call, so their
+// handle is marked AlreadyAttached.
 //
 // The pre-existing m.rootfsMounts fast-path has been removed — every call
 // goes through the kernel-state probe. Cost is microseconds per call;
@@ -932,7 +935,9 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 		// Legacy workspace size upgrade must run on every attach path
 		// (codex5-P2). Idempotent — no-op when already at default size.
 		m.upgradeUndersizedWorkspace(ctx, volumeID, meta)
-		return deriveRootfsHandle(volumeID, meta), nil
+		handle := deriveRootfsHandle(volumeID, meta)
+		handle.AlreadyAttached = true
+		return handle, nil
 	case AttachStateForeignMountAtPath:
 		return RootfsHandle{}, fmt.Errorf("foreign mount at %s; volume %s in unrecoverable state — logged for diagnostics", paths.MountDir(volumeID), volumeID)
 	case AttachStateKernelStateCorrupted:
@@ -963,7 +968,13 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 			return RootfsHandle{}, err
 		}
 	}
-	return m.attachRootfsFromMeta(ctx, volumeID, meta)
+	handle, err := m.attachRootfsFromMeta(ctx, volumeID, meta)
+	if err != nil {
+		return RootfsHandle{}, err
+	}
+	// A partial stack is completed around the mapper and mounts found live.
+	handle.AlreadyAttached = state == AttachStatePartialMapperOnly
+	return handle, nil
 }
 
 // followLiveIDMap records the app user's live map in meta before
@@ -1185,7 +1196,8 @@ func (m *luksVolumeManager) unmountStaleIfPresent(ctx context.Context, path stri
 
 // deriveRootfsHandle reconstructs the caller-facing handle from metadata
 // and naming convention — the cache that used to hold this is being
-// eliminated (Phase 4). All fields are convention-derivable.
+// eliminated (Phase 4). All fields but AlreadyAttached, which reports on one
+// attach and is set by its caller, are convention-derivable.
 func deriveRootfsHandle(volumeID string, meta *volumeMetaV3) RootfsHandle {
 	mountDir := paths.MountDir(volumeID)
 	resultPath := mountDir

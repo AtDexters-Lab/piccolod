@@ -3,9 +3,11 @@ package app
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"reflect"
 	"slices"
+	"strings"
 	"syscall"
 	"testing"
 
@@ -192,6 +194,89 @@ func TestDestroyAllServiceRootfsDestroysAnchorWithoutServices(t *testing.T) {
 			}
 			if slices.Contains(rootfs.destroyed, otherAnchor) {
 				t.Errorf("destroyed rootfs = %v, includes another app's %s", rootfs.destroyed, otherAnchor)
+			}
+		})
+	}
+}
+
+// A failed call detaches only the volumes it attached itself. A volume it
+// found attached may back running containers: the anchor and siblings of a
+// service that fails to attach while they run.
+func TestEnsureAllServiceRootfsAttachedRollsBackOnlyItsOwnAttaches(t *testing.T) {
+	const instanceID = "site"
+	anchor := persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
+	web := persistence.ServiceRootfsVolumeID(instanceID, "web")
+	worker := persistence.ServiceRootfsVolumeID(instanceID, "worker")
+	def := &api.AppDefinition{Services: map[string]api.AppService{
+		"web":    {Image: "registry.example/web:1"},
+		"worker": {Image: "registry.example/worker:1"},
+	}}
+
+	tests := []struct {
+		name            string
+		alreadyAttached []string
+		configFails     bool // the failing service attaches, but its golden image config is unreadable
+		wantErr         string
+	}{
+		{name: "attach fails beside running siblings", alreadyAttached: []string{anchor, web, worker}, wantErr: "attach rootfs for service"},
+		{name: "image config unreadable beside running siblings", alreadyAttached: []string{anchor, web, worker}, configFails: true, wantErr: "read image config for service"},
+		{name: "image config unreadable after this call attached the services", alreadyAttached: []string{anchor}, configFails: true, wantErr: "read image config for service"},
+		{name: "attach fails on a cold start", wantErr: "attach rootfs for service"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			rootfs := newStubRootfsManager(t.TempDir())
+			rootfs.alreadyAttached = map[string]bool{}
+			for _, volumeID := range tc.alreadyAttached {
+				rootfs.alreadyAttached[volumeID] = true
+			}
+			if tc.configFails {
+				rootfs.attachGoldenLVs = map[string]string{web: "golden-web", worker: "golden-worker"}
+			}
+			// The anchor attaches first, then the services in map order. Fail
+			// whichever service comes second, so the rollback always covers the
+			// anchor and a sibling.
+			attaches := 0
+			rootfs.attachHook = func() {
+				attaches++
+				switch {
+				case !tc.configFails && attaches == 2:
+					rootfs.attachErrs = map[string]error{web: persistence.ErrIDMapStaleMount, worker: persistence.ErrIDMapStaleMount}
+				case tc.configFails && attaches == 3:
+					rootfs.goldenConfigs = map[string]persistence.GoldenImageConfig{} // the reads from here on fail
+				}
+			}
+			mgr := &AppManager{subIDRangeResolver: liveTestSubIDRanges}
+			mgr.SetRootfsManager(rootfs)
+
+			attached, err := mgr.ensureAllServiceRootfsAttached(context.Background(), instanceID, ModeService, def, nil, liveTestRuntime())
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("error = %v, want %s", err, tc.wantErr)
+			}
+			if !tc.configFails && !errors.Is(err, persistence.ErrIDMapStaleMount) {
+				t.Fatalf("error = %v, want it to wrap the attach failure", err)
+			}
+			if attached != nil {
+				t.Fatalf("attached = %v, want nil on failure", attached)
+			}
+
+			wantAttaches := 2 // the anchor and the first service
+			if tc.configFails {
+				wantAttaches = 3 // and the service whose config is unreadable
+			}
+			if len(rootfs.attachIDMaps) != wantAttaches {
+				t.Fatalf("attached volumes = %v, want %d", rootfs.attachIDMaps, wantAttaches)
+			}
+			var want []string
+			for volumeID := range rootfs.attachIDMaps {
+				if !rootfs.alreadyAttached[volumeID] {
+					want = append(want, volumeID)
+				}
+			}
+			slices.Sort(want)
+			got := slices.Sorted(slices.Values(rootfs.detached))
+			if !slices.Equal(got, want) {
+				t.Fatalf("detached %v, want only the volumes this call attached %v", got, want)
 			}
 		})
 	}

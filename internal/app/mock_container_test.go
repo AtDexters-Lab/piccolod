@@ -393,7 +393,10 @@ type stubRootfsManager struct {
 	detachErr          error
 	destroyErr         error
 	attachHook         func()
-	attachIDMaps       map[string]*persistence.IDMapConfig
+	attachIDMaps       map[string]*persistence.IDMapConfig // volumes attached, with their ID maps
+	attachErrs         map[string]error                    // AttachRootfs fails for these volumes
+	attachGoldenLVs    map[string]string                   // golden LV reported for each volume
+	alreadyAttached    map[string]bool                     // reported as found attached
 	findGoldenDigest   string
 	findGoldenID       string
 	findGoldenOK       bool
@@ -457,6 +460,9 @@ func (s *stubRootfsManager) ListClones(_ context.Context, _ string) ([]string, e
 }
 
 func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string, idmap *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
+	if err := s.attachErrs[volumeID]; err != nil {
+		return persistence.RootfsHandle{}, err
+	}
 	if s.attachIDMaps == nil {
 		s.attachIDMaps = make(map[string]*persistence.IDMapConfig)
 	}
@@ -469,7 +475,13 @@ func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string, idm
 	if s.attachHook != nil {
 		s.attachHook()
 	}
-	return persistence.RootfsHandle{VolumeID: volumeID, MountPath: mp, ReadOnly: true}, nil
+	return persistence.RootfsHandle{
+		VolumeID:        volumeID,
+		MountPath:       mp,
+		ReadOnly:        true,
+		GoldenLV:        s.attachGoldenLVs[volumeID],
+		AlreadyAttached: s.alreadyAttached[volumeID],
+	}, nil
 }
 
 func (s *stubRootfsManager) DetachRootfs(_ context.Context, volumeID string) error {
