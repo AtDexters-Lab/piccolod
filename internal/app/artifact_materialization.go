@@ -123,6 +123,10 @@ type preparedArtifactAttachments struct {
 	CreatedByCall []string
 }
 
+// artifactReferenceSeparator follows the owning instance ID in every artifact
+// reference ID.
+const artifactReferenceSeparator = "--artifact--"
+
 func artifactReferenceID(instanceID, artifactName, goldenID string) string {
 	sum := sha256.Sum256([]byte(
 		"piccolo-artifact-reference-v1\x00" +
@@ -130,24 +134,37 @@ func artifactReferenceID(instanceID, artifactName, goldenID string) string {
 			artifactName + "\x00" +
 			goldenID,
 	))
-	return instanceID + "--artifact--" + hex.EncodeToString(sum[:])
+	return instanceID + artifactReferenceSeparator + hex.EncodeToString(sum[:])
 }
 
-func idMapForRuntime(instanceID string, runtime container.PodmanRuntime) persistence.IDMapConfig {
-	var idmap persistence.IDMapConfig
+// appIDMap returns the ID map of instanceID's app user as it is now:
+// container root maps to the user's UID/GID and container IDs 1..N to its
+// subordinate ranges, exactly as rootless Podman maps the user namespace.
+// Rootfs volumes and artifact references are always mounted with this map;
+// their metadata only records the last map applied. A missing credential or
+// subordinate range fails closed rather than producing a partial map.
+func (m *AppManager) appIDMap(instanceID string, runtime container.PodmanRuntime) (persistence.IDMapConfig, error) {
 	if runtime.Credential == nil {
-		return idmap
+		return persistence.IDMapConfig{}, fmt.Errorf("app %s: runtime has no app user credential", instanceID)
 	}
-	idmap.AppUID = runtime.Credential.Uid
-	idmap.AppGID = runtime.Credential.Gid
-	username := container.AppUsername(instanceID)
-	if subStart, subCount, err := container.LookupSubUIDRange(username); err == nil {
-		idmap.SubUIDStart = subStart
-		idmap.SubUIDCount = subCount
-		idmap.SubGIDStart = subStart
-		idmap.SubGIDCount = subCount
+	lookup := m.subIDRangeResolver
+	if lookup == nil {
+		lookup = func(instanceID string) (container.SubIDRanges, error) {
+			return container.LookupSubIDRanges(container.AppUsername(instanceID))
+		}
 	}
-	return idmap
+	ranges, err := lookup(instanceID)
+	if err != nil {
+		return persistence.IDMapConfig{}, fmt.Errorf("app %s: subordinate ID ranges: %w", instanceID, err)
+	}
+	return persistence.IDMapConfig{
+		AppUID:      runtime.Credential.Uid,
+		AppGID:      runtime.Credential.Gid,
+		SubUIDStart: ranges.UIDStart,
+		SubUIDCount: ranges.UIDCount,
+		SubGIDStart: ranges.GIDStart,
+		SubGIDCount: ranges.GIDCount,
+	}, nil
 }
 
 func (m *AppManager) beginArtifactProgress(
@@ -425,7 +442,7 @@ func (m *AppManager) prepareArtifactAttachments(
 		)
 		prepareErr := func() error {
 			if referenceID := recorded[name]; referenceID != "" {
-				handle, err := manager.AttachArtifactReference(progressCtx, referenceID)
+				handle, err := manager.AttachArtifactReference(progressCtx, referenceID, idmap)
 				var missing *persistence.ArtifactContentMissingError
 				if errors.As(err, &missing) {
 					if rebuildErr := m.reconstructRecordedArtifactContent(
@@ -439,7 +456,7 @@ func (m *AppManager) prepareArtifactAttachments(
 							rebuildErr,
 						)
 					}
-					handle, err = manager.AttachArtifactReference(progressCtx, referenceID)
+					handle, err = manager.AttachArtifactReference(progressCtx, referenceID, idmap)
 				}
 				if err != nil {
 					return fmt.Errorf("attach recorded artifact %q: %w", name, err)
@@ -564,11 +581,15 @@ func (m *AppManager) ensureAppArtifactAttachments(
 	if progress > progressMax {
 		progressMax = progress
 	}
+	idmap, err := m.appIDMap(app.InstanceID, runtime)
+	if err != nil {
+		return nil, err
+	}
 	prepared, err := m.prepareArtifactAttachments(
 		ctx,
 		def,
 		app.InstanceID,
-		idMapForRuntime(app.InstanceID, runtime),
+		idmap,
 		true,
 		transferProgressRange{Min: progress, Max: progressMax},
 	)

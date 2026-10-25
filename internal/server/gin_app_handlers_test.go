@@ -954,7 +954,7 @@ func (s *stubTestRootfsManager) CloneWorkspace(_ context.Context, _, cloneID str
 func (s *stubTestRootfsManager) ListClones(_ context.Context, _ string) ([]string, error) {
 	return nil, nil
 }
-func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
+func (s *stubTestRootfsManager) AttachRootfs(_ context.Context, volumeID string, _ *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
 	mp := filepath.Join(s.root, "rootfs", volumeID)
 	_ = os.MkdirAll(mp, 0o755)
 	return persistence.RootfsHandle{MountPath: mp, ReadOnly: true}, nil

@@ -146,11 +146,11 @@ func TestApplyCustomManifestUpdateCandidateStartFailureRestoresOriginalPublicati
 	}
 	originalRegistry := mgr.serviceManager.SnapshotRegistry()[instanceID]
 	rt := container.PodmanRuntime{}
-	anchorHandle, err := rootfs.AttachRootfs(ctx, originalRootfs[networkAnchorServiceName])
+	anchorHandle, err := rootfs.AttachRootfs(ctx, originalRootfs[networkAnchorServiceName], nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mainHandle, err := rootfs.AttachRootfs(ctx, originalRootfs["main"])
+	mainHandle, err := rootfs.AttachRootfs(ctx, originalRootfs["main"], nil)
 	if err != nil {
 		t.Fatal(err)
 	}

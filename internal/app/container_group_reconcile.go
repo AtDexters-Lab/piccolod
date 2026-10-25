@@ -554,7 +554,7 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	var rootfsMap func() (map[string]*rootfsMountInfo, error)
 	if desiredRunning {
 		rootfsMap = sync.OnceValues(func() (map[string]*rootfsMountInfo, error) {
-			return m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+			return m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst, runtime)
 		})
 	}
 	// Artifact mounts are needed only when creating a service container. Keep

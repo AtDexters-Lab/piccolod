@@ -37,7 +37,7 @@ func (m *AppManager) startContainerGroup(ctx context.Context, state *FilesystemS
 	// Only a complete known observation may project Starting or attach rootfs.
 	m.updateStatusAndMessageWithEvent(appInst.InstanceID, StatusStarting, "Starting containers")
 	mode := piccoloModeFromExtensions(def.Extensions)
-	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+	blockNativeRootfsMap, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst, runtime)
 	if err != nil {
 		m.updateStatusWithEvent(appInst.InstanceID, StatusError)
 		return fmt.Errorf("failed to attach rootfs: %w", err)

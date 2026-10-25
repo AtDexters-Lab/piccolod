@@ -94,10 +94,14 @@ type AppManager struct {
 	// credentialResolver overrides per-app user provisioning for tests.
 	// When non-nil, resolveAppCredential returns this instead of calling ProvisionAppUser.
 	credentialResolver func(instanceID string) (*syscall.Credential, string, error)
+	// subIDRangeResolver overrides the per-app subordinate ID lookup for tests.
+	subIDRangeResolver func(instanceID string) (container.SubIDRanges, error)
 	// userSessionQuiescer overrides PID 1 user-unit quiescence for tests.
 	userSessionQuiescer func(context.Context, string) error
 	// appUserDestroyer overrides final per-app identity cleanup for tests.
 	appUserDestroyer func(string) error
+	// orphanUserCleanup overrides startup orphan user removal for tests.
+	orphanUserCleanup func(knownInstanceIDs map[string]bool)
 
 	// Per-app user orphan cleanup runs once at first reconciliation.
 	orphanCleanupOnce sync.Once
@@ -1489,6 +1493,11 @@ func testMountVerifier(path string) error {
 	return nil
 }
 
+// testSubIDRanges stands in for /etc/subuid and /etc/subgid in unit tests.
+func testSubIDRanges(string) (container.SubIDRanges, error) {
+	return container.SubIDRanges{UIDStart: 200000, UIDCount: 65536, GIDStart: 200000, GIDCount: 65536}, nil
+}
+
 // NewAppManagerForTest creates an AppManager with a synthetic credential for unit tests.
 // Skips EnsureXDGRuntimeDir and CheckCgroupDelegation —
 // avoids syscall side effects in CI. Uses a permissive mount verifier.
@@ -1527,6 +1536,7 @@ func NewAppManagerForTest(containerManager ContainerManager, stateDir string) (*
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		subIDRangeResolver:       testSubIDRanges,
 		acceleratorDiscover:      func() ([]string, error) { return nil, nil },
 		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
@@ -1567,6 +1577,7 @@ func NewAppManagerForTestWithServices(containerManager ContainerManager, stateDi
 		credentialResolver: func(string) (*syscall.Credential, string, error) {
 			return testCred, testHome, nil
 		},
+		subIDRangeResolver:       testSubIDRanges,
 		acceleratorDiscover:      func() ([]string, error) { return nil, nil },
 		userSessionQuiescer:      func(context.Context, string) error { return nil },
 		syncInFlight:             make(map[string]bool),
@@ -2122,6 +2133,35 @@ func transitionRecoveryMustYield(ctx context.Context) bool {
 	return admission != nil && admission.continuationUsed && pressure.IsTransitionContinuation(ctx)
 }
 
+// volumeOwnerInstanceIDs returns every instance ID that still owns durable
+// volume state: an app data volume, a rootfs volume, or an artifact reference.
+func volumeOwnerInstanceIDs() (map[string]bool, error) {
+	owners := make(map[string]bool)
+	volumeIDs, err := persistence.ListVolumeIDs()
+	if err != nil {
+		return nil, err
+	}
+	for _, volumeID := range volumeIDs {
+		if instanceID, ok := strings.CutPrefix(volumeID, appVolumeID("")); ok && instanceID != "" {
+			owners[instanceID] = true
+			continue
+		}
+		for _, instanceID := range persistence.RootfsVolumeInstanceIDs(volumeID) {
+			owners[instanceID] = true
+		}
+	}
+	referenceIDs, err := persistence.ListArtifactReferenceIDs()
+	if err != nil {
+		return nil, fmt.Errorf("list artifact references: %w", err)
+	}
+	for _, referenceID := range referenceIDs {
+		if instanceID, _, ok := strings.Cut(referenceID, artifactReferenceSeparator); ok && instanceID != "" {
+			owners[instanceID] = true
+		}
+	}
+	return owners, nil
+}
+
 // ReconcileOnce ensures Podman observed state converges to Piccolo desired state.
 //
 // Desired state is derived from the persisted Enabled flag:
@@ -2175,11 +2215,17 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 	// Clean up orphaned per-app users on first reconciliation. On-disk
 	// publications, including incomplete or unreadable ones, remain user
 	// owners until their dedicated recovery path proves process absence.
+	// So do surviving volumes: deleting a user whose app still has data would
+	// kill its runtime and re-create the user with new IDs.
 	appDirectoryIDs, directoryErr := state.listAppDirectoryIDs()
-	if directoryErr != nil {
+	volumeOwnerIDs, volumeErr := volumeOwnerInstanceIDs()
+	switch {
+	case directoryErr != nil:
 		log.Printf("ERROR: orphan app-user cleanup: list app directories: %v", directoryErr)
-	} else {
-		knownIDs := make(map[string]bool)
+	case volumeErr != nil:
+		log.Printf("ERROR: orphan app-user cleanup: list app volumes: %v", volumeErr)
+	default:
+		knownIDs := volumeOwnerIDs
 		for _, app := range state.ListApps() {
 			if app != nil {
 				knownIDs[app.InstanceID] = true
@@ -2189,7 +2235,11 @@ func (m *AppManager) ReconcileOnce(ctx context.Context) {
 			knownIDs[instanceID] = true
 		}
 		m.orphanCleanupOnce.Do(func() {
-			container.CleanupOrphanAppUsers(knownIDs)
+			cleanup := m.orphanUserCleanup
+			if cleanup == nil {
+				cleanup = container.CleanupOrphanAppUsers
+			}
+			cleanup(knownIDs)
 		})
 	}
 
@@ -2944,23 +2994,10 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 		}
 	}()
 
-	// Build IDMap config from clone's per-app user.
-	var idmapPtr *persistence.IDMapConfig
-	if runtime.Credential != nil {
-		idmap := persistence.IDMapConfig{
-			AppUID: runtime.Credential.Uid,
-			AppGID: runtime.Credential.Gid,
-		}
-		username := container.AppUsername(cloneID)
-		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
-			idmap.SubUIDStart = subStart
-			idmap.SubUIDCount = subCount
-			idmap.SubGIDStart = subStart
-			idmap.SubGIDCount = subCount
-		} else {
-			log.Printf("WARN: clone %s: subuid lookup failed for %s: %v", cloneID, username, lookupErr)
-		}
-		idmapPtr = &idmap
+	// The clone's rootfs belongs to the clone's own per-app user.
+	idmap, err := m.appIDMap(cloneID, runtime)
+	if err != nil {
+		return nil, fmt.Errorf("clone %s from %s: %w", cloneID, originID, err)
 	}
 
 	// Clone rootfs: thin LV snapshot with clone's IDMap.
@@ -2969,7 +3006,7 @@ func (m *AppManager) cloneWorkspaceLocked(ctx context.Context, originID, cloneID
 		return nil, fmt.Errorf("clone %s from %s: rootfs manager not available", cloneID, originID)
 	}
 
-	handle, err := rootfsMgr.CloneWorkspace(ctx, originID, cloneID, idmapPtr)
+	handle, err := rootfsMgr.CloneWorkspace(ctx, originID, cloneID, &idmap)
 	if err != nil {
 		return nil, fmt.Errorf("clone %s from %s: snapshot: %w", cloneID, originID, err)
 	}
@@ -3403,7 +3440,7 @@ func (m *AppManager) startLocked(ctx context.Context, instanceID string) (err er
 	// Unified start path for all app modes (container group: network anchor + services)
 	m.emitProgress(ctx, taskTypeStartApp, instanceID, taskPhaseStarting, 60, "Starting containers", false, nil)
 	if strings.TrimSpace(app.NetworkAnchorID) == "" {
-		bn, rootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app)
+		bn, rootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app, runtime)
 		if rootfsErr != nil {
 			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
 		}
@@ -4404,21 +4441,9 @@ func (m *AppManager) updateServiceModeImage(
 	}
 
 	// 2. Build IDMap config (once, shared across all services).
-	var idmap persistence.IDMapConfig
-	if runtime.Credential != nil {
-		idmap = persistence.IDMapConfig{
-			AppUID: runtime.Credential.Uid,
-			AppGID: runtime.Credential.Gid,
-		}
-		username := container.AppUsername(instanceID)
-		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
-			idmap.SubUIDStart = subStart
-			idmap.SubUIDCount = subCount
-			idmap.SubGIDStart = subStart
-			idmap.SubGIDCount = subCount
-		} else {
-			log.Printf("WARN: update %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
-		}
+	idmap, err := m.appIDMap(instanceID, runtime)
+	if err != nil {
+		return err
 	}
 
 	m.emitProgress(ctx, taskTypeUpdateImage, instanceID, taskPhaseCreatingRootfs, 30, "Creating root filesystem", false, nil)
@@ -4456,7 +4481,7 @@ func (m *AppManager) updateServiceModeImage(
 				return fmt.Errorf("existing rootfs for service %s does not match planned image identity: %w", cs.svcName, err)
 			}
 			log.Printf("INFO: update %s: rootfs %s already exists, attaching", instanceID, cs.volumeID)
-			cs.handle, err = rootfs.AttachRootfs(ctx, cs.volumeID)
+			cs.handle, err = rootfs.AttachRootfs(ctx, cs.volumeID, &idmap)
 			if err != nil {
 				return fmt.Errorf("attach existing rootfs %s: %w", cs.volumeID, err)
 			}
@@ -4585,7 +4610,7 @@ func (m *AppManager) updateServiceModeImage(
 	}
 
 	// Attach unchanged service rootfs volumes.
-	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
+	unchangedRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst, runtime)
 	if err != nil {
 		return restartPreviousRuntime(fmt.Errorf("update %s: attach unchanged rootfs: %w", instanceID, err))
 	}
@@ -5214,7 +5239,7 @@ func (m *AppManager) rollbackToSnapshotLocked(ctx context.Context, state *Filesy
 	rootfs := m.currentRootfsManager()
 	var prebuiltRootfs map[string]*rootfsMountInfo
 	if rootfs != nil {
-		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst)
+		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst, runtime)
 		if err != nil {
 			// Rootfs attach failed — cannot create containers with correct snapshot rootfs.
 			// State is already persisted and consistent. Reconciler will retry.
@@ -5410,7 +5435,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 				_ = state.StoreApp(appInst)
 				return nil, fmt.Errorf("update failed: %w; rollback failed (ports): %v", cause, rbErr)
 			}
-			rbRootfs, rbRootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst)
+			rbRootfs, rbRootfsErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst, runtime)
 			if rbRootfsErr != nil {
 				m.setObservedStatus(instanceID, StatusError)
 				_ = state.StoreApp(appInst)
@@ -5455,7 +5480,7 @@ func (m *AppManager) updateListenersLocked(ctx context.Context, instanceID strin
 		}
 
 		// Attach all service rootfs volumes (idempotent — returns cached handle if mounted).
-		prebuiltRootfs, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef, appInst)
+		prebuiltRootfs, rErr := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, &newDef, appInst, runtime)
 		if rErr != nil {
 			return rollbackContainers(fmt.Errorf("attach rootfs: %w", rErr))
 		}

@@ -387,6 +387,7 @@ type stubRootfsManager struct {
 	detachErr          error
 	destroyErr         error
 	attachHook         func()
+	attachIDMaps       map[string]*persistence.IDMapConfig
 	findGoldenDigest   string
 	findGoldenID       string
 	findGoldenOK       bool
@@ -449,7 +450,11 @@ func (s *stubRootfsManager) ListClones(_ context.Context, _ string) ([]string, e
 	return nil, nil
 }
 
-func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string) (persistence.RootfsHandle, error) {
+func (s *stubRootfsManager) AttachRootfs(_ context.Context, volumeID string, idmap *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
+	if s.attachIDMaps == nil {
+		s.attachIDMaps = make(map[string]*persistence.IDMapConfig)
+	}
+	s.attachIDMaps[volumeID] = idmap
 	mp := filepath.Join(s.baseDir, "rootfs", volumeID)
 	os.MkdirAll(mp, 0o755)
 	if s.exists != nil {

@@ -56,7 +56,7 @@ func (s *attachmentBoundaryRootfs) mount(volumeID string) (persistence.RootfsHan
 	return h, nil
 }
 
-func (s *attachmentBoundaryRootfs) AttachRootfs(ctx context.Context, volumeID string) (persistence.RootfsHandle, error) {
+func (s *attachmentBoundaryRootfs) AttachRootfs(ctx context.Context, volumeID string, idmap *persistence.IDMapConfig) (persistence.RootfsHandle, error) {
 	s.attached = append(s.attached, volumeID)
 	if s.attachErr != nil {
 		return persistence.RootfsHandle{}, s.attachErr
@@ -64,13 +64,13 @@ func (s *attachmentBoundaryRootfs) AttachRootfs(ctx context.Context, volumeID st
 	if s.attachResult != nil {
 		return *s.attachResult, nil
 	}
-	if _, err := s.stubRootfsManager.AttachRootfs(ctx, volumeID); err != nil {
+	if _, err := s.stubRootfsManager.AttachRootfs(ctx, volumeID, idmap); err != nil {
 		return persistence.RootfsHandle{}, err
 	}
 	return s.mount(volumeID)
 }
 
-func (s *attachmentBoundaryRootfs) AttachArtifactReference(_ context.Context, referenceID string) (persistence.ArtifactHandle, error) {
+func (s *attachmentBoundaryRootfs) AttachArtifactReference(_ context.Context, referenceID string, _ persistence.IDMapConfig) (persistence.ArtifactHandle, error) {
 	s.artifactAttaches = append(s.artifactAttaches, referenceID)
 	return persistence.ArtifactHandle{}, errors.New("artifact preparation must follow rootfs validation")
 }

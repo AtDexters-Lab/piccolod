@@ -71,6 +71,13 @@ Usernames derived deterministically from instanceID — no persistent metadata n
 
 At startup, scan `/etc/passwd` for `pa-*` users not matching any known app. Clean up via `DestroyAppUser`.
 
+> **Volume ownership amendment (2026-10-25):** an app is known while its
+> record, its app directory, or any of its durable volume state (app data
+> volume, rootfs volumes, artifact references) exists. A re-provisioned user
+> may get new IDs; rootfs volumes and artifact references follow the live
+> user's ID map rather than a map pinned at creation. See
+> [../rca/20261025-rootfs-idmap-drift.md](../rca/20261025-rootfs-idmap-drift.md).
+
 ### 4.7 Migration
 
 Existing apps get per-app users on next lifecycle operation. `PodmanRoot` and `RunRoot` re-chowned from `piccolo-runtime` to the new per-app user.

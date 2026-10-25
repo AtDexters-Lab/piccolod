@@ -15,6 +15,7 @@
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-verify    # stage 6: block-native rootfs verification
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> service-app      # stage 7: service app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> ai-provider      # stage 22: released AI provider + private capability binding
+#   ./scripts/alpha/dev-vm-alpha-test.sh <IP> rootfs-idmap-drift # stage 24: rootfs ID map follows a re-created app user
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> workspace-app    # stage 8: workspace app lifecycle
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> system-update    # stage 4a: OS update status + diagnostic log availability
 #   ./scripts/alpha/dev-vm-alpha-test.sh <IP> app-resize       # stage 19: app storage resize recovery
@@ -4224,6 +4225,143 @@ print(json.dumps({
 }
 
 # ─────────────────────────────────────────────────────────
+# Stage 24: Rootfs ID map follows a re-created app user
+#
+# Reproduces the piccolospace field failure: the app user was deleted and
+# re-created with a new UID while its workspace rootfs kept the ID map recorded
+# at creation, so root-owned files showed as nobody inside the container and
+# writes failed with EOVERFLOW. A fixed piccolod rebuilds the idmapped mounts
+# from the live app user on the next start; baseline binaries fail 24.7-24.11.
+# ─────────────────────────────────────────────────────────
+stage_rootfs_idmap_drift() {
+  echo -e "\n${CYAN}═══ Stage 24: Rootfs ID map follows a re-created app user ═══${NC}"
+  ensure_session
+
+  local APP_NAME="idmapdrift"
+  local app_user="pa-$APP_NAME"
+  local holder="idmapdrift-hold"
+  local ws_meta="/piccolo-core/volumes/ws-$APP_NAME/piccolo.volume.json"
+  local anchor_meta="/piccolo-core/volumes/svc-rootfs-$APP_NAME--__netns__/piccolo.volume.json"
+
+  _drift_status() {
+    api "/api/v1/apps/$APP_NAME" 2>/dev/null | python3 -c "
+import sys, json
+try: print(json.load(sys.stdin).get('data',{}).get('app',{}).get('status',''))
+except Exception: print('')" 2>/dev/null
+  }
+  _drift_wait() {
+    local expected="$1" status=""
+    for _ in $(seq 1 "${2:-120}"); do
+      status=$(_drift_status)
+      [[ "$status" == "$expected" ]] && return 0
+      sleep 2
+    done
+    echo "  (last status: ${status:-unknown})"
+    return 1
+  }
+  _drift_recorded_uid() {
+    vssh "grep -o '\"app_uid\": [0-9]*' '$1' | grep -o '[0-9]*\$'" 2>/dev/null | tail -1 | tr -d '[:space:]'
+  }
+  # Runs a shell command as root inside the workspace container through the
+  # app user's rootless Podman, the view the workspace terminal has.
+  _drift_exec() {
+    local uid home
+    uid=$(vssh "id -u $app_user 2>/dev/null" | tail -1 | tr -d '[:space:]')
+    home=$(vssh "getent passwd $app_user | cut -d: -f6" | tail -1 | tr -d '[:space:]')
+    [[ "$uid" =~ ^[1-9][0-9]*$ && -n "$home" ]] || return 1
+    vssh "cd /tmp && /usr/sbin/runuser --user $app_user -- /usr/bin/env HOME=$home XDG_RUNTIME_DIR=/run/user/$uid \
+      /usr/bin/podman --root /run/piccolo/podman/apps/$APP_NAME --runroot /run/piccolo/podman/app-$APP_NAME --storage-driver overlay \
+      exec --user 0 $APP_NAME sh -c '$1'" 2>&1 | grep -v 'level=warning'
+  }
+  _drift_cleanup() {
+    delete_app_if_present "$APP_NAME" >/dev/null || true
+    vssh "userdel $holder >/dev/null 2>&1 || true" >/dev/null 2>&1 || true
+  }
+
+  local template_yaml
+  template_yaml=$(api "/api/v1/catalog/code-server/template")
+  if [[ -z "$template_yaml" ]]; then
+    skip "24.x" "Rootfs ID map drift" "catalog template not available"
+    return
+  fi
+  _drift_cleanup
+  local payload token install_http
+  payload=$(YAML="$template_yaml" NAME="$APP_NAME" python3 -c "
+import json, os
+print(json.dumps({
+    'app_definition': os.environ['YAML'],
+    'inputs': {'__app_address__': os.environ['NAME'], 'password': 'E2eTest-2026!'},
+    'catalog_source': 'code-server'
+}))")
+  token=$(csrf)
+  install_http=$(curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 --max-time 600 \
+    -b "$COOKIE_JAR" -c "$COOKIE_JAR" \
+    -X POST -H "Content-Type: application/json" -H "X-CSRF-Token: $token" \
+    -d "$payload" "http://$IP/api/v1/apps" 2>/dev/null)
+  check "24.1" "Workspace app installed" "$install_http" "201"
+  if [[ "$install_http" != "201" ]] || ! _drift_wait running; then
+    check "24.2" "Workspace app reaches running" "$(_drift_status)" "running"
+    dump_logs "stage24-install"
+    _drift_cleanup
+    return
+  fi
+  check "24.2" "Workspace app reaches running" "running" "running"
+
+  local old_uid
+  old_uid=$(vssh "id -u $app_user" | tail -1 | tr -d '[:space:]')
+  check "24.3" "Workspace rootfs records the app user at creation" "$(_drift_recorded_uid "$ws_meta")" "$old_uid"
+  check "24.4" "Container root can write its rootfs before drift" \
+    "$(_drift_exec 'touch /root/.idmap-drift-before && stat -c %u:%g /root/.idmap-drift-before')" "0:0"
+
+  # Re-create the app user the way the field node lost it: stop the app,
+  # delete the user like orphan cleanup does, and let piccolod provision it
+  # again. The placeholder takes the freed system UID/GID so the re-created
+  # user gets different outer IDs, as pa-git's account did on the node.
+  local drift_since
+  drift_since=$(vssh "date +%s" | tail -1 | tr -d '[:space:]')
+  post_csrf "/api/v1/apps/$APP_NAME/stop" >/dev/null || true
+  if ! _drift_wait stopped 90; then
+    check "24.5" "Workspace app stops before user re-creation" "$(_drift_status)" "stopped"
+    _drift_cleanup
+    return
+  fi
+  vssh "loginctl disable-linger $app_user; systemctl stop user@$old_uid.service; \
+    userdel --remove $app_user && useradd --system --no-create-home --shell /usr/sbin/nologin $holder" >/dev/null 2>&1 || true
+  post_csrf "/api/v1/apps/$APP_NAME/start" >/dev/null || true
+  _drift_wait running 120 || true
+  local new_uid
+  new_uid=$(vssh "id -u $app_user 2>/dev/null" | tail -1 | tr -d '[:space:]')
+  if [[ -z "$new_uid" || "$new_uid" == "$old_uid" ]]; then
+    check "24.5" "App user re-created with a new UID (old $old_uid)" "${new_uid:-missing}" "not $old_uid"
+    dump_logs "stage24-recreate"
+    _drift_cleanup
+    return
+  fi
+  echo -e "  ${GREEN}PASS${NC} [24.5] App user re-created with a new UID ($old_uid -> $new_uid)"
+  ((PASS_COUNT++)) || true
+
+  check "24.6" "Workspace app runs after user re-creation" "$(_drift_status)" "running"
+  check "24.7" "Workspace rootfs record follows the re-created user" "$(_drift_recorded_uid "$ws_meta")" "$new_uid"
+  check "24.8" "Network anchor rootfs record follows the re-created user" "$(_drift_recorded_uid "$anchor_meta")" "$new_uid"
+  check "24.9" "Container root still owns data written before drift" \
+    "$(_drift_exec 'stat -c %u:%g /root/.idmap-drift-before')" "0:0"
+  check "24.10" "Container root can write its rootfs after drift" \
+    "$(_drift_exec 'touch /root/.idmap-drift-after && stat -c %u:%g /root/.idmap-drift-after')" "0:0"
+  check_ssh "24.11" "piccolod logs the ID map following the app user" \
+    "journalctl -u piccolod --no-pager --since @$drift_since | grep 'rootfs ws-$APP_NAME: ID map follows its app user' | tail -1" \
+    "uid $old_uid"
+
+  # KEEP_DRIFT_APP=1 leaves the drifted app installed, e.g. to upgrade a
+  # baseline-drifted app to a fixed binary and reboot as a node would.
+  if [[ "${KEEP_DRIFT_APP:-0}" == "1" ]]; then
+    echo -e "  ${CYAN}INFO${NC} [24.12] Kept $APP_NAME (KEEP_DRIFT_APP=1); placeholder user $holder remains"
+    return
+  fi
+  _drift_cleanup
+  check_http "24.12" "Drift fixture uninstalled" "GET" "/api/v1/apps/$APP_NAME" "404"
+}
+
+# ─────────────────────────────────────────────────────────
 # Runner
 # ─────────────────────────────────────────────────────────
 if [[ -L "$ALPHA_STATE_DIR" ]] || { [[ -e "$ALPHA_STATE_DIR" ]] && [[ ! -d "$ALPHA_STATE_DIR" ]]; }; then
@@ -4259,6 +4397,7 @@ case "$STAGE" in
   rootfs-verify)     stage_rootfs_verify ;;
   service-app)       stage_service_app ;;
   ai-provider)       stage_ai_provider ;;
+  rootfs-idmap-drift) stage_rootfs_idmap_drift ;;
   workspace-app)     stage_workspace_app ;;
   app-resize)        stage_app_resize ;;
   image-update-rollback) stage_image_update_rollback ;;
@@ -4305,7 +4444,7 @@ case "$STAGE" in
     ;;
   *)
     echo "Unknown stage: $STAGE"
-    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider workspace-app app-resize image-update-rollback modify-app-image-update reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
+    echo "Valid: prereq boot pre-setup setup post-setup system-update storage-inspect rootfs-verify service-app ai-provider rootfs-idmap-drift workspace-app app-resize image-update-rollback modify-app-image-update reboot storage-post stewardship oom-recovery auto-unlock connection-auth tcp-raw cookie-isolation listener-pipeline net-supervisor wifi-secret-agent network-transition async-recovery-key logs all"
     exit 1
     ;;
 esac
@@ -4313,6 +4452,6 @@ esac
 summary
 # This regression is suitable for baseline/fixed gates: report a failed check
 # through the process status as well as the harness summary.
-if [[ "$STAGE" == "modify-app-image-update" ]]; then
+if [[ "$STAGE" == "modify-app-image-update" || "$STAGE" == "rootfs-idmap-drift" ]]; then
   [[ "$FAIL_COUNT" -eq 0 ]]
 fi

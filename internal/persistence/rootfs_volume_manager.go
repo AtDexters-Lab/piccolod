@@ -63,6 +63,37 @@ func VersionedServiceRootfsVolumeID(instanceID, serviceName, shortDigest string)
 	return base + svcRootfsDelimiter + shortDigest
 }
 
+// RootfsVolumeInstanceIDs returns the instance IDs a rootfs volume ID can
+// belong to: ws-<id>, svc-rootfs-<id>, or svc-rootfs-<id>--<service>[--<digest>].
+// Every delimiter split is returned, so callers protecting owners never miss
+// one. Other volume IDs return nil.
+func RootfsVolumeInstanceIDs(volumeID string) []string {
+	if instanceID, ok := strings.CutPrefix(volumeID, workspaceLVPrefix); ok && instanceID != "" {
+		return []string{instanceID}
+	}
+	rest, ok := strings.CutPrefix(volumeID, svcRootfsLVPrefix)
+	if !ok || rest == "" {
+		return nil
+	}
+	ids := []string{rest}
+	for offset := 0; ; {
+		i := strings.Index(rest[offset:], svcRootfsDelimiter)
+		if i < 0 {
+			break
+		}
+		if offset+i > 0 {
+			ids = append(ids, rest[:offset+i])
+		}
+		offset += i + len(svcRootfsDelimiter)
+	}
+	return ids
+}
+
+// ListVolumeIDs returns the ID of every volume with persisted metadata.
+func ListVolumeIDs() ([]string, error) {
+	return listVolumeIDs()
+}
+
 // goldenLVSizeForImage returns the right-sized LV allocation for a given
 // uncompressed image size. Uses max(1.5x, image + 1 GiB) with a 256 MiB
 // floor (btrfs minimum for DUP metadata is ~109 MiB).
@@ -651,7 +682,7 @@ func (m *luksVolumeManager) createRootfsFromGolden(ctx context.Context, goldenID
 	// it and lazy-umounts before the fresh mount runs. attachRootfsLocked
 	// re-reads metadata from disk; the metadata we just wrote is what it
 	// will see.
-	handle, err := m.attachRootfsLocked(ctx, volumeID)
+	handle, err := m.attachRootfsLocked(ctx, volumeID, idmap)
 	if err != nil {
 		m.lvMgr.DeactivateLV(ctx, snapshotName)
 		m.lvMgr.RemoveThinLV(ctx, snapshotName)
@@ -704,8 +735,9 @@ func goldenHasArtifactReference(goldenID string) (bool, error) {
 	return false, nil
 }
 
-// CloneWorkspace creates a clone of an existing workspace.
-// When idmap is non-nil, it overrides the origin's IDMap in the clone metadata.
+// CloneWorkspace creates a clone of an existing workspace. idmap is the clone
+// owner's live ID map and becomes the clone's recorded map; it is required
+// whenever the origin carries one.
 func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneID string, idmap *IDMapConfig) (RootfsHandle, error) {
 	cloneVolumeID := workspaceLVPrefix + cloneID
 	lock := m.lockFor(cloneVolumeID)
@@ -723,6 +755,9 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 	originMeta, err := readVolumeMetaV3(originMetaPath)
 	if err != nil {
 		return RootfsHandle{}, fmt.Errorf("read origin metadata: %w", err)
+	}
+	if originMeta.IDMap != nil && idmap == nil {
+		return RootfsHandle{}, fmt.Errorf("clone %s: the clone owner's live ID map is required", cloneVolumeID)
 	}
 
 	if err := m.lvMgr.CreateSnapshot(ctx, originVolumeID, cloneVolumeID); err != nil {
@@ -760,20 +795,13 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 		BaseImageRef:         originMeta.BaseImageRef,
 		GoldenLV:             originMeta.GoldenLV,
 		CloneOf:              originVolumeID,
-		IDMap:                originMeta.IDMap,
 		PasswordKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 		RecoveryKeyslotKeyID: KeyslotKeyIDUnprovisioned,
 	}
-	// Override IDMap when the clone belongs to a different per-app user.
+	// The clone belongs to its own per-app user.
 	if idmap != nil {
-		meta.IDMap = &IDMapMeta{
-			AppUID:      idmap.AppUID,
-			AppGID:      idmap.AppGID,
-			SubUIDStart: idmap.SubUIDStart,
-			SubUIDCount: idmap.SubUIDCount,
-			SubGIDStart: idmap.SubGIDStart,
-			SubGIDCount: idmap.SubGIDCount,
-		}
+		applied := idMapMeta(*idmap)
+		meta.IDMap = &applied
 	}
 	metaPath := filepath.Join(metaDir, metadataV2File)
 	if err := writeVolumeMetaV3(metaPath, meta); err != nil {
@@ -784,7 +812,7 @@ func (m *luksVolumeManager) CloneWorkspace(ctx context.Context, originID, cloneI
 
 	// Per-volume transition lock + reconciler-shaped attach —
 	// see createRootfsFromGolden for rationale.
-	handle, err := m.attachRootfsLocked(ctx, cloneVolumeID)
+	handle, err := m.attachRootfsLocked(ctx, cloneVolumeID, idmap)
 	if err != nil {
 		m.lvMgr.DeactivateLV(ctx, cloneVolumeID)
 		m.lvMgr.RemoveThinLV(ctx, cloneVolumeID)
@@ -820,6 +848,11 @@ func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID strin
 // AttachRootfs activates and mounts an existing rootfs volume. Acquires
 // the per-volume transition lock; concurrent callers serialize.
 //
+// idmap is the owning app user's live ID map (nil only for volumes without
+// one, such as golden content). The recorded map follows it before any bind
+// is built (see idmap_live.go); a bind still mounted with an older map fails
+// with ErrIDMapStaleMount instead of being returned.
+//
 // Reconciliation shape: probes AttachStateOf under lock first.
 //   - Attached → return the metadata-derived RootfsHandle (no cache lookup
 //     required; rootfs handle is fully derivable from metadata).
@@ -831,11 +864,11 @@ func (m *luksVolumeManager) ListClones(ctx context.Context, originVolumeID strin
 // The pre-existing m.rootfsMounts fast-path has been removed — every call
 // goes through the kernel-state probe. Cost is microseconds per call;
 // eliminates the divergence-risk-via-cache-shortcut hazard.
-func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (RootfsHandle, error) {
+func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string, idmap *IDMapConfig) (RootfsHandle, error) {
 	lock := m.lockFor(volumeID)
 	lock.Lock()
 	defer lock.Unlock()
-	return m.attachRootfsLocked(ctx, volumeID)
+	return m.attachRootfsLocked(ctx, volumeID, idmap)
 }
 
 // attachRootfsLocked is the lock-already-held variant of AttachRootfs.
@@ -853,11 +886,15 @@ func (m *luksVolumeManager) AttachRootfs(ctx context.Context, volumeID string) (
 // check before deriving the handle (codex P2): a volume that stayed
 // mounted across a daemon restart with hand-edited metadata would
 // otherwise return the derived handle bypassing the immutability guard.
-func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID string) (RootfsHandle, error) {
+func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID string, live *IDMapConfig) (RootfsHandle, error) {
 	metaPath := filepath.Join(paths.VolumeMetaDir(volumeID), metadataV2File)
 	meta, err := readVolumeMetaV3(metaPath)
 	if err != nil {
 		return RootfsHandle{}, fmt.Errorf("read rootfs metadata: %w", err)
+	}
+	follow, err := liveIDMapChanged(volumeID, meta, live)
+	if err != nil {
+		return RootfsHandle{}, err
 	}
 
 	state, probeErr := m.attachStateOfUnderLock(ctx, volumeID)
@@ -889,6 +926,9 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 		if err := verifyIDMapFingerprint(volumeID, meta); err != nil {
 			return RootfsHandle{}, err
 		}
+		if follow {
+			return RootfsHandle{}, staleIDMapMountError("rootfs "+volumeID, meta.IDMap, *live)
+		}
 		// Legacy workspace size upgrade must run on every attach path
 		// (codex5-P2). Idempotent — no-op when already at default size.
 		m.upgradeUndersizedWorkspace(ctx, volumeID, meta)
@@ -918,7 +958,43 @@ func (m *luksVolumeManager) attachRootfsLocked(ctx context.Context, volumeID str
 		// Fall through to attachRootfsFromMeta.
 	}
 
+	if follow {
+		if err := m.followLiveIDMap(ctx, volumeID, metaPath, meta, *live); err != nil {
+			return RootfsHandle{}, err
+		}
+	}
 	return m.attachRootfsFromMeta(ctx, volumeID, meta)
+}
+
+// followLiveIDMap records the app user's live map in meta before
+// attachRootfsFromMeta builds the bind from it. A bind that is still mounted
+// here (raw mount gone, bind left behind) was built from the old record and
+// may back running containers, so it is refused rather than reused or rebuilt
+// underneath them.
+func (m *luksVolumeManager) followLiveIDMap(ctx context.Context, volumeID, metaPath string, meta *volumeMetaV3, live IDMapConfig) error {
+	layers, err := m.LiveLayers(ctx, volumeID)
+	if err != nil {
+		return fmt.Errorf("rootfs %s: probe idmap bind before recording the live ID map: %w", volumeID, err)
+	}
+	for _, layer := range layers {
+		if layer.Kind == LiveLayerKindIDMapBind {
+			return staleIDMapMountError("rootfs "+volumeID, meta.IDMap, live)
+		}
+	}
+	// Re-read so fields stamped meanwhile by writers that do not take the
+	// per-volume lock (keyslot reconciliation) are carried forward.
+	fresh, err := readVolumeMetaV3(metaPath)
+	if err != nil {
+		return fmt.Errorf("rootfs %s: re-read metadata before recording the live ID map: %w", volumeID, err)
+	}
+	if err := verifyIDMapFingerprint(volumeID, fresh); err != nil {
+		return err
+	}
+	if err := writeLiveIDMap(metaPath, volumeID, fresh, live); err != nil {
+		return err
+	}
+	*meta = *fresh
+	return nil
 }
 
 // liveResizeSpec describes which live layers above the LV must be
@@ -1265,7 +1341,7 @@ func (m *luksVolumeManager) attachRootfsFromMeta(ctx context.Context, volumeID s
 				SubGIDStart: meta.IDMap.SubGIDStart,
 				SubGIDCount: meta.IDMap.SubGIDCount,
 			}
-			if err := fsutil.CreateIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
+			if err := m.createIDMappedMount(mountDir, idmapPath, idmapConfig); err != nil {
 				return RootfsHandle{}, fmt.Errorf("idmap mount: %w", err)
 			}
 		}

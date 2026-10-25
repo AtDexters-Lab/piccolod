@@ -983,7 +983,7 @@ func (m *AppManager) recreateContainersInPlaceWithHookAndPublicationResumeToken(
 
 	var prebuiltRootfs map[string]*rootfsMountInfo
 	if rootfs := m.currentRootfsManager(); rootfs != nil {
-		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst)
+		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, newDef, appInst, runtime)
 		if err != nil {
 			return fmt.Errorf("attach existing rootfs: %w", err)
 		}

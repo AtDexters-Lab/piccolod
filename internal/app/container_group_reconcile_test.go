@@ -449,6 +449,7 @@ func (m *compensationRootfsManager) CreateArtifactReference(
 func (m *compensationRootfsManager) AttachArtifactReference(
 	_ context.Context,
 	referenceID string,
+	_ persistence.IDMapConfig,
 ) (persistence.ArtifactHandle, error) {
 	m.artifactAttached = append(m.artifactAttached, referenceID)
 	return persistence.ArtifactHandle{

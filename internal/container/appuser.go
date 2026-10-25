@@ -261,16 +261,54 @@ func resolveAppUser(username string) (*AppUser, error) {
 // LookupSubUIDRange returns the subuid start and count for the given username.
 // Returns an error if the user has no subuid allocation.
 func LookupSubUIDRange(username string) (start, count uint32, err error) {
-	entries, err := parseSubUIDFile("/etc/subuid")
+	return lookupSubIDRange("/etc/subuid", username)
+}
+
+// SubIDRanges holds a user's subordinate UID and GID ranges, the IDs that
+// rootless Podman maps container IDs 1..N onto.
+type SubIDRanges struct {
+	UIDStart, UIDCount uint32
+	GIDStart, GIDCount uint32
+}
+
+// LookupSubIDRanges returns the user's subordinate ranges from /etc/subuid
+// and /etc/subgid. A missing subuid allocation is an error. Provisioning
+// allocates both from one range, so a missing subgid entry falls back to the
+// subuid range, the GID range callers used before they read /etc/subgid.
+func LookupSubIDRanges(username string) (SubIDRanges, error) {
+	return lookupSubIDRanges("/etc/subuid", "/etc/subgid", username)
+}
+
+func lookupSubIDRanges(subuidPath, subgidPath, username string) (SubIDRanges, error) {
+	var ranges SubIDRanges
+	var err error
+	if ranges.UIDStart, ranges.UIDCount, err = lookupSubIDRange(subuidPath, username); err != nil {
+		return SubIDRanges{}, err
+	}
+	ranges.GIDStart, ranges.GIDCount, err = lookupSubIDRange(subgidPath, username)
+	switch {
+	case errors.Is(err, errNoSubIDAllocation):
+		log.Printf("WARN: %v; using the subuid range %d+%d for GIDs", err, ranges.UIDStart, ranges.UIDCount)
+		ranges.GIDStart, ranges.GIDCount = ranges.UIDStart, ranges.UIDCount
+	case err != nil:
+		return SubIDRanges{}, err
+	}
+	return ranges, nil
+}
+
+var errNoSubIDAllocation = errors.New("no subordinate ID allocation")
+
+func lookupSubIDRange(path, username string) (start, count uint32, err error) {
+	entries, err := parseSubUIDFile(path)
 	if err != nil {
-		return 0, 0, fmt.Errorf("parse /etc/subuid: %w", err)
+		return 0, 0, fmt.Errorf("parse %s: %w", path, err)
 	}
 	for _, e := range entries {
 		if e.Username == username {
 			return e.Start, e.Count, nil
 		}
 	}
-	return 0, 0, fmt.Errorf("no subuid allocation for %s", username)
+	return 0, 0, fmt.Errorf("%w in %s for %s", errNoSubIDAllocation, path, username)
 }
 
 // CleanupOrphanAppUsers removes per-app users that don't correspond to any
