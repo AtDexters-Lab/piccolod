@@ -159,11 +159,12 @@ start while `kvm_amd` holds AMD-V (`VERR_SVM_IN_USE`).
   (`fix/rootfs-idmap-follows-app-user`).
 - Deletion dated and explained: the first v0.2.24 start after 2 June 00:11
   (see "Why the user was deleted").
-- Follow-up: `loadCache` still skips an app whose stored definition no longer
-  parses, with only a printed warning. Its user and volumes now survive, but
-  the app silently stops being reconciled and listed. A tightened validation
-  rule needs a migration for stored definitions, and an unloadable record
-  should be surfaced instead of dropped.
+- Accepted limitation, no follow-up planned: `loadCache` still skips an app
+  whose stored definition no longer parses, with only a printed warning. The
+  `bind_ports` rule cannot recur, because installs and updates have enforced
+  it since v0.2.24 and every stored definition on the node loads today. The
+  user and volumes now survive any such skip. A future validation rule that
+  is stricter than stored definitions should ship with a migration for them.
 - Follow-up: uninstall and install cleanup destroyed the network anchor
   rootfs only when the definition had `Services`. The gate was latent: the
   parser has required `services` since January 2026, before anchors had their
