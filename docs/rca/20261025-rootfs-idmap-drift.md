@@ -134,6 +134,7 @@ start while `kvm_amd` holds AMD-V (`VERR_SVM_IN_USE`).
   parser has required `services` since January 2026, before anchors had their
   own rootfs, and the one nil-definition call runs after a call that covers
   the anchor. `destroyAllServiceRootfs` now destroys
-  `svc-rootfs-<id>--__netns__` and its versioned variants regardless. To spot
-  a leaked anchor on a node, list anchor volumes with no app record:
+  `svc-rootfs-<id>--__netns__` and its versioned variants regardless
+  (PR AtDexters-Lab/piccolod#48). To spot a leaked anchor on a node, list
+  anchor volumes with no app record:
   `comm -23 <(ls /piccolo-core/volumes | sed -n 's/^svc-rootfs-\(.*\)--__netns__.*/\1/p' | sort -u) <(ls /piccolo-core/apps | sort)`.
