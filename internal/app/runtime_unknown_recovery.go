@@ -368,7 +368,7 @@ func (m *AppManager) recoverPersistentUnknownRuntime(ctx context.Context, state 
 	if observed.known() {
 		return m.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true, observed)
 	}
-	if err := m.validateRuntimeRecoveryDependencies(ctx, appInst, def, mode); err != nil {
+	if err := m.validateRuntimeRecoveryDependencies(ctx, appInst, def, mode, runtime); err != nil {
 		return err
 	}
 	if err := m.runSharedRuntimeSentinel(ctx); err != nil {
@@ -385,8 +385,8 @@ func (m *AppManager) recoverPersistentUnknownRuntime(ctx context.Context, state 
 	return m.recoverRuntimeRecoveryTransition(ctx, state, appInst, record)
 }
 
-func (m *AppManager) validateRuntimeRecoveryDependencies(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, mode PiccoloMode) error {
-	attached, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst)
+func (m *AppManager) validateRuntimeRecoveryDependencies(ctx context.Context, appInst *AppInstance, def *api.AppDefinition, mode PiccoloMode, runtime container.PodmanRuntime) error {
+	attached, err := m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst, runtime)
 	if err != nil {
 		return fmt.Errorf("shared rootfs dependency unavailable: %w", err)
 	}

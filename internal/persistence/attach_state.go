@@ -141,8 +141,16 @@ var (
 	// ErrIDMapImmutable is returned by writeVolumeMetaV3 when a metadata
 	// write attempts to mutate IDMap fields after the volume's
 	// IDMapFingerprint was already established (i.e., the volume has been
-	// attached / fingerprint-backfilled at least once).
+	// attached / fingerprint-backfilled at least once). Only an attach that
+	// follows the app user's live ID map may change a recorded map
+	// (writeLiveIDMap).
 	ErrIDMapImmutable = errors.New("persistence: idmap is immutable post-creation")
+
+	// ErrIDMapStaleMount is returned when an idmapped mount is still live
+	// with a recorded ID map that its app user no longer has. The mount may
+	// back running containers, so it is never rebuilt underneath them; the
+	// app's containers must stop and the volume detach first.
+	ErrIDMapStaleMount = errors.New("persistence: idmapped mount is stale for its app user")
 )
 
 // Volume type identifiers persisted in volumeMetaV2.Type / volumeMetaV3.Type.

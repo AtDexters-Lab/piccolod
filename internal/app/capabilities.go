@@ -523,7 +523,7 @@ func (m *AppManager) recreateAppForCapabilityEffects(
 	if err != nil {
 		return err
 	}
-	rootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app)
+	rootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, piccoloModeFromExtensions(def.Extensions), def, app, runtimeConfig)
 	if err != nil {
 		return err
 	}

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -109,6 +110,26 @@ func goldenIdentityFromMeta(meta *volumeMetaV3) (GoldenContentIdentity, error) {
 	return identity, nil
 }
 
+// ListArtifactReferenceIDs returns the ID of every persisted artifact
+// reference without parsing the records.
+func ListArtifactReferenceIDs() ([]string, error) {
+	entries, err := os.ReadDir(artifactReferencesDir())
+	if os.IsNotExist(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
+			continue
+		}
+		ids = append(ids, strings.TrimSuffix(entry.Name(), ".json"))
+	}
+	return ids, nil
+}
+
 func listArtifactReferences() ([]artifactReferenceRecord, error) {
 	entries, err := os.ReadDir(artifactReferencesDir())
 	if os.IsNotExist(err) {
@@ -178,9 +199,11 @@ func (m *luksVolumeManager) CreateArtifactReference(ctx context.Context, req Art
 	created := false
 	if existing, loadErr := loadArtifactReference(req.ReferenceID); loadErr == nil {
 		if existing.GoldenID != record.GoldenID ||
-			existing.Identity != record.Identity ||
-			existing.IDMap != record.IDMap {
+			existing.Identity != record.Identity {
 			return ArtifactHandle{}, fmt.Errorf("artifact reference %s already names different durable content", req.ReferenceID)
+		}
+		if err := m.followLiveArtifactIDMap(existing, req.IDMap); err != nil {
+			return ArtifactHandle{}, err
 		}
 		record = *existing
 	} else if !os.IsNotExist(loadErr) {
@@ -207,7 +230,7 @@ func (m *luksVolumeManager) CreateArtifactReference(ctx context.Context, req Art
 	return handle, err
 }
 
-func (m *luksVolumeManager) AttachArtifactReference(ctx context.Context, referenceID string) (ArtifactHandle, error) {
+func (m *luksVolumeManager) AttachArtifactReference(ctx context.Context, referenceID string, idmap IDMapConfig) (ArtifactHandle, error) {
 	lock := m.lockFor("artifact-reference-" + referenceID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -216,7 +239,46 @@ func (m *luksVolumeManager) AttachArtifactReference(ctx context.Context, referen
 	if err != nil {
 		return ArtifactHandle{}, err
 	}
+	if err := m.followLiveArtifactIDMap(record, idmap); err != nil {
+		return ArtifactHandle{}, err
+	}
 	return m.attachArtifactReferenceLocked(ctx, record)
+}
+
+// followLiveArtifactIDMap makes a reference's recorded map follow the app
+// user's live map, as rootfs volumes do. A projection still mounted with the
+// old map may back running containers, so it is refused until the app's
+// artifacts detach. Callers hold the per-reference lock.
+func (m *luksVolumeManager) followLiveArtifactIDMap(record *artifactReferenceRecord, live IDMapConfig) error {
+	applied := idMapMeta(live)
+	if record.IDMap == applied {
+		return nil
+	}
+	target := artifactMountPath(record.ReferenceID)
+	reader := m.kernelSnapshotFn
+	if reader == nil {
+		reader = readLiveKernelSnapshot
+	}
+	snap, err := reader(nil)
+	if err != nil {
+		return fmt.Errorf("probe artifact mount %s: %w", target, err)
+	}
+	if mounted, _ := snap.lookupMount(target); mounted {
+		return staleIDMapMountError("artifact reference "+record.ReferenceID, &record.IDMap, live)
+	}
+	next := *record
+	next.IDMap = applied
+	data, err := json.Marshal(next)
+	if err != nil {
+		return fmt.Errorf("marshal artifact reference: %w", err)
+	}
+	if err := fsutil.AtomicWriteFile(artifactReferencePath(record.ReferenceID), data, 0o600); err != nil {
+		return fmt.Errorf("record live ID map for artifact reference %s: %w", record.ReferenceID, err)
+	}
+	log.Printf("INFO: artifact reference %s: ID map follows its app user: %s -> %s",
+		record.ReferenceID, describeIDMap(&record.IDMap), describeIDMap(&applied))
+	*record = next
+	return nil
 }
 
 func (m *luksVolumeManager) attachArtifactReferenceLocked(ctx context.Context, record *artifactReferenceRecord) (ArtifactHandle, error) {
@@ -251,7 +313,7 @@ func (m *luksVolumeManager) attachArtifactReferenceWithIdentityLocked(
 		return ArtifactHandle{}, fmt.Errorf("artifact reference %s no longer matches verified Ready content", record.ReferenceID)
 	}
 
-	goldenHandle, err := m.AttachRootfs(ctx, record.GoldenID)
+	goldenHandle, err := m.AttachRootfs(ctx, record.GoldenID, nil)
 	if err != nil {
 		return ArtifactHandle{}, fmt.Errorf("attach golden content %s: %w", record.GoldenID, err)
 	}
@@ -273,7 +335,7 @@ func (m *luksVolumeManager) attachArtifactReferenceWithIdentityLocked(
 		return ArtifactHandle{MountPath: target}, nil
 	}
 
-	if err := fsutil.CreateIDMappedMount(goldenHandle.MountPath, target, idMapConfig(record.IDMap)); err != nil {
+	if err := m.createIDMappedMount(goldenHandle.MountPath, target, idMapConfig(record.IDMap)); err != nil {
 		_ = m.detachGoldenIfUnused(ctx, record.GoldenID, record.ReferenceID)
 		return ArtifactHandle{}, fmt.Errorf("create artifact idmapped mount: %w", err)
 	}

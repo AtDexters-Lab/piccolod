@@ -42,7 +42,12 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	if err != nil {
 		return nil, err
 	}
-	prebuiltRootfs, err = m.attachPrebuiltRootfs(ctx, appDef, prebuiltRootfs)
+	// One app user owns every service rootfs, anchor, and artifact.
+	idmap, err := m.appIDMap(instanceID, runtime)
+	if err != nil {
+		return nil, err
+	}
+	prebuiltRootfs, err = m.attachPrebuiltRootfs(ctx, appDef, prebuiltRootfs, idmap)
 	if err != nil {
 		return nil, err
 	}
@@ -161,8 +166,6 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 	}
 	blockNativeRootfsMap := make(map[string]*rootfsMountInfo)
 
-	// Build IDMap config once (shared across all services — same per-app user).
-	idmap := idMapForRuntime(instanceID, runtime)
 	state, err := m.ensureStateManager()
 	if err != nil {
 		return nil, err
@@ -664,7 +667,7 @@ func (m *AppManager) installContainerGroup(ctx context.Context, appDef *api.AppD
 // current storage state. A mount path saved during staging can become stale
 // when the previous runtime is quiesced. Copies keep refreshed handles local;
 // callers retain volume ownership and their existing rollback/cleanup rules.
-func (m *AppManager) attachPrebuiltRootfs(ctx context.Context, appDef *api.AppDefinition, selected map[string]*rootfsMountInfo) (map[string]*rootfsMountInfo, error) {
+func (m *AppManager) attachPrebuiltRootfs(ctx context.Context, appDef *api.AppDefinition, selected map[string]*rootfsMountInfo, idmap persistence.IDMapConfig) (map[string]*rootfsMountInfo, error) {
 	if len(selected) == 0 {
 		return selected, nil
 	}
@@ -694,7 +697,7 @@ func (m *AppManager) attachPrebuiltRootfs(ctx context.Context, appDef *api.AppDe
 	for _, name := range names {
 		info := selected[name]
 		volumeID := info.handle.VolumeID
-		handle, err := rootfs.AttachRootfs(ctx, volumeID)
+		handle, err := rootfs.AttachRootfs(ctx, volumeID, &idmap)
 		if err != nil {
 			return nil, fmt.Errorf("attach prebuilt rootfs for %s (%s): %w", name, volumeID, err)
 		}

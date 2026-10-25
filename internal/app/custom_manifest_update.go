@@ -3391,7 +3391,7 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 	}
 
 	prebuiltRootfs := map[string]*rootfsMountInfo{}
-	if existing, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst); err != nil {
+	if existing, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, curDef, appInst, runtime); err != nil {
 		return nil, fmt.Errorf("attach current rootfs: %w", err)
 	} else {
 		for svcName, info := range existing {
@@ -3412,21 +3412,9 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 		}
 	}
 
-	var idmap persistence.IDMapConfig
-	if runtime.Credential != nil {
-		idmap = persistence.IDMapConfig{
-			AppUID: runtime.Credential.Uid,
-			AppGID: runtime.Credential.Gid,
-		}
-		username := container.AppUsername(instanceID)
-		if subStart, subCount, lookupErr := container.LookupSubUIDRange(username); lookupErr == nil {
-			idmap.SubUIDStart = subStart
-			idmap.SubUIDCount = subCount
-			idmap.SubGIDStart = subStart
-			idmap.SubGIDCount = subCount
-		} else {
-			log.Printf("WARN: manifest update %s: subuid lookup failed for %s: %v", instanceID, username, lookupErr)
-		}
+	idmap, err := m.appIDMap(instanceID, runtime)
+	if err != nil {
+		return nil, err
 	}
 
 	ephRT, ephCleanup, err := m.newFlattenRuntime(ctx)
@@ -3469,7 +3457,7 @@ func (m *AppManager) stageManifestUpdateRootfs(ctx context.Context, taskType, in
 			if err := verifyRootfsIdentityForDigest(rootfs, volID, canonicalDigest); err != nil {
 				return nil, fmt.Errorf("existing planned rootfs for %s does not match planned image identity: %w", manifestUpdateImagePlanDisplayName(plannedItem), err)
 			}
-			handle, err = rootfs.AttachRootfs(ctx, volID)
+			handle, err = rootfs.AttachRootfs(ctx, volID, &idmap)
 			if err != nil {
 				return nil, fmt.Errorf("attach staged rootfs %s: %w", volID, err)
 			}
@@ -3714,7 +3702,7 @@ func (m *AppManager) recreateContainersInPlaceWithPreparedListenersAndHook(ctx c
 
 	var prebuiltRootfs map[string]*rootfsMountInfo
 	if rootfs := m.currentRootfsManager(); rootfs != nil {
-		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, candidateDef, appInst)
+		prebuiltRootfs, err = m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, candidateDef, appInst, runtime)
 		if err != nil {
 			return fmt.Errorf("attach existing rootfs: %w", err)
 		}

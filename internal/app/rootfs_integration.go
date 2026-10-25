@@ -336,10 +336,10 @@ func canonicalImageDigestKey(digest string) string {
 	return strings.TrimSpace(extractDigestHash(strings.TrimSpace(digest)))
 }
 
-// ensureRootfsAttached ensures a rootfs volume is attached.
-// Returns (nil, nil) if the volume doesn't exist — the app was installed
-// before block-native rootfs and uses the legacy storage path.
-func (m *AppManager) ensureRootfsAttached(ctx context.Context, instanceID string, mode PiccoloMode) (*rootfsMountInfo, error) {
+// ensureRootfsAttached ensures a rootfs volume is attached with the app
+// user's live ID map. Returns (nil, nil) if the volume doesn't exist — the
+// app was installed before block-native rootfs and uses the legacy storage path.
+func (m *AppManager) ensureRootfsAttached(ctx context.Context, instanceID string, mode PiccoloMode, idmap persistence.IDMapConfig) (*rootfsMountInfo, error) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return nil, nil
@@ -361,7 +361,7 @@ func (m *AppManager) ensureRootfsAttached(ctx context.Context, instanceID string
 		return nil, nil
 	}
 
-	handle, err := rootfs.AttachRootfs(ctx, volumeID)
+	handle, err := rootfs.AttachRootfs(ctx, volumeID, &idmap)
 	if err != nil {
 		return nil, fmt.Errorf("attach rootfs %s: %w", volumeID, err)
 	}
@@ -443,21 +443,27 @@ func (m *AppManager) destroyAppRootfs(ctx context.Context, instanceID string, mo
 // Returns a map of svcName → *rootfsMountInfo, or (nil, nil) if no rootfs exists.
 // For workspace mode, delegates to the single-rootfs path.
 // When appInst is non-nil and has ActiveRootfs set, uses the versioned volume IDs.
+// Every volume attaches with the live ID map of runtime's app user.
 func (m *AppManager) ensureAllServiceRootfsAttached(
 	ctx context.Context,
 	instanceID string,
 	mode PiccoloMode,
 	appDef *api.AppDefinition,
 	appInst *AppInstance,
+	runtime container.PodmanRuntime,
 ) (map[string]*rootfsMountInfo, error) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return nil, nil
 	}
+	idmap, err := m.appIDMap(instanceID, runtime)
+	if err != nil {
+		return nil, err
+	}
 
 	// Workspace mode: single rootfs for the primary service + anchor rootfs.
 	if mode == ModeWorkspace {
-		rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode)
+		rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode, idmap)
 		if err != nil || rInfo == nil {
 			return nil, err
 		}
@@ -481,7 +487,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 			anchorVolID = persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
 		}
 		if rootfs.RootfsExists(anchorVolID) {
-			handle, aErr := rootfs.AttachRootfs(ctx, anchorVolID)
+			handle, aErr := rootfs.AttachRootfs(ctx, anchorVolID, &idmap)
 			if aErr != nil {
 				return nil, fmt.Errorf("attach rootfs for network anchor: %w", aErr)
 			}
@@ -520,7 +526,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 		anchorVolID = persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)
 	}
 	if rootfs.RootfsExists(anchorVolID) {
-		handle, err := rootfs.AttachRootfs(ctx, anchorVolID)
+		handle, err := rootfs.AttachRootfs(ctx, anchorVolID, &idmap)
 		if err != nil {
 			return nil, fmt.Errorf("attach rootfs for network anchor: %w", err)
 		}
@@ -549,7 +555,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 		if !rootfs.RootfsExists(volumeID) {
 			continue
 		}
-		handle, err := rootfs.AttachRootfs(ctx, volumeID)
+		handle, err := rootfs.AttachRootfs(ctx, volumeID, &idmap)
 		if err != nil {
 			rollbackAttached()
 			return nil, fmt.Errorf("attach rootfs for service %q: %w", svcName, err)
@@ -574,7 +580,7 @@ func (m *AppManager) ensureAllServiceRootfsAttached(
 	}
 
 	// Fallback: legacy single-rootfs volume.
-	rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode)
+	rInfo, err := m.ensureRootfsAttached(ctx, instanceID, mode, idmap)
 	if err != nil || rInfo == nil {
 		return nil, err
 	}

@@ -789,6 +789,46 @@ pa-other:265536:65536
 	}
 }
 
+func TestLookupSubIDRange_ReadsTheGivenFile(t *testing.T) {
+	subgid := writeTempFile(t, "pa-site:393216:65536\npa-other:458752:65536\n")
+	start, count, err := lookupSubIDRange(subgid, "pa-site")
+	if err != nil {
+		t.Fatalf("lookupSubIDRange: %v", err)
+	}
+	if start != 393216 || count != 65536 {
+		t.Fatalf("range = %d+%d, want 393216+65536", start, count)
+	}
+	if _, _, err := lookupSubIDRange(subgid, "pa-missing"); err == nil {
+		t.Fatal("missing allocation must fail closed")
+	}
+}
+
+func TestLookupSubIDRanges_UsesBothFilesAndFallsBackForMissingSubGID(t *testing.T) {
+	subuid := writeTempFile(t, "pa-site:327680:65536\npa-blog:393216:65536\n")
+	subgid := writeTempFile(t, "pa-site:458752:65536\n")
+	ranges, err := lookupSubIDRanges(subuid, subgid, "pa-site")
+	if err != nil {
+		t.Fatalf("lookupSubIDRanges: %v", err)
+	}
+	if ranges != (SubIDRanges{UIDStart: 327680, UIDCount: 65536, GIDStart: 458752, GIDCount: 65536}) {
+		t.Fatalf("ranges = %+v, want subgid read from its own file", ranges)
+	}
+	ranges, err = lookupSubIDRanges(subuid, subgid, "pa-blog")
+	if err != nil {
+		t.Fatalf("lookupSubIDRanges without a subgid entry: %v", err)
+	}
+	if ranges.GIDStart != 393216 || ranges.GIDCount != 65536 {
+		t.Fatalf("ranges = %+v, want the subuid range for GIDs", ranges)
+	}
+	if _, err := lookupSubIDRanges(subuid, subgid, "pa-missing"); err == nil {
+		t.Fatal("a missing subuid allocation must fail closed")
+	}
+	// Only a missing entry falls back; an unreadable subgid file fails closed.
+	if _, err := lookupSubIDRanges(subuid, t.TempDir(), "pa-site"); err == nil {
+		t.Fatal("an unreadable /etc/subgid must fail closed")
+	}
+}
+
 func TestParseSubUIDFile_empty(t *testing.T) {
 	tmpFile := writeTempFile(t, "")
 	entries, err := parseSubUIDFile(tmpFile)

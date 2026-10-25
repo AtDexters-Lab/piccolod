@@ -109,13 +109,16 @@ type RootfsVolumeManager interface {
 	CreateWorkspaceFromGolden(ctx context.Context, req WorkspaceRootfsRequest) (RootfsHandle, error)
 	// CreateServiceRootfs creates a read-only service rootfs from a golden LV snapshot.
 	CreateServiceRootfs(ctx context.Context, req ServiceRootfsRequest) (RootfsHandle, error)
-	// CloneWorkspace creates a clone of an existing workspace.
-	// When idmap is non-nil, it overrides the origin's IDMap in the clone metadata.
+	// CloneWorkspace creates a clone of an existing workspace. idmap is the
+	// clone owner's live ID map; it is required when the origin has one.
 	CloneWorkspace(ctx context.Context, originID, cloneID string, idmap *IDMapConfig) (RootfsHandle, error)
 	// ListClones returns volume IDs of clones created from the given origin volume.
 	ListClones(ctx context.Context, originVolumeID string) ([]string, error)
-	// AttachRootfs activates and mounts an existing rootfs volume.
-	AttachRootfs(ctx context.Context, volumeID string) (RootfsHandle, error)
+	// AttachRootfs activates and mounts an existing rootfs volume. idmap is
+	// the owning app user's live ID map, nil only for volumes without one
+	// (golden content). The volume's recorded map follows it; a bind still
+	// mounted with an older map fails with ErrIDMapStaleMount.
+	AttachRootfs(ctx context.Context, volumeID string, idmap *IDMapConfig) (RootfsHandle, error)
 	// DetachRootfs unmounts and deactivates a rootfs volume.
 	DetachRootfs(ctx context.Context, volumeID string) error
 	// DestroyRootfs permanently removes a rootfs volume.
@@ -164,7 +167,9 @@ type RootfsVolumeManager interface {
 type GoldenContentManager interface {
 	EnsureGoldenContent(ctx context.Context, req GoldenContentRequest) (GoldenContentHandle, error)
 	CreateArtifactReference(ctx context.Context, req ArtifactReferenceRequest) (ArtifactHandle, error)
-	AttachArtifactReference(ctx context.Context, referenceID string) (ArtifactHandle, error)
+	// AttachArtifactReference attaches a recorded reference with the owning
+	// app user's live ID map, which its record follows like a rootfs volume.
+	AttachArtifactReference(ctx context.Context, referenceID string, idmap IDMapConfig) (ArtifactHandle, error)
 	DetachArtifactReference(ctx context.Context, referenceID string) error
 	DestroyArtifactReference(ctx context.Context, referenceID string) error
 	GarbageCollectArtifactReferences(ctx context.Context, retained map[string]struct{}) error
@@ -213,6 +218,7 @@ type GoldenContentHandle struct {
 
 // ArtifactReferenceRequest creates a durable app-owned reference before its
 // live attachment. ReferenceID must be stable for the app/artifact generation.
+// IDMap is the owning app user's live ID map.
 type ArtifactReferenceRequest struct {
 	ReferenceID string
 	GoldenID    string

@@ -126,6 +126,17 @@ type luksVolumeManager struct {
 	// a fake to drive the AttachStateOf partition without touching the
 	// real kernel.
 	kernelSnapshotFn kernelSnapshotReader
+
+	// idmappedMountFn creates an idmapped bind. nil = fsutil.CreateIDMappedMount.
+	// Tests inject a fake to observe the ID map a bind is built from.
+	idmappedMountFn func(source, target string, config fsutil.IDMapConfig) error
+}
+
+func (m *luksVolumeManager) createIDMappedMount(source, target string, config fsutil.IDMapConfig) error {
+	if m.idmappedMountFn != nil {
+		return m.idmappedMountFn(source, target, config)
+	}
+	return fsutil.CreateIDMappedMount(source, target, config)
 }
 
 // LUKSVolumeManagerConfig holds dependencies for the unified volume manager.
@@ -1785,7 +1796,7 @@ type volumeMetaV3 struct {
 	BaseImageRef    string     `json:"base_image_ref,omitempty"`
 	GoldenLV        string     `json:"golden_lv,omitempty"`
 	CloneOf         string     `json:"clone_of,omitempty"`
-	IDMap           *IDMapMeta `json:"idmap,omitempty"`
+	IDMap           *IDMapMeta `json:"idmap,omitempty"`            // map the idmapped bind was last built with; follows the app user (idmap_live.go)
 	FlattenComplete string     `json:"flatten_complete,omitempty"` // RFC3339 timestamp
 	// GoldenIdentity is the complete source+resolved-content+projection identity
 	// for generic golden content. Legacy image goldens without this field are
@@ -1795,7 +1806,8 @@ type volumeMetaV3 struct {
 
 	// IDMapFingerprint is the lowercase hex BLAKE2b-256 of canonicalIDMapBytes(*IDMap).
 	// Empty for volumes without IDMap. Once non-empty, mutations to the IDMap
-	// fields are rejected by writeVolumeMetaV3 (ErrIDMapImmutable). Backfilled
+	// fields are rejected by writeVolumeMetaV3 (ErrIDMapImmutable); only
+	// writeLiveIDMap, on an attach following the app user, rewrites both. Backfilled
 	// from the in-memory IDMap on first read for volumes created before the
 	// volume-attach-truth work shipped — pre-existing hand-edited metadata is
 	// grandfathered (see plan §"Pre-Phase-1 fleet grandfathering").
@@ -1984,6 +1996,8 @@ func writeVolumeMeta(path string, meta *volumeMetaV2) error {
 // persisted) is also rejected — otherwise an attacker could clear the
 // guard by deleting the idmap field, then re-add a different IDMap on
 // the next write (which would have no fingerprint to compare against).
+// The one exception is writeLiveIDMap, which an attach uses to make the
+// record follow the owning app user's live IDs.
 // 2. Fingerprint maintenance: when meta.IDMap != nil and meta.IDMapFingerprint
 // is empty, the fingerprint is computed and stored. When IDMap == nil
 // AND no fingerprint was previously persisted, the fingerprint stays

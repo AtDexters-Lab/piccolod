@@ -598,6 +598,12 @@ One entry in the control plane. All volumes reference this key.
 
 ### 7.3 Workspace Metadata
 
+> **ID map amendment (2026-10-25):** the `idmap` block records the map the
+> volume's idmapped mount was last built with; it is not a pin. Every create,
+> clone and attach passes the owning app user's live map, and the record
+> follows it whenever no mount built from the old record is live. See
+> [../rca/20261025-rootfs-idmap-drift.md](../rca/20261025-rootfs-idmap-drift.md).
+
 ```json
 {
   "version": 3,

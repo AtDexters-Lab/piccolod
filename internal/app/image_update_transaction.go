@@ -318,7 +318,7 @@ func (m *AppManager) abortV2OnlyImageUpdateTransition(ctx context.Context, state
 			}
 		}
 		m.configureOIDCAuthorizePaths(instanceID, def)
-		prebuiltRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, def, appInst)
+		prebuiltRootfs, err := m.ensureAllServiceRootfsAttached(ctx, instanceID, mode, def, appInst, runtime)
 		if err != nil {
 			return fmt.Errorf("attach previous rootfs: %w", err)
 		}
