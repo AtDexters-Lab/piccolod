@@ -126,7 +126,8 @@ start while `kvm_amd` holds AMD-V (`VERR_SVM_IN_USE`).
 
 ## Remediation Status
 
-- Fix, tests and alpha stage: branch `fix/rootfs-idmap-follows-app-user`.
+- Fix, tests and alpha stage: PR AtDexters-Lab/piccolod#47
+  (`fix/rootfs-idmap-follows-app-user`).
 - Open: date the account deletion with the snapshot command above.
 - Follow-up: on uninstall, `destroyAllServiceRootfs` destroys the network
   anchor rootfs only when the definition has `Services`, so a legacy
