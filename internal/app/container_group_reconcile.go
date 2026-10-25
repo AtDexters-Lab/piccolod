@@ -546,20 +546,22 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 	}
 
 	// Service rootfs volumes attach lazily: sync.OnceValues memoizes the
-	// (map, error) so the first create/recreate consumer triggers the attach and
-	// the rest reuse it. A steady-state pass reaches no consumer and never
-	// attaches, probes, or logs. Constructed only on the running path —
-	// consumers are unreachable when this is nil (the !desiredRunning branch
-	// return first).
+	// (map, error) so the first branch that needs the volumes triggers the
+	// attach and the rest reuse it. Starting an existing container needs them
+	// too: `podman start` reuses its recorded --rootfs path, and quiescing a
+	// group (Stop, the shutdown drain) detaches the volume behind it. A
+	// steady-state pass reaches no consumer and never attaches, probes, or
+	// logs. Constructed only on the running path — consumers are unreachable
+	// when this is nil (the !desiredRunning branch return first).
 	var rootfsMap func() (map[string]*rootfsMountInfo, error)
 	if desiredRunning {
 		rootfsMap = sync.OnceValues(func() (map[string]*rootfsMountInfo, error) {
 			return m.ensureAllServiceRootfsAttached(ctx, appInst.InstanceID, mode, def, appInst, runtime)
 		})
 	}
-	// Artifact mounts are needed only when creating a service container. Keep
-	// steady-state reconciliation independent of artifact size: the first
-	// create/recreate consumer attaches and validates the recorded references,
+	// Artifact mounts are needed only when starting or creating a service
+	// container. Keep steady-state reconciliation independent of artifact size:
+	// the first such consumer attaches and validates the recorded references,
 	// and any later consumer in this pass reuses the same handles.
 	artifactMap := sync.OnceValues(func() (map[string]persistence.ArtifactHandle, error) {
 		return m.ensureAppArtifactAttachments(ctx, state, appInst, def, runtime)
@@ -649,8 +651,14 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			"anchor process no longer belongs to its libpod cgroup", bn)
 	}
 
-	// Ensure anchor running.
+	// Ensure anchor running. Attach before starting: on a detached rootfs
+	// Podman overlays the empty mountpoint and the start fails with
+	// `exec: "/pause": stat /pause: no such file or directory`.
 	if !anchorState.Running {
+		bn, rootfsErr := rootfsMap()
+		if rootfsErr != nil {
+			return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+		}
 		if err := m.containerManager.StartContainer(ctx, runtime, anchorID); err != nil {
 			if pressure.IsAdmissionError(err) {
 				return err
@@ -658,10 +666,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 			// Container can't start — remove and recreate the entire group.
 			// Covers all stale state: reboot (wiped /run/), dead netns, corrupted runtime, etc.
 			m.setObservedStatusMessage(appInst.InstanceID, "Container start failed, recreating")
-			bn, rootfsErr := rootfsMap()
-			if rootfsErr != nil {
-				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
-			}
 			if recoverErr := m.recoverStaleAnchor(ctx, state, appInst, def, layout, runtime,
 				fmt.Sprintf("anchor start failed (%v), recreating container group", err), bn); recoverErr != nil {
 				m.handleStartupEffectFailure(state, appInst, recoverErr)
@@ -798,6 +802,17 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 		}
 
 		if !st.Running {
+			// Like the anchor, a service starts on its recorded rootfs and any
+			// artifact mounts, so attach them first.
+			bn, rootfsErr := rootfsMap()
+			if rootfsErr != nil {
+				return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
+			}
+			if storage := def.Services[svcName].Storage; storage != nil && len(storage.Artifacts) > 0 {
+				if _, artifactErr := artifactMap(); artifactErr != nil {
+					return fmt.Errorf("failed to attach artifacts: %w", artifactErr)
+				}
+			}
 			if err := m.containerManager.StartContainer(ctx, runtime, cid); err != nil {
 				if pressure.IsAdmissionError(err) {
 					return err
@@ -806,10 +821,6 @@ func (m *AppManager) reconcileContainerGroup(ctx context.Context, state *Filesys
 					appInst.InstanceID, svcName, cid, err)
 				m.setObservedStatusMessage(appInst.InstanceID, "Service start failed, recreating")
 
-				bn, rootfsErr := rootfsMap()
-				if rootfsErr != nil {
-					return fmt.Errorf("failed to attach rootfs: %w", rootfsErr)
-				}
 				artifactHandles, artifactErr := artifactMap()
 				if artifactErr != nil {
 					return fmt.Errorf("failed to attach artifacts: %w", artifactErr)

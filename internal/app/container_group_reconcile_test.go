@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -279,6 +280,141 @@ func TestReconcileContainerGroupDoesNotAttachArtifactsForHealthyRuntime(t *testi
 	}
 	if !reflect.DeepEqual(rootfs.artifactAttached, []string{"ref-model"}) {
 		t.Fatalf("missing-service reconcile artifact attachments = %v, want one recorded reference", rootfs.artifactAttached)
+	}
+}
+
+// The shutdown drain stops a group and detaches its rootfs and artifact mounts
+// but keeps the containers. Reconcile must attach both before `podman start`;
+// started first, the anchor's overlay has no /pause and the whole group is
+// recreated after every graceful restart.
+func TestReconcileAttachesMountsBeforeStartingQuiescedGroup(t *testing.T) {
+	serviceVolumes := map[string]string{
+		networkAnchorServiceName: persistence.ServiceRootfsVolumeID("testapp", networkAnchorServiceName),
+		"main":                   persistence.ServiceRootfsVolumeID("testapp", "main"),
+		"side":                   persistence.ServiceRootfsVolumeID("testapp", "side"),
+	}
+	for _, tc := range []struct {
+		name          string
+		mode          string
+		anchorRunning bool              // only the services stopped; their starts must attach
+		volumes       map[string]string // service → rootfs volume its container was created on
+	}{
+		{name: "service mode", mode: "service", volumes: serviceVolumes},
+		{name: "service mode with the anchor running", mode: "service", anchorRunning: true, volumes: serviceVolumes},
+		{
+			name: "workspace mode",
+			mode: "workspace",
+			volumes: map[string]string{
+				networkAnchorServiceName: persistence.ServiceRootfsVolumeID("testapp", networkAnchorServiceName),
+				"main":                   "workspace-testapp",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mgr, mock, state, def, layout, runtime := newReconcileTestEnv(t)
+			ctx := context.Background()
+			def.Extensions = map[string]interface{}{"mode": tc.mode}
+			if tc.mode == "workspace" {
+				delete(def.Services, "side")
+			}
+			def.Artifacts = map[string]api.AppArtifact{
+				"model": {
+					Source: api.ArtifactSource{
+						Type:       "huggingface",
+						Repository: "example/model",
+						Revision:   "commit",
+						Path:       ".",
+					},
+				},
+			}
+			mainService := def.Services["main"]
+			mainService.Storage = &api.AppStorage{
+				Artifacts: map[string]api.AppArtifactMount{
+					"model": {Container: "/models/model"},
+				},
+			}
+			def.Services["main"] = mainService
+
+			rootfs := &compensationRootfsManager{
+				stubRootfsManager: newStubRootfsManager(t.TempDir()),
+			}
+			rootfs.exists = make(map[string]bool, len(tc.volumes))
+			for _, volumeID := range tc.volumes {
+				rootfs.exists[volumeID] = true
+			}
+			mgr.SetRootfsManager(rootfs)
+
+			appInst := createRunningReconcileGroup(t, mock, state, def, runtime)
+			appInst.ArtifactReferences = map[string]string{"model": "ref-model"}
+			if err := state.StoreApp(appInst); err != nil {
+				t.Fatalf("store artifact app: %v", err)
+			}
+			endpoints, err := mgr.serviceManager.AllocateForApp(appInst.InstanceID, def.Listeners)
+			if err != nil || len(endpoints) != 1 {
+				t.Fatalf("allocate publication: endpoints=%+v err=%v", endpoints, err)
+			}
+			mock.containers[appInst.NetworkAnchorID].Spec.Ports = []container.PortMapping{{
+				Host:      endpoints[0].HostBind,
+				Container: endpoints[0].GuestPort,
+				Protocol:  "tcp",
+			}}
+			mgr.serviceManager.SetAppContainerID(appInst.InstanceID, appInst.NetworkAnchorID)
+
+			// Leave the group as the drain does: stopped, nothing attached.
+			containerIDs := map[string]string{networkAnchorServiceName: appInst.NetworkAnchorID}
+			for svcName, id := range appInst.Containers {
+				containerIDs[svcName] = id
+			}
+			for svcName, id := range containerIDs {
+				mock.containers[id].Spec.Rootfs = filepath.Join(rootfs.baseDir, "rootfs", tc.volumes[svcName])
+				if svcName == networkAnchorServiceName && tc.anchorRunning {
+					continue
+				}
+				if err := mock.StopContainer(ctx, runtime, id); err != nil {
+					t.Fatalf("stop %s: %v", svcName, err)
+				}
+			}
+			mock.containers[containerIDs["main"]].Spec.Volumes = []container.VolumeMapping{{
+				Host:      rootfs.baseDir,
+				Container: "/models/model",
+				Options:   "ro",
+			}}
+			mock.startHook = func(c *mockContainer) error {
+				if _, attached := rootfs.attachIDMaps[filepath.Base(c.Spec.Rootfs)]; !attached {
+					return fmt.Errorf("rootfs %s is not mounted", c.Spec.Rootfs)
+				}
+				if len(c.Spec.Volumes) > 0 && !slices.Contains(rootfs.artifactAttached, "ref-model") {
+					return fmt.Errorf("artifact bind source %s is not mounted", c.Spec.Volumes[0].Host)
+				}
+				return nil
+			}
+
+			if err := mgr.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true); err != nil {
+				t.Fatalf("post-drain reconcile: %v", err)
+			}
+			for svcName, id := range containerIDs {
+				st, _ := mock.InspectContainerState(ctx, runtime, id)
+				if !st.Running {
+					t.Errorf("%s container %s was not started in place (exists=%v)", svcName, id, st.Exists)
+				}
+			}
+			if len(mock.containers) != len(containerIDs) {
+				t.Errorf("reconcile recreated containers: have %d, want the original %d", len(mock.containers), len(containerIDs))
+			}
+			if got := mgr.getObservedStatus(appInst.InstanceID); got != StatusRunning {
+				t.Errorf("status = %q, want %q", got, StatusRunning)
+			}
+
+			// The running group needs no mounts: steady state stays attach-free.
+			rootfs.attachIDMaps = nil
+			rootfs.artifactAttached = nil
+			if err := mgr.reconcileContainerGroup(ctx, state, appInst, def, layout, runtime, true); err != nil {
+				t.Fatalf("steady-state reconcile: %v", err)
+			}
+			if len(rootfs.attachIDMaps) != 0 || len(rootfs.artifactAttached) != 0 {
+				t.Errorf("steady-state reconcile attached rootfs=%v artifacts=%v", rootfs.attachIDMaps, rootfs.artifactAttached)
+			}
+		})
 	}
 }
 
