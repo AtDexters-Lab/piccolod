@@ -2092,6 +2092,58 @@ func TestResizeConvergeDoesNotShrinkLVWhenMetadataIsStale(t *testing.T) {
 	requireCallContaining(t, calls, " piccolo-vol-app-drawguess")
 }
 
+// AlreadyAttached tells a caller undoing its own attaches which volumes to
+// leave attached: the attach kept layers it found live, and they may back
+// running containers.
+func TestAttachRootfsReportsLayersFoundLive(t *testing.T) {
+	const volumeID = "svc-rootfs-site--main"
+	mapperName := volMapperName(volumeID)
+	tests := []struct {
+		name                string
+		mapper, raw, bind   bool // layers live before the attach
+		wantAlreadyAttached bool
+	}{
+		{name: "attached", mapper: true, raw: true, bind: true, wantAlreadyAttached: true},
+		{name: "partial", mapper: true, raw: true, wantAlreadyAttached: true},
+		{name: "detached"},
+		// The attach clears a stale mount record and builds every layer anew.
+		{name: "stale mount record", raw: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			core, _ := paths.SetRootsForTest(t)
+			writeServiceRootfsMeta(t, volumeID, true)
+			snap := newSnap()
+			devKey := ""
+			if tc.mapper {
+				devKey = snap.mapper(mapperName)
+			}
+			if tc.raw {
+				snap.mount(paths.MountDir(volumeID), "btrfs", "/dev/mapper/"+mapperName, devKey)
+			}
+			if tc.bind {
+				snap.mount(paths.MountDir(volumeID)+"-idmap", "btrfs", "/dev/mapper/"+mapperName, devKey)
+			}
+			run := &fakeRunner{}
+			mgr := newTestManager()
+			mgr.run = run
+			mgr.crypto = newResizeTestCryptManager(t, core)
+			mgr.tmpfsDir = t.TempDir()
+			mgr.lvMgr = lvm.NewLVManager(run, lvm.DefaultVGName, lvm.DefaultThinPoolName)
+			mgr.idmappedMountFn = func(string, string, IDMapConfig) error { return nil }
+			mgr.kernelSnapshotFn = staticSnapshot(snap.build())
+
+			handle, err := mgr.AttachRootfs(context.Background(), volumeID, &recordedTestIDMap)
+			if err != nil {
+				t.Fatalf("AttachRootfs: %v", err)
+			}
+			if handle.AlreadyAttached != tc.wantAlreadyAttached {
+				t.Fatalf("AlreadyAttached = %v, want %v", handle.AlreadyAttached, tc.wantAlreadyAttached)
+			}
+		})
+	}
+}
+
 func newResizeTestCryptManager(t *testing.T, core string) *crypt.Manager {
 	t.Helper()
 	mgr, err := crypt.NewManager(core)
