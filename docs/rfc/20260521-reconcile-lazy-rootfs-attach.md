@@ -51,6 +51,15 @@ A `grep blockNativeRootfsMap` is the surface-area check: **six** consumer sites 
 
 Genuinely-plain start paths — anchor `StartContainer` success (~281) and service `StartContainer` success (~368) — do **not** consume the map. But their **failure siblings do** (286, 382): a failed start escalates to recreate, which needs the handles. That distinction is the correction over the earlier draft.
 
+> **Start-path amendment (2026-10-25):** the plain starts do need the
+> volumes. `podman start` reuses the container's recorded `--rootfs` path,
+> and the shutdown drain detaches the volume behind it, so after every
+> graceful restart the anchor failed with `exec: "/pause"` and the group was
+> recreated. Both starts now resolve the rootfs accessor first, and the start
+> of a service with artifact mounts also resolves the artifact accessor.
+> Steady state still attaches nothing. See
+> [../rca/20261025-anchor-start-before-rootfs-attach.md](../rca/20261025-anchor-start-before-rootfs-attach.md).
+
 ## Q2 — named behavior at each site
 
 - **Accessor error** at any consumer: wrap/return the error before the (re)create runs (see Decision for ordering). Fail-closed: no container (re)created without its rootfs.

@@ -22,6 +22,7 @@ type MockContainerManager struct {
 	createError              error
 	startError               error
 	startErrorForContainer   map[string]error // per-container start errors (checked before global startError)
+	startHook                func(*mockContainer) error
 	stopError                error
 	resolveErrorForName      map[string]error
 	inspectErrorForContainer map[string]error
@@ -74,6 +75,11 @@ func (m *MockContainerManager) StartContainer(ctx context.Context, runtime conta
 		return m.startError
 	}
 	if c, ok := m.containers[containerID]; ok {
+		if m.startHook != nil {
+			if err := m.startHook(c); err != nil {
+				return err
+			}
+		}
 		c.Status = "running"
 		return nil
 	}
