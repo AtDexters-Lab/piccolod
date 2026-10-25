@@ -653,39 +653,39 @@ func (m *AppManager) detachAllServiceRootfs(ctx context.Context, instanceID stri
 
 // destroyAllServiceRootfs destroys all per-service rootfs volumes and runs GC.
 // Scans for both legacy (no digest) and versioned (with digest) rootfs volumes
-// to ensure complete cleanup on uninstall.
+// to ensure complete cleanup on uninstall. The network anchor's volumes are
+// destroyed even when appDef is nil or has no services.
 func (m *AppManager) destroyAllServiceRootfs(ctx context.Context, instanceID string, mode PiccoloMode, appDef *api.AppDefinition) {
 	rootfs := m.currentRootfsManager()
 	if rootfs == nil {
 		return
 	}
 
-	if appDef != nil && appDef.Services != nil {
-		// Scan metadata directory for ALL rootfs volumes matching each service prefix.
-		// This catches both legacy (svc-rootfs-id--svcName) and versioned
-		// (svc-rootfs-id--svcName--digest) volumes from image updates.
-		// Not gated on mode — all multi-container apps have an anchor rootfs.
-		metaBase := paths.CoreJoin("volumes")
-		entries, readErr := os.ReadDir(metaBase)
-		if readErr != nil {
-			log.Printf("WARN: scan rootfs volumes: %v", readErr)
-		}
+	// Scan metadata directory for ALL rootfs volumes matching each service prefix.
+	// This catches both legacy (svc-rootfs-id--svcName) and versioned
+	// (svc-rootfs-id--svcName--digest) volumes from image updates.
+	metaBase := paths.CoreJoin("volumes")
+	entries, readErr := os.ReadDir(metaBase)
+	if readErr != nil {
+		log.Printf("WARN: scan rootfs volumes: %v", readErr)
+	}
 
-		// Collect all prefixes: anchor + services.
-		prefixes := make([]string, 0, len(appDef.Services)+1)
-		prefixes = append(prefixes, persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName))
+	// Collect all prefixes: anchor + services. Not gated on mode or definition —
+	// every container group has an anchor rootfs, named by instance alone.
+	prefixes := []string{persistence.ServiceRootfsVolumeID(instanceID, networkAnchorServiceName)}
+	if appDef != nil {
 		for svcName, svc := range appDef.Services {
 			if svc.Image == "" {
 				continue
 			}
 			prefixes = append(prefixes, persistence.ServiceRootfsVolumeID(instanceID, svcName))
 		}
-		for _, prefix := range prefixes {
-			for _, e := range entries {
-				if e.IsDir() && (e.Name() == prefix || strings.HasPrefix(e.Name(), prefix+"--")) {
-					if err := rootfs.DestroyRootfs(ctx, e.Name()); err != nil {
-						log.Printf("WARN: destroy rootfs %s: %v", e.Name(), err)
-					}
+	}
+	for _, prefix := range prefixes {
+		for _, e := range entries {
+			if e.IsDir() && (e.Name() == prefix || strings.HasPrefix(e.Name(), prefix+"--")) {
+				if err := rootfs.DestroyRootfs(ctx, e.Name()); err != nil {
+					log.Printf("WARN: destroy rootfs %s: %v", e.Name(), err)
 				}
 			}
 		}
