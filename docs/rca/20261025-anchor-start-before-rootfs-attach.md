@@ -122,12 +122,15 @@ recreate with the same handles.
 
 - Fix, unit test and alpha stage: PR AtDexters-Lab/piccolod#49
   (`claude/anchor-pause-restart-110e20`).
-- Follow-up, existed before this fix: when one volume fails to attach,
-  `ensureAllServiceRootfsAttached` rolls back by detaching every volume it
-  collected. That includes volumes that were already attached and may back
-  running containers. The attach-before-start calls make this reachable from
-  restarting one stopped container while its siblings run. There, a plain
-  `podman start` used to need no attach.
+- Follow-up, existed before this fix: when one volume failed to attach,
+  `ensureAllServiceRootfsAttached` rolled back by detaching every volume it
+  had collected. That included volumes that were already attached and may
+  back running containers. The attach-before-start calls made this reachable
+  from restarting one stopped container while its siblings run. There, a
+  plain `podman start` used to need no attach. Fixed in PR
+  AtDexters-Lab/piccolod#50: `AttachRootfs` marks a handle `AlreadyAttached`
+  when it found the volume attached, fully or in part, and the rollback
+  leaves such volumes attached.
 - Not fixed, cosmetic: Podman's error output ends in a newline, so the
   "anchor start failed (...), recreating container group" line is split into
   two journal entries.
