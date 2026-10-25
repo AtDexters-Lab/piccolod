@@ -120,7 +120,8 @@ recreate with the same handles.
 
 ## Remediation Status
 
-- Fix, unit test and alpha stage: branch `claude/anchor-pause-restart-110e20`.
+- Fix, unit test and alpha stage: PR AtDexters-Lab/piccolod#49
+  (`claude/anchor-pause-restart-110e20`).
 - Follow-up, existed before this fix: when one volume fails to attach,
   `ensureAllServiceRootfsAttached` rolls back by detaching every volume it
   collected. That includes volumes that were already attached and may back
